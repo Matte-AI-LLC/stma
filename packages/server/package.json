@@ -1,0 +1,67 @@
+{
+  "name": "@matteai/stma-server",
+  "version": "0.11.2",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts --dev",
+    "build": "tsup",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "db:generate": "drizzle-kit generate",
+    "seed:demo": "tsx scripts/seed-demo.ts"
+  },
+  "dependencies": {
+    "@electric-sql/pglite": "^0.3.3",
+    "@hono/node-server": "^2.1.1",
+    "@modelcontextprotocol/sdk": "^1.13.0",
+    "dotenv": "^17.4.2",
+    "drizzle-orm": "^0.45.2",
+    "hono": "^4.7.0",
+    "postgres": "^3.4.5",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@bridge/shared": "*",
+    "@types/node": "^22.10.0",
+    "drizzle-kit": "^0.31.1",
+    "tsup": "^8.3.5",
+    "tsx": "^4.19.2",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.11"
+  },
+  "description": "STMA (Speak to my Agent) server — self-hostable control plane for coding agents: MCP endpoint, environment snapshots, debug sessions, agent runs, work claims and policy. Runs on an embedded database with no setup.",
+  "license": "Elastic-2.0",
+  "bin": {
+    "stma-server": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "drizzle",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=20.6"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Matte-AI-LLC/stma.git",
+    "directory": "packages/server"
+  },
+  "homepage": "https://stma.ai",
+  "bugs": {
+    "url": "https://github.com/Matte-AI-LLC/stma/issues"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "coding-agents",
+    "agent-fleet",
+    "self-hosted",
+    "devtools"
+  ]
+}

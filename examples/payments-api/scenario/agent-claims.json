@@ -1,0 +1,44 @@
+{
+  "team": "acme-payments",
+  "project": "payments-api",
+  "runs": [
+    {
+      "agent": "alice-claude",
+      "taskKey": "PAY-201",
+      "intent": "Add payment retry and attempt tracking",
+      "claims": [
+        {
+          "resourceType": "path",
+          "resourceKey": "src/domain/payment.js",
+          "access": "write"
+        },
+        {
+          "resourceType": "migration",
+          "resourceKey": "payments-db",
+          "access": "write"
+        }
+      ]
+    },
+    {
+      "agent": "bob-codex",
+      "taskKey": "PAY-202",
+      "intent": "Add refunds and captured amount accounting",
+      "claims": [
+        {
+          "resourceType": "path",
+          "resourceKey": "src/domain/payment.js",
+          "access": "write"
+        },
+        {
+          "resourceType": "migration",
+          "resourceKey": "payments-db",
+          "access": "write"
+        }
+      ]
+    }
+  ],
+  "expected": {
+    "minimumConflicts": 2,
+    "highestSeverity": "critical"
+  }
+}

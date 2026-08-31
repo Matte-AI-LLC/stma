@@ -1,0 +1,54 @@
+{
+  "name": "@matteai/stma",
+  "version": "0.11.2",
+  "description": "STMA (Speak to my Agent) CLI — local-first agent fleet control plane: run lifecycle, work claims, policy publish/pull, environment baseline/preflight, and native lifecycle adapters for Claude Code, Codex and Cursor",
+  "type": "module",
+  "license": "Elastic-2.0",
+  "bin": {
+    "stma": "./dist/index.js"
+  },
+  "files": [
+    "README.md",
+    "LICENSE",
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=20.6"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Matte-AI-LLC/stma.git",
+    "directory": "packages/cli"
+  },
+  "homepage": "https://stma.ai",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "coding-agents",
+    "agent-fleet",
+    "claude-code",
+    "cursor",
+    "codex",
+    "works-on-my-machine",
+    "environment-diff",
+    "devtools"
+  ],
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "build": "tsup",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@bridge/shared": "*",
+    "@types/node": "^22.10.0",
+    "tsup": "^8.3.5",
+    "tsx": "^4.19.2",
+    "typescript": "^7.0.2"
+  },
+  "bugs": {
+    "url": "https://github.com/Matte-AI-LLC/stma/issues"
+  }
+}

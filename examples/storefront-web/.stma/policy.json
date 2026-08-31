@@ -1,0 +1,18 @@
+{
+  "guidance": [
+    "Keep cart prices in integer cents.",
+    "Treat src/cart.js and src/catalog.js as separate work domains when tasks do not cross their API boundary."
+  ],
+  "permissions": {
+    "deny": ["read or print secret values"],
+    "requireApproval": ["change checkout or payment contracts"]
+  },
+  "requiredChecks": ["npm test"],
+  "protectedPaths": ["src/checkout/**"],
+  "environment": {
+    "requiredEnvVarNames": [],
+    "runtimes": {
+      "node": ">=20"
+    }
+  }
+}

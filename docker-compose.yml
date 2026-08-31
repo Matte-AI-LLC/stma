@@ -1,0 +1,57 @@
+# Self-hosted STMA: app + Postgres.
+#   docker compose up -d          → http://localhost:3000
+# For a public deployment set BASE_URL to your https origin.
+#
+# !! SECURITY: change the database password before any non-local deployment.
+#    Set POSTGRES_PASSWORD once — in your shell or in a `.env` file next to this
+#    compose file — and it is wired into BOTH the postgres service and the app's
+#    DATABASE_URL below. The `change-me` fallback is for throwaway local trials only.
+#
+# Minimal single-container alternative (embedded database, no Postgres — one
+# instance only, data lives in the named volume):
+#   docker run -d -p 3000:3000 \
+#     -e NODE_ENV=production -e EMBEDDED_DB=1 -e BASE_URL=http://localhost:3000 \
+#     -v stma-data:/app/packages/server/.data ghcr.io/matte-ai-llc/stma:latest
+
+services:
+  stma:
+    build: .
+    # image: ghcr.io/matte-ai-llc/stma:latest   # use the published image instead of building
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      BASE_URL: http://localhost:3000
+      DATABASE_URL: postgresql://stma:${POSTGRES_PASSWORD:-change-me}@db:5432/stma
+      # GITHUB_CLIENT_ID: ""
+      # GITHUB_CLIENT_SECRET: ""
+      # SIGNUPS_OPEN: "1"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:'+(process.env.PORT||3000)+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: stma
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me} # override via POSTGRES_PASSWORD — see header
+      POSTGRES_DB: stma
+    volumes:
+      - stma-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U stma"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+volumes:
+  stma-db:

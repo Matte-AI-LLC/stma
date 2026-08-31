@@ -1,0 +1,37 @@
+{
+  "team": "demo-company",
+  "project": "storefront-web",
+  "agents": [
+    {
+      "name": "maya-codex",
+      "clientType": "codex",
+      "taskKey": "SHOP-104",
+      "intent": "Add immutable cart totals",
+      "branch": "codex/shop-104-cart-totals",
+      "claims": [
+        { "resourceType": "path", "resourceKey": "src/cart.js", "access": "write" },
+        { "resourceType": "component", "resourceKey": "storefront-cart", "access": "write" }
+      ]
+    },
+    {
+      "name": "deniz-cursor",
+      "clientType": "cursor",
+      "taskKey": "SHOP-105",
+      "intent": "Refresh catalog presentation data",
+      "branch": "cursor/shop-105-catalog-copy",
+      "claims": [
+        { "resourceType": "path", "resourceKey": "src/catalog.js", "access": "write" },
+        { "resourceType": "component", "resourceKey": "storefront-catalog", "access": "write" }
+      ]
+    }
+  ],
+  "crossProjectPeer": {
+    "name": "arda-claude",
+    "clientType": "claude-code",
+    "project": "payments-api",
+    "taskKey": "PAY-142",
+    "claims": [
+      { "resourceType": "migration", "resourceKey": "payments-db", "access": "write" }
+    ]
+  }
+}
