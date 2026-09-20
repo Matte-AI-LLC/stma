@@ -5,10 +5,22 @@
  * replica since it booted, and they reset on restart. Everything here is fixed-size —
  * a 60-slot minute ring, fixed latency histograms and capped path/tool maps — so
  * neither a traffic spike nor a path-scanning bot can grow the process's memory.
+ *
+ * `lib/loadHistory` is the other half: it copies closed five-minute windows of this
+ * ring into the database so the same page can answer "what happened" as well as
+ * "what is happening". The ring stays the live, forgetful one; nothing here reads
+ * the table back, and the page keeps the two visibly apart.
  */
 
-/** Upper bounds (ms) of the latency histogram. Anything slower lands in the last bucket. */
-const LATENCY_BUCKETS = [
+/**
+ * Upper bounds (ms) of the latency histogram. Anything slower lands in the last bucket.
+ *
+ * `lib/loadHistory` persists these counts verbatim, so a stored row's meaning is this
+ * array. Changing it silently re-labels every bucket already on disk — a row written
+ * yesterday would be read against today's boundaries — so `admin-history.test.ts`
+ * pins the contents. Adding a boundary is a schema change, not a tuning knob.
+ */
+export const LATENCY_BUCKETS = [
   1, 2, 5, 10, 25, 50, 75, 100, 150, 200, 300, 500, 750, 1000, 1500, 2000, 3000, 5000, 10_000,
   30_000,
 ] as const;
@@ -89,6 +101,12 @@ interface MinuteBucket {
   requests: number;
   serverErrors: number;
   clientErrors: number;
+  redirects: number;
+  rateLimited: number;
+  /** Worst event-loop lag sampled in this minute, ms. */
+  lagMaxMs: number;
+  /** Highest resident set size sampled in this minute, MB. */
+  rssMb: number;
   latency: Uint32Array;
 }
 
@@ -151,6 +169,10 @@ function emptyBucket(minute: number): MinuteBucket {
     requests: 0,
     serverErrors: 0,
     clientErrors: 0,
+    redirects: 0,
+    rateLimited: 0,
+    lagMaxMs: 0,
+    rssMb: 0,
     latency: new Uint32Array(LATENCY_BUCKETS.length),
   };
 }
@@ -162,9 +184,17 @@ function bucketIndex(ms: number): number {
   return LATENCY_BUCKETS.length - 1;
 }
 
-function percentile(hist: Uint32Array, p: number): number | null {
+/**
+ * A percentile read off a histogram — the bucket's upper bound, never an average.
+ *
+ * Exported because this is the only honest way to answer "what was p95 last
+ * Tuesday": histograms of two windows add element-wise and the percentile is
+ * recomputed from the sum. Percentiles themselves do not add, so a stored p95
+ * could never be rolled up into an hour, a day or a second replica.
+ */
+export function percentileFrom(hist: ArrayLike<number>, p: number): number | null {
   let total = 0;
-  for (const v of hist) total += v;
+  for (let i = 0; i < hist.length; i++) total += hist[i]!;
   if (total === 0) return null;
   const target = Math.max(1, Math.ceil((p / 100) * total));
   let seen = 0;
@@ -175,6 +205,29 @@ function percentile(hist: Uint32Array, p: number): number | null {
   return LATENCY_BUCKETS[LATENCY_BUCKETS.length - 1]!;
 }
 
+const percentile = (hist: Uint32Array, p: number) => percentileFrom(hist, p);
+
+/**
+ * One closed stretch of minutes, read straight out of the ring.
+ *
+ * `lib/loadHistory` persists these. There is deliberately no drain state — the
+ * reader names the window and the ring answers — so a flush that never ran, ran
+ * twice or ran late produces exactly the same row.
+ */
+export interface LoadBucket {
+  /** Minutes in the window this process actually observed. 0 = nothing to record. */
+  minutes: number;
+  requests: number;
+  redirects: number;
+  clientErrors: number;
+  serverErrors: number;
+  rateLimited: number;
+  /** One count per LATENCY_BUCKETS index. */
+  latency: number[];
+  loopLagMaxMs: number;
+  rssMb: number;
+}
+
 export interface MetricsStore {
   recordRequest(r: { method: string; path: string; status: number; ms: number; tool?: string }): void;
   recordRateLimited(): void;
@@ -182,6 +235,8 @@ export interface MetricsStore {
   /** Starts the shared event-loop-lag sampler; the returned stop is reference counted. */
   startSampler(): () => void;
   read(): MetricsSnapshot;
+  /** Roll up the minutes in `[fromMs, toMs)`. Only whole closed windows belong on disk. */
+  bucket(fromMs: number, toMs: number): LoadBucket;
 }
 
 /**
@@ -237,6 +292,7 @@ export function createMetricsStore(): MetricsStore {
       slot.latency[li] += 1;
       if (status >= 500) slot.serverErrors += 1;
       else if (status >= 400) slot.clientErrors += 1;
+      else if (status >= 300) slot.redirects += 1;
 
       const pathKey = keyWithin(paths, templatePath(path), MAX_PATHS);
       const stat = paths.get(pathKey) ?? { n: 0, sum: 0, max: 0 };
@@ -253,6 +309,7 @@ export function createMetricsStore(): MetricsStore {
 
     recordRateLimited() {
       rateLimited += 1;
+      slotFor(Math.floor(Date.now() / 60_000)).rateLimited += 1;
     },
 
     recordLoopGuardTrip() {
@@ -268,6 +325,15 @@ export function createMetricsStore(): MetricsStore {
           eventLoopLagMs = Math.max(0, now - last - SAMPLE_MS);
           if (eventLoopLagMs > eventLoopLagMaxMs) eventLoopLagMaxMs = eventLoopLagMs;
           last = now;
+          // Stamp the current minute so lag and memory reach the persisted
+          // history, and — the reason this is here rather than in the request
+          // path — so an idle minute still has a live slot. A gap in the
+          // history then means the process was not running, which is the more
+          // useful reading than "nobody called us".
+          const slot = slotFor(Math.floor(now / 60_000));
+          if (eventLoopLagMs > slot.lagMaxMs) slot.lagMaxMs = eventLoopLagMs;
+          const rssMb = Math.round(process.memoryUsage.rss() / 1e6);
+          if (rssMb > slot.rssMb) slot.rssMb = rssMb;
         }, SAMPLE_MS);
         // Never keep the process (or a test run) alive for a metrics sample.
         samplerTimer.unref?.();
@@ -283,6 +349,38 @@ export function createMetricsStore(): MetricsStore {
           samplerRefs = 0;
         }
       };
+    },
+
+    bucket(fromMs, toMs) {
+      const out: LoadBucket = {
+        minutes: 0,
+        requests: 0,
+        redirects: 0,
+        clientErrors: 0,
+        serverErrors: 0,
+        rateLimited: 0,
+        latency: Array.from({ length: LATENCY_BUCKETS.length }, () => 0),
+        loopLagMaxMs: 0,
+        rssMb: 0,
+      };
+      const first = Math.floor(fromMs / 60_000);
+      const last = Math.ceil(toMs / 60_000) - 1;
+      for (let m = first; m <= last; m++) {
+        const slot = ring[((m % MINUTES) + MINUTES) % MINUTES]!;
+        // A recycled slot holds a different minute, so a window older than the
+        // ring reports the minutes it can still prove and no others.
+        if (slot.minute !== m) continue;
+        out.minutes += 1;
+        out.requests += slot.requests;
+        out.redirects += slot.redirects;
+        out.clientErrors += slot.clientErrors;
+        out.serverErrors += slot.serverErrors;
+        out.rateLimited += slot.rateLimited;
+        for (let i = 0; i < out.latency.length; i++) out.latency[i]! += slot.latency[i]!;
+        if (slot.lagMaxMs > out.loopLagMaxMs) out.loopLagMaxMs = slot.lagMaxMs;
+        if (slot.rssMb > out.rssMb) out.rssMb = slot.rssMb;
+      }
+      return out;
     },
 
     read() {

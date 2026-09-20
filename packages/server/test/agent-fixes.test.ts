@@ -1,8 +1,10 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { afterAll, beforeAll, expect, it } from 'vitest';
+import { afterAll, beforeAll, expect, it, vi } from 'vitest';
 import { loadEnv } from '../src/env';
+import { logLine } from '../src/lib/log';
+import { redactSecrets } from '../src/lib/redact';
 import { TOOL_PARAMS } from '../src/routes/mcp';
 import { startServer, type StartedServer } from '../src/server';
 
@@ -82,7 +84,7 @@ beforeAll(async () => {
   srv = await startServer(
     loadEnv({
       port: 0,
-      host: 'localhost',
+      host: '127.0.0.1',
       nodeEnv: 'test',
       devMode: true,
       databaseUrl: undefined,
@@ -106,6 +108,97 @@ beforeAll(async () => {
 afterAll(async () => {
   await srv?.close();
   rmSync(dataDir, { recursive: true, force: true });
+});
+
+it('redacts enrollment codes and invite join URLs as credentials', () => {
+  const enrollmentCode = `stma_enroll_${'a'.repeat(40)}`;
+  const inviteCode = 'AbCdEf123_-x';
+  const inviteEndingInDash = 'AbCdEf12345-';
+  const redacted = redactSecrets(
+    `{"STMA_ENROLLMENT_CODE":"${enrollmentCode}"}\n` +
+      `join=https://stma.example/join/${inviteCode}\n` +
+      `dash=https://stma.example/join/${inviteEndingInDash}\n` +
+      `STMA_INVITE_CODE=${inviteCode}`,
+  );
+
+  expect(redacted).toContain('"STMA_ENROLLMENT_CODE":"[REDACTED]"');
+  expect(redacted.match(/\/join\/\[REDACTED\]/g)).toHaveLength(2);
+  expect(redacted).toContain('STMA_INVITE_CODE=[REDACTED]');
+  expect(redacted).not.toContain(enrollmentCode);
+  expect(redacted).not.toContain(inviteCode);
+  expect(redacted).not.toContain(inviteEndingInDash);
+});
+
+it('redacts complete unquoted authorization and password values including whitespace', () => {
+  const redacted = redactSecrets(
+    [
+      'Authorization: Bearer opaque-credential-value',
+      'authorization=Basic dXNlcjpwYXNz',
+      'password=correct horse battery staple',
+      'status=keep-this',
+    ].join('\n'),
+  );
+
+  expect(redacted).toBe(
+    [
+      'Authorization: [REDACTED]',
+      'authorization=[REDACTED]',
+      'password=[REDACTED]',
+      'status=keep-this',
+    ].join('\n'),
+  );
+  for (const fragment of ['opaque', 'credential', 'Basic', 'dXNlcjpwYXNz', 'correct', 'horse', 'battery', 'staple']) {
+    expect(redacted).not.toContain(fragment);
+  }
+});
+
+it('keeps structured logs valid while scrubbing serialized secrets', () => {
+  const enrollmentCode = `stma_enroll_${'b'.repeat(40)}`;
+  const pat = `stma_${'c'.repeat(40)}`;
+  const inviteCode = 'QwErTy123_-z';
+  const quotedToken = 'abc"def\\ghi';
+  const nestedToken = 'nested-sensitive-value';
+  const embeddedQuotedSecret = 'alpha"beta\\gamma';
+  const output = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+  try {
+    logLine({
+      evt: 'redaction_fixture',
+      detail: `token=${pat} enrollment=${enrollmentCode} join=https://stma.example/join/${inviteCode}`,
+      token: quotedToken,
+      nested: { authorization: nestedToken },
+      message: `upstream ${JSON.stringify({ password: embeddedQuotedSecret })}`,
+    });
+
+    expect(output).toHaveBeenCalledTimes(1);
+    const line = output.mock.calls[0]?.[0];
+    expect(typeof line).toBe('string');
+    const parsed = JSON.parse(line as string) as {
+      t: string;
+      evt: string;
+      detail: string;
+      token: string;
+      nested: { authorization: string };
+      message: string;
+    };
+    expect(Date.parse(parsed.t)).not.toBeNaN();
+    expect(parsed.evt).toBe('redaction_fixture');
+    expect(parsed.detail).toContain('[REDACTED]');
+    expect(parsed.detail).toContain('/join/[REDACTED]');
+    expect(parsed.token).toBe('[REDACTED]');
+    expect(parsed.nested.authorization).toBe('[REDACTED]');
+    expect(parsed.message).toBe('upstream {"password":"[REDACTED]"}');
+    expect(line).not.toContain(enrollmentCode);
+    expect(line).not.toContain(pat);
+    expect(line).not.toContain(inviteCode);
+    expect(line).not.toContain(quotedToken);
+    expect(line).not.toContain(nestedToken);
+    expect(line).not.toContain('alpha');
+    expect(line).not.toContain('beta');
+    expect(line).not.toContain('gamma');
+  } finally {
+    output.mockRestore();
+  }
 });
 
 // ---------------------------------------------------------------- unknown args
@@ -233,6 +326,51 @@ it('a heartbeat without claims keeps the collision on the map', async () => {
 
   const map = await fetch(`${srv.url}/app/agents`, { headers: cookie });
   expect(await map.text()).toContain('payments-db');
+});
+
+it('disabling an installation ends its active run and prevents self-reactivation', async () => {
+  const registration = {
+    name: 'dana-revoked-agent',
+    clientType: 'codex',
+    deviceFingerprint: 'fixes-device-revoked',
+    role: 'implementer',
+  };
+  const install = await api(`${srv.url}/api/agent/installations/register`, registration);
+  expect(install.status).toBe(200);
+  const installationId = ((await install.json()) as { installation: { id: string } }).installation
+    .id;
+  const started = await api(`${srv.url}/api/agent/runs/start`, {
+    installationId,
+    team: 'fixes',
+    project: 'payments-api',
+    taskKey: 'PAY-REVOKE',
+    claims: [{ resourceType: 'contract', resourceKey: 'refund-api', access: 'write' }],
+  });
+  expect(started.status).toBe(200);
+  const runId = ((await started.json()) as { run: { id: string } }).run.id;
+
+  const revoked = await form(
+    `${srv.url}/app/agents/installations/${installationId}/revoke`,
+    {},
+    cookie,
+  );
+  expect(revoked.status).toBe(302);
+  expect(decodeURIComponent(revoked.headers.get('location') ?? '')).toContain(
+    'Disabled dana-revoked-agent',
+  );
+
+  const heartbeat = await api(`${srv.url}/api/agent/runs/${runId}/heartbeat`, {
+    status: 'active',
+  });
+  expect(heartbeat.status).toBe(404);
+  const retry = await api(`${srv.url}/api/agent/installations/register`, registration);
+  expect(retry.status).toBe(409);
+
+  const activity = await (
+    await fetch(`${srv.url}/app/teams/fixes/activity`, { headers: cookie })
+  ).text();
+  expect(activity).toContain('agent_installation_revoked');
+  expect(activity).toContain('dana-revoked-agent; ended 1 active run(s)');
 });
 
 // ---------------------------------------------------------------- preflight

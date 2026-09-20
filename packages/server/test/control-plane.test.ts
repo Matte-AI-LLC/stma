@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import {
+  areAttemptSiblings,
   detectClaimConflicts,
   mergePolicyDocuments,
+  pathClaimsOverlap,
   policyDocumentSchema,
   type ConflictClaim,
 } from '@bridge/shared';
@@ -53,6 +55,54 @@ describe('deterministic conflict radar', () => {
     );
     expect(conflicts[0]?.severity).toBe('critical');
   });
+
+  it('uses glob semantics rather than comparing only static directory prefixes', () => {
+    expect(pathClaimsOverlap('src/foo*.ts', 'src/foobar.ts')).toBe(true);
+    expect(pathClaimsOverlap('src/file?.ts', 'src/file1.ts')).toBe(true);
+    expect(pathClaimsOverlap('src/[ab].ts', 'src/b.ts')).toBe(true);
+    expect(pathClaimsOverlap('src/[!ab].ts', 'src/c.ts')).toBe(true);
+    expect(pathClaimsOverlap('src/**/index.ts', 'src/index.ts')).toBe(true);
+    expect(pathClaimsOverlap('src/**/index.ts', 'src/a/b/index.ts')).toBe(true);
+
+    expect(pathClaimsOverlap('src/a*.ts', 'src/b*.ts')).toBe(false);
+    expect(pathClaimsOverlap('src/[ab].ts', 'src/c.ts')).toBe(false);
+    expect(pathClaimsOverlap('src/[!ab].ts', 'src/a.ts')).toBe(false);
+    expect(pathClaimsOverlap('src/*.ts', 'src/*.js')).toBe(false);
+  });
+
+  it('keeps literal directory scopes covering their descendants', () => {
+    expect(pathClaimsOverlap('src/payments', 'src/payments/refund.ts')).toBe(true);
+    expect(pathClaimsOverlap('src/payments', 'src/catalog/refund.ts')).toBe(false);
+  });
+
+  it('only exempts a same-owner attempt when both worktrees are present and distinct', () => {
+    const base = { ownerId: 'alice', attemptGroup: 'PAY-1-fanout', taskKey: 'PAY-1' };
+    expect(areAttemptSiblings(
+      { ...base, attemptGroup: null, worktree: '/worktrees/a' },
+      { ...base, attemptGroup: null, worktree: '/worktrees/b' },
+    )).toBe(false);
+    expect(
+      areAttemptSiblings(
+        { ...base, worktree: '/worktrees/pay-1-a' },
+        { ...base, worktree: '/worktrees/pay-1-b' },
+      ),
+    ).toBe(true);
+    expect(
+      areAttemptSiblings(
+        { ...base, worktree: '/worktrees/pay-1-a/' },
+        { ...base, worktree: '/worktrees/./pay-1-a' },
+      ),
+    ).toBe(false);
+    expect(
+      areAttemptSiblings({ ...base, worktree: null }, { ...base, worktree: '/worktrees/pay-1-b' }),
+    ).toBe(false);
+    expect(
+      areAttemptSiblings(
+        { ...base, ownerId: 'alice', worktree: '/worktrees/pay-1-a' },
+        { ...base, ownerId: 'bob', worktree: '/worktrees/pay-1-b' },
+      ),
+    ).toBe(false);
+  });
 });
 
 describe('policy merge', () => {
@@ -74,4 +124,3 @@ describe('policy merge', () => {
     expect(merged.environment.runtimes.node).toBe('24');
   });
 });
-

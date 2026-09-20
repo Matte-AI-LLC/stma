@@ -65,6 +65,7 @@ export async function devicesForUser(
 export async function devicesByMember(
   db: Db,
   teamId: string,
+  projectId?: string,
 ): Promise<Map<string, DeviceSummary[]>> {
   const rows = await db
     .select({
@@ -73,7 +74,12 @@ export async function devicesByMember(
       last: max(snapshots.createdAt),
     })
     .from(snapshots)
-    .where(eq(snapshots.teamId, teamId))
+    .where(
+      and(
+        eq(snapshots.teamId, teamId),
+        projectId ? eq(snapshots.projectId, projectId) : undefined,
+      ),
+    )
     .groupBy(snapshots.userId, snapshots.deviceLabel);
   const byUser = new Map<string, DeviceSummary[]>();
   for (const row of rows) {

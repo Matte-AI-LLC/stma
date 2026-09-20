@@ -70,6 +70,7 @@ let existingFiles: string[] = [];
 let existingBranches: string[] = ['main'];
 /** Pipelines already registered — a POST for one of these names fails like Azure's does. */
 let existingPipelines: Array<{ id: number; name: string }> = [];
+let observedBuilds: Record<string, unknown> = {};
 
 export const adoOutbox = {
   all(): readonly RecordedCall[] {
@@ -90,11 +91,15 @@ export const adoOutbox = {
   seedPipelines(pipelines: Array<{ id: number; name: string }>): void {
     existingPipelines = pipelines;
   },
+  seedBuild(id: number, value: unknown): void {
+    observedBuilds[String(id)] = value;
+  },
   clear(): void {
     calls.length = 0;
     existingFiles = [];
     existingBranches = ['main'];
     existingPipelines = [];
+    observedBuilds = {};
   },
 };
 
@@ -110,6 +115,11 @@ async function request<T>(
   if (env.nodeEnv === 'test') {
     calls.push({ method, path, body, at: new Date() });
     if (calls.length > CALL_CAP) calls.splice(0, calls.length - CALL_CAP);
+    const build = /\/build\/builds\/(\d+)\?/.exec(path);
+    if (method === 'GET' && build) {
+      const value = observedBuilds[build[1]!];
+      return value ? { ok: true, value: value as T } : { ok: false, error: 'not_found_or_no_access' };
+    }
     // Wire shapes, as Azure sends them. An empty repository has no defaultBranch
     // field at all — measured against a fresh project 2026-08-31.
     if (method === 'GET' && /\/git\/repositories\/[^/?]+\?/.test(path)) {
@@ -254,6 +264,13 @@ interface RawRepo {
 
 interface RawRefs {
   value: Array<{ name: string; objectId: string }>;
+}
+
+/** Read one build, never queue or retry it. Validate the wire response in the domain. */
+export async function readAdoBuild(env: Env, config: AdoConfig, buildId: number): Promise<AdoResult<unknown>> {
+  if (!Number.isSafeInteger(buildId) || buildId < 1 || buildId > 2_147_483_647)
+    return { ok: false, error: 'invalid_build_id' };
+  return request(env, config, 'GET', `${base(config)}/build/builds/${buildId}?api-version=${API_VERSION}`);
 }
 
 /**

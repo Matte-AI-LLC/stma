@@ -1,5 +1,6 @@
 node_modules/
 dist/
+ee/.preview/
 .data/
 .env
 .env.*
@@ -10,3 +11,6 @@ coverage/
 .stma/adapter.json
 .stma/effective-policy.json
 .stma/outbox.json
+# Native adapter profiles contain machine-local credentials/state and a durable
+# hook outbox whose payload can include the user's prompt. Never publish it.
+.stma/profiles/

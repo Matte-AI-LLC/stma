@@ -1,0 +1,40 @@
+{
+  "guidance": [
+    "This is a human acceptance fixture. Work only inside this payments-api fixture.",
+    "Call start_run and check_environment before editing. Stop and report every critical conflict.",
+    "Keep migrations backwards compatible and never rewrite an applied migration.",
+    "The human, not the agent, decides task order and approves migration work."
+  ],
+  "permissions": {
+    "deny": [
+      "read or disclose secret values",
+      "deploy this fixture",
+      "push directly to main"
+    ],
+    "requireApproval": [
+      "database migration changes",
+      "force-push, branch deletion, or destructive git operations"
+    ]
+  },
+  "requiredChecks": [
+    "npm test"
+  ],
+  "protectedPaths": [
+    "migrations/**"
+  ],
+  "environment": {
+    "requiredEnvVarNames": [
+      "STMA_HUMAN_LAB"
+    ],
+    "runtimes": {}
+  },
+  "autonomy": {
+    "requireApprovalFor": [
+      "migration"
+    ]
+  },
+  "changeBudget": {
+    "maxScopeItems": 4,
+    "maxPaths": 3
+  }
+}

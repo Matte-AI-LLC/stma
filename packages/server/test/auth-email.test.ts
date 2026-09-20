@@ -8,7 +8,7 @@ import { connectDb, type Db } from '../src/db';
 import { authCodes, users } from '../src/db/schema';
 import { loadEnv } from '../src/env';
 import { runCleanupOnce } from '../src/lib/cleanup';
-import { mailOutbox } from '../src/lib/mailer';
+import { failedSignInsEmail, mailOutbox, passwordChangedEmail } from '../src/lib/mailer';
 import { startServer, type StartedServer } from '../src/server';
 
 /** Email codes on (memory transport) + ADMIN_EMAILS. */
@@ -41,8 +41,6 @@ function jar() {
     },
   };
 }
-
-type Jar = ReturnType<typeof jar>;
 
 /**
  * Each test speaks from its own address so the per-IP /auth/* limiter (30/min)
@@ -112,7 +110,7 @@ beforeAll(async () => {
   srv = await startServer(
     loadEnv({
       port: 0,
-      host: 'localhost',
+      host: '127.0.0.1',
       nodeEnv: 'test',
       devMode: true,
       databaseUrl: undefined,
@@ -127,7 +125,7 @@ beforeAll(async () => {
   plain = await startServer(
     loadEnv({
       port: 0,
-      host: 'localhost',
+      host: '127.0.0.1',
       nodeEnv: 'test',
       devMode: true,
       databaseUrl: undefined,
@@ -535,7 +533,7 @@ it('lets an operator set a missing email and refuses a duplicate', async () => {
 
   const html = await (await fetch(`${srv.url}/admin/users`, { headers: ops.header() })).text();
   const id = new RegExp(
-    '<td class="name">legacy-user</td>[\\s\\S]{0,400}?/admin/users/([0-9a-f-]{36})/email',
+    'data-user-row="legacy-user"[\\s\\S]{0,200}?/admin/users/([0-9a-f-]{36})',
   ).exec(html)?.[1];
   expect(id).toBeTruthy();
 
@@ -651,7 +649,12 @@ it('answers identically for an unknown address and sends nothing', async () => {
   const res = await post(srv, '/auth/local/forgot', { email: 'nobody@example.com' }, ip('22'));
   expect(res.headers.get('location')).toContain('/reset?ok=');
   expect(where(res)).toContain('If that address has an account');
-  expect(res.headers.getSetCookie().some((line) => line.startsWith('reset='))).toBe(false);
+  // The cookie is set here too, and that is the point. Until 2026-09-20 it was
+  // issued only where a code had really been minted, so `Set-Cookie` answered
+  // the question the status, the Location and the body all refuse to answer.
+  // The id names no auth_codes row, so /auth/local/reset turns it away exactly
+  // as it turns away a stale one.
+  expect(res.headers.getSetCookie().some((line) => line.startsWith('reset='))).toBe(true);
   expect(mailOutbox.all().length).toBe(before);
   expect(mailOutbox.latest('nobody@example.com')).toBeUndefined();
 
@@ -744,4 +747,39 @@ it('masks inbound hook tokens in the access log', async () => {
   expect(lines.join('\n')).not.toContain(secret);
   expect(http.some((l) => l.includes('"p":"/api/hooks/announce/:token"'))).toBe(true);
   expect(http.some((l) => l.includes('"p":"/api/hooks/github/:token"'))).toBe(true);
+});
+
+// ----------------------------------------------- the mail a locked-out reader gets
+
+it('sends somebody whose password just changed to the door that still opens', () => {
+  const mail = passwordChangedEmail('https://stma.ai', 'support@stma.ai');
+  const both = `${mail.text}\n${mail.html}`;
+
+  // `/login` is a wall for the one reader this mail is written for: if somebody
+  // else made the change, the old password no longer works.
+  expect(both).not.toContain('/login');
+  expect(mail.text).toContain('https://stma.ai/forgot');
+  expect(mail.html).toContain('href="https://stma.ai/forgot"');
+
+  // The two parts used to disagree — "reset it immediately" against "sign in".
+  expect(mail.text).toContain('reset your password now');
+  expect(mail.html).toContain('reset your password now');
+  expect(both).not.toContain('sign in at');
+
+  expect(mail.text).toContain('support@stma.ai');
+  expect(mail.html).toContain('mailto:support@stma.ai');
+});
+
+it('offers no support address when the instance has none', () => {
+  const mail = passwordChangedEmail('https://example.test');
+  expect(mail.text).not.toContain('write to');
+  expect(mail.html).not.toContain('mailto:');
+  expect(mail.text).toContain('https://example.test/forgot'); // still says what to do
+});
+
+it('points a throttled account at reset too, because its own password is refused', () => {
+  const mail = failedSignInsEmail('https://stma.ai', 15);
+  expect(`${mail.text}\n${mail.html}`).not.toContain('/login');
+  expect(mail.text).toContain('https://stma.ai/forgot');
+  expect(mail.html).toContain('href="https://stma.ai/forgot"');
 });

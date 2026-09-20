@@ -1,7 +1,7 @@
 import { ACTIVE_AGENT_RUN_STATUSES } from '@bridge/shared';
-import { count, countDistinct, desc, eq, gt, inArray, isNull, max, sql } from 'drizzle-orm';
+import { and, count, countDistinct, desc, eq, gt, inArray, isNull, max, sql } from 'drizzle-orm';
 import { Hono } from 'hono';
-import type { MiddlewareHandler } from 'hono';
+import type { Context, MiddlewareHandler } from 'hono';
 import type { Db } from '../db';
 import {
   activity,
@@ -15,15 +15,38 @@ import {
   projects,
   snapshots,
   teams,
+  tokens,
   users,
 } from '../db/schema';
 import { adminConfigured, isAdminUser } from '../lib/admin';
-import { activationFunnel, teamUsage, usageWindows } from '../lib/usage';
-import { PLANS } from '../lib/entitlements';
+import { ceilingHistory, setTeamPlan, type CeilingChangeRow } from '../lib/ceilings';
+import {
+  LOAD_BUCKET_MS,
+  LOAD_WINDOWS,
+  LOAD_WINDOW_KEYS,
+  loadWindowKey,
+  readLoadHistory,
+  sliceErrorRate,
+  slicePercentiles,
+  type LoadHistory,
+} from '../lib/loadHistory';
+import {
+  activationFunnel,
+  ECONOMIC_SOURCE_COVERAGE,
+  economicObservation,
+  launchCohorts,
+  PILOT_OBSERVATION_WEEKS,
+  teamUsage,
+  usageWindows,
+} from '../lib/usage';
+import { effectiveLimits, PLANS } from '../lib/entitlements';
 import { emailIsFree, isEmail, normalizeEmail } from '../lib/email';
 import { fmtDate, initials, timeAgo } from '../lib/format';
 import { logLine } from '../lib/log';
+import { mailHealth, mailTransport } from '../lib/mailer';
 import { metrics } from '../lib/metrics';
+import { criticalAudit, SecurityRefusal } from '../lib/securityHooks';
+import { track } from '../lib/track';
 import type { AppEnv } from '../types';
 import { AppLayout } from '../ui/Layout';
 
@@ -73,7 +96,7 @@ const AdminTabs = ({
       Ops
     </a>
     <a class={`tab${active === 'teams' ? ' active' : ''}`} href="/admin/teams">
-      Teams
+      Workspaces
     </a>
     <a class={`tab${active === 'users' ? ' active' : ''}`} href="/admin/users">
       Users
@@ -106,6 +129,97 @@ const Stat = ({
 );
 
 const statGrid = 'display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:14px';
+
+/**
+ * Which regime the rows below were written under.
+ *
+ * `STMA_HOSTED` and `BETA_UNMETERED` move every workspace's ceiling at once and
+ * write nothing at all — they are read from the process, not the database — so
+ * a history of per-workspace changes is only readable next to the answer to
+ * "were the ceilings even being applied then". This is the honest version of a
+ * gap the table cannot close.
+ */
+const meteringNote = (env: { hosted: boolean; betaUnmetered: boolean }) =>
+  !env.hosted
+    ? 'This instance is not hosted (STMA_HOSTED unset), so every workspace resolves UNMETERED and its plan column decides nothing.'
+    : env.betaUnmetered
+      ? 'This instance is hosted with BETA_UNMETERED=1: plans are recorded but the ceilings are lifted for everyone.'
+      : 'This instance is hosted and metered: the plan column decides what each workspace may do.';
+
+/**
+ * What moved, both times said in full.
+ *
+ * "free → team" is the whole row; the route and the source are what tell an
+ * operator whether a person did it or a webhook did, which is the first
+ * question after "when".
+ */
+const CeilingHistoryCard = ({
+  rows,
+  title,
+  note,
+  withWorkspace,
+}: {
+  rows: CeilingChangeRow[];
+  title: string;
+  note: string;
+  withWorkspace: boolean;
+}) => (
+  <div class="card scroll-x" data-card="ceiling-history">
+    <div class="card-head">
+      <div>
+        <div class="card-title">{title}</div>
+        <div class="card-note">{note}</div>
+      </div>
+    </div>
+    {rows.length === 0 ? (
+      <div class="card-pad muted small">
+        No ceiling change recorded. Plan switches and evaluations appear here from the moment they
+        happen; changes made before this record existed are not in it.
+      </div>
+    ) : (
+      <table class="tbl" data-table="ceiling-history">
+        <tr>
+          <th>When</th>
+          {withWorkspace ? <th>Workspace</th> : null}
+          <th>What</th>
+          <th>Change</th>
+          <th>By</th>
+          <th class="hide-sm">Route</th>
+        </tr>
+        {rows.map((r) => (
+          <tr>
+            <td class="muted" style="white-space:nowrap" title={r.at.toISOString()}>
+              {timeAgo(r.at)}
+            </td>
+            {withWorkspace ? (
+              <td>
+                <a href={`/admin/teams/${r.teamId}`}>{r.teamName ?? r.teamSlug}</a>
+                {r.teamName && r.teamName !== r.teamSlug ? (
+                  <div class="mono muted small">{r.teamSlug}</div>
+                ) : null}
+              </td>
+            ) : null}
+            <td>
+              <span class="pill pill-member">{r.field}</span>
+            </td>
+            <td class="mono">
+              {r.previous ?? '—'} → {r.next ?? '—'}
+              {/* Prose, not a value: the change itself is the mono part. */}
+              {r.detail ? <div class="muted small" style="font-family:var(--sans)">{r.detail}</div> : null}
+            </td>
+            <td>
+              <span class={`pill ${r.source === 'billing' ? 'pill-active' : 'pill-member'}`}>
+                {r.source}
+              </span>
+              {r.actorLabel ? <div class="muted small">{r.actorLabel}</div> : null}
+            </td>
+            <td class="mono muted small hide-sm">{r.route}</td>
+          </tr>
+        ))}
+      </table>
+    )}
+  </div>
+);
 
 // ---------------------------------------------------------------- fleet
 
@@ -280,6 +394,7 @@ adminRoutes.get('/admin', async (c) => {
     fleetBy.set(row.username, person);
   }
   const fleet = [...fleetBy.values()].slice(0, FLEET_PEOPLE);
+  const ceilings = await ceilingHistory(db, { limit: 15 });
   const clientTop = byClient[0]?.n ?? 0;
   const runnersTop = activeByUser.reduce((m, r) => Math.max(m, r.n), 0);
   const runners = [...activeByUser].sort((a, b) => b.n - a.n).slice(0, 8);
@@ -315,6 +430,13 @@ adminRoutes.get('/admin', async (c) => {
         <Stat label="Active users (7d)" value={week.activeUsers} />
         <Stat label="Active agent tokens (7d)" value={week.activeTokens} />
       </div>
+
+      <CeilingHistoryCard
+        rows={ceilings}
+        title="Recent ceiling changes"
+        note={`When a workspace's limits last moved, whoever moved them — an operator here, a workspace owner starting an evaluation, or a Stripe reconciliation nobody was watching. Newest ${ceilings.length}; a workspace's whole history is on its own page. ${meteringNote(c.get('env'))}`}
+        withWorkspace
+      />
 
       <div>
         <div class="card-title">Fleet</div>
@@ -432,13 +554,18 @@ adminRoutes.get('/admin', async (c) => {
 // ---------------------------------------------------------------- usage
 
 const pct = (n: number, of: number) => (of > 0 ? Math.round((n / of) * 100) : 0);
+const usd = (cents: number | null) => (cents === null ? 'unknown' : `$${(cents / 100).toFixed(2)}`);
 
 adminRoutes.get('/admin/usage', async (c) => {
   const user = c.get('user')!;
   const db = c.get('db');
-  const windows = await usageWindows(db);
-  const funnel = await activationFunnel(db);
-  const rows = await teamUsage(db);
+  const [windows, funnel, cohorts, rows, economics] = await Promise.all([
+    usageWindows(db),
+    activationFunnel(db),
+    launchCohorts(db),
+    teamUsage(db),
+    economicObservation(db),
+  ]);
   const top = funnel[0]?.teams ?? 0;
 
   return c.html(
@@ -472,10 +599,9 @@ adminRoutes.get('/admin/usage', async (c) => {
       <div class="card">
         <div class="card-head">
           <div>
-            <div class="card-title">Activation funnel</div>
+            <div class="card-title">Independent feature adoption counts</div>
             <div class="card-note">
-              By team, because STMA only does anything once a second machine shows up. The drop
-              between two steps is the thing worth reading.
+              These are independent retained-history totals, not a sequential funnel. Solo use needs no second human. Legacy activity cannot prove activation.
             </div>
           </div>
         </div>
@@ -495,6 +621,135 @@ adminRoutes.get('/admin/usage', async (c) => {
                 </span>
               </div>
               <div class="funnelnote">{step.note}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <section class="card card-pad"><h3>Launch cohorts · last 30 days</h3><p>Durable, sequential connection-test milestones. A hello is not real work. Completion is an authenticated report, not provider verification. Older unobserved launches remain unknown.</p>{cohorts.map((row) => <p>{row.intent}: {row.opened} opened → {row.first} sender → {row.second} second installation → {row.exchanged} exchanged → {row.realResultReported} real handoff reported complete. Mean time to exchange: {row.meanSecondsToExchange === null ? 'unknown' : `${Math.round(Number(row.meanSecondsToExchange))}s`}.</p>)}</section>
+
+      <div class="card">
+        <div class="card-head">
+          <div>
+            <div class="card-title">Pilot value and cost signals · last {economics.days} days</div>
+            <div class="card-note">
+              Counts distinct workflows or runs, not event volume. They are retained signals with
+              explicit provenance, not customer acceptance or an ROI claim.
+            </div>
+          </div>
+        </div>
+        <div style={statGrid} class="card-pad">
+          <Stat
+            label="First real results"
+            value={nfmt(economics.firstRealResults.reports)}
+            note={`${nfmt(economics.firstRealResults.teams)} workspaces · authenticated report`}
+            metric="first-real-results"
+          />
+          <Stat
+            label="Repeat handoff workspaces"
+            value={nfmt(economics.handoffs.repeatTeams)}
+            note={`${nfmt(economics.handoffs.resumed)} resumed · ${nfmt(economics.handoffs.completed)} completed`}
+            metric="repeat-handoff-teams"
+          />
+          <Stat
+            label="Repeat review-signal workspaces"
+            value={nfmt(economics.reviewSignals.repeatTeams)}
+            note={`${nfmt(economics.reviewSignals.runs)} distinct runs · provider PR/CI signal`}
+            metric="repeat-review-teams"
+          />
+          <Stat
+            label="Measured run cost"
+            value={usd(economics.runCosts.measuredCents)}
+            note={`${nfmt(economics.runCosts.measuredRuns)} agent-reported measured runs`}
+            metric="measured-run-cost"
+          />
+          <Stat
+            label="Estimated run cost"
+            value={usd(economics.runCosts.estimatedCents)}
+            note={`${nfmt(economics.runCosts.estimatedRuns)} runs · excluded from measured total`}
+            metric="estimated-run-cost"
+          />
+          <Stat
+            label="Run cost not reported"
+            value={nfmt(economics.runCosts.unreportedRuns)}
+            note="Unknown is not zero"
+            metric="unreported-run-cost"
+          />
+        </div>
+        <div class="card-pad" style="padding-top:0">
+          <p class="small muted m0">
+            Latest retained signals — first result:{' '}
+            {timeAgo(economics.firstRealResults.latestAt) ?? 'none retained'}; handoff:{' '}
+            {timeAgo(economics.handoffs.latestAt) ?? 'none retained'}; provider review:{' '}
+            {timeAgo(economics.reviewSignals.latestAt) ?? 'none retained'}.
+          </p>
+        </div>
+      </div>
+
+      <div class="card scroll-x">
+        <div class="card-head">
+          <div>
+            <div class="card-title">Economic source coverage</div>
+            <div class="card-note">
+              Missing inputs stay unknown. Activity, message volume and quota are never converted
+              into support time, expense or billable consumption.
+            </div>
+          </div>
+        </div>
+        <table class="tbl">
+          <tr>
+            <th>Input</th>
+            <th>Status</th>
+            <th>Source</th>
+            <th>Boundary</th>
+          </tr>
+          {ECONOMIC_SOURCE_COVERAGE.map((row) => (
+            <tr>
+              <td class="name">{row.label}</td>
+              <td>
+                <span
+                  class={`pill ${
+                    row.status === 'retained'
+                      ? 'pill-active'
+                      : row.status === 'partial'
+                        ? 'pill-warn'
+                        : 'pill-muted'
+                  }`}
+                >
+                  {row.status}
+                </span>
+              </td>
+              <td>{row.source}</td>
+              <td class="muted">{row.boundary}</td>
+            </tr>
+          ))}
+        </table>
+        <div class="card-pad small muted">
+          Contribution is not estimated on this page. The pilot calculation keeps subscription
+          cash, optional managed-job cash and consumed service separate; included usage is never
+          added to revenue, and one expense identity can be allocated only once. Fixed company
+          costs remain outside customer contribution.
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <div>
+            <div class="card-title">Four-week pilot observation plan</div>
+            <div class="card-note">
+              Four weeks is the observation window, not an implementation estimate. Do not collect
+              source, prompt or secret content.
+            </div>
+          </div>
+        </div>
+        <div class="card-pad" style="padding-top:0">
+          {PILOT_OBSERVATION_WEEKS.map((week) => (
+            <div class="introw">
+              <div class="mono">W{week.week}</div>
+              <div>
+                <div class="name">{week.focus}</div>
+                <div class="muted small">{week.observe}</div>
+              </div>
             </div>
           ))}
         </div>
@@ -608,6 +863,155 @@ async function databaseSize(db: Db, hasPostgres: boolean): Promise<number | null
   }
 }
 
+/**
+ * A slice label narrow enough to read and wide enough to be unambiguous.
+ *
+ * The hour alone is only unambiguous inside a single day: over a week, "06:00"
+ * appears seven times, which is exactly the confusion the history exists to
+ * remove. So a day-wide slice is the date, a slice inside one day is the hour,
+ * and anything in between says both.
+ */
+const sliceLabel = (at: Date, sliceMs: number, windowMs: number) =>
+  sliceMs >= 24 * 3_600_000
+    ? at.toISOString().slice(5, 10)
+    : windowMs > 24 * 3_600_000
+      ? `${at.toISOString().slice(5, 10)} ${hhmm(at)}`
+      : hhmm(at);
+
+/**
+ * When a history bar goes red.
+ *
+ * The live chart paints a minute red for a single 5xx, and that is right: one
+ * minute with an error is an event. A slice here is an hour or a day, and the
+ * same rule painted two thirds of the chart red for one failed request in
+ * fifteen hundred — a chart where most bars are red carries no information and
+ * the eye stops reading it. So a slice goes red when 5xx crossed this share of
+ * its requests; the exact count is in the tooltip and in the table either way,
+ * so nothing is hidden, only ranked.
+ */
+const BAD_SLICE_PCT = 1;
+
+/**
+ * The record, beside the live numbers and never mixed into them.
+ *
+ * Everything above this card on the page is one process since it booted, and
+ * everything in it is what was written down. Keeping the boundary visible is
+ * the point: an operator reading "p95 ≤200 ms" has to know whether that is the
+ * last four minutes of a container that restarted or the last four weeks.
+ */
+const LoadHistoryCard = ({ history, days }: { history: LoadHistory; days: number }) => {
+  const spec = LOAD_WINDOWS[history.window];
+  const peak = Math.max(1, ...history.slices.map((s) => s.requests));
+  const totals = slicePercentiles(history.totals);
+  const covered = history.totals.buckets;
+  return (
+    <div class="card" data-card="load-history">
+      <div class="card-head">
+        <div>
+          <div class="card-title">Load history — the record</div>
+          <div class="card-note">
+            Five-minute rollups written to the database, so a restart does not erase them.{' '}
+            {covered === 0
+              ? `Nothing recorded yet: the first bucket is written about ${LOAD_BUCKET_MS / 60_000} minutes after boot.`
+              : `${nfmt(covered)} buckets in this window, ${nfmt(history.totals.requests)} requests, p95 ${fmtLatency(totals.p95)}, p99 ${fmtLatency(totals.p99)}.`}{' '}
+            {history.gaps > 0
+              ? `${nfmt(history.gaps)} buckets have no row at all — the process was not running for about ${nfmt(Math.round((history.gaps * LOAD_BUCKET_MS) / 60_000))} minutes of it.`
+              : covered === 0
+                ? ''
+                : 'No gaps: a row for every bucket since the oldest one kept.'}{' '}
+            {history.truncated
+              ? 'The window was truncated at the read limit, so the oldest part is missing.'
+              : ''}{' '}
+            A bar is red where 5xx crossed {BAD_SLICE_PCT}% of the slice's requests — the table has
+            the exact count for every slice. Kept for{' '}
+            {days === 0 ? 'as long as the row cap allows' : `${days} days`}.
+          </div>
+        </div>
+        <div class="row" style="gap:6px">
+          {LOAD_WINDOW_KEYS.map((key) => (
+            <a
+              class={`btn btn-sm${key === history.window ? ' btn-primary' : ''}`}
+              href={`/admin/ops?history=${key}`}
+            >
+              {LOAD_WINDOWS[key].label}
+            </a>
+          ))}
+        </div>
+      </div>
+      <div
+        class="spark"
+        data-spark="history"
+        role="img"
+        aria-label={`Requests per ${spec.slice} over the last ${spec.label}. ${nfmt(history.totals.requests)} requests recorded, ${nfmt(history.totals.serverErrors)} server errors, ${nfmt(history.gaps)} five-minute buckets missing.`}
+      >
+        {history.slices.map((s) => (
+          <span
+            class={`spark-bar${sliceErrorRate(s) >= BAD_SLICE_PCT ? ' bad' : s.requests > 0 ? ' on' : ''}`}
+            style={`height:${s.requests === 0 ? 2 : Math.max(6, Math.round((s.requests / peak) * 100))}%`}
+            title={`${s.at.toISOString().slice(0, 16).replace('T', ' ')} UTC · ${nfmt(s.requests)} req · ${nfmt(s.serverErrors)} 5xx · ${nfmt(s.clientErrors)} 4xx`}
+          />
+        ))}
+      </div>
+      <div class="scroll-x">
+        <table class="tbl" data-table="load-history">
+          <tr>
+            <th>{spec.sliceMs >= 24 * 3_600_000 ? 'Day (UTC)' : 'From (UTC)'}</th>
+            <th>Requests</th>
+            <th>Peak/min</th>
+            <th>4xx</th>
+            <th>5xx</th>
+            <th>Error rate</th>
+            <th>p95</th>
+            <th>p99</th>
+            <th class="hide-sm">Rate limited</th>
+            <th class="hide-sm">Peak rss</th>
+            <th class="hide-sm">Peak lag</th>
+            <th class="hide-sm">Coverage</th>
+          </tr>
+          {[...history.slices]
+            .reverse()
+            .filter((s) => s.buckets > 0)
+            .map((s) => {
+              const p = slicePercentiles(s);
+              const rate = sliceErrorRate(s);
+              return (
+                <tr>
+                  <td class="mono" style="white-space:nowrap">
+                    {sliceLabel(s.at, spec.sliceMs, spec.ms)}
+                  </td>
+                  <td>{nfmt(s.requests)}</td>
+                  <td class="muted">{nfmt(Math.round(s.peakPerMinute))}</td>
+                  <td class="muted">{nfmt(s.clientErrors)}</td>
+                  <td class={s.serverErrors > 0 ? 'mono' : 'muted'}>{nfmt(s.serverErrors)}</td>
+                  <td class="muted">{rate.toFixed(rate >= 10 ? 0 : 1)}%</td>
+                  <td class="muted">{fmtLatency(p.p95)}</td>
+                  <td class="muted">{fmtLatency(p.p99)}</td>
+                  <td class="muted hide-sm">{nfmt(s.rateLimited)}</td>
+                  <td class="muted hide-sm">{s.rssMb === 0 ? '—' : `${nfmt(s.rssMb)} MB`}</td>
+                  <td class="muted hide-sm">{nfmt(s.loopLagMaxMs)} ms</td>
+                  {/* Buckets held against buckets that should exist by now. The
+                      slice we are inside expects only what has elapsed, so a
+                      still-filling hour does not read as downtime. */}
+                  <td class={`hide-sm ${s.buckets < s.expected ? 'mono' : 'muted'}`}>
+                    {s.buckets}/{s.expected}
+                    {s.instances > 1 ? ` · ${s.instances} processes` : ''}
+                  </td>
+                </tr>
+              );
+            })}
+        </table>
+      </div>
+      {covered === 0 ? null : (
+        <div class="card-pad small muted" style="border-top:1px solid var(--line-2);padding:10px 18px">
+          Percentiles are recomputed from the stored latency histograms, never averaged — a p95 of
+          two windows is not the mean of their p95s. Slices with no recorded bucket are left out of
+          the table and drawn flat in the chart.
+        </div>
+      )}
+    </div>
+  );
+};
+
 const PathTable = ({
   title,
   note,
@@ -655,6 +1059,9 @@ adminRoutes.get('/admin/ops', async (c) => {
   const db = c.get('db');
   const m = metrics.read();
   const dayAgo = new Date(Date.now() - DAY);
+  const mailTransportName = mailTransport(env);
+  const mailCounts = mailHealth.counts();
+  const mailFails = mailHealth.failures();
 
   const recent = await db
     .select()
@@ -689,6 +1096,7 @@ adminRoutes.get('/admin/ops', async (c) => {
   const activeRuns = activeRunRows[0]?.n ?? 0;
   const storage = await tableCounts(db);
   const dbSize = await databaseSize(db, Boolean(env.databaseUrl));
+  const history = await readLoadHistory(db, loadWindowKey(c.req.query('history')));
 
   const total = Math.max(1, m.totals.requests);
   const classes = [
@@ -706,8 +1114,11 @@ adminRoutes.get('/admin/ops', async (c) => {
         <div>
           <h1 class="title">Ops</h1>
           <p class="sub">
-            Live errors and load for this replica. Counters are in-process and reset when the
-            container restarts; the error log is persisted.
+            Two different things on one page, and the difference matters. The tiles, the sparkline,
+            the status mix, the endpoint tables and <strong>Mail</strong> are{' '}
+            <strong>this process since it booted</strong> — in memory, gone on restart. The error
+            log and <strong>Load history</strong> are the <strong>record</strong>, and they survive
+            one.
           </p>
         </div>
       </div>
@@ -750,15 +1161,18 @@ adminRoutes.get('/admin/ops', async (c) => {
       <div class="card">
         <div class="card-head">
           <div>
-            <div class="card-title">Traffic — last 60 minutes</div>
+            <div class="card-title">Traffic — last 60 minutes (this process)</div>
             <div class="card-note">
-              One bar per minute. Red marks a minute that contained a 5xx. Peak{' '}
-              {nfmt(m.lastHour.peak)} req/min.
+              One bar per minute, from memory. Red marks a minute that contained a 5xx. Peak{' '}
+              {nfmt(m.lastHour.peak)} req/min. For anything older, read the record below.
             </div>
           </div>
         </div>
+        {/* Two charts share this page now, so each says which it is: a test or a
+            script counting bars has to be able to name the one it means. */}
         <div
           class="spark"
+          data-spark="live"
           role="img"
           aria-label={`Requests per minute over the last 60 minutes. ${nfmt(
             m.lastHour.requests,
@@ -782,10 +1196,12 @@ adminRoutes.get('/admin/ops', async (c) => {
         </div>
       </div>
 
+      <LoadHistoryCard history={history} days={env.loadRetentionDays} />
+
       <div class="card scroll-x">
         <div class="card-head">
           <div>
-            <div class="card-title">Status codes</div>
+            <div class="card-title">Status codes (this process)</div>
             <div class="card-note">
               Since boot, {nfmt(m.totals.requests)} requests (static assets and /health excluded).
             </div>
@@ -814,6 +1230,78 @@ adminRoutes.get('/admin/ops', async (c) => {
             </tr>
           ))}
         </table>
+      </div>
+
+      {/*
+       * Mail is the one subsystem that fails completely silently. `sendMail`
+       * returns a result instead of throwing, so nothing reaches the error
+       * handler and nothing reaches the error log below — a provider refusing
+       * every message looked exactly like a quiet evening. Sign-in codes and
+       * password resets are the traffic, so "quiet evening" and "nobody can get
+       * in and nobody can tell us" render identically without this card.
+       *
+       * Per process, like the traffic numbers above it: no database write on the
+       * failure path, and production runs one replica.
+       */}
+      <div class="card scroll-x">
+        <div class="card-head">
+          <div>
+            <div class="card-title">Mail (this process)</div>
+            <div class="card-note">
+              {mailCounts.failed > 0
+                ? 'Sends are failing. A sign-in code or password reset that does not arrive is a person who cannot get in and has nobody to tell.'
+                : 'Sign-in codes, password resets and notifications. Counted since this process started.'}
+            </div>
+          </div>
+          <span class={`pill ${mailCounts.failed > 0 ? 'pill-warn' : 'pill-active'}`}>
+            {mailTransportName === 'memory' ? 'not sending' : 'resend'}
+          </span>
+        </div>
+        <table class="tbl">
+          <tr>
+            <th>Transport</th>
+            <th>From</th>
+            <th>Sent</th>
+            <th>Failed</th>
+          </tr>
+          <tr>
+            <td class="mono">{mailTransportName}</td>
+            <td class="mono">{env.mailFrom}</td>
+            <td>{nfmt(mailCounts.sent)}</td>
+            <td class={mailCounts.failed > 0 ? 'mono' : 'muted'}>{nfmt(mailCounts.failed)}</td>
+          </tr>
+        </table>
+        {mailTransportName === 'memory' ? (
+          <div class="card-pad muted small">
+            No <code>RESEND_API_KEY</code>, so nothing leaves this process — codes are recorded in
+            memory and logged. Email sign-in codes and self-service password reset are off.
+          </div>
+        ) : null}
+        {mailFails.length > 0 ? (
+          <table class="tbl" data-table="mail-failures">
+            <tr>
+              <th>When</th>
+              <th>Kind</th>
+              <th>To</th>
+              <th>What the provider said</th>
+            </tr>
+            {/* The provider's own words: an unverified sending domain says so here. */}
+            {mailFails.map((f) => (
+              <tr>
+                <td class="muted" style="white-space:nowrap" title={f.at.toISOString()}>
+                  {timeAgo(f.at)}
+                </td>
+                <td>
+                  <span class="pill pill-member">{f.kind}</span>
+                </td>
+                <td class="mono muted">{f.to}</td>
+                <td class="mono small" style="max-width:420px;white-space:pre-wrap">
+                  {f.reason}
+                </td>
+              </tr>
+            ))}
+          </table>
+        ) : null}
       </div>
 
       <div class="card scroll-x">
@@ -967,11 +1455,48 @@ adminRoutes.get('/admin/ops', async (c) => {
 // ---------------------------------------------------------------- teams
 
 const planIds = Object.keys(PLANS) as (keyof typeof PLANS)[];
+const membershipRoles = ['member', 'owner'] as const;
+const adminFilter = (value: string | undefined, max = 100) => (value ?? '').trim().slice(0, max);
+
+async function adminOwnerCount(db: Db, teamId: string): Promise<number> {
+  return (
+    await db
+      .select({ n: count() })
+      .from(memberships)
+      .where(and(eq(memberships.teamId, teamId), eq(memberships.role, 'owner')))
+  )[0]?.n ?? 0;
+}
+
+async function adminMembershipAllowed(
+  c: Context<AppEnv>,
+  teamId: string,
+  action: 'add' | 'role' | 'remove',
+) {
+  return (
+    (await c.get('lifecycle').beforeAdminMembershipChange?.({
+      db: c.get('db'),
+      teamId,
+      action,
+    })) ?? { ok: true as const }
+  );
+}
+
+const userAdminBack = (id: string, message: string, ok = false) =>
+  `/admin/users/${id}?${ok ? 'ok' : 'error'}=${encodeURIComponent(message)}`;
 
 adminRoutes.get('/admin/teams', async (c) => {
   const user = c.get('user')!;
   const db = c.get('db');
-  const list = await db.select().from(teams).orderBy(desc(teams.createdAt));
+  const managedBilling = c.get('capabilities').managedBilling;
+  const all = await db.select().from(teams).orderBy(desc(teams.createdAt));
+  const q = adminFilter(c.req.query('q')).toLocaleLowerCase('en-US');
+  const requestedPlan = adminFilter(c.req.query('plan'), 20);
+  const plan = (planIds as string[]).includes(requestedPlan) ? requestedPlan : '';
+  const list = all.filter(
+    (workspace) =>
+      (!q || `${workspace.name} ${workspace.slug}`.toLocaleLowerCase('en-US').includes(q)) &&
+      (!plan || workspace.plan === plan),
+  );
   const byTeam = <T,>(rows: { id: string | null; v: T }[]) =>
     new Map(rows.filter((r) => r.id != null).map((r) => [r.id as string, r.v]));
   const memberCounts = byTeam(
@@ -1000,29 +1525,60 @@ adminRoutes.get('/admin/teams', async (c) => {
   const notice = c.req.query('ok');
 
   return c.html(
-    <AppLayout user={user} active="admin" title="Admin — Teams">
+    <AppLayout user={user} active="admin" title="Admin — Workspaces">
       {error ? <Banner kind="error" text={error} /> : null}
       {notice ? <Banner kind="success" text={notice} /> : null}
       <div class="page-head">
         <div>
-          <h1 class="title">Teams</h1>
-          <p class="sub">Every team on this instance. Plan changes take effect immediately.</p>
+          <h1 class="title">Workspaces</h1>
+          <p class="sub">
+            The billing and authorization parent. Every project, membership and scoped agent
+            connection belongs to a workspace. Plan changes take effect immediately
+            {managedBilling ? '; a later Stripe webhook supersedes a manual override for managed subscriptions' : ''}.
+          </p>
         </div>
+        {managedBilling ? <a class="btn btn-sm" href="/admin/billing">Stripe billing</a> : null}
       </div>
       <AdminTabs active="teams" />
 
-      {list.length === 0 ? (
+      <form class="card card-pad" method="get" action="/admin/teams" style="margin-bottom:14px">
+        <div class="row" style="gap:10px;align-items:flex-end;flex-wrap:wrap">
+          <label class="field" style="margin:0;min-width:260px;flex:1">
+            <span>Search workspaces</span>
+            <input class="in" type="search" name="q" value={adminFilter(c.req.query('q'))} placeholder="Name or slug" />
+          </label>
+          <label class="field" style="margin:0;min-width:170px">
+            <span>Plan</span>
+            <select class="in" name="plan">
+              <option value="">All plans</option>
+              {planIds.map((id) => <option value={id} selected={plan === id}>{id}</option>)}
+            </select>
+          </label>
+          <button class="btn btn-primary" type="submit">Filter</button>
+          <a class="btn" href="/admin/teams">Clear</a>
+          <span class="muted small">{list.length} of {all.length}</span>
+        </div>
+      </form>
+
+      {all.length === 0 ? (
         <div class="card">
           <div class="empty">
-            <h2>No teams yet</h2>
-            <p>Teams appear here as soon as someone creates one in the app.</p>
+            <h2>No workspaces yet</h2>
+            <p>Workspaces appear here as soon as someone creates one in the app.</p>
+          </div>
+        </div>
+      ) : list.length === 0 ? (
+        <div class="card">
+          <div class="empty">
+            <h2>No matching workspaces</h2>
+            <p>Clear or change the filters above.</p>
           </div>
         </div>
       ) : (
         <div class="card scroll-x">
           <table class="tbl">
             <tr>
-              <th>Team</th>
+              <th>Workspace</th>
               <th>Plan</th>
               <th>Members</th>
               <th>Projects</th>
@@ -1034,7 +1590,7 @@ adminRoutes.get('/admin/teams', async (c) => {
             {list.map((t) => (
               <tr>
                 <td>
-                  <div class="name">{t.name}</div>
+                  <div class="name"><a href={`/admin/teams/${t.id}`}>{t.name}</a></div>
                   <div class="mono muted small">{t.slug}</div>
                 </td>
                 <td>
@@ -1078,21 +1634,185 @@ adminRoutes.get('/admin/teams', async (c) => {
 adminRoutes.post('/admin/teams/:id/plan', async (c) => {
   const user = c.get('user')!;
   const db = c.get('db');
-  const back = (msg: string, ok = false) =>
-    c.redirect(`/admin/teams?${ok ? 'ok' : 'error'}=${encodeURIComponent(msg)}`);
+  const id = c.req.param('id');
   const body = await c.req.parseBody();
+  const returnToDetail = body.return_to === 'detail' && UUID_RE.test(id);
+  const back = (msg: string, ok = false) =>
+    c.redirect(`${returnToDetail ? `/admin/teams/${id}` : '/admin/teams'}?${ok ? 'ok' : 'error'}=${encodeURIComponent(msg)}`);
   const plan = typeof body.plan === 'string' ? body.plan.trim() : '';
   if (!(planIds as string[]).includes(plan)) {
     return back(`Unknown plan "${plan.slice(0, 40)}". Valid plans: ${planIds.join(', ')}.`);
   }
-  const updated = await db
-    .update(teams)
-    .set({ plan })
-    .where(eq(teams.id, c.req.param('id')))
-    .returning({ name: teams.name, slug: teams.slug });
-  if (updated.length === 0) return back('Team not found.');
-  logLine({ evt: 'admin', a: 'plan_change', u: user.username, team: updated[0]!.slug, plan });
-  return back(`${updated[0]!.name} is now on the ${plan} plan.`, true);
+  if (!UUID_RE.test(id)) return back('Team not found.');
+  // setTeamPlan owns the update and the history row in one transaction; this
+  // route no longer writes teams.plan itself, and nothing else may.
+  const result = await setTeamPlan(db, {
+    teamId: id,
+    plan,
+    source: 'operator',
+    route: 'POST /admin/teams/:id/plan',
+    actorId: user.id,
+    actorLabel: user.username,
+  });
+  if (!result) return back('Team not found.');
+  if (!result.changed) return back(`${result.team.name} was already on the ${plan} plan.`, true);
+  logLine({
+    evt: 'admin',
+    a: 'plan_change',
+    u: user.username,
+    team: result.team.slug,
+    from: result.previous,
+    plan,
+  });
+  return back(
+    `${result.team.name} moved from ${result.previous} to the ${plan} plan.`,
+    true,
+  );
+});
+
+adminRoutes.get('/admin/teams/:id', async (c) => {
+  const user = c.get('user')!;
+  const db = c.get('db');
+  const id = c.req.param('id');
+  if (!UUID_RE.test(id)) return c.notFound();
+  const workspace = (await db.select().from(teams).where(eq(teams.id, id)).limit(1))[0];
+  if (!workspace) return c.notFound();
+
+  const memberRows = await db
+    .select({ user: users, role: memberships.role, joinedAt: memberships.createdAt })
+    .from(memberships)
+    .innerJoin(users, eq(memberships.userId, users.id))
+    .where(eq(memberships.teamId, id))
+    .orderBy(users.username);
+  const projectRows = await db
+    .select()
+    .from(projects)
+    .where(eq(projects.teamId, id))
+    .orderBy(projects.name);
+  const connectionRows = await db
+    .select({
+      tokenId: tokens.id,
+      tokenName: tokens.name,
+      scope: tokens.scope,
+      projectId: tokens.projectId,
+      projectName: projects.name,
+      username: users.username,
+      installationId: agentInstallations.id,
+      installationName: agentInstallations.name,
+      deviceLabel: agentInstallations.deviceLabel,
+      clientType: agentInstallations.clientType,
+      tokenRevokedAt: tokens.revokedAt,
+      installationRevokedAt: agentInstallations.revokedAt,
+      lastUsedAt: tokens.lastUsedAt,
+    })
+    .from(tokens)
+    .innerJoin(users, eq(tokens.userId, users.id))
+    .leftJoin(projects, eq(tokens.projectId, projects.id))
+    .leftJoin(agentInstallations, eq(agentInstallations.tokenId, tokens.id))
+    .where(eq(tokens.teamId, id))
+    .orderBy(desc(tokens.createdAt));
+  const ceilings = await ceilingHistory(db, { teamId: id, limit: 50 });
+  const projectConnections = new Map<string, number>();
+  for (const connection of connectionRows) {
+    if (!connection.projectId || connection.tokenRevokedAt || connection.installationRevokedAt) continue;
+    projectConnections.set(
+      connection.projectId,
+      (projectConnections.get(connection.projectId) ?? 0) + 1,
+    );
+  }
+
+  return c.html(
+    <AppLayout user={user} active="admin" title={`Admin — ${workspace.name}`}>
+      {c.req.query('error') ? <Banner kind="error" text={c.req.query('error')!} /> : null}
+      {c.req.query('ok') ? <Banner kind="success" text={c.req.query('ok')!} /> : null}
+      <div class="page-head">
+        <div>
+          <div class="overline"><a href="/admin/teams">Workspaces</a> / {workspace.slug}</div>
+          <h1 class="title">{workspace.name}</h1>
+          <p class="sub">Workspace → projects → scoped agent connections. Membership and plan live at the workspace boundary.</p>
+        </div>
+        <form class="inline m0" method="post" action={`/admin/teams/${workspace.id}/plan`}>
+          <input type="hidden" name="return_to" value="detail" />
+          <select class="in" name="plan">
+            {planIds.map((plan) => <option value={plan} selected={workspace.plan === plan}>{plan}</option>)}
+          </select>
+          <button class="btn" type="submit">Change plan</button>
+        </form>
+      </div>
+      <AdminTabs active="teams" />
+
+      <div style={statGrid}>
+        <Stat label="Workspace plan" value={workspace.plan} note="Applies to this workspace, not directly to a user" />
+        <Stat label="Members" value={memberRows.length} note="Humans; agents are not seats" />
+        <Stat label="Projects" value={projectRows.length} note="Children of this workspace" />
+        <Stat label="Scoped connections" value={connectionRows.length} note="Team + project credentials" />
+      </div>
+
+      <div style="margin-top:14px">
+        <CeilingHistoryCard
+          rows={ceilings}
+          title="Ceiling history"
+          note={`Every time this workspace's limits moved, newest first (up to 50). ${meteringNote(c.get('env'))} Membership add, role change and removal are not here — they spend a ceiling rather than move one, and they are in the workspace's own activity feed.`}
+          withWorkspace={false}
+        />
+      </div>
+
+      <div class="card scroll-x" style="margin-top:14px">
+        <div class="card-head"><div><div class="card-title">Members</div><div class="card-note">Manage a person's workspace memberships from their user detail.</div></div></div>
+        <table class="tbl">
+          <tr><th>User</th><th>Role</th><th>Joined</th><th></th></tr>
+          {memberRows.map((row) => (
+            <tr>
+              <td class="name"><a href={`/admin/users/${row.user.id}`}>{row.user.username}</a><div class="muted small">{row.user.email ?? 'no sign-in email'}</div></td>
+              <td><span class={`pill ${row.role === 'owner' ? 'pill-owner' : 'pill-member'}`}>{row.role}</span></td>
+              <td class="muted">{fmtDate(row.joinedAt)}</td>
+              <td><a class="btn btn-sm" href={`/admin/users/${row.user.id}`}>Manage membership</a></td>
+            </tr>
+          ))}
+        </table>
+      </div>
+
+      <div class="card scroll-x" style="margin-top:14px">
+        <div class="card-head"><div><div class="card-title">Projects</div><div class="card-note">Every row is inside this workspace; project-scoped credentials cannot leave it.</div></div></div>
+        {projectRows.length === 0 ? <div class="card-pad muted">No projects.</div> : (
+          <table class="tbl">
+            <tr><th>Project</th><th>Repository identity</th><th>Active project connections</th><th>Created</th></tr>
+            {projectRows.map((project) => (
+              <tr>
+                <td><div class="name">{project.name}</div><div class="mono muted small">{project.slug}</div></td>
+                <td class="mono muted small">{project.repositoryIdentity ?? 'not bound'}</td>
+                <td>{projectConnections.get(project.id) ?? 0}</td>
+                <td class="muted">{fmtDate(project.createdAt)}</td>
+              </tr>
+            ))}
+          </table>
+        )}
+      </div>
+
+      <div class="card scroll-x" style="margin-top:14px">
+        <div class="card-head"><div><div class="card-title">Agent connections</div><div class="card-note">Only credentials explicitly bound to this workspace. Personal cross-workspace credentials are intentionally not relabelled as workspace connections.</div></div></div>
+        {connectionRows.length === 0 ? <div class="card-pad muted">No workspace- or project-scoped connections.</div> : (
+          <table class="tbl">
+            <tr><th>Agent</th><th>User</th><th>Scope</th><th>Project</th><th>Client / device</th><th>Last used</th><th>Status</th></tr>
+            {connectionRows.map((connection) => {
+              const revoked = Boolean(connection.tokenRevokedAt || connection.installationRevokedAt);
+              return (
+                <tr>
+                  <td><div class="name">{connection.installationName ?? connection.tokenName}</div><div class="mono muted small">{connection.installationId ?? connection.tokenId}</div></td>
+                  <td><a href={`/admin/users?${new URLSearchParams({ q: connection.username })}`}>{connection.username}</a></td>
+                  <td><span class={`pill ${connection.scope === 'project' ? 'pill-member' : 'pill-active'}`}>{connection.scope}</span></td>
+                  <td>{connection.projectName ?? (connection.scope === 'team' ? 'All workspace projects' : '—')}</td>
+                  <td class="muted">{connection.clientType ?? 'legacy'} · {connection.deviceLabel ?? 'unknown device'}</td>
+                  <td class="muted">{timeAgo(connection.lastUsedAt) ?? 'never'}</td>
+                  <td>{revoked ? <span class="pill pill-member">revoked</span> : <span class="pill pill-active">active</span>}</td>
+                </tr>
+              );
+            })}
+          </table>
+        )}
+      </div>
+    </AppLayout>,
+  );
 });
 
 // ---------------------------------------------------------------- users
@@ -1101,18 +1821,54 @@ adminRoutes.get('/admin/users', async (c) => {
   const user = c.get('user')!;
   const env = c.get('env');
   const db = c.get('db');
-  const list = await db.select().from(users).orderBy(desc(users.createdAt));
+  const all = await db.select().from(users).orderBy(desc(users.createdAt));
   const memberRows = await db
-    .select({ userId: memberships.userId, teamName: teams.name })
+    .select({
+      userId: memberships.userId,
+      teamId: memberships.teamId,
+      teamName: teams.name,
+      teamSlug: teams.slug,
+      teamPlan: teams.plan,
+      role: memberships.role,
+    })
     .from(memberships)
     .innerJoin(teams, eq(memberships.teamId, teams.id))
     .orderBy(teams.name);
-  const teamsByUser = new Map<string, string[]>();
+  type UserWorkspace = (typeof memberRows)[number];
+  const workspacesByUser = new Map<string, UserWorkspace[]>();
   for (const r of memberRows) {
-    const names = teamsByUser.get(r.userId) ?? [];
-    names.push(r.teamName);
-    teamsByUser.set(r.userId, names);
+    const rows = workspacesByUser.get(r.userId) ?? [];
+    rows.push(r);
+    workspacesByUser.set(r.userId, rows);
   }
+  const q = adminFilter(c.req.query('q')).toLocaleLowerCase('en-US');
+  const requestedPlan = adminFilter(c.req.query('plan'), 20);
+  const plan = (planIds as string[]).includes(requestedPlan) ? requestedPlan : '';
+  const membership = ['has', 'none'].includes(c.req.query('membership') ?? '')
+    ? c.req.query('membership')!
+    : '';
+  const auth = ['password', 'github', 'admin', 'blocked'].includes(c.req.query('auth') ?? '')
+    ? c.req.query('auth')!
+    : '';
+  const list = all.filter((account) => {
+    const workspaceRows = workspacesByUser.get(account.id) ?? [];
+    const haystack = [
+      account.username,
+      account.email ?? '',
+      account.displayName ?? '',
+      ...workspaceRows.flatMap((row) => [row.teamName, row.teamSlug]),
+    ].join(' ').toLocaleLowerCase('en-US');
+    return (
+      (!q || haystack.includes(q)) &&
+      (!plan || workspaceRows.some((row) => row.teamPlan === plan)) &&
+      (!membership || (membership === 'has' ? workspaceRows.length > 0 : workspaceRows.length === 0)) &&
+      (!auth ||
+        (auth === 'password' && Boolean(account.passwordHash)) ||
+        (auth === 'github' && account.githubId != null) ||
+        (auth === 'admin' && isAdminUser(env, account)) ||
+        (auth === 'blocked' && !account.passwordHash && account.githubId == null))
+    );
+  });
 
   return c.html(
     <AppLayout user={user} active="admin" title="Admin — Users">
@@ -1120,8 +1876,8 @@ adminRoutes.get('/admin/users', async (c) => {
         <div>
           <h1 class="title">Users</h1>
           <p class="sub">
-            Every account on this instance. The email is the sign-in identity — set one to unlock an
-            account that predates email login.
+            Accounts are people. Plans belong to workspaces, so one user can appear under several
+            workspace plans and roles. Open a user to manage those memberships.
           </p>
         </div>
       </div>
@@ -1129,43 +1885,49 @@ adminRoutes.get('/admin/users', async (c) => {
       {c.req.query('error') ? <Banner kind="error" text={c.req.query('error')!} /> : null}
       {c.req.query('ok') ? <Banner kind="success" text={c.req.query('ok')!} /> : null}
 
+      <form class="card card-pad" method="get" action="/admin/users" style="margin-bottom:14px">
+        <div class="row" style="gap:10px;align-items:flex-end;flex-wrap:wrap">
+          <label class="field" style="margin:0;min-width:260px;flex:1">
+            <span>Search users</span>
+            <input class="in" type="search" name="q" value={adminFilter(c.req.query('q'))} placeholder="Username, email or workspace" />
+          </label>
+          <label class="field" style="margin:0;min-width:160px"><span>Workspace plan</span><select class="in" name="plan"><option value="">Any plan</option>{planIds.map((id) => <option value={id} selected={plan === id}>{id}</option>)}</select></label>
+          <label class="field" style="margin:0;min-width:150px"><span>Membership</span><select class="in" name="membership"><option value="">Any</option><option value="has" selected={membership === 'has'}>Has workspace</option><option value="none" selected={membership === 'none'}>No workspace</option></select></label>
+          <label class="field" style="margin:0;min-width:150px"><span>Authentication</span><select class="in" name="auth"><option value="">Any</option><option value="password" selected={auth === 'password'}>Password</option><option value="github" selected={auth === 'github'}>GitHub</option><option value="admin" selected={auth === 'admin'}>Admin</option><option value="blocked" selected={auth === 'blocked'}>No sign-in</option></select></label>
+          <button class="btn btn-primary" type="submit">Filter</button>
+          <a class="btn" href="/admin/users">Clear</a>
+          <span class="muted small">{list.length} of {all.length}</span>
+        </div>
+      </form>
+
       <div class="card scroll-x">
         <table class="tbl">
           <tr>
             <th>User</th>
-            <th>Email (sign-in)</th>
+            <th>Email</th>
             <th>Display name</th>
-            <th>Teams</th>
+            <th>Workspace memberships</th>
             <th>Auth</th>
             <th>Created</th>
+            <th></th>
           </tr>
           {list.map((u) => {
-            const names = teamsByUser.get(u.id) ?? [];
-            const shown = names.slice(0, 3).join(', ');
+            const workspaceRows = workspacesByUser.get(u.id) ?? [];
             return (
-              <tr>
-                <td class="name">{u.username}</td>
-                <td>
-                  <form class="inline m0" method="post" action={`/admin/users/${u.id}/email`}>
-                    <input
-                      class="in"
-                      style="min-width:210px"
-                      type="email"
-                      name="email"
-                      value={u.email ?? ''}
-                      placeholder="none — sign-in blocked"
-                      required
-                    />
-                    <button class="btn" type="submit">
-                      Save
-                    </button>
-                  </form>
-                </td>
+              <tr data-user-row={u.username}>
+                <td class="name"><a href={`/admin/users/${u.id}`}>{u.username}</a></td>
+                <td class="muted">{u.email ?? '—'}</td>
                 <td class="muted">{u.displayName ?? '—'}</td>
-                <td class="muted" title={names.join(', ')}>
-                  {names.length === 0
-                    ? '—'
-                    : `${names.length} · ${shown}${names.length > 3 ? ` +${names.length - 3}` : ''}`}
+                <td>
+                  {workspaceRows.length === 0 ? <span class="muted">—</span> : (
+                    <div class="row" style="gap:6px;flex-wrap:wrap">
+                      {workspaceRows.map((workspace) => (
+                        <a class={`pill ${workspace.teamPlan === 'free' ? 'pill-member' : 'pill-active'}`} href={`/admin/teams/${workspace.teamId}`} title={`${workspace.teamSlug} · ${workspace.role}`}>
+                          {workspace.teamName} · {workspace.role} · {workspace.teamPlan}
+                        </a>
+                      ))}
+                    </div>
+                  )}
                 </td>
                 <td>
                   <div class="row" style="gap:6px;flex-wrap:wrap">
@@ -1178,6 +1940,7 @@ adminRoutes.get('/admin/users', async (c) => {
                   </div>
                 </td>
                 <td class="muted">{fmtDate(u.createdAt)}</td>
+                <td><a class="btn btn-sm" href={`/admin/users/${u.id}`}>Manage</a></td>
               </tr>
             );
           })}
@@ -1185,6 +1948,257 @@ adminRoutes.get('/admin/users', async (c) => {
       </div>
     </AppLayout>,
   );
+});
+
+adminRoutes.get('/admin/users/:id', async (c) => {
+  const actor = c.get('user')!;
+  const env = c.get('env');
+  const db = c.get('db');
+  const id = c.req.param('id');
+  if (!UUID_RE.test(id)) return c.notFound();
+  const account = (await db.select().from(users).where(eq(users.id, id)).limit(1))[0];
+  if (!account) return c.notFound();
+  const workspaceRows = await db
+    .select({ team: teams, role: memberships.role, joinedAt: memberships.createdAt })
+    .from(memberships)
+    .innerJoin(teams, eq(memberships.teamId, teams.id))
+    .where(eq(memberships.userId, id))
+    .orderBy(teams.name);
+  const allWorkspaces = await db.select().from(teams).orderBy(teams.name);
+  const currentIds = new Set(workspaceRows.map((row) => row.team.id));
+  const available = allWorkspaces.filter((workspace) => !currentIds.has(workspace.id));
+  const authentication = [
+    account.passwordHash ? 'password' : '',
+    account.githubId != null ? 'GitHub' : '',
+    isAdminUser(env, account) ? 'admin' : '',
+  ].filter(Boolean).join(', ') || 'none — sign-in blocked';
+
+  return c.html(
+    <AppLayout user={actor} active="admin" title={`Admin — ${account.username}`}>
+      {c.req.query('error') ? <Banner kind="error" text={c.req.query('error')!} /> : null}
+      {c.req.query('ok') ? <Banner kind="success" text={c.req.query('ok')!} /> : null}
+      <div class="page-head">
+        <div>
+          <div class="overline"><a href="/admin/users">Users</a> / {account.username}</div>
+          <h1 class="title">{account.displayName ?? account.username}</h1>
+          <p class="sub">One person, with independently managed roles in each workspace.</p>
+        </div>
+      </div>
+      <AdminTabs active="users" />
+
+      <div class="grid2">
+        <div class="card card-pad">
+          <div class="card-title">Account</div>
+          <dl class="kv">
+            <dt>Username</dt><dd>{account.username}</dd>
+            <dt>Display name</dt><dd>{account.displayName ?? '—'}</dd>
+            <dt>Created</dt><dd>{fmtDate(account.createdAt)}</dd>
+            <dt>Authentication</dt><dd>{authentication}</dd>
+          </dl>
+          <form method="post" action={`/admin/users/${account.id}/email`} style="margin-top:14px">
+            <label class="field"><span>Email (sign-in)</span><div class="inline"><input class="in" type="email" name="email" value={account.email ?? ''} placeholder="none — sign-in blocked" required /><button class="btn" type="submit">Save email</button></div></label>
+          </form>
+        </div>
+        <div class="card card-pad">
+          <div class="card-title">Add workspace membership</div>
+          <p class="small muted">Plans belong to the selected workspace. Organization-managed workspaces refuse this action and must use their identity administrator.</p>
+          {available.length === 0 ? <p class="muted">This user already belongs to every workspace.</p> : (
+            <form method="post" action={`/admin/users/${account.id}/memberships`}>
+              <label class="field"><span>Workspace</span><select class="in" name="team_id" required><option value="">Choose workspace</option>{available.map((workspace) => <option value={workspace.id}>{workspace.name} · {workspace.plan}</option>)}</select></label>
+              <label class="field"><span>Role</span><select class="in" name="role">{membershipRoles.map((role) => <option value={role}>{role}</option>)}</select></label>
+              <button class="btn btn-primary" type="submit">Add membership</button>
+            </form>
+          )}
+        </div>
+      </div>
+
+      <div class="card scroll-x" style="margin-top:14px">
+        <div class="card-head"><div><div class="card-title">Workspace memberships</div><div class="card-note">Each membership has its own role. Changing one does not affect another workspace.</div></div><span class="mono muted">{workspaceRows.length}</span></div>
+        {workspaceRows.length === 0 ? <div class="card-pad muted">No workspace memberships.</div> : (
+          <table class="tbl">
+            <tr><th>Workspace</th><th>Plan</th><th>Joined</th><th>Role</th><th></th></tr>
+            {workspaceRows.map((row) => (
+              <tr>
+                <td><div class="name"><a href={`/admin/teams/${row.team.id}`}>{row.team.name}</a></div><div class="mono muted small">{row.team.slug}</div></td>
+                <td><span class={`pill ${row.team.plan === 'free' ? 'pill-member' : 'pill-active'}`}>{row.team.plan}</span></td>
+                <td class="muted">{fmtDate(row.joinedAt)}</td>
+                <td>
+                  <form class="inline m0" method="post" action={`/admin/users/${account.id}/memberships/${row.team.id}/role`}>
+                    <select class="in" name="role" style="height:32px;font-size:12px">{membershipRoles.map((role) => <option value={role} selected={row.role === role}>{role}</option>)}</select>
+                    <button class="btn btn-sm" type="submit">Save role</button>
+                  </form>
+                </td>
+                <td><form class="inline m0" method="post" action={`/admin/users/${account.id}/memberships/${row.team.id}/remove`} data-confirm={`Remove ${account.username} from ${row.team.name}? Their team/project-scoped agent credentials stop working immediately. This does not delete the account or its other memberships.`}><button class="btn btn-sm btn-danger" type="submit">Remove</button></form></td>
+              </tr>
+            ))}
+          </table>
+        )}
+      </div>
+    </AppLayout>,
+  );
+});
+
+adminRoutes.post('/admin/users/:id/memberships', async (c) => {
+  const actor = c.get('user')!;
+  const db = c.get('db');
+  const userId = c.req.param('id');
+  if (!UUID_RE.test(userId)) return c.notFound();
+  const body = await c.req.parseBody();
+  const teamId = typeof body.team_id === 'string' ? body.team_id : '';
+  const role = membershipRoles.includes(body.role as (typeof membershipRoles)[number])
+    ? (body.role as (typeof membershipRoles)[number])
+    : 'member';
+  if (!UUID_RE.test(teamId)) return c.redirect(userAdminBack(userId, 'Choose a valid workspace.'));
+  const account = (await db.select().from(users).where(eq(users.id, userId)).limit(1))[0];
+  const workspace = (await db.select().from(teams).where(eq(teams.id, teamId)).limit(1))[0];
+  if (!account || !workspace) return c.redirect(userAdminBack(userId, 'User or workspace not found.'));
+  const allowed = await adminMembershipAllowed(c, teamId, 'add');
+  if (!allowed.ok) return c.redirect(userAdminBack(userId, allowed.message));
+  try {
+    const result = await db.transaction(async (tx) => {
+      await tx.execute(sql`select ${teams.id} from ${teams} where ${teams.id} = ${teamId} for update`);
+      const lockedWorkspace = (
+        await tx.select().from(teams).where(eq(teams.id, teamId)).limit(1)
+      )[0];
+      if (!lockedWorkspace) return { kind: 'missing' } as const;
+      const existing = await tx
+        .select({ userId: memberships.userId })
+        .from(memberships)
+        .where(and(eq(memberships.teamId, teamId), eq(memberships.userId, userId)))
+        .limit(1);
+      if (existing[0]) return { kind: 'existing' } as const;
+      const limits = await effectiveLimits(
+        tx as unknown as Db,
+        lockedWorkspace,
+        c.get('env').hosted,
+      );
+      const memberCount = (
+        await tx.select({ n: count() }).from(memberships).where(eq(memberships.teamId, teamId))
+      )[0]?.n ?? 0;
+      if (memberCount >= limits.maxMembers) {
+        return { kind: 'limit', plan: lockedWorkspace.plan } as const;
+      }
+      const rows = await tx
+        .insert(memberships)
+        .values({ teamId, userId, role })
+        .onConflictDoNothing()
+        .returning({ userId: memberships.userId });
+      if (rows[0]) {
+        await criticalAudit(tx as unknown as Db, {
+          teamId,
+          actorId: actor.id,
+          action: 'membership_joined',
+          subjectId: userId,
+        });
+      }
+      return rows[0] ? { kind: 'inserted' } as const : { kind: 'existing' } as const;
+    });
+    if (result.kind === 'missing') {
+      return c.redirect(userAdminBack(userId, 'Workspace not found.'));
+    }
+    if (result.kind === 'existing') {
+      return c.redirect(userAdminBack(userId, `${account.username} is already a member of ${workspace.name}.`, true));
+    }
+    if (result.kind === 'limit') {
+      return c.redirect(userAdminBack(userId, `${workspace.name} is at its ${result.plan} plan member limit.`));
+    }
+  } catch (error) {
+    if (error instanceof SecurityRefusal) return c.redirect(userAdminBack(userId, error.message));
+    throw error;
+  }
+  await c.get('lifecycle').teamMemberCountChanged?.({ db, teamId });
+  await track(db, { teamId, userId: actor.id, action: 'admin_member_added', detail: `${account.username} was added as ${role} by operator ${actor.username}` });
+  logLine({ evt: 'admin', a: 'membership_add', u: actor.username, target: account.username, team: workspace.slug, role });
+  return c.redirect(userAdminBack(userId, `${account.username} was added to ${workspace.name} as ${role}.`, true));
+});
+
+adminRoutes.post('/admin/users/:id/memberships/:teamId/role', async (c) => {
+  const actor = c.get('user')!;
+  const db = c.get('db');
+  const userId = c.req.param('id');
+  const teamId = c.req.param('teamId');
+  if (!UUID_RE.test(userId) || !UUID_RE.test(teamId)) return c.notFound();
+  const body = await c.req.parseBody();
+  const role = membershipRoles.includes(body.role as (typeof membershipRoles)[number])
+    ? (body.role as (typeof membershipRoles)[number])
+    : null;
+  if (!role) return c.redirect(userAdminBack(userId, 'Choose member or owner.'));
+  const allowed = await adminMembershipAllowed(c, teamId, 'role');
+  if (!allowed.ok) return c.redirect(userAdminBack(userId, allowed.message));
+  const result = await db.transaction(async (tx) => {
+    await tx.execute(sql`select ${teams.id} from ${teams} where ${teams.id} = ${teamId} for update`);
+    const row = (
+      await tx
+        .select({ username: users.username, workspaceName: teams.name, workspaceSlug: teams.slug, currentRole: memberships.role })
+        .from(memberships)
+        .innerJoin(users, eq(memberships.userId, users.id))
+        .innerJoin(teams, eq(memberships.teamId, teams.id))
+        .where(and(eq(memberships.userId, userId), eq(memberships.teamId, teamId)))
+        .limit(1)
+    )[0];
+    if (!row) return { kind: 'missing' } as const;
+    if (row.currentRole === role) return { kind: 'same', row } as const;
+    if (
+      row.currentRole === 'owner' &&
+      role === 'member' &&
+      (await adminOwnerCount(tx as unknown as Db, teamId)) <= 1
+    ) {
+      return { kind: 'last_owner' } as const;
+    }
+    await tx
+      .update(memberships)
+      .set({ role })
+      .where(and(eq(memberships.userId, userId), eq(memberships.teamId, teamId)));
+    return { kind: 'updated', row } as const;
+  });
+  if (result.kind === 'missing') return c.redirect(userAdminBack(userId, 'Membership not found.'));
+  if (result.kind === 'same') return c.redirect(userAdminBack(userId, `${result.row.username} is already ${role} in ${result.row.workspaceName}.`, true));
+  if (result.kind === 'last_owner') {
+    return c.redirect(userAdminBack(userId, 'A workspace needs at least one owner. Promote another member first.'));
+  }
+  const row = result.row;
+  await track(db, { teamId, userId: actor.id, action: role === 'owner' ? 'member_promoted' : 'member_demoted', detail: `${row.username} was changed to ${role} by operator ${actor.username}` });
+  logLine({ evt: 'admin', a: 'membership_role', u: actor.username, target: row.username, team: row.workspaceSlug, role });
+  return c.redirect(userAdminBack(userId, `${row.username} is now ${role} in ${row.workspaceName}.`, true));
+});
+
+adminRoutes.post('/admin/users/:id/memberships/:teamId/remove', async (c) => {
+  const actor = c.get('user')!;
+  const db = c.get('db');
+  const userId = c.req.param('id');
+  const teamId = c.req.param('teamId');
+  if (!UUID_RE.test(userId) || !UUID_RE.test(teamId)) return c.notFound();
+  const allowed = await adminMembershipAllowed(c, teamId, 'remove');
+  if (!allowed.ok) return c.redirect(userAdminBack(userId, allowed.message));
+  const result = await db.transaction(async (tx) => {
+    await tx.execute(sql`select ${teams.id} from ${teams} where ${teams.id} = ${teamId} for update`);
+    const row = (
+      await tx
+        .select({ username: users.username, workspaceName: teams.name, workspaceSlug: teams.slug, role: memberships.role })
+        .from(memberships)
+        .innerJoin(users, eq(memberships.userId, users.id))
+        .innerJoin(teams, eq(memberships.teamId, teams.id))
+        .where(and(eq(memberships.userId, userId), eq(memberships.teamId, teamId)))
+        .limit(1)
+    )[0];
+    if (!row) return { kind: 'missing' } as const;
+    if (row.role === 'owner' && (await adminOwnerCount(tx as unknown as Db, teamId)) <= 1) {
+      return { kind: 'last_owner' } as const;
+    }
+    await tx
+      .delete(memberships)
+      .where(and(eq(memberships.userId, userId), eq(memberships.teamId, teamId)));
+    return { kind: 'removed', row } as const;
+  });
+  if (result.kind === 'missing') return c.redirect(userAdminBack(userId, 'Membership not found.'));
+  if (result.kind === 'last_owner') {
+    return c.redirect(userAdminBack(userId, 'The last workspace owner cannot be removed. Promote another member first.'));
+  }
+  const row = result.row;
+  await c.get('lifecycle').teamMemberCountChanged?.({ db, teamId });
+  await track(db, { teamId, userId: actor.id, action: 'member_removed', detail: `${row.username} was removed by operator ${actor.username}` });
+  logLine({ evt: 'admin', a: 'membership_remove', u: actor.username, target: row.username, team: row.workspaceSlug });
+  return c.redirect(userAdminBack(userId, `${row.username} was removed from ${row.workspaceName}.`, true));
 });
 
 /**

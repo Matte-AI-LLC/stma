@@ -1,6 +1,8 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
+declare const STMA_BUNDLED_VERSION: string | undefined;
+
 /**
  * What this CLI calls itself — same trick as the server's `src/version.ts`, and
  * for the same reason: `src/version.ts` and the bundled `dist/index.js` are both
@@ -19,7 +21,9 @@ function readVersion(): string {
   }
 }
 
-export const VERSION = readVersion();
+// The self-contained project runtime is moved away from our package.json.
+// Never mistake the customer's project version for STMA's version.
+export const VERSION = typeof STMA_BUNDLED_VERSION === 'string' ? STMA_BUNDLED_VERSION : readVersion();
 
 /** The header every STMA client sends, so a server can see its version mix. */
 export const CLIENT_HEADER = 'x-stma-client';

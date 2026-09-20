@@ -141,6 +141,188 @@
       "when": 1788175842430,
       "tag": "0019_brown_dragon_lord",
       "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "7",
+      "when": 1788282656887,
+      "tag": "0020_minor_ares",
+      "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "7",
+      "when": 1788348897083,
+      "tag": "0021_loose_reptil",
+      "breakpoints": true
+    },
+    {
+      "idx": 22,
+      "version": "7",
+      "when": 1788348942762,
+      "tag": "0022_calm_crusher_hogan",
+      "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "7",
+      "when": 1788350223461,
+      "tag": "0023_common_vargas",
+      "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1788377289354,
+      "tag": "0024_material_cobalt_man",
+      "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "7",
+      "when": 1788377491920,
+      "tag": "0025_tiny_wallflower",
+      "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "7",
+      "when": 1788377733002,
+      "tag": "0026_mighty_spirit",
+      "breakpoints": true
+    },
+    {
+      "idx": 27,
+      "version": "7",
+      "when": 1788379956534,
+      "tag": "0027_odd_arachne",
+      "breakpoints": true
+    },
+    {
+      "idx": 28,
+      "version": "7",
+      "when": 1788383890068,
+      "tag": "0028_stale_spectrum",
+      "breakpoints": true
+    },
+    {
+      "idx": 29,
+      "version": "7",
+      "when": 1788384451290,
+      "tag": "0029_sticky_living_lightning",
+      "breakpoints": true
+    },
+    {
+      "idx": 30,
+      "version": "7",
+      "when": 1788557518391,
+      "tag": "0030_robust_warpath",
+      "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "7",
+      "when": 1788557887714,
+      "tag": "0031_wealthy_valeria_richards",
+      "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "7",
+      "when": 1788558581148,
+      "tag": "0032_robust_red_hulk",
+      "breakpoints": true
+    },
+    {
+      "idx": 33,
+      "version": "7",
+      "when": 1788559381301,
+      "tag": "0033_yellow_proteus",
+      "breakpoints": true
+    },
+    {
+      "idx": 34,
+      "version": "7",
+      "when": 1788560820739,
+      "tag": "0034_common_the_hunter",
+      "breakpoints": true
+    },
+    {
+      "idx": 35,
+      "version": "7",
+      "when": 1788561095780,
+      "tag": "0035_damp_matthew_murdock",
+      "breakpoints": true
+    },
+    {
+      "idx": 36,
+      "version": "7",
+      "when": 1788562212107,
+      "tag": "0036_dear_inhumans",
+      "breakpoints": true
+    },
+    {
+      "idx": 37,
+      "version": "7",
+      "when": 1789307976722,
+      "tag": "0037_enrollment_activation",
+      "breakpoints": true
+    },
+    {
+      "idx": 38,
+      "version": "7",
+      "when": 1789312988658,
+      "tag": "0038_cultured_shinko_yamashiro",
+      "breakpoints": true
+    },
+    {
+      "idx": 39,
+      "version": "7",
+      "when": 1789336433598,
+      "tag": "0039_medical_triathlon",
+      "breakpoints": true
+    },
+    {
+      "idx": 40,
+      "version": "7",
+      "when": 1789744893174,
+      "tag": "0040_assignments",
+      "breakpoints": true
+    },
+    {
+      "idx": 41,
+      "version": "7",
+      "when": 1789768195724,
+      "tag": "0041_companions",
+      "breakpoints": true
+    },
+    {
+      "idx": 42,
+      "version": "7",
+      "when": 1789852333226,
+      "tag": "0042_right_of_way",
+      "breakpoints": true
+    },
+    {
+      "idx": 43,
+      "version": "7",
+      "when": 1789911986399,
+      "tag": "0043_account_recovery",
+      "breakpoints": true
+    },
+    {
+      "idx": 44,
+      "version": "7",
+      "when": 1789925292083,
+      "tag": "0044_invite_role",
+      "breakpoints": true
+    },
+    {
+      "idx": 45,
+      "version": "7",
+      "when": 1789935227793,
+      "tag": "0045_operator_history",
+      "breakpoints": true
     }
   ]
 }

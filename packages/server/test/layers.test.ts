@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -12,10 +12,11 @@ import { startServer, type StartedServer } from '../src/server';
 import { VERSION } from '../src/version';
 
 /**
- * The three layers, and the rules that keep them from lying to each other.
+ * The public layers, and the rules that keep them from lying to each other.
  *
- * This repository ships the same code three ways: as source under ELv2, as two
- * npm packages, and as a container image running the hosted service. Nothing in
+ * This repository ships the deterministic core as source under ELv2, as two
+ * npm packages, and as a public self-host container. The private tree also
+ * composes that core with ee/ into the hosted service. Nothing in
  * a monorepo notices when those drift — a workspace-only dependency left in a
  * published manifest, a version that means three different things, a feature
  * that quietly exists on one layer and not another. Each of those is invisible
@@ -23,7 +24,7 @@ import { VERSION } from '../src/version';
  * that belongs in a test rather than in a document.
  *
  * The rules asserted here:
- *   1. One version across all four manifests, so a tag names one thing.
+ *   1. One version across the four public manifests and private EE when present.
  *   2. A published package may not depend on a package that is not published.
  *   3. Self-host is the full product; the paid Team plan is the same product.
  *   4. The API surface is additive — removing a tool has to be deliberate.
@@ -68,7 +69,7 @@ async function tenant(srv: StartedServer, who: string): Promise<string> {
 beforeAll(async () => {
   hostedDir = mkdtempSync(path.join(tmpdir(), 'stma-layers-hosted-'));
   selfHostDir = mkdtempSync(path.join(tmpdir(), 'stma-layers-own-'));
-  const base = { port: 0, host: 'localhost', nodeEnv: 'test' as const, devMode: true, databaseUrl: undefined };
+  const base = { port: 0, host: '127.0.0.1', nodeEnv: 'test' as const, devMode: true, databaseUrl: undefined };
   hosted = await startServer(loadEnv({ ...base, pgliteDir: hostedDir, hosted: true }));
   selfHost = await startServer(loadEnv({ ...base, pgliteDir: selfHostDir, hosted: false }));
   hostedToken = await tenant(hosted, 'tenant');
@@ -84,16 +85,18 @@ afterAll(async () => {
 
 describe('one version', () => {
   it('is the same number in every manifest', () => {
-    // The train's whole premise: a `v*` tag publishes two npm packages, a ghcr
-    // image and a production deploy from one commit. Four numbers would make
+    // The train's whole premise: a `v*` tag publishes two npm packages, a public
+    // image and a production deploy from one commit. Divergent numbers would make
     // "which build is this" unanswerable — it was, before: the image was on
     // v0.10.1 while the server package said 0.7.2 and the CLI said 0.2.2.
-    const versions = [
+    const manifests = [
       'package.json',
       'packages/shared/package.json',
       'packages/server/package.json',
       'packages/cli/package.json',
-    ].map((rel) => [rel, manifest(rel).version] as const);
+    ];
+    if (existsSync(path.join(repo, 'ee/package.json'))) manifests.push('ee/package.json');
+    const versions = manifests.map((rel) => [rel, manifest(rel).version] as const);
     const distinct = new Set(versions.map(([, v]) => v));
     expect([...distinct], JSON.stringify(versions)).toHaveLength(1);
   });
@@ -104,6 +107,16 @@ describe('one version', () => {
     // them at all.
     expect(VERSION).toBe(manifest('packages/server/package.json').version);
     expect(CLI_VERSION).toBe(manifest('packages/cli/package.json').version);
+  });
+
+  it('survives being copied out of the package, in both bundles', () => {
+    // `adapter install --pin-runtime` copies a bundle into a checkout's .stma,
+    // where `../package.json` is the customer's project. Only a build-time
+    // define keeps the pinned runtime reporting STMA's version instead of
+    // theirs, in `stma version` and in the x-stma-client header.
+    for (const config of ['packages/cli/tsup.config.ts', 'packages/server/tsup.config.ts']) {
+      expect(readFileSync(path.join(repo, config), 'utf8'), config).toContain('define: { STMA_BUNDLED_VERSION:');
+    }
   });
 
   it('is what `stma serve` asks npm for', () => {
@@ -160,6 +173,30 @@ describe('the npm layer is installable', () => {
     expect(manifest('packages/shared/package.json').private).toBe(true);
   });
 
+  it('keeps STMA schemas on the explicit Zod 3 compatibility surface', () => {
+    // zod@4 still ships the supported v3 subpath. Importing the package root
+    // would switch validation/default semantics and made the downloaded agent
+    // runtime more than three times larger in the migration probe.
+    const roots = ['packages/shared/src', 'packages/server/src'];
+    if (existsSync(path.join(repo, 'ee/src'))) roots.push('ee/src');
+    const files: string[] = [];
+    const walk = (dir: string) => {
+      for (const name of readdirSync(dir)) {
+        const file = path.join(dir, name);
+        if (statSync(file).isDirectory()) walk(file);
+        else if (/\.(ts|tsx)$/.test(name)) files.push(file);
+      }
+    };
+    for (const root of roots) walk(path.join(repo, root));
+    const zodImports = files.flatMap((file) =>
+      [...readFileSync(file, 'utf8').matchAll(/from\s+['"](zod[^'"]*)['"]/g)].map(
+        (match) => [path.relative(repo, file), match[1]] as const,
+      ),
+    );
+    expect(zodImports.length).toBeGreaterThan(0);
+    expect(zodImports.filter(([, specifier]) => specifier !== 'zod/v3')).toEqual([]);
+  });
+
   it('pins exactly what each tarball ships, so ee/ can never ride along', () => {
     // The day commercial-only code is born it lives under ee/, stays out of the
     // public mirror by allowlist, and out of the npm artefacts by THIS pin: any
@@ -171,6 +208,53 @@ describe('the npm layer is installable', () => {
       'LICENSE',
     ]);
     expect(manifest('packages/cli/package.json').files).toEqual(['README.md', 'LICENSE', 'dist']);
+  });
+});
+
+describe('the commercial boundary is mechanical', () => {
+  it('does not render links to operator routes when only core metering is enabled', async () => {
+    const html = await (await fetch(`${hosted.url}/`)).text();
+    expect(html).not.toContain('href="/pricing"');
+    expect((await fetch(`${hosted.url}/pricing`)).status).toBe(404);
+  });
+
+  it('does not send ee/ in the public image build context', () => {
+    const ignore = readFileSync(path.join(repo, 'Dockerfile.dockerignore'), 'utf8');
+    expect(ignore.split(/\r?\n/)).toContain('ee');
+    expect(ignore.split(/\r?\n/)).toContain('Dockerfile.hosted');
+  });
+
+  it('never imports the private layer from public server source', () => {
+    const files: string[] = [];
+    const walk = (dir: string) => {
+      for (const name of readdirSync(dir)) {
+        const file = path.join(dir, name);
+        if (statSync(file).isDirectory()) walk(file);
+        else if (/\.(ts|tsx)$/.test(name)) files.push(file);
+      }
+    };
+    walk(path.join(repo, 'packages/server/src'));
+    for (const file of files) {
+      const source = readFileSync(file, 'utf8');
+      expect(source, path.relative(repo, file)).not.toMatch(/from\s+['"][^'"]*\/ee(?:\/|['"])/);
+    }
+  });
+
+  it('uses the separate hosted Dockerfile only in the private deployment tree', () => {
+    if (!existsSync(path.join(repo, 'ee'))) return; // public mirror intentionally has neither
+    const publicDocker = readFileSync(path.join(repo, 'Dockerfile'), 'utf8');
+    const hostedDocker = readFileSync(path.join(repo, 'Dockerfile.hosted'), 'utf8');
+    expect(publicDocker).not.toContain('/ee/dist');
+    expect(hostedDocker).toContain('/app/ee/dist');
+  });
+
+  it('puts the private package outside the public core license', () => {
+    if (!existsSync(path.join(repo, 'ee'))) return;
+    expect(manifest('ee/package.json').private).toBe(true);
+    expect(manifest('ee/package.json').license).toBe('UNLICENSED');
+    const notice = readFileSync(path.join(repo, 'ee/LICENSE'), 'utf8');
+    expect(notice).toContain('not licensed under the Elastic License 2.0');
+    expect(notice).toContain('All rights reserved');
   });
 });
 
@@ -274,6 +358,10 @@ describe('the API surface is additive', () => {
   // and a self-hosted server on last quarter's version still answers it. The
   // list is a decision record, not a snapshot to regenerate when it goes red.
   const PUBLIC_TOOLS = [
+    'launch_check',
+    'update_handoff',
+    'record_delivery_receipt',
+    'assign_work',
     // identity and projects
     'whoami',
     'list_teammates',
@@ -295,6 +383,12 @@ describe('the API surface is additive', () => {
     'inbox',
     'search_past_issues',
     'announce',
+    // knowledge hub
+    'get_knowledge_context',
+    'report_knowledge_receipt',
+    'search_knowledge',
+    'get_knowledge',
+    'propose_knowledge',
     // fleet
     'start_run',
     'update_run',
@@ -305,6 +399,7 @@ describe('the API surface is additive', () => {
     'get_workflow',
     'get_evidence',
     'list_issues',
+    'list_clickup_tasks',
   ];
 
   const list = async (srv: StartedServer, token: string) => {

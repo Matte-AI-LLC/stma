@@ -1,23 +1,27 @@
-import { policyDocumentSchema, snapshotSchema, type PolicyDocument } from '@bridge/shared';
+import { snapshotSchema, type PolicyDocument } from '@bridge/shared';
 import { and, count, desc, eq } from 'drizzle-orm';
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import { loginRedirect } from '../auth/session';
 import { agentRuns, environmentChecks, policyReceipts, projects, snapshots, users } from '../db/schema';
 import { projectForTeam, teamForUser } from '../domain/access';
-import { recentAgentEvents } from '../domain/agents';
+import { recentAgentEvents } from '../domain/fleetReaders';
 import {
   activeBaselines,
   recentEnvironmentChecks,
   setEnvironmentBaseline,
 } from '../domain/environments';
-import { effectivePolicy, policyScopes, publishPolicy, recentPolicyReceipts } from '../domain/policies';
-import { cheapestWith, planLimits } from '../lib/entitlements';
+import { EMPTY_POLICY, policyScopes, publishPolicy, recentPolicyReceipts } from '../domain/policies';
+import { policyOrigins, type OriginRule, type PolicyOrigins, type RuleOrigin } from '../lib/policyOrigin';
+import { recentPolicyViolations } from '../domain/violations';
+import { renderPolicyEditor } from './policyEditor';
+import { cheapestWith, effectiveLimits } from '../lib/entitlements';
 import { timeAgo } from '../lib/format';
-import { isEmptyPolicy, listToLines, policyFromForm, runtimesToLines } from '../lib/policyForm';
+import { isEmptyPolicy, policyFromForm } from '../lib/policyForm';
 import { failed } from '../lib/result';
+import { projectInPath, scopedProjectParam, sectionHref } from '../lib/scope';
 import { track } from '../lib/track';
 import type { AppEnv } from '../types';
-import { Lead, PageHead, ProjectScope, Vr } from '../ui/Console';
+import { Lead, PageHead, ProjectScope, scopedTrail, Vr } from '../ui/Console';
 import { AppLayout } from '../ui/Layout';
 
 export const governanceRoutes = new Hono<AppEnv>();
@@ -27,6 +31,9 @@ const RECEIPT_LIMIT = 25;
 const CHECK_LIMIT = 25;
 const BASELINE_LIMIT = 25;
 const EVENT_LIMIT = 50;
+const VIOLATION_LIMIT = 25;
+/** A stopped attempt is news for a day; after that it is history on the card, not an alarm on the strip. */
+const VIOLATION_ALERT_MS = 24 * 60 * 60 * 1000;
 const SCOPE_LIMIT = 12;
 const PROJECT_LIMIT = 50;
 /** Snapshots offered as a baseline candidate — newest first, never a full scan. */
@@ -57,9 +64,7 @@ const Rules = ({ label, items }: { label: string; items: string[] }) => (
     ) : (
       <div class="row" style="flex-wrap:wrap;gap:6px">
         {items.map((item) => (
-          <span class="pill pill-member" style="text-transform:none;letter-spacing:0">
-            {item}
-          </span>
+          <span class="pill pill-member pill-rule">{item}</span>
         ))}
       </div>
     )}
@@ -95,6 +100,59 @@ const PolicyDoc = ({ document }: { document: PolicyDocument }) => (
   </div>
 );
 
+/**
+ * The same document, with every rule filed under where it comes from. A project
+ * page answers "is this ours or everybody's" — the question that decides where
+ * to go to change it. `only` draws one origin: the workspace page lists what a
+ * project adds without repeating the workspace's rules in every card.
+ */
+const PolicyByOrigin = ({ origins, only }: { origins: PolicyOrigins; only?: RuleOrigin }) => {
+  const sections = origins.sections
+    .map((section) => ({
+      ...section,
+      rules: only ? section.rules.filter((rule) => rule.origin === only) : section.rules,
+    }))
+    .filter((section) => !only || section.rules.length > 0);
+  const Group = ({ origin, rules }: { origin: RuleOrigin; rules: OriginRule[] }) =>
+    rules.length === 0 ? null : (
+      <div class="origin-row">
+        {only ? null : (
+          <span class={`origin origin-${origin}`}>
+            {origin === 'workspace' ? 'from the workspace' : 'this project only'}
+          </span>
+        )}
+        <div class="row" style="flex-wrap:wrap;gap:6px">
+          {rules.map((rule) => (
+            <span
+              class={`pill pill-rule ${origin === 'project' ? 'pill-own' : 'pill-member'}`}
+              title={rule.note}
+            >
+              {rule.text}
+              {rule.note ? <span class="origin-note"> · {rule.note}</span> : null}
+            </span>
+          ))}
+        </div>
+      </div>
+    );
+  return (
+    <div style="display:flex;flex-direction:column;gap:16px">
+      {sections.map((section) => (
+        <div class="step">
+          <span class="steplabel">{section.label}</span>
+          {section.rules.length === 0 ? (
+            <span class="muted small">none</span>
+          ) : (
+            <>
+              <Group origin="workspace" rules={section.rules.filter((rule) => rule.origin === 'workspace')} />
+              <Group origin="project" rules={section.rules.filter((rule) => rule.origin === 'project')} />
+            </>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+};
+
 const plural = (n: number, word: string): string => `${n} ${word}${n === 1 ? '' : 's'}`;
 
 /**
@@ -106,6 +164,9 @@ function eventDetail(type: string, detail: unknown): string {
   const d = detail as Record<string, unknown>;
   if (type === 'run_started') {
     return [d.repo, d.branch].filter(Boolean).join(' · ');
+  }
+  if (type === 'policy_violation') {
+    return [d.outcome, d.path, d.rule].filter(Boolean).join(' · ');
   }
   if (type === 'run_finished') {
     return [d.status, d.detail].filter(Boolean).join(' · ');
@@ -140,6 +201,7 @@ function eventDetail(type: string, detail: unknown): string {
 }
 
 function eventPill(type: string, detail: unknown): string {
+  if (type === 'policy_violation') return 'pill pill-danger';
   if (type === 'conflicts_detected') {
     const severity = (detail as { highestSeverity?: string } | null)?.highestSeverity;
     return severity === 'critical' ? 'pill pill-danger' : 'pill pill-warn';
@@ -157,11 +219,19 @@ function eventPill(type: string, detail: unknown): string {
   return 'pill pill-member';
 }
 
-governanceRoutes.get('/app/teams/:slug/governance', async (c) => {
+/**
+ * One page, two addresses: the workspace's governance, and a project's own.
+ *
+ * `/app/teams/:slug/projects/:project/governance` is what the rail links to;
+ * `/app/teams/:slug/governance?project=…` is the address it replaces and still
+ * answers. Both run this function — a second render would be a second set of
+ * rules about who may read what, which is exactly what this page is about.
+ */
+const governancePage = async (c: Context<AppEnv>) => {
   const user = c.get('user');
   if (!user) return loginRedirect(c);
   const db = c.get('db');
-  const found = await teamForUser(db, user.id, c.req.param('slug'));
+  const found = await teamForUser(db, user.id, c.req.param('slug') ?? '');
   if (!found) {
     return c.html(
       <AppLayout user={user} active="governance" title="Not found">
@@ -185,7 +255,7 @@ governanceRoutes.get('/app/teams/:slug/governance', async (c) => {
   // refused the rulebook while its human read the whole governance screen next
   // to it. One line in a matrix cannot mean two things depending on which door
   // you come through.
-  const limits = planLimits(team.plan, c.get('env').hosted);
+  const limits = (await effectiveLimits(db, team, c.get('env').hosted));
   if (!limits.governance) {
     const [receiptCount, checkCount] = await Promise.all([
       db.select({ n: count() }).from(policyReceipts).innerJoin(agentRuns, eq(policyReceipts.runId, agentRuns.id)).where(eq(agentRuns.teamId, team.id)),
@@ -224,13 +294,17 @@ governanceRoutes.get('/app/teams/:slug/governance', async (c) => {
     );
   }
 
-  // Global by default; `?project=` narrows every list on the page to one
-  // project — same idiom as the agent map's `?run=`: state in the URL, so the
-  // view survives a refresh and can be handed to a teammate.
-  const projectQuery = (c.req.query('project') ?? '').trim();
+  // Global by default; a project narrows every list on the page to that project.
+  // Named in the path it is part of the page's identity, so a spelling that names
+  // no project is a wrong address and answers like one — the same 404 the project
+  // pages give. As the older `?project=` filter it stays a filter: the page draws
+  // the whole team and says the name matched nothing.
+  const projectQuery = scopedProjectParam(c);
+  const inPath = projectInPath(c);
   const scopeProject = projectQuery
     ? await projectForTeam(db, team.id, projectQuery)
     : undefined;
+  if (inPath && !scopeProject) return c.notFound();
   const scopeMissing = Boolean(projectQuery) && !scopeProject;
   const scopeId = scopeProject?.id;
 
@@ -239,14 +313,21 @@ governanceRoutes.get('/app/teams/:slug/governance', async (c) => {
   const baselines = await activeBaselines(db, team.id, BASELINE_LIMIT, scopeId);
   const checks = await recentEnvironmentChecks(db, team.id, CHECK_LIMIT, scopeId);
   const events = await recentAgentEvents(db, team.id, EVENT_LIMIT, scopeId);
+  // Its own bounded read rather than a filter over the timeline: fifty busy
+  // heartbeats must not push the one row a lead came here for off the page.
+  const violations = await recentPolicyViolations(db, team.id, VIOLATION_LIMIT, scopeId);
 
   // Scoped view of policy: the team base plus this project's override, nothing else.
   const visibleScopes = scopeProject
     ? scopes.filter((s) => s.isTeam || s.bundle.projectId === scopeProject.id)
     : scopes;
-  const projectOwnBundle = scopeProject
-    ? scopes.find((s) => s.bundle.projectId === scopeProject.id)
-    : undefined;
+
+  // Origin is derived from the two published documents, never stored.
+  const teamScope = scopes.find((s) => s.isTeam);
+  const ownScope = scopeProject ? scopes.find((s) => s.bundle.projectId === scopeProject.id) : undefined;
+  const teamDocument = teamScope?.own ?? EMPTY_POLICY;
+  const projectOrigins = policyOrigins(teamDocument, ownScope?.own);
+  const addingProjects = scopes.filter((s) => !s.isTeam);
 
   // Two different facts, kept apart because they call for different actions:
   // an agent that applied other rules is a breach, an agent that never answered
@@ -257,21 +338,8 @@ governanceRoutes.get('/app/teams/:slug/governance', async (c) => {
   const unreported = receipts.filter((row) => !row.receipt.reportedHash && !row.receipt.drift);
   const confirmed = receipts.filter((row) => row.receipt.reportedHash && !row.receipt.drift);
   const criticals = checks.filter((row) => row.check.status === 'critical');
-  // What the editor opens with: the document the team is serving today, so
-  // "publish" is an edit of the live rulebook rather than a blank page. Scoped
-  // to a project, it opens on that project's *own additions* — opening the
-  // merged document there would republish every team rule as project rules.
-  const current = await effectivePolicy(db, user.id, { team: team.slug });
-  const draft = scopeProject
-    ? projectOwnBundle
-      ? policyDocumentSchema.parse(projectOwnBundle.bundle.document)
-      : null
-    : failed(current)
-      ? null
-      : current.document;
-
   const teamProjects = await db
-    .select({ name: projects.name })
+    .select({ id: projects.id, name: projects.name, slug: projects.slug, repositoryIdentity: projects.repositoryIdentity })
     .from(projects)
     .where(eq(projects.teamId, team.id))
     .orderBy(projects.name)
@@ -302,6 +370,14 @@ governanceRoutes.get('/app/teams/:slug/governance', async (c) => {
   const failure = c.req.query('error');
 
   const criticalChecks = checks.filter((row) => row.check.status === 'critical');
+  const recentViolations = violations.filter(
+    (row) => Date.now() - row.event.createdAt.getTime() < VIOLATION_ALERT_MS,
+  );
+  const needsAttention =
+    drifted.length > 0 ||
+    unreported.length > 0 ||
+    criticalChecks.length > 0 ||
+    recentViolations.length > 0;
 
   return c.html(
     <AppLayout
@@ -310,7 +386,10 @@ governanceRoutes.get('/app/teams/:slug/governance', async (c) => {
       title={`Governance — ${team.name}`}
       strip={
         <>
-          <Lead text="Policy served" live={scopes.length > 0} />
+          <Lead
+            text={needsAttention ? 'Attention required' : scopes.length > 0 ? 'Governance healthy' : 'No policy served'}
+            live={!needsAttention && scopes.length > 0}
+          />
           <Vr />
           {scopeProject ? (
             <span>
@@ -339,6 +418,14 @@ governanceRoutes.get('/app/teams/:slug/governance', async (c) => {
               <span class="bad">{criticalChecks.length} preflight critical</span>
             </>
           ) : null}
+          {recentViolations.length > 0 ? (
+            <>
+              <span class="dim">·</span>
+              <a class="bad" href="#policy-violations" data-open-details="policy-violations">
+                {recentViolations.length} policy {recentViolations.length === 1 ? 'violation' : 'violations'} stopped
+              </a>
+            </>
+          ) : null}
           <Vr />
           <span data-freeze-state="poll 30s">poll 30s</span>
         </>
@@ -348,10 +435,15 @@ governanceRoutes.get('/app/teams/:slug/governance', async (c) => {
           <span class="chip">
             team <b>{team.slug}</b>
           </span>
+          {/* The picker posts to the workspace address on purpose. Its options carry
+              project *ids* — two projects can share a display name — and a GET form
+              can only put its value in a query string, so `?project=<id>` is the one
+              spelling it can produce. Picking a project is how you leave this one;
+              the path form is what a link produces. */}
           <ProjectScope
-            path={`/app/teams/${team.slug}/governance`}
+            path={sectionHref(team.slug, null, 'governance')}
             projects={teamProjects}
-            current={scopeProject?.name ?? null}
+            current={scopeProject?.id ?? null}
             allLabel="Global — whole team"
           />
           <a class="chip" href="/app/agents">
@@ -361,7 +453,7 @@ governanceRoutes.get('/app/teams/:slug/governance', async (c) => {
       }
       head={
         <PageHead
-          crumb={`/ ${team.slug} / governance`}
+          trail={scopedTrail({ team, project: scopeProject }, 'Governance')}
           title="Governance"
           sub="Whether the rules this team published actually reached the agents — policy, receipts, environment baselines and the run trail."
           actions={
@@ -439,6 +531,24 @@ governanceRoutes.get('/app/teams/:slug/governance', async (c) => {
         </div>
       ) : null}
 
+      <nav class="section-jump" aria-label="Governance sections">
+        <a href="#environment-baselines" data-open-details="environment-baselines">
+          Baselines <span>{baselines.length}</span>
+        </a>
+        <a href="#effective-policy" data-open-details="effective-policy">
+          Policy <span>{visibleScopes.length}</span>
+        </a>
+        <a href="#policy-receipts" data-open-details="policy-receipts">
+          Receipts <span>{receipts.length}</span>
+        </a>
+        <a href="#preflight-results" data-open-details="preflight-results">
+          Preflights <span>{checks.length}</span>
+        </a>
+        <a href="#run-timeline" data-open-details="run-timeline">
+          Timeline <span>{events.length}</span>
+        </a>
+      </nav>
+
       {drifted.length > 0 ? (
         <div class="sumbar">
           <div class="sumbar-left">
@@ -483,19 +593,19 @@ governanceRoutes.get('/app/teams/:slug/governance', async (c) => {
         </div>
       ) : null}
 
-      <div class="card">
-        <div class="card-head">
+      <details class="card fold-card" id="effective-policy">
+        <summary class="card-head">
           <div>
             <div class="card-title">Effective policy</div>
             <div class="card-note">
               {scopeProject
-                ? `What an agent in ${scopeProject.name} is handed — team rules, plus this project's additions merged on top.`
-                : "What an agent is handed when it starts a run — team rules, plus each project's additions merged on top."}
+                ? `What an agent in ${scopeProject.name} is handed: the workspace's rules, plus what this project adds. A project can add a rule or tighten one, never remove one.`
+                : "What an agent is handed when it starts a run: the workspace's rules reach every project, and a project can add or tighten, never remove."}
               {scopes.length >= SCOPE_LIMIT ? ` First ${SCOPE_LIMIT} scopes only.` : ''}
             </div>
           </div>
           <span class="mono muted">{visibleScopes.length}</span>
-        </div>
+        </summary>
         {visibleScopes.length === 0 ? (
           <div class="empty">
             <h2>No policy published yet</h2>
@@ -522,6 +632,7 @@ governanceRoutes.get('/app/teams/:slug/governance', async (c) => {
               <table class="tbl">
                 <tr>
                   <th>Scope</th>
+                  <th>Applies to</th>
                   <th>Version</th>
                   <th>Effective hash</th>
                   <th>Published</th>
@@ -529,7 +640,16 @@ governanceRoutes.get('/app/teams/:slug/governance', async (c) => {
                 </tr>
                 {visibleScopes.map((scope) => (
                   <tr>
-                    <td class="name">{scope.label}</td>
+                    <td class="name">{scope.isTeam ? 'Workspace' : scope.label}</td>
+                    <td class="muted">
+                      {scope.isTeam ? (
+                        'every project'
+                      ) : (
+                        <a href={sectionHref(team.slug, scope.projectSlug ?? scope.label, 'governance')}>
+                          {scope.label} only
+                        </a>
+                      )}
+                    </td>
                     <td class="mono">v{scope.bundle.version}</td>
                     <td class="mono">
                       {short(scope.hash)}
@@ -546,28 +666,76 @@ governanceRoutes.get('/app/teams/:slug/governance', async (c) => {
                 ))}
               </table>
             </div>
-            {visibleScopes.map((scope) => (
-              <div class="card-pad" style="border-top:1px solid var(--line-2)">
-                <div class="row" style="justify-content:space-between;margin-bottom:14px">
+            {scopeProject ? (
+              <div class="card-pad" style="border-top:1px solid var(--line-2)" id="in-effect">
+                <div class="row" style="justify-content:space-between;margin-bottom:14px;gap:12px;flex-wrap:wrap">
                   <div>
-                    <div class="card-title">{scope.label}</div>
+                    <div class="card-title">In effect in {scopeProject.name}</div>
                     <div class="card-note">
-                      {scope.isTeam
-                        ? 'Applies to every run in the team.'
-                        : 'Team rules merged with this project’s additions.'}
+                      {projectOrigins.inherited} from the workspace
+                      {teamScope ? ` (v${teamScope.bundle.version})` : ''} ·{' '}
+                      {ownScope
+                        ? `${projectOrigins.own} this project adds (v${ownScope.bundle.version})`
+                        : 'this project adds nothing of its own yet'}
                     </div>
                   </div>
-                  <span class="mono muted small">{short(scope.hash)}</span>
+                  <div class="row" style="gap:8px;flex-wrap:wrap">
+                    <span class="mono muted small">{short((ownScope ?? teamScope)!.hash)}</span>
+                    {isOwner ? (
+                      <>
+                        <a
+                          class="btn btn-sm btn-primary"
+                          href={`/app/teams/${team.slug}/policy?project=${encodeURIComponent(scopeProject.slug)}`}
+                        >
+                          Add for this project only
+                        </a>
+                        <a class="btn btn-sm" href={`/app/teams/${team.slug}/policy`}>
+                          Edit workspace rules
+                        </a>
+                      </>
+                    ) : null}
+                  </div>
                 </div>
-                <PolicyDoc document={scope.document} />
+                <PolicyByOrigin origins={projectOrigins} />
               </div>
-            ))}
+            ) : (
+              visibleScopes.map((scope) => (
+                <div class="card-pad" style="border-top:1px solid var(--line-2)">
+                  <div class="row" style="justify-content:space-between;margin-bottom:14px;gap:12px;flex-wrap:wrap">
+                    <div>
+                      <div class="card-title">{scope.isTeam ? 'Workspace rules' : `${scope.label} adds`}</div>
+                      <div class="card-note">
+                        {scope.isTeam
+                          ? `Applies to every project.${addingProjects.length === 0 ? '' : addingProjects.length === 1 ? ' 1 project adds rules of its own.' : ` ${addingProjects.length} projects add rules of their own.`}`
+                          : `Applies to ${scope.label} only, on top of the workspace rules above.`}
+                      </div>
+                    </div>
+                    <div class="row" style="gap:8px">
+                      <span class="mono muted small">{short(scope.hash)}</span>
+                      {scope.isTeam ? null : (
+                        <a
+                          class="btn btn-sm"
+                          href={`${sectionHref(team.slug, scope.projectSlug ?? scope.label, 'governance')}#effective-policy`}
+                        >
+                          What is in effect there
+                        </a>
+                      )}
+                    </div>
+                  </div>
+                  {scope.isTeam ? (
+                    <PolicyDoc document={scope.document} />
+                  ) : (
+                    <PolicyByOrigin origins={policyOrigins(teamDocument, scope.own)} only="project" />
+                  )}
+                </div>
+              ))
+            )}
           </>
         )}
-      </div>
+      </details>
 
-      <div class="card">
-        <div class="card-head">
+      <details class="card fold-card" id="policy-receipts">
+        <summary class="card-head">
           <div>
             <div class="card-title">Policy receipts</div>
             <div class="card-note">
@@ -576,7 +744,7 @@ governanceRoutes.get('/app/teams/:slug/governance', async (c) => {
             </div>
           </div>
           <span class="mono muted">{receipts.length}</span>
-        </div>
+        </summary>
         {receipts.length === 0 ? (
           <div class="card-pad muted small">
             No receipts yet — one is written every time an agent starts a run, whether it calls
@@ -596,9 +764,12 @@ governanceRoutes.get('/app/teams/:slug/governance', async (c) => {
               </tr>
               {receipts.map((row) => {
                 const drift = row.receipt.drift;
-                const never = drift && !row.receipt.reportedHash;
+                // Silence is neither drift nor agreement. The domain records an
+                // unanswered receipt with drift=false, so tying this state to
+                // `drift` made every silent agent render as a policy match.
+                const never = !row.receipt.reportedHash;
                 return (
-                  <tr class={drift ? 'warm' : undefined}>
+                  <tr id={`receipt-${row.run.id}`} class={drift || never ? 'warm' : undefined}>
                     <td>
                       <div class="name">
                         {row.run.taskKey ?? row.run.intent?.slice(0, 60) ?? 'run'}
@@ -630,10 +801,10 @@ governanceRoutes.get('/app/teams/:slug/governance', async (c) => {
             </table>
           </div>
         )}
-      </div>
+      </details>
 
-      <div class="card">
-        <div class="card-head">
+      <details class="card fold-card" id="environment-baselines">
+        <summary class="card-head">
           <div>
             <div class="card-title">Environment baselines</div>
             <div class="card-note">
@@ -642,7 +813,7 @@ governanceRoutes.get('/app/teams/:slug/governance', async (c) => {
             </div>
           </div>
           <span class="mono muted">{baselines.length}</span>
-        </div>
+        </summary>
         {baselines.length === 0 ? (
           <div class="empty">
             <h2>No baseline recorded</h2>
@@ -682,10 +853,10 @@ governanceRoutes.get('/app/teams/:slug/governance', async (c) => {
             </table>
           </div>
         )}
-      </div>
+      </details>
 
-      <div class="card">
-        <div class="card-head">
+      <details class="card fold-card" id="preflight-results">
+        <summary class="card-head">
           <div>
             <div class="card-title">Preflight results</div>
             <div class="card-note">
@@ -694,7 +865,7 @@ governanceRoutes.get('/app/teams/:slug/governance', async (c) => {
             </div>
           </div>
           <span class="mono muted">{checks.length}</span>
-        </div>
+        </summary>
         {checks.length === 0 ? (
           <div class="card-pad muted small">
             No preflight has run yet — an agent checks in with <code>check_environment</code>
@@ -731,10 +902,97 @@ governanceRoutes.get('/app/teams/:slug/governance', async (c) => {
             </table>
           </div>
         )}
-      </div>
+      </details>
 
-      <div class="card">
-        <div class="card-head">
+      <details class="card fold-card" id="policy-violations" open={violations.length > 0}>
+        <summary class="card-head">
+          <div>
+            <div class="card-title">Policy violations</div>
+            <div class="card-note">
+              Content a published <code>content:</code> deny rule names. Two kinds, and they answer
+              different questions: <b>stopped</b> is an edit the local file guard refused, and{' '}
+              <b>in the checkout</b> is what the end-of-run scan found there anyway — which is the
+              half a guard on one client's file tools can never see. Who, which rule, which file,
+              never the content, which stays on the agent's machine. Last {VIOLATION_LIMIT}.
+            </div>
+          </div>
+          <span class={`mono ${violations.length > 0 ? 'bad' : 'muted'}`}>{violations.length}</span>
+        </summary>
+        {violations.length === 0 ? (
+          <div class="card-pad muted small">
+            Nothing stopped, and nothing found. No agent with the STMA hook installed tried to add
+            content a <code>content:</code> rule forbids, and the scan each run runs over its own
+            checkout when it ends found none there either. That is still not proof nothing landed:
+            the scan reads one checkout at the end of one run, so work done elsewhere, or after it,
+            is not in it, and an agent connected over MCP only has no hook to run either half. Add
+            a rule under <b>Edit policy → Denied</b>, shaped{' '}
+            <code>content: "text" in path/** — reason</code>.
+          </div>
+        ) : (
+          <div class="scroll-x">
+            <table class="tbl">
+              <tr>
+                <th>When</th>
+                <th>Agent</th>
+                <th>Project · task</th>
+                <th>Rule</th>
+                <th>File</th>
+                <th>Outcome</th>
+              </tr>
+              {violations.map((row) => {
+                const detail = (row.event.detail ?? {}) as {
+                  rule?: string;
+                  path?: string;
+                  outcome?: string;
+                };
+                return (
+                  <tr>
+                    <td class="muted" style="white-space:nowrap">
+                      {timeAgo(row.event.createdAt)}
+                    </td>
+                    <td>
+                      {/* The hook reports, so the run belongs to the local adapter.
+                          A lead knows the agent they gave the task to, not its
+                          adapter — name that one, and keep who reported it in view. */}
+                      <div>
+                        <b>{row.companionName ?? row.agentName}</b>
+                      </div>
+                      <div class="mono muted small">
+                        {row.owner}
+                        {row.device ? ` · ${row.device}` : ''}
+                      </div>
+                      {row.companionName ? (
+                        <div class="muted small">via its adapter {row.agentName}</div>
+                      ) : null}
+                    </td>
+                    <td class="muted">
+                      {row.projectName ?? '—'}
+                      <div class="small">{row.run.taskKey ?? row.run.id.slice(0, 8)}</div>
+                    </td>
+                    <td class="small">{detail.rule ?? '—'}</td>
+                    <td class="mono small">{detail.path ?? '—'}</td>
+                    <td>
+                      {/* An edit that was stopped is a rule working. Content that
+                          is in the checkout anyway is the rule being broken, so
+                          the two do not get one colour. */}
+                      <span class={detail.outcome === 'blocked' ? 'pill pill-warn' : 'pill pill-danger'}>
+                        {detail.outcome === 'blocked'
+                          ? 'stopped'
+                          : detail.outcome === 'present'
+                            ? 'in the checkout'
+                            : (detail.outcome ?? 'reported')}
+                      </span>
+                    </td>
+                  </tr>
+                );
+              })}
+            </table>
+          </div>
+        )}
+      </details>
+
+      <details class="card fold-card" id="run-timeline">
+        <summary class="card-head">
           <div>
             <div class="card-title">Run timeline</div>
             <div class="card-note">
@@ -743,7 +1001,7 @@ governanceRoutes.get('/app/teams/:slug/governance', async (c) => {
             </div>
           </div>
           <span class="mono muted">{events.length}</span>
-        </div>
+        </summary>
         {events.length === 0 ? (
           <div class="card-pad muted small">
             No runs recorded yet — ask an agent to call <code>start_run</code>. Over MCP that
@@ -773,7 +1031,10 @@ governanceRoutes.get('/app/teams/:slug/governance', async (c) => {
                   <td>{row.run.taskKey ?? row.run.id.slice(0, 8)}</td>
                   <td>
                     <div>{row.owner}</div>
-                    <div class="mono muted small">{row.agentName}</div>
+                    <div class="mono muted small">{row.companionName ?? row.agentName}</div>
+                    {row.companionName ? (
+                      <div class="muted small">via its adapter {row.agentName}</div>
+                    ) : null}
                   </td>
                   <td class="muted">{row.projectName ?? '—'}</td>
                   <td class="muted small">{eventDetail(row.event.type, row.event.detail)}</td>
@@ -782,7 +1043,7 @@ governanceRoutes.get('/app/teams/:slug/governance', async (c) => {
             </table>
           </div>
         )}
-      </div>
+      </details>
 
       {isOwner ? (
         <dialog id="record-baseline" class="formdlg wide">
@@ -832,20 +1093,23 @@ governanceRoutes.get('/app/teams/:slug/governance', async (c) => {
               </div>
               <div class="field">
                 <label>Project</label>
-                <input
+                <select
                   class="in"
-                  type="text"
                   name="project"
                   aria-label="Project this baseline applies to"
-                  list="gov-projects"
-                  value={scopeProject?.name ?? ''}
-                  placeholder="leave blank to use the snapshot's own project"
-                />
-                <datalist id="gov-projects">
+                >
+                  <option value="" selected={!scopeProject}>
+                    Use the snapshot's own project
+                  </option>
                   {teamProjects.map((p) => (
-                    <option value={p.name}></option>
+                    <option value={p.id} selected={p.id === scopeProject?.id}>
+                      {p.name}
+                      {teamProjects.some((other) => other.id !== p.id && other.name === p.name)
+                        ? ` — ${p.repositoryIdentity ? 'repository-bound' : p.slug}`
+                        : ''}
+                    </option>
                   ))}
-                </datalist>
+                </select>
                 <span class="help">
                   Baselines are per project. Recording a second one replaces the active one.
                 </span>
@@ -865,14 +1129,22 @@ governanceRoutes.get('/app/teams/:slug/governance', async (c) => {
 
     </AppLayout>,
   );
-});
+};
+
+governanceRoutes.get('/app/teams/:slug/governance', governancePage);
+governanceRoutes.get('/app/teams/:slug/projects/:project/governance', governancePage);
 
 // ---------------------------------------------------------------- write paths
 
+/**
+ * Where a write returns: this page, in the scope the write was made in.
+ *
+ * `project` is a slug the handler resolved against this team, never a spelling
+ * somebody typed, so building the project's own address out of it cannot answer
+ * 404 to a person who just published successfully.
+ */
 const back = (slug: string, msg: string, ok = false, project?: string): string =>
-  `/app/teams/${slug}/governance?${ok ? 'ok' : 'error'}=${encodeURIComponent(msg)}${
-    project ? `&project=${encodeURIComponent(project)}` : ''
-  }`;
+  `${sectionHref(slug, project, 'governance')}?${ok ? 'ok' : 'error'}=${encodeURIComponent(msg)}`;
 
 /**
  * Publish policy from the browser.
@@ -891,20 +1163,28 @@ governanceRoutes.post('/app/teams/:slug/policy', async (c) => {
   const found = await teamForUser(db, user.id, slug);
   if (!found) return c.notFound();
   // Same door as the page. A gate on the read and not the write is not a gate.
-  if (!planLimits(found.team.plan, c.get('env').hosted).governance) return c.notFound();
+  if (!(await effectiveLimits(db, found.team, c.get('env').hosted)).governance) return c.notFound();
 
   const form = await c.req.parseBody();
   const scope = String(form.scope ?? '').trim();
   const project = scope && scope !== 'team' ? scope : undefined;
-  const parsed = policyFromForm(form as Record<string, unknown>);
-  if (failed(parsed)) return c.redirect(back(slug, parsed.error), 302);
+  const selectedProject = project ? await projectForTeam(db, found.team.id, project) : undefined;
+  const projectLabel = selectedProject?.name ?? project ?? 'team';
+  const typed = form as Record<string, unknown>;
+  const parsed = policyFromForm(typed);
+  // A refusal hands the editor back with what was typed (`renderPolicyEditor`): the
+  // usual one is a single malformed line at the end of a long rulebook, and a redirect
+  // with a band threw the rulebook away with it. Somebody who is not an owner has no
+  // editor to be handed; they go to the page they may read, with the reason.
+  const refuse = (error: string) =>
+    found.role === 'owner'
+      ? renderPolicyEditor(c, { typed, error })
+      : c.redirect(back(slug, error), 302);
+  if (failed(parsed)) return refuse(parsed.error);
   // Publishing an empty document silently removes every rule the agents were
   // following. If that is really the intent it deserves a different gesture.
   if (isEmptyPolicy(parsed.document)) {
-    return c.redirect(
-      back(slug, 'Every field was empty — that would publish a rulebook with no rules. Nothing was written.'),
-      302,
-    );
+    return refuse('Every field was empty — that would publish a rulebook with no rules.');
   }
 
   const result = await publishPolicy(db, user.id, {
@@ -912,20 +1192,20 @@ governanceRoutes.post('/app/teams/:slug/policy', async (c) => {
     project,
     document: parsed.document,
   });
-  if (failed(result)) return c.redirect(back(slug, result.error), 302);
+  if ('error' in result) return refuse(result.error);
   void track(db, {
     teamId: result.policy.teamId,
     projectId: result.policy.projectId,
     userId: user.id,
     action: 'policy_published',
-    detail: `${project ?? 'team scope'} v${result.policy.version} · ${short(result.policy.hash)}`,
+    detail: `${projectLabel} v${result.policy.version} · ${short(result.policy.hash)}`,
   });
   return c.redirect(
     back(
       slug,
-      `Published ${project ?? 'team'} policy v${result.policy.version} (${short(result.policy.hash)}). Agents receive it on their next run.`,
+      `Published ${projectLabel} policy v${result.policy.version} (${short(result.policy.hash)}). Agents receive it on their next run.`,
       true,
-      project,
+      selectedProject?.slug,
     ),
     302,
   );
@@ -948,7 +1228,7 @@ governanceRoutes.post('/app/teams/:slug/baseline', async (c) => {
   const found = await teamForUser(db, user.id, slug);
   if (!found) return c.notFound();
   // Same door as the page. A gate on the read and not the write is not a gate.
-  if (!planLimits(found.team.plan, c.get('env').hosted).governance) return c.notFound();
+  if (!(await effectiveLimits(db, found.team, c.get('env').hosted)).governance) return c.notFound();
 
   const form = await c.req.parseBody();
   const snapshotId = String(form.snapshot ?? '').trim();
@@ -964,8 +1244,17 @@ governanceRoutes.post('/app/teams/:slug/baseline', async (c) => {
   const chosen = rows[0];
   if (!chosen) return c.redirect(back(slug, 'That snapshot is not in this team.'), 302);
 
-  const project = String(form.project ?? '').trim() || chosen.projectName || chosen.snap.repo;
-  if (!project) {
+  const requestedProject = String(form.project ?? '').trim();
+  const targetProject = requestedProject
+    ? await projectForTeam(db, found.team.id, requestedProject)
+    : chosen.snap.projectId
+      ? await projectForTeam(db, found.team.id, chosen.snap.projectId)
+      : chosen.projectName
+        ? await projectForTeam(db, found.team.id, chosen.projectName)
+        : chosen.snap.repo
+          ? await projectForTeam(db, found.team.id, chosen.snap.repo)
+          : undefined;
+  if (!targetProject) {
     return c.redirect(
       back(slug, 'That snapshot names no project, so there is nothing to baseline. Pick a project.'),
       302,
@@ -979,23 +1268,23 @@ governanceRoutes.post('/app/teams/:slug/baseline', async (c) => {
 
   const result = await setEnvironmentBaseline(db, user.id, {
     team: slug,
-    project,
+    project: targetProject.name,
     snapshot: parsedSnapshot.data,
-  });
+  }, targetProject.id);
   if (failed(result)) return c.redirect(back(slug, result.error), 302);
   void track(db, {
     teamId: result.baseline.teamId,
     projectId: result.baseline.projectId,
     userId: user.id,
     action: 'env_baseline_set',
-    detail: `${project} · ${short(result.baseline.fingerprint)} · from ${chosen.owner}@${chosen.snap.deviceLabel}`,
+    detail: `${targetProject.name} · ${short(result.baseline.fingerprint)} · from ${chosen.owner}@${chosen.snap.deviceLabel}`,
   });
   return c.redirect(
     back(
       slug,
-      `Baseline for ${project} recorded from ${chosen.owner}@${chosen.snap.deviceLabel} (${short(result.baseline.fingerprint)}). Preflight compares against it from now on.`,
+      `Baseline for ${targetProject.name} recorded from ${chosen.owner}@${chosen.snap.deviceLabel} (${short(result.baseline.fingerprint)}). Preflight compares against it from now on.`,
       true,
-      project,
+      targetProject.slug,
     ),
     302,
   );

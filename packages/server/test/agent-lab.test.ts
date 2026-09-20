@@ -130,7 +130,7 @@ beforeAll(async () => {
   server = await startServer(
     loadEnv({
       port: 0,
-      host: 'localhost',
+      host: '127.0.0.1',
       nodeEnv: 'test',
       devMode: true,
       databaseUrl: undefined,

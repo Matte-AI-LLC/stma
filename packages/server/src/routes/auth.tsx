@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { and, eq, isNotNull } from 'drizzle-orm';
 import { Hono } from 'hono';
 import type { Context } from 'hono';
@@ -25,6 +26,7 @@ import {
   invalidateAllSessions,
   sanitizeNext,
 } from '../auth/session';
+import { accessCodeRequired, matchAccessCode } from '../auth/accessCodes';
 import {
   LOGIN_FAIL_WINDOW_MS,
   clearLoginFailures,
@@ -32,11 +34,12 @@ import {
   loginGate,
   recordLoginFailure,
 } from '../auth/attempts';
-import { hashPassword, randomCode, verifyPassword } from '../lib/crypto';
+import { burnPasswordCheck, hashPassword, randomCode, verifyPassword } from '../lib/crypto';
 import { emailIsFree, isEmail, maskEmail, normalizeEmail, usernameFromEmail } from '../lib/email';
 import { logLine } from '../lib/log';
 import {
   failedSignInsEmail,
+  emailVerifyCodeEmail,
   loginCodeEmail,
   passwordChangedEmail,
   passwordResetCodeEmail,
@@ -130,10 +133,16 @@ authRoutes.get('/login', (c) => {
                 </p>
               </>
             ) : null}
-            {env.demoLogins.length > 0 ? (
+            {env.demoLogins.length > 0 && !env.hosted ? (
               // Only ever the strings in DEMO_LOGINS. Nothing is read from the
               // users table, so this cannot print a real account's details even
               // if the variable ends up somewhere it should not be.
+              //
+              // And never on the hosted service. The environment already drops
+              // the variable there, but the check that matters is the one at the
+              // place that renders: a list of example accounts under the
+              // password box of the service people actually use is an invitation
+              // to try them, whatever route put it in the configuration.
               <div class="devbox">
                 <span class="overline">Demo accounts</span>
                 <p class="m0 small muted">
@@ -193,6 +202,7 @@ authRoutes.get('/login', (c) => {
                 GITHUB_CLIENT_SECRET.
               </p>
             ) : null}
+            <SupportNote support={env.supportEmail} what="Locked out and the reset is not helping?" />
           </div>
         </div>
       </body>
@@ -208,6 +218,11 @@ authRoutes.get('/signup', (c) => {
   if (c.get('user')) return c.redirect('/app');
   const next = sanitizeNext(c.req.query('next'));
   const error = c.req.query('error');
+  const needsCode = accessCodeRequired(env);
+  // A link can carry the code, so a cohort email is one click rather than a
+  // copy-paste. It is not a secret the URL leaks — it is the thing the email
+  // was sent to hand over.
+  const presetCode = (c.req.query('code') ?? '').slice(0, 64);
   return c.html(
     <html lang="en">
       <Head title="Create account" />
@@ -217,7 +232,11 @@ authRoutes.get('/signup', (c) => {
             <Logo lg />
             <div>
               <h1>Create your STMA account</h1>
-              <p class="lede">One account per person — teammates join you through invite links.</p>
+              <p class="lede">
+                {needsCode
+                  ? 'STMA is in private beta. Your access code lets you create one account; teammates join you through invite links.'
+                  : 'One account per person — teammates join you through invite links.'}
+              </p>
             </div>
             {error ? (
               <div class="banner banner-error">
@@ -227,6 +246,25 @@ authRoutes.get('/signup', (c) => {
             ) : null}
             <form class="authform wide" method="post" action="/auth/local/signup">
               <input type="hidden" name="next" value={next} />
+              {needsCode ? (
+                <div class="field">
+                  <label>Access code</label>
+                  <input
+                    class="in"
+                    type="text"
+                    name="access_code"
+                    autocomplete="one-time-code"
+                    spellcheck={false}
+                    value={presetCode}
+                    placeholder="the code from your invitation"
+                    required
+                  />
+                  <span class="help">
+                    From the email that invited you to the beta. One code works for everyone in
+                    your group — it is not consumed when you sign up.
+                  </span>
+                </div>
+              ) : null}
               <div class="field">
                 <label>Email</label>
                 <input
@@ -260,6 +298,13 @@ authRoutes.get('/signup', (c) => {
                 Already have one? <a href={`/login?next=${encodeURIComponent(next)}`}>Sign in</a>
               </p>
             </form>
+            {/* The access code is the first wall a beta user meets and the one
+                page that could not link anywhere: a refused code is a dead end
+                otherwise, and the person holding it has no account to sign into. */}
+            <SupportNote
+              support={env.supportEmail}
+              what={needsCode ? 'Access code refused, or you have none?' : 'Cannot create an account?'}
+            />
           </div>
         </div>
       </body>
@@ -276,6 +321,16 @@ authRoutes.post('/auth/local/signup', async (c) => {
   const next = sanitizeNext(typeof body.next === 'string' ? body.next : undefined);
   const back = (msg: string) =>
     c.redirect(`/signup?error=${encodeURIComponent(msg)}&next=${encodeURIComponent(next)}`);
+
+  // Checked before anything else, and before the address is looked at: a beta
+  // door that validates the email first would confirm whether an account exists
+  // to somebody who never had a code.
+  const submittedCode = typeof body.access_code === 'string' ? body.access_code : '';
+  const verdict = matchAccessCode(env, submittedCode);
+  if (!verdict.ok) {
+    logLine({ evt: 'auth', a: 'signup_fail', why: 'access_code' });
+    return back('That access code is not valid. Check the email that invited you to the beta.');
+  }
 
   if (!isEmail(email)) return back('Enter a valid email address.');
   if (password.length < 8 || password.length > 128) {
@@ -304,7 +359,46 @@ authRoutes.post('/auth/local/signup', async (c) => {
     return back(taken);
   }
   await createSession(c, user.id);
-  logLine({ evt: 'auth', a: 'signup', u: user.username });
+  /**
+   * Prove the address, starting now, without standing in the way.
+   *
+   * A typo here used to be a permanent lockout: with sign-in codes on, both the
+   * second factor and the reset go to this address and nowhere else, and the
+   * only fix was an operator. So the code goes out at signup and the console
+   * says, on every page, that the address is unconfirmed and how to fix it.
+   *
+   * It deliberately does not block. Holding the account hostage to a mail that
+   * may not arrive would turn a provider outage into "nobody can sign up", and
+   * the window this closes is the session the person already has — they are
+   * signed in for the next month and can correct the address from Account
+   * without help. If that proves too soft, making it a gate is a small change
+   * from here; making it softer after a gate is not.
+   */
+  if (env.twoFactor) {
+    const issued = await issueAuthCode(db, user.id, 'email_verify');
+    if (issued.ok) {
+      // Still not awaited — the paragraph above is the reason, and a mail
+      // round trip does not belong on the critical path of creating an
+      // account. But the result was previously dropped on the floor, so a
+      // provider refusing every message left no trace at all against the one
+      // signup where somebody would have wanted to know. It is silent to the
+      // person on purpose: they are signed in, the console now carries the
+      // unconfirmed band on every page, and Account has a Send-me-a-code
+      // button that *does* report its failure. The operator is who needs to
+      // hear this, and `sendMail` files it for /admin/ops either way.
+      void sendMail(env, { to: email, ...emailVerifyCodeEmail(issued.code, CODE_TTL_MINUTES) }).then(
+        (sent) => {
+          if (!sent.ok) {
+            logLine({ evt: 'auth', a: 'verify_code_fail', u: user.username, why: sent.error });
+          }
+        },
+      );
+    }
+  }
+  // The cohort, never the code: an operator wants to know which invitation wave
+  // an account came from, and a log that carries the code itself is a log that
+  // hands out beta access to anyone who can read it.
+  logLine({ evt: 'auth', a: 'signup', u: user.username, ...(verdict.label ? { cohort: verdict.label } : {}) });
   return c.redirect(next);
 });
 
@@ -377,6 +471,9 @@ authRoutes.post('/auth/local/login', async (c) => {
     .where(and(eq(users.email, email), isNotNull(users.passwordHash)))
     .limit(1);
   const user = rows[0];
+  // An address with no account must cost what one with an account costs, or the
+  // response time answers the question every other line here refuses to.
+  if (!user) await burnPasswordCheck(password);
   if (!user || !(await verifyPassword(password, user.passwordHash!))) {
     const failed = await recordLoginFailure(db, email);
     logLine({ evt: 'auth', a: 'login_fail', em: maskEmail(email), n: failed.attempts });
@@ -456,8 +553,13 @@ const VerifyPage = ({ next, error, notice }: { next: string; error?: string; not
               Send a new code
             </button>
           </form>
+          {/* The digits are in the subject on purpose — that is what a phone's
+              notification preview shows — and saying so here saves opening the
+              mail at all. It was true and printed nowhere. */}
           <p class="finenote">
-            Nothing arrived? Check spam, or <a href="/login">start over</a>.
+            The six digits are in the subject line. Nothing arrived? Check spam,{' '}
+            <a href="/help#signin">see what usually causes this</a>, or{' '}
+            <a href="/login">start over</a>.
           </p>
         </div>
       </div>
@@ -554,7 +656,36 @@ authRoutes.post('/auth/local/resend', async (c) => {
 const RESET_SENT =
   'If that address has an account with a password, a 6-digit reset code is on its way. It expires in 10 minutes.';
 
-const ForgotPage = ({ error }: { error?: string }) => (
+/**
+ * The way out, on the pages somebody stuck is actually looking at.
+ *
+ * `SUPPORT_EMAIL` existed and appeared on exactly one page a locked-out person
+ * cannot reach, plus inside an email they may never receive. Recovery answers
+ * have to stay neutral — saying "we could not send it" would say it only for
+ * addresses that exist — so the page, not the response, is where the honest
+ * "nothing arrived?" belongs.
+ *
+ * `/help` comes first and always renders, because most of what goes wrong here
+ * is answerable without a person: a lock that refuses the right password on
+ * purpose, a code that belongs to the browser that asked, an access code that
+ * is checked before the address. The mail address is the end of the page rather
+ * than the whole of it, and renders only when the instance has one — the same
+ * rule the access-code call to action follows.
+ */
+const SupportNote = ({ support, what }: { support: string; what: string }) => (
+  <p class="finenote">
+    {what} <a href="/help#signin">What usually causes this</a>.
+    {support ? (
+      <>
+        {' '}
+        If that does not cover it, write to <a href={`mailto:${support}`}>{support}</a> from the
+        address on the account. Never put a password or a code in that mail.
+      </>
+    ) : null}
+  </p>
+);
+
+const ForgotPage = ({ error, support }: { error?: string; support: string }) => (
   <html lang="en">
     <Head title="Reset password" />
     <body>
@@ -582,8 +713,12 @@ const ForgotPage = ({ error }: { error?: string }) => (
               Email me a reset code
             </button>
           </form>
+          <SupportNote
+            support={support}
+            what="Nothing in your inbox after a few minutes, or no email on the account at all?"
+          />
           <p class="finenote">
-            No email on your account yet? Ask your STMA operator to set one — <a href="/login">back to sign in</a>.
+            <a href="/login">Back to sign in</a>.
           </p>
         </div>
       </div>
@@ -591,7 +726,15 @@ const ForgotPage = ({ error }: { error?: string }) => (
   </html>
 );
 
-const ResetPage = ({ error, notice }: { error?: string; notice?: string }) => (
+const ResetPage = ({
+  error,
+  notice,
+  support,
+}: {
+  error?: string;
+  notice?: string;
+  support: string;
+}) => (
   <html lang="en">
     <Head title="Choose a new password" />
     <body>
@@ -601,8 +744,9 @@ const ResetPage = ({ error, notice }: { error?: string; notice?: string }) => (
           <div>
             <h1>Choose a new password</h1>
             <p class="lede">
-              Enter the code we emailed and your new password. Setting it signs you out on every
-              device.
+              Enter the code we emailed and your new password. Finish this in the same browser you
+              asked from. Setting a new password signs you out of every browser; your agent
+              connections keep working.
             </p>
           </div>
           {error ? (
@@ -660,8 +804,9 @@ const ResetPage = ({ error, notice }: { error?: string; notice?: string }) => (
             </button>
           </form>
           <p class="finenote">
-            Code expired? <a href="/forgot">Request another</a>.
+            Code expired, or none arrived? <a href="/forgot">Request another</a>.
           </p>
+          <SupportNote support={support} what="Still stuck after a second code?" />
         </div>
       </div>
     </body>
@@ -674,7 +819,7 @@ authRoutes.get('/forgot', (c) => {
   // the operator escape hatch (/admin/users) is the recovery path.
   if (!env.localAuth || !env.twoFactor) return c.notFound();
   if (c.get('user')) return c.redirect('/app');
-  return c.html(<ForgotPage error={c.req.query('error')} />);
+  return c.html(<ForgotPage error={c.req.query('error')} support={env.supportEmail} />);
 });
 
 authRoutes.get('/reset', (c) => {
@@ -683,7 +828,25 @@ authRoutes.get('/reset', (c) => {
   // the operator escape hatch (/admin/users) is the recovery path.
   if (!env.localAuth || !env.twoFactor) return c.notFound();
   if (c.get('user')) return c.redirect('/app');
-  return c.html(<ResetPage error={c.req.query('error')} notice={c.req.query('ok')} />);
+  /**
+   * The link in the reset email, which is how somebody reading it on their phone
+   * finishes there.
+   *
+   * The pending id is not the secret — the six-digit code is, and it is in the
+   * same message — so carrying the id in the link is exactly as strong as the
+   * cookie it replaces, and the person still has to type the code. Setting it
+   * and redirecting clean keeps it out of the address bar, out of the referrer
+   * and out of browser history, and means a link scanner that fetches the URL
+   * has set a cookie in a browser nobody is using rather than consuming a code.
+   */
+  const carried = c.req.query('t');
+  if (carried && /^[0-9a-f-]{36}$/.test(carried)) {
+    setPendingChallenge(c, 'reset', carried);
+    return c.redirect('/reset');
+  }
+  return c.html(
+    <ResetPage error={c.req.query('error')} notice={c.req.query('ok')} support={env.supportEmail} />,
+  );
 });
 
 authRoutes.post('/auth/local/forgot', async (c) => {
@@ -693,9 +856,23 @@ authRoutes.post('/auth/local/forgot', async (c) => {
   if (!env.localAuth || !env.twoFactor) return c.notFound();
   const body = await c.req.parseBody();
   const email = normalizeEmail(body.email);
-  // One neutral answer for every outcome below. Unknown addresses still pay the
-  // per-IP /auth/* budget, which is the only rate limit that can apply to them.
-  const done = () => c.redirect(`/reset?ok=${encodeURIComponent(RESET_SENT)}`);
+  /**
+   * One neutral answer for every outcome below — **including the headers**.
+   *
+   * The status, the Location and the body were already identical, and the
+   * `reset` cookie was not: it was set only where a code had actually been
+   * issued, so `Set-Cookie` answered "does this address have an account" to
+   * anyone reading the response instead of the page. A cookie naming an id that
+   * exists nowhere fails the lookup in /auth/local/reset exactly as a stale one
+   * does, so the neutral path costs a random UUID and reveals nothing.
+   *
+   * Unknown addresses still pay the per-IP /auth/* budget, which is the only
+   * rate limit that can apply to them.
+   */
+  const done = (challengeId?: string) => {
+    setPendingChallenge(c, 'reset', challengeId ?? randomUUID());
+    return c.redirect(`/reset?ok=${encodeURIComponent(RESET_SENT)}`);
+  };
   if (!isEmail(email)) return c.redirect(`/forgot?error=${encodeURIComponent('Enter a valid email address.')}`);
 
   const db = c.get('db');
@@ -714,17 +891,36 @@ authRoutes.post('/auth/local/forgot', async (c) => {
     logLine({ evt: 'auth', a: 'reset_limited', u: user.username });
     return done();
   }
-  const sent = await sendMail(env, {
+  /**
+   * Started, not waited for, because the neutral answer has to be neutral in
+   * TIME as well as in words.
+   *
+   * This branch awaited an HTTPS round trip to the mail provider while the "no
+   * such account" branch returned after one indexed SELECT — a few
+   * milliseconds against a few hundred, which answers "does this address have
+   * an account" to anybody with a stopwatch. It is the same leak
+   * `burnPasswordCheck` exists to close on the other door, an order of
+   * magnitude wider. The memory transport used by dev and tests records before
+   * it yields, so nothing there becomes timing-dependent.
+   *
+   * A failure still writes its line and still answers neutrally; the cookie now
+   * carries the real challenge either way, which is no weaker than the random
+   * one it replaces and lets a retry reuse the same throttle state.
+   */
+  void sendMail(env, {
     to: user.email!,
-    ...passwordResetCodeEmail(issued.code, CODE_TTL_MINUTES),
+    ...passwordResetCodeEmail(
+      issued.code,
+      CODE_TTL_MINUTES,
+      `${env.baseUrl}/reset?t=${encodeURIComponent(issued.id)}`,
+    ),
+  }).then((sent) => {
+    if (!sent.ok) {
+      logLine({ evt: 'auth', a: 'reset_send_fail', u: user.username, why: sent.error });
+    }
   });
-  if (!sent.ok) {
-    logLine({ evt: 'auth', a: 'reset_send_fail', u: user.username, why: sent.error });
-    return done();
-  }
-  setPendingChallenge(c, 'reset', issued.id);
   logLine({ evt: 'auth', a: 'reset_request', hit: true, u: user.username });
-  return done();
+  return done(issued.id);
 });
 
 authRoutes.post('/auth/local/reset', async (c) => {
@@ -772,10 +968,17 @@ authRoutes.post('/auth/local/reset', async (c) => {
     .where(eq(users.id, user.id));
   // Recovery path: assume the old session belongs to whoever locked them out.
   await invalidateAllSessions(db, user.id);
+  // And lift the sign-in lock, because failing to sign in is *how people arrive
+  // here*. Without this the product contradicts itself one screen apart:
+  // "Password updated — sign in with your new password", then "Too many
+  // sign-in attempts for this email address". Proving the mailbox is stronger
+  // evidence than the password the counter was guarding, so clearing it is the
+  // right call rather than a concession.
+  await clearLoginFailures(db, user.email ?? '');
   clearPendingChallenge(c, 'reset');
   logLine({ evt: 'auth', a: 'reset_done', u: user.username });
   if (user.email) {
-    void sendMail(env, { to: user.email, ...passwordChangedEmail(env.baseUrl) });
+    void sendMail(env, { to: user.email, ...passwordChangedEmail(env.baseUrl, env.supportEmail) });
   }
   return c.redirect(
     `/login?ok=${encodeURIComponent('Password updated — sign in with your new password.')}`,

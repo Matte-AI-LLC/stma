@@ -8,12 +8,39 @@ export interface Env {
   pgliteDir: string;
   migrationsDir?: string;
   github?: { clientId: string; clientSecret: string };
+  /** Customer-facing ClickUp OAuth app. Personal API tokens are never requested by the UI. */
+  clickup?: { clientId: string; clientSecret: string };
   /** Passwordless dev login form. Auto-enabled outside production when GitHub OAuth is not configured. */
   devMode: boolean;
   /** Username+password accounts (default on; AUTH_LOCAL=0 disables). */
   localAuth: boolean;
   /** Whether new local accounts can be created (SIGNUPS_OPEN=0 closes signup). */
   signupsOpen: boolean;
+  /**
+   * Access codes that a private beta hands out, from `SIGNUP_ACCESS_CODES`
+   * (comma separated, `code:label` to name a cohort in the log).
+   *
+   * Set, signup asks for one and refuses without it. Unset, signup behaves as
+   * it always has, so a self-hosted instance and `npm run dev` are untouched.
+   *
+   * A cohort code, deliberately not a one-use invite: a team invite already
+   * exists for joining a workspace, and this is the earlier door — somebody who
+   * has no account and no workspace yet. Codes are compared in constant time
+   * and only ever come from configuration, never from the database, so the page
+   * cannot leak anything but the strings an operator typed.
+   */
+  signupAccessCodes: Array<{ code: string; label?: string }>;
+  /**
+   * Every workspace gets every feature, whatever its plan says (`BETA_UNMETERED=1`).
+   *
+   * The private beta sells nothing, so metering it would only produce refusals
+   * nobody can pay their way out of. This is deliberately a separate switch from
+   * `hosted`: the instance stays hosted — audit, identity composition and the
+   * operator surfaces all behave as they will when billing turns on — and only
+   * the ceilings lift. Turning it off restores the matrix with no data to unwind,
+   * which is why the beta does not simply write a plan onto every team.
+   */
+  betaUnmetered: boolean;
   /**
    * What a stranger sees.
    *
@@ -36,6 +63,35 @@ export interface Env {
    */
   hosted: boolean;
   /**
+   * How many proxies of our own stand in front of this instance.
+   *
+   * `X-Forwarded-For` is a list each proxy appends to, so its LEFTMOST entry is
+   * whatever the client sent and its rightmost is the address the nearest proxy
+   * actually saw. Reading the leftmost, which is what this did until 2026-09-20,
+   * let anyone give every request a fresh identity and walk through every
+   * per-IP limit in the table — including the one brake on guessing a private
+   * beta access code.
+   *
+   * 0 means "trust only what the nearest proxy appended", which is never
+   * forgeable and is right for a direct-to-origin deployment. Each extra hop
+   * walks one entry further left, past a proxy we know is there: behind
+   * Cloudflare in front of Container Apps the chain ends `…, client, cf-edge`,
+   * so 1 is the real client. Set it too high and the limiter groups a whole
+   * proxy's traffic together, which is coarse; set it too low and nothing is
+   * forgeable either. Both failure directions are safe, which is why the
+   * default is 0 rather than a guess about somebody's topology.
+   */
+  trustedProxyHops: number;
+  /**
+   * Where a person writes when the product goes wrong. Empty means the instance
+   * has no support channel and nothing offers one.
+   *
+   * Defaulted for the hosted service and for nobody else: a self-hosted instance
+   * telling its users to email our address would send us mail we cannot act on
+   * and send its own operator none. `SUPPORT_EMAIL` sets it either way.
+   */
+  supportEmail: string;
+  /**
    * Demo credentials printed on the sign-in page, for a throwaway environment
    * where hunting for them is the friction.
    *
@@ -57,6 +113,12 @@ export interface Env {
   /** Operator error-log entries older than this are purged. 0 disables the age purge (the row cap still applies). */
   errorRetentionDays: number;
   /**
+   * How far back `/admin/ops` can look at load: five-minute rollups older than
+   * this are purged. 0 disables the age purge (the row cap still applies).
+   * Deliberately not a plan attribute — it describes the instance, not a tenant.
+   */
+  loadRetentionDays: number;
+  /**
    * How long the app remembers *what happened*: the team activity feed, the
    * append-only agent run trail behind the governance page, and the announcements
    * channel. 0 disables the age purge (the row caps still apply).
@@ -66,6 +128,8 @@ export interface Env {
   agentStaleMinutes: number;
   /** Work-claim leases are renewed by run heartbeats. */
   agentClaimLeaseMinutes: number;
+  /** Waiting/blocked runs keep their claims this long while a human responds. */
+  agentWaitingLeaseMinutes: number;
   /**
    * Usernames allowed into the operator /admin area (ADMIN_USERNAMES, comma-separated,
    * case-insensitive). Stored trimmed and lowercased; empty list disables /admin entirely.
@@ -92,6 +156,15 @@ export interface Env {
   notifyDebounceSeconds: number;
   /** Hard ceiling on notification emails per user per rolling hour. */
   notifyMaxPerHour: number;
+  /**
+   * Hosted Knowledge Hub engineering guardrails. These are configurable safety
+   * ceilings, not commercial plan entitlements; self-hosted instances do not
+   * apply them.
+   */
+  knowledgeHostedMaxBytes: number;
+  knowledgeHostedMaxDrafts: number;
+  knowledgeHostedMaxPublished: number;
+  knowledgeHostedMaxVersions: number;
 }
 
 /**
@@ -113,6 +186,25 @@ function parseDemoLogins(raw: string | undefined): Env['demoLogins'] {
     })
     .filter((row) => row.email !== '' && row.password !== '')
     .slice(0, 8);
+}
+
+/**
+ * `SIGNUP_ACCESS_CODES` — `code` or `code:label`, comma separated.
+ *
+ * The label is for the log line, so an operator can tell which cohort a beta
+ * account came from without the code itself ever being written down next to it.
+ */
+function parseAccessCodes(raw: string | undefined): Env['signupAccessCodes'] {
+  return (raw ?? '')
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .map((entry) => {
+      const [code, label] = entry.split(':').map((part) => part.trim());
+      return { code: code ?? '', label: label || undefined };
+    })
+    .filter((row) => row.code.length >= 6)
+    .slice(0, 32);
 }
 
 /**
@@ -141,11 +233,19 @@ export function bootNodeEnv(
 
 export function loadEnv(overrides: Partial<Env> = {}): Env {
   const e = process.env;
+  // Read once, before the object is built: two fields below key off it, and an
+  // override has to reach them as well as the field it names.
+  const hostedInstance = overrides.hosted ?? e.STMA_HOSTED === '1';
   const nodeEnv = e.NODE_ENV ?? 'development';
   const port = Number(e.PORT ?? 3000);
+  const configuredBaseUrl = e.BASE_URL?.trim();
   const github =
     e.GITHUB_CLIENT_ID && e.GITHUB_CLIENT_SECRET
       ? { clientId: e.GITHUB_CLIENT_ID, clientSecret: e.GITHUB_CLIENT_SECRET }
+      : undefined;
+  const clickup =
+    e.CLICKUP_CLIENT_ID && e.CLICKUP_CLIENT_SECRET
+      ? { clientId: e.CLICKUP_CLIENT_ID, clientSecret: e.CLICKUP_CLIENT_SECRET }
       : undefined;
   const devMode = e.AUTH_DEV_MODE === '1' || (!github && nodeEnv !== 'production');
   const resendApiKey = e.RESEND_API_KEY || undefined;
@@ -154,30 +254,51 @@ export function loadEnv(overrides: Partial<Env> = {}): Env {
       .split(',')
       .map((s) => s.trim().toLowerCase())
       .filter(Boolean);
+  const positiveInteger = (name: string, raw: string | undefined, fallback: number) => {
+    const parsed = Number(raw ?? fallback);
+    if (!Number.isSafeInteger(parsed) || parsed < 1) {
+      throw new Error(`${name} must be a positive integer.`);
+    }
+    return parsed;
+  };
 
   const env: Env = {
     nodeEnv,
     port,
     host: e.HOST ?? (nodeEnv === 'production' ? '0.0.0.0' : 'localhost'),
-    baseUrl: (e.BASE_URL ?? `http://localhost:${port}`).replace(/\/+$/, ''),
+    baseUrl: (configuredBaseUrl || `http://localhost:${port}`).replace(/\/+$/, ''),
     databaseUrl: e.DATABASE_URL || undefined,
     pgliteDir: e.PGLITE_DIR ?? '.data/pglite',
     migrationsDir: e.MIGRATIONS_DIR || undefined,
     github,
+    clickup,
     devMode,
     localAuth: e.AUTH_LOCAL !== '0',
     signupsOpen: e.SIGNUPS_OPEN !== '0',
+    signupAccessCodes: parseAccessCodes(e.SIGNUP_ACCESS_CODES),
+    betaUnmetered: e.BETA_UNMETERED === '1',
     publicMode: e.SITE_MODE === 'teaser' ? 'teaser' : 'full',
-    hosted: e.STMA_HOSTED === '1',
-    demoLogins: parseDemoLogins(e.DEMO_LOGINS),
+    hosted: hostedInstance,
+    trustedProxyHops: Math.max(0, Math.min(8, Number(e.TRUSTED_PROXY_HOPS ?? '0') || 0)),
+    supportEmail: (e.SUPPORT_EMAIL ?? (hostedInstance ? 'support@stma.ai' : '')).trim(),
+    // Never on the hosted service, whatever the variable says. The panel exists
+    // for a throwaway environment where hunting for the test credentials is the
+    // friction; on the service people actually sign in to, a list of example
+    // accounts under the password box is an invitation to try them. Dropping it
+    // here rather than at the template keeps one answer for "is it on", and it
+    // reads the same `hosted` the overrides can set rather than the raw
+    // variable — otherwise a caller that passes `hosted: true` gets the panel.
+    demoLogins: hostedInstance ? [] : parseDemoLogins(e.DEMO_LOGINS),
     embeddedDb: e.EMBEDDED_DB === '1',
     sessionTtlDays: Number(e.SESSION_TTL_DAYS ?? 30),
     snapshotRetentionDays: Number(e.SNAPSHOT_RETENTION_DAYS ?? 90),
     sessionRetentionDays: Number(e.SESSION_RETENTION_DAYS ?? 0),
     errorRetentionDays: Number(e.ERROR_RETENTION_DAYS ?? 30),
+    loadRetentionDays: Number(e.LOAD_RETENTION_DAYS ?? 30),
     activityRetentionDays: Number(e.ACTIVITY_RETENTION_DAYS ?? 180),
     agentStaleMinutes: Number(e.AGENT_STALE_MINUTES ?? 3),
     agentClaimLeaseMinutes: Number(e.AGENT_CLAIM_LEASE_MINUTES ?? 5),
+    agentWaitingLeaseMinutes: Number(e.AGENT_WAITING_LEASE_MINUTES ?? 30),
     adminUsernames: csv(e.ADMIN_USERNAMES),
     adminEmails: csv(e.ADMIN_EMAILS),
     resendApiKey,
@@ -185,6 +306,28 @@ export function loadEnv(overrides: Partial<Env> = {}): Env {
     twoFactor: e.AUTH_2FA === '1' ? true : e.AUTH_2FA === '0' ? false : Boolean(resendApiKey),
     notifyDebounceSeconds: Number(e.NOTIFY_DEBOUNCE_SECONDS ?? 120),
     notifyMaxPerHour: Number(e.NOTIFY_MAX_PER_HOUR ?? 6),
+    // Conservative engineering defaults keep a not-yet-priced hosted corpus
+    // bounded. M01 may later turn reviewed values into commercial entitlements.
+    knowledgeHostedMaxBytes: positiveInteger(
+      'KNOWLEDGE_HOSTED_MAX_BYTES',
+      e.KNOWLEDGE_HOSTED_MAX_BYTES,
+      10 * 1024 * 1024,
+    ),
+    knowledgeHostedMaxDrafts: positiveInteger(
+      'KNOWLEDGE_HOSTED_MAX_DRAFTS',
+      e.KNOWLEDGE_HOSTED_MAX_DRAFTS,
+      250,
+    ),
+    knowledgeHostedMaxPublished: positiveInteger(
+      'KNOWLEDGE_HOSTED_MAX_PUBLISHED',
+      e.KNOWLEDGE_HOSTED_MAX_PUBLISHED,
+      250,
+    ),
+    knowledgeHostedMaxVersions: positiveInteger(
+      'KNOWLEDGE_HOSTED_MAX_VERSIONS',
+      e.KNOWLEDGE_HOSTED_MAX_VERSIONS,
+      1_000,
+    ),
     ...overrides,
   };
 
@@ -205,6 +348,39 @@ export function loadEnv(overrides: Partial<Env> = {}): Env {
     console.warn(
       '[stma] WARNING: email sign-in codes are off — a leaked password is enough to sign in. Set RESEND_API_KEY (or AUTH_2FA=1 with a working mailer) to enable them.',
     );
+  }
+  /**
+   * Say which address the mail actually goes out as.
+   *
+   * A configured key proves an account, never a verified sending domain, and
+   * those fail in opposite ways: with no key nothing is sent and the warning
+   * above says so, while with a key and an unverified `MAIL_FROM` domain the
+   * product looks entirely healthy and every message is refused — sign-in codes
+   * and password resets included. Nothing here can check the provider's
+   * verification state, so this prints the one fact that makes the question
+   * askable, next to the key that makes it matter. `MAIL_FROM` defaults to a
+   * domain this deployment may not own.
+   */
+  if (env.resendApiKey && env.nodeEnv !== 'test') {
+    console.log(
+      `[stma] Mail: sending as ${env.mailFrom}. Its domain must be verified with the mail provider, or every message is refused and nobody can sign in or reset a password. Failures show on /admin/ops.`,
+    );
+  }
+  // A private beta whose door is open is not a private beta, and the difference
+  // is one unset variable. Say it at boot rather than letting the first stranger
+  // discover it.
+  if (env.hosted && env.signupsOpen && env.signupAccessCodes.length === 0 && env.nodeEnv !== 'test') {
+    console.warn(
+      '[stma] WARNING: hosted signup is open to anyone — no SIGNUP_ACCESS_CODES are set. Set them for an invite-only beta, or SIGNUPS_OPEN=0 to close signup entirely.',
+    );
+  }
+  if (env.betaUnmetered && env.nodeEnv !== 'test') {
+    console.warn(
+      '[stma] BETA_UNMETERED=1: every workspace has every feature and no ceiling. Plan limits resume the moment this is unset.',
+    );
+  }
+  if (env.hosted && (e.DEMO_LOGINS ?? '') !== '') {
+    console.warn('[stma] DEMO_LOGINS ignored: the hosted service never prints example accounts.');
   }
   return env;
 }

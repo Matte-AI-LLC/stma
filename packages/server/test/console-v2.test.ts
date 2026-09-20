@@ -1,7 +1,9 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { eq } from 'drizzle-orm';
 import { afterAll, beforeAll, expect, it } from 'vitest';
+import { memberships, teams, users } from '../src/db/schema';
 import { loadEnv } from '../src/env';
 import { startServer, type StartedServer } from '../src/server';
 
@@ -69,7 +71,7 @@ beforeAll(async () => {
   srv = await startServer(
     loadEnv({
       port: 0,
-      host: 'localhost',
+      host: '127.0.0.1',
       nodeEnv: 'test',
       devMode: true,
       databaseUrl: undefined,
@@ -91,12 +93,50 @@ afterAll(async () => {
   rmSync(dataDir, { recursive: true, force: true });
 });
 
-it('gives a project a page of its own, born from the run that named it', async () => {
-  // Nothing to create: the project appears because an agent named a repository.
+it('creates a project before enrollment and still discovers projects from agent runs', async () => {
   const empty = await page('/app/teams/v2-team/projects');
   expect(empty.status).toBe(200);
-  expect(empty.html).toContain('Nothing to create');
+  expect(empty.html).toContain('New project');
+  expect(empty.html).toContain('name="project"');
 
+  const manual = await form(
+    `${srv.url}/app/projects`,
+    {
+      team: 'v2-team',
+      project: 'https://github.com/acme/manual-api.git',
+      return_to: 'projects',
+    },
+    { cookie },
+  );
+  expect(manual.status).toBe(302);
+  expect(manual.headers.get('location')).toContain('/app/teams/v2-team/projects?');
+  expect(manual.headers.get('location')).toContain('project=manual-api');
+
+  const manualList = await page('/app/teams/v2-team/projects');
+  expect(manualList.html).toContain('/app/teams/v2-team/projects/manual-api');
+
+  const picker = await page('/app/tokens?team=v2-team');
+  expect(picker.html).toContain('New project');
+  const fromConnections = await form(
+    `${srv.url}/app/projects`,
+    {
+      team: 'v2-team',
+      project: 'parcel-desk-agent-lab',
+      return_to: 'tokens',
+    },
+    { cookie },
+  );
+  expect(fromConnections.status).toBe(302);
+  const connectionLocation = fromConnections.headers.get('location') ?? '';
+  expect(connectionLocation).toContain('/app/tokens?');
+  expect(connectionLocation).toContain('team=v2-team');
+  expect(connectionLocation).toContain('project=parcel-desk-agent-lab');
+  const selected = await page(connectionLocation);
+  expect(selected.html).toMatch(
+    /<option value="project:[0-9a-f-]{36}" selected="">Project only — parcel-desk-agent-lab<\/option>/,
+  );
+
+  // Agent discovery remains valid and uses the same resolver as manual creation.
   const started = await call('start_run', {
     team: 'v2-team',
     project: 'payments-api',
@@ -116,15 +156,91 @@ it('gives a project a page of its own, born from the run that named it', async (
   // The five answers the page exists to put together.
   expect(detail.html).toContain('Active runs');
   expect(detail.html).toContain('Open sessions');
-  expect(detail.html).toContain('Policy');
+  // Policy, Knowledge and Delivery share one card, named for the rail group that
+  // leads to them; with nothing published it says so for each rather than going quiet.
+  expect(detail.html).toContain('Rules in effect here');
+  expect(detail.html).toContain('No policy rule is in force for payments-api');
+  expect(detail.html).toContain('no record reaches this project yet');
+  expect(detail.html).toContain('no flow published');
   expect(detail.html).toContain('Environment');
   expect(detail.html).toContain('PAY-1');
-  // …each next to the page that owns it, rather than replacing it.
+  // …each next to the page that owns it, rather than replacing it, and each at
+  // that page's address inside this project.
   expect(detail.html).toContain('/app/agents');
-  expect(detail.html).toContain('/app/teams/v2-team/governance');
+  expect(detail.html).toContain('/app/teams/v2-team/projects/payments-api/governance');
+  const sessionHref = /href="(\/app\/sessions\?new=1&amp;team=v2-team&amp;project=([0-9a-f-]{36}))"/.exec(
+    detail.html,
+  );
+  expect(sessionHref).toBeTruthy();
+  const sessionForm = await page(sessionHref![1]!.replaceAll('&amp;', '&'));
+  expect(sessionForm.html).toContain('data-auto-open="t"');
+  expect(sessionForm.html).toContain('data-session-project="true"');
+  expect(sessionForm.html).toContain('data-team="v2-team"');
+  expect(sessionForm.html).toContain(
+    `<option value="${sessionHref![2]}" data-team="v2-team" selected="">`,
+  );
+
+  const opened = await form(
+    `${srv.url}/app/sessions`,
+    {
+      team: 'v2-team',
+      project: sessionHref![2]!,
+      title: 'Project-prefilled session',
+      body: 'The project context came from its own page.',
+    },
+    { cookie },
+  );
+  expect(opened.status).toBe(302);
+  expect(opened.headers.get('location')).toMatch(/^\/app\/sessions\/[0-9a-f-]{36}$/);
+  expect((await page('/app/teams/v2-team/projects/payments-api')).html).toContain(
+    'Project-prefilled session',
+  );
+
+  const invalid = await form(
+    `${srv.url}/app/sessions`,
+    {
+      team: 'v2-team',
+      project: '00000000-0000-4000-8000-000000000000',
+      title: 'Typo must not create a project',
+    },
+    { cookie },
+  );
+  expect(decodeURIComponent(invalid.headers.get('location') ?? '')).toContain(
+    'Pick an existing project',
+  );
 
   // A project nobody has named is not a page.
   expect((await page('/app/teams/v2-team/projects/nope-api')).status).toBe(404);
+});
+
+it('keeps manual project creation owner-only in projects and Agent connections', async () => {
+  const login = await form(`${srv.url}/auth/dev`, { username: 'v2-member' });
+  const memberCookie = login.headers
+    .getSetCookie()
+    .map((line) => line.split(';')[0]!)
+    .join('; ');
+  const [member] = await srv.db.select().from(users).where(eq(users.username, 'v2-member')).limit(1);
+  const [team] = await srv.db.select().from(teams).where(eq(teams.slug, 'v2-team')).limit(1);
+  await srv.db.insert(memberships).values({
+    teamId: team!.id,
+    userId: member!.id,
+    role: 'member',
+  });
+
+  const projectsPage = await fetch(`${srv.url}/app/teams/v2-team/projects`, {
+    headers: { cookie: memberCookie },
+  });
+  expect(await projectsPage.text()).not.toContain('>New project</summary>');
+  const connectionsPage = await fetch(`${srv.url}/app/tokens?team=v2-team`, {
+    headers: { cookie: memberCookie },
+  });
+  expect(await connectionsPage.text()).not.toContain('>New project</summary>');
+  const denied = await form(
+    `${srv.url}/app/projects`,
+    { team: 'v2-team', project: 'member-created', return_to: 'projects' },
+    { cookie: memberCookie },
+  );
+  expect(denied.status).toBe(404);
 });
 
 it('agrees with the agent map about a collision, because it asks the same question', async () => {
@@ -158,8 +274,207 @@ it('agrees with the agent map about a collision, because it asks the same questi
   // The band the map raises for a critical overlap, on the project's own page.
   expect(detail.html).toContain('critical');
   expect(detail.html).toContain('Claims are advisory');
+  expect(detail.html).toContain('>conflicts detected</span>');
+  expect(detail.html).not.toContain('>conflicts_detected</');
   const map = await page('/app/agents');
   expect(map.html).toContain('critical');
+});
+
+it('makes every step of the way to a page a way back, and keeps the map readable on a wide screen', async () => {
+  // Reported by the owner after the first two-device round, 2026-09-20: the line
+  // above every title named the places ("/ across workspaces / agent map") and led
+  // to none of them; and the agent map shrank as the screen grew.
+  const project = await page('/app/teams/v2-team/projects/manual-api');
+  expect(project.status).toBe(200);
+  const trail = /<nav class="crumb" aria-label="Breadcrumb">(.*?)<\/nav>/s.exec(project.html)?.[1] ?? '';
+  expect(trail).toContain('<a href="/app/teams/v2-team">');
+  expect(trail).toContain('<a href="/app/teams/v2-team/projects">Projects</a>');
+  // The page itself is the last step: named, marked current, not a link to itself.
+  expect(trail).toMatch(/<span aria-current="page">manual-api<\/span>$/);
+
+  const map = await page('/app/agents');
+  expect(map.html).toContain('<a href="/app">All workspaces</a>');
+  expect(map.html).not.toContain('/ across workspaces / agent map');
+
+  // Savings left the rail on the owner's call; the page still answers its address.
+  expect(map.html).not.toContain('/app/teams/v2-team/savings');
+  expect((await page('/app/teams/v2-team/savings')).status).toBe(200);
+
+  // A height cap on a scaled drawing makes it SMALLER as the column gets wider.
+  const { css } = await import('../src/ui/styles');
+  const graph = /\.sg \{([^}]*)\}/.exec(css)?.[1] ?? '';
+  expect(graph).toContain('max-width');
+  expect(graph).not.toContain('max-height');
+});
+
+it('draws the rail of the scope the page is in: account, workspace or project', async () => {
+  // The owner's verdict, 2026-09-20: "Current workspace", "Manage workspace" and
+  // "Across workspaces" mixed where you are with what you can do, the agent map
+  // poured every workspace into one ledger, and a project had no sections of its
+  // own, so everything about it was reached by leaving it.
+  const lit = (html: string) =>
+    [...html.matchAll(/class="rail-link active"[^>]*>([^<]*)/g)].map((m) => m[1]!.trim());
+
+  // Inside a project the rail is that project's, and its first line is the way out.
+  const project = await page('/app/teams/v2-team/projects/payments-api');
+  expect(project.html).toContain('<a class="rail-link rail-up" href="/app/teams/v2-team/projects">');
+  expect(project.html).toContain('class="rail-group">payments-api</span>');
+  expect(project.html).toContain('class="rail-group later">Rules in effect here</span>');
+  expect(lit(project.html)).toEqual(['Overview']);
+  // Sections of a project are addressed under it; the agent map is not one of its
+  // sections and keeps the filter form.
+  expect(project.html).toContain('href="/app/agents?team=v2-team&amp;project=payments-api"');
+  expect(project.html).toContain('href="/app/teams/v2-team/projects/payments-api/work"');
+  expect(project.html).toContain('href="/app/teams/v2-team/projects/payments-api/governance"');
+  expect(project.html).not.toContain('class="rail-group">Workspace</span>');
+  // The scope bar names both, and marks the project as the scope you are in.
+  expect(project.html).toMatch(/class="scope-at in"[^>]*>\s*payments-api/);
+
+  // A workspace page filtered to a project is inside that project too: the rail,
+  // the trail and the content all say the same thing.
+  const governance = await page('/app/teams/v2-team/governance?project=payments-api');
+  expect(lit(governance.html)).toEqual(['Governance']);
+  expect(governance.html).toContain('class="rail-group">payments-api</span>');
+  const trail = /<nav class="crumb" aria-label="Breadcrumb">(.*?)<\/nav>/s.exec(governance.html)?.[1] ?? '';
+  expect(trail).toContain('<a href="/app/teams/v2-team/projects/payments-api">payments-api</a>');
+  expect(trail).toMatch(/<span aria-current="page">Governance<\/span>$/);
+  // Without the filter it is a workspace page again.
+  const everyProject = await page('/app/teams/v2-team/governance');
+  expect(everyProject.html).toContain('class="rail-group">Workspace</span>');
+  expect(everyProject.html).toContain('class="rail-group later">Rules for every project</span>');
+
+  // The map has a scope as well. payments-api has two live runs; manual-api none.
+  const workspaceMap = await page('/app/agents?team=v2-team');
+  expect(lit(workspaceMap.html)).toEqual(['Agent map']);
+  expect(workspaceMap.html).toContain('PAY-2');
+  const projectMap = await page('/app/agents?team=v2-team&project=payments-api');
+  expect(lit(projectMap.html)).toEqual(['Agents']);
+  expect(projectMap.html).toContain('PAY-2');
+  // Links inside the map keep the scope they were opened in.
+  expect(projectMap.html).toMatch(/href="\/app\/agents\?run=[0-9a-f-]{36}&amp;team=v2-team&amp;project=payments-api"/);
+  const quiet = await page('/app/agents?team=v2-team&project=manual-api');
+  expect(quiet.html).not.toContain('PAY-2');
+  expect(quiet.html).toMatch(/<span aria-current="page">Agents<\/span>/);
+  // The badge counts what the link opens: two runs in the project, none in the other.
+  expect(projectMap.html).toMatch(/Agents<span class="rail-badge">2<\/span>/);
+  expect(quiet.html).not.toMatch(/Agents<span class="rail-badge">/);
+
+  // Work and Sessions take the same scope.
+  const work = await page('/app/handoffs?team=v2-team&project=payments-api');
+  expect(lit(work.html)).toEqual(['Work']);
+  expect(work.html).toContain('<a href="/app/teams/v2-team/projects/payments-api">payments-api</a>');
+  const sessions = await page('/app/sessions?team=v2-team&project=payments-api');
+  expect(lit(sessions.html)).toEqual(['Sessions']);
+  expect(sessions.html).toContain('<a href="/app/teams/v2-team/projects/payments-api">payments-api</a>');
+
+  // A project of another workspace is not a scope: the rail stays at workspace level.
+  const stray = await page('/app/agents?team=v2-team&project=no-such-project');
+  expect(stray.html).toContain('class="rail-group">Workspace</span>');
+});
+
+it('puts a project in the address of its own sections, and keeps the filter form answering', async () => {
+  // The console draws three scopes and a scope bar; the address said two, and the
+  // one it left out was the one you had just clicked into. Every section of a
+  // project is addressed under it now. The `?project=` filter it replaces is in
+  // browser tabs and in messages, so it answers exactly as before — it is not
+  // redirected away, because a redirect is how a link somebody sent last week
+  // quietly stops meaning what it said.
+  const under = '/app/teams/v2-team/projects/payments-api';
+  const sections: [string, string, string][] = [
+    ['governance', '/app/teams/v2-team/governance?project=payments-api', 'Governance'],
+    ['knowledge', '/app/teams/v2-team/knowledge?project=payments-api', 'Knowledge'],
+    ['delivery', '/app/teams/v2-team/delivery?project=payments-api', 'Delivery'],
+    ['environments', '/app/teams/v2-team/compare?project=payments-api', 'Environments'],
+    ['activity', '/app/teams/v2-team/activity?project=payments-api', 'Activity'],
+    ['work', '/app/handoffs?team=v2-team&project=payments-api', 'Work'],
+    ['sessions', '/app/sessions?team=v2-team&project=payments-api', 'Sessions'],
+    ['agents', '/app/teams/v2-team/projects/payments-api/agents', 'Agents'],
+  ];
+  const lit = (html: string) =>
+    [...html.matchAll(/class="rail-link active"[^>]*>([^<]*)/g)].map((m) => m[1]!.trim());
+  for (const [section, filtered, label] of sections) {
+    const hierarchical = await page(`${under}/${section}`);
+    expect(hierarchical.status, section).toBe(200);
+    // Same scope, same rail entry lit, and the trail walks through the project.
+    expect(lit(hierarchical.html), section).toEqual([label]);
+    expect(hierarchical.html, section).toContain(`<a href="${under}">payments-api</a>`);
+    const old = await page(filtered);
+    expect(old.status, filtered).toBe(200);
+    expect(lit(old.html), filtered).toEqual([label]);
+    expect(old.html, filtered).toContain(`<a href="${under}">payments-api</a>`);
+  }
+
+  // In the path the project is the page's identity, so a spelling that names none
+  // is a wrong address — the same 404 `/projects/<name>` itself answers. As a
+  // filter it stayed a filter, and governance says so rather than pretending.
+  for (const section of ['governance', 'knowledge', 'delivery', 'environments', 'activity', 'work', 'sessions']) {
+    expect((await page(`/app/teams/v2-team/projects/no-such-project/${section}`)).status, section).toBe(404);
+  }
+  const filteredMiss = await page('/app/teams/v2-team/governance?project=no-such-project');
+  expect(filteredMiss.status).toBe(200);
+  expect(filteredMiss.html).toContain('No project called');
+  // A project of another workspace resolves the same way: `projectForTeam` only
+  // ever looks inside the workspace in the address, so it is simply not found.
+  // The export sits beside a project's log, so it has the project's address too.
+  expect((await page('/app/teams/v2-team/projects/payments-api/activity.csv')).status).toBe(200);
+  expect((await page('/app/teams/v2-team/projects/no-such-project/activity.csv')).status).toBe(404);
+
+  // The forms that pick a project write a query string — that is all a GET form
+  // can write — so they stay on the workspace address, and every link is the path.
+  const governance = await page(`${under}/governance`);
+  expect(governance.html).toContain('action="/app/teams/v2-team/governance"');
+  const activity = await page(`${under}/activity`);
+  expect(activity.html).toContain('action="/app/teams/v2-team/activity"');
+  expect(activity.html).toContain(`href="${under}/activity.csv`);
+});
+
+it('answers "is anything happening anywhere" from the list of workspaces, not from a ledger that mixes them', async () => {
+  // Phase 4 of the console plan. The account rail offered an agent map, work and
+  // sessions "across workspaces": every workspace in one ledger, every row
+  // ambiguous about where. The list of workspaces carries a number per workspace
+  // instead, each a link into that workspace's own page.
+  const home = await page('/app');
+  expect(home.html).not.toContain('Across workspaces');
+  const accountRail = /<div class="rail-nav"[^>]*>(.*?)<\/div><div class="rail-foot">/s.exec(home.html)?.[1] ?? '';
+  expect(accountRail).toContain('All workspaces');
+  expect(accountRail).not.toContain('href="/app/agents"');
+  expect(accountRail).not.toContain('href="/app/sessions"');
+  expect(accountRail).not.toContain('href="/app/handoffs"');
+  for (const column of ['Working now', 'Work open', 'Unread']) expect(home.html).toContain(`>${column}</th>`);
+  // v2-team has live runs from the tests above: the number is a link into its own map.
+  const row = /<tr><td><div class="cellrow">(?:(?!<\/tr>).)*?\/app\/teams\/v2-team"(?:(?!<\/tr>).)*<\/tr>/s.exec(home.html)?.[0] ?? '';
+  expect(row).toMatch(/<a href="\/app\/agents\?team=v2-team">[1-9]\d*<\/a>/);
+  // A quiet counter is a plain zero, not a link to an empty page.
+  expect(row).toContain('<span class="muted">0</span>');
+  // The addresses still answer: links in mail and in people's bookmarks point at them.
+  for (const old of ['/app/agents', '/app/sessions', '/app/handoffs']) expect((await page(old)).status).toBe(200);
+});
+
+it('says a result once, keeps text and fields readable on a wide screen, and gives the map its width back', async () => {
+  const { clientJs } = await import('../src/ui/client');
+  // The parameter that carried a result band leaves the address once the page drew
+  // it, so a refresh or a pasted link does not announce it again. Signed-in pages only.
+  expect(clientJs).toContain('history.replaceState');
+  for (const key of ['ok', 'error', 'notice', 'assigned', 'cancelled', 'assign_error', 'handoff']) {
+    expect(clientJs).toContain(`'${key}'`);
+  }
+  expect(clientJs).toContain("path.indexOf('/app') === 0");
+  // Selection and filters are address state and must survive it.
+  for (const kept of ["'run'", "'scope'", "'project'", "'team'", "'tab'", "'flow'", "'q'"]) {
+    expect(/var once = \[([^\]]*)\]/.exec(clientJs)?.[1] ?? '').not.toContain(kept);
+  }
+
+  const { css } = await import('../src/ui/styles');
+  // Measured at 1920 and 2560 on 2026-09-20: inputs 1607px wide and 200-character
+  // lines on seven pages. Prose keeps a measure and a field a width.
+  expect(css).toMatch(/--measure:\s*\d+ch/);
+  expect(css).toMatch(/--field-max:\s*\d+px/);
+  expect(css).toMatch(/input\.in, textarea\.in, select\.in \{ max-width: var\(--field-max\); \}/);
+  expect(css).toMatch(/\.cpad p,[^{]*\{ max-width: var\(--measure\); \}/);
+  // The graph is capped in width, so past that the ledger stands beside it.
+  expect(css).toMatch(/@media \(min-width: 2300px\) \{\s*\.map-split \{ display: grid;/);
+  const map = await page('/app/agents?team=v2-team');
+  expect(map.html).toContain('class="map-split"');
 });
 
 it('puts the password and the danger zone on a page reached from your own name', async () => {
@@ -183,7 +498,9 @@ it('puts the password and the danger zone on a page reached from your own name',
 
 it('splits the team page into tabs, and keeps the tab in the URL', async () => {
   const overview = await page('/app/teams/v2-team');
-  expect(overview.html).toContain('Team health');
+  expect(overview.html).toContain('Observed workspace activity');
+  expect(overview.html).toContain('2 agents active (7d)');
+  expect(overview.html).not.toContain('<h3>Connect your agent</h3>');
   expect(overview.html).toContain('?tab=people');
   // Members and invites are one tab away, not three screens down the scroll.
   expect(overview.html).not.toContain('Invite links');
@@ -202,20 +519,41 @@ it('splits the team page into tabs, and keeps the tab in the URL', async () => {
   // a typo in a pasted link should still show somebody their team.
   const nonsense = await page('/app/teams/v2-team?tab=zzz');
   expect(nonsense.status).toBe(200);
-  expect(nonsense.html).toContain('Team health');
+  expect(nonsense.html).toContain('Observed workspace activity');
+
+  const map = await page('/app/agents');
+  expect(map.html).toContain('active projects <b>1</b>');
 });
 
-it('offers the team switcher only when there is somewhere to switch to', async () => {
-  const one = await page('/app/agents');
-  // One team: a label, not a control that cannot do anything.
-  expect(one.html).toContain('class="teamswitch"');
-  expect(one.html).not.toContain('class="teampick"');
+it('offers the workspace switcher only when there is somewhere to switch to', async () => {
+  const one = await page('/app/teams/v2-team');
+  // One workspace: a link to it, not a control that cannot do anything.
+  expect(one.html).toContain('<a class="scope-at" href="/app/teams/v2-team" title="This workspace">');
+  expect(one.html).not.toContain('title="Switch workspace"');
 
   await form(`${srv.url}/app/teams`, { name: 'Second Team' }, { cookie });
-  const two = await page('/app/agents');
-  expect(two.html).toContain('class="teampick"');
-  expect(two.html).toContain('All teams');
+  const two = await page('/app/teams/v2-team');
+  expect(two.html).toContain('title="Switch workspace"');
+  expect(two.html).toContain('All workspaces');
   expect(two.html).toContain('Second Team');
+
+  // A scoped route, not membership creation order, owns the rail context: the
+  // newest workspace is Second Team, and this page is still about the first.
+  const firstTeam = await page('/app/teams/v2-team');
+  expect(firstTeam.html).toContain('class="rail-group">Workspace</span>');
+  // The rail lists this scope's sections and nothing that pours every workspace together.
+  expect(firstTeam.html).not.toContain('Across workspaces');
+  expect(firstTeam.html).toContain('href="/app/agents?team=v2-team"');
+  expect(firstTeam.html).toContain(
+    'class="rail-link active" href="/app/teams/v2-team">Overview</a>',
+  );
+  expect(firstTeam.html).toContain('href="/app/teams/v2-team/projects"');
+  expect(firstTeam.html).toContain('href="/app/teams/v2-team/governance"');
+  expect(firstTeam.html).not.toContain('href="/app/teams/second-team/projects"');
+
+  const secondTeam = await page('/app/teams/second-team');
+  expect(secondTeam.html).toContain('href="/app/teams/second-team/projects"');
+  expect(secondTeam.html).toContain('href="/app/teams/second-team/delivery"');
 });
 
 it('shows a stranger the documentation and an honest sentence, not a product page', async () => {
@@ -225,7 +563,7 @@ it('shows a stranger the documentation and an honest sentence, not a product pag
   const teaser = await startServer(
     loadEnv({
       port: 0,
-      host: 'localhost',
+      host: '127.0.0.1',
       nodeEnv: 'test',
       devMode: true,
       databaseUrl: undefined,
@@ -236,8 +574,10 @@ it('shows a stranger the documentation and an honest sentence, not a product pag
   );
   try {
     const landing = await (await fetch(`${teaser.url}/`)).text();
-    expect(landing).toContain('Coming very soon');
-    expect(landing).toContain('invite only');
+    // Signups are closed on this instance, so the page must not offer a door
+    // that is not there — no access-code call to action without codes set.
+    expect(landing).toContain('private beta');
+    expect(landing).not.toContain('I have an access code');
     // A "coming soon" page with nothing to do is a page nobody returns to: the
     // packages are real, public and need no invite.
     expect(landing).toContain('npx @matteai/stma serve');
@@ -252,6 +592,25 @@ it('shows a stranger the documentation and an honest sentence, not a product pag
     expect(docs).toContain('Paste-ready prompts');
     expect(docs).not.toContain('The console (for humans)');
     expect(docs).not.toContain('href="#dashboard"');
+
+    // Help is public on the same rule the legal pages are: a person who cannot
+    // sign in cannot read a page behind the login, and that person is exactly
+    // the one this page exists for. Its sign-in half is therefore always there.
+    const help = await fetch(`${teaser.url}/help`);
+    expect(help.status, '/help must answer a stranger').toBe(200);
+    const helpHtml = await help.text();
+    expect(helpHtml).toContain('That access code is not valid');
+    expect(helpHtml).toContain('Too many sign-in attempts for this email address');
+    // A stranger has no account, so no enrollment code and no running agent:
+    // those two sections are console content and follow the same rule as the
+    // guide's, table of contents included.
+    expect(helpHtml).not.toContain('id="connect"');
+    expect(helpHtml).not.toContain('href="#connect"');
+    expect(helpHtml).not.toContain('href="#working"');
+    expect(helpHtml).not.toContain('stma adapter repair --pin-runtime --apply');
+    // What is left still has to be worth reading on its own.
+    expect(helpHtml).toContain('id="selfhost"');
+    expect(helpHtml).toContain('id="expected"');
 
     // An invited member sees the whole thing on the same instance — this is not
     // a reduced build.
@@ -268,9 +627,57 @@ it('shows a stranger the documentation and an honest sentence, not a product pag
     const member = await (await fetch(`${teaser.url}/docs`, { headers: { cookie: cookies } })).text();
     expect(member).toContain('The console (for humans)');
     expect((await fetch(`${teaser.url}/app`, { headers: { cookie: cookies } })).status).toBe(200);
+    const memberHelp = await (
+      await fetch(`${teaser.url}/help`, { headers: { cookie: cookies } })
+    ).text();
+    expect(memberHelp).toContain('id="connect"');
+    expect(memberHelp).toContain('id="working"');
+    expect(memberHelp).toContain('stma adapter repair --pin-runtime --apply');
   } finally {
     await teaser.close();
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+it('names the walls people actually hit, in the words the product prints', async () => {
+  // The value of this page is entirely in whether somebody can find their own
+  // error on it, so it quotes the strings verbatim. Each of these was hit by a
+  // real person or a real agent in this repository's own rounds; if one ever
+  // stops matching what the product says, the page has drifted into a FAQ.
+  const res = await fetch(`${srv.url}/help`);
+  expect(res.status, '/help must be readable with no account').toBe(200);
+  const html = await res.text();
+  for (const printed of [
+    'That access code is not valid',
+    'Too many sign-in codes were requested',
+    'invite code is invalid, expired or used up',
+    'Run this in a regular interactive terminal',
+    'This checkout already has local profile',
+    'Not confirmed yet',
+    'work_conflict',
+    'stale_ground',
+    'unknown_or_inactive_run',
+    'PostgreSQL 17',
+  ]) {
+    expect(html, `somebody searching for "${printed}" must land on an answer`).toContain(printed);
+  }
+  // This instance sets no SUPPORT_EMAIL, so the page must not invent a door —
+  // and must still not end in silence.
+  expect(html).not.toContain('mailto:support@stma.ai');
+  expect(html).toContain('publishes no support address');
+});
+
+it('links help from every footer a signed-out reader can reach', async () => {
+  // Signed out, because that is the reader who needs it; the three marketing
+  // footers are hand-rolled copies and have drifted before.
+  for (const route of ['/', '/docs', '/terms', '/privacy']) {
+    const html = await (await fetch(`${srv.url}${route}`)).text();
+    expect(html, `${route} should link /help`).toContain('href="/help"');
+  }
+  // And on the pages somebody stuck is actually looking at.
+  for (const route of ['/login', '/signup']) {
+    const html = await (await fetch(`${srv.url}${route}`)).text();
+    expect(html, `${route} should point at the troubleshooting page`).toContain('/help#signin');
   }
 });
 

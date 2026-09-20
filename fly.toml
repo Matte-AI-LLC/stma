@@ -1,5 +1,6 @@
 # Fly.io config — rename `app` before the first deploy.
-# Required secrets: fly secrets set DATABASE_URL=... GITHUB_CLIENT_ID=... GITHUB_CLIENT_SECRET=... BASE_URL=https://<app>.fly.dev
+# Core secrets: fly secrets set DATABASE_URL=... GITHUB_CLIENT_ID=... GITHUB_CLIENT_SECRET=... BASE_URL=https://<app>.fly.dev
+# Optional ClickUp task integration: CLICKUP_CLIENT_ID=... CLICKUP_CLIENT_SECRET=...
 app = "stma"
 primary_region = "fra"
 

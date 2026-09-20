@@ -30,12 +30,14 @@ export const ALLOWLIST = [
   'examples',
   'scripts',
   'Dockerfile',
+  'Dockerfile.dockerignore',
   'docker-compose.yml',
   'fly.toml',
   'package.json',
   'package-lock.json',
   'tsconfig.base.json',
   'README.md',
+  'PRODUCT_FLOWS.md',
   'LICENSE',
   'CONTRIBUTING.md',
   'SECURITY.md',
@@ -46,8 +48,14 @@ export const ALLOWLIST = [
   '.github/workflows/ci.yml',
 ];
 
-/** Paths inside allowlisted directories that still must not ship. */
-export const DENYLIST = ['packages/server/src/ee', 'ee'];
+/**
+ * Paths inside allowlisted directories that still must not ship.
+ *
+ * `agent-lab-past.test.ts` is here because it imports `acceptance/agent-lab`,
+ * the private test harness, which is not allowlisted: shipped, it would be a
+ * red suite in the public repository on the first run.
+ */
+export const DENYLIST = ['packages/server/src/ee', 'ee', 'packages/server/test/agent-lab-past.test.ts'];
 
 /**
  * Identifiers that end the build if they appear anywhere in the public tree.
@@ -81,7 +89,12 @@ if (!out) {
 const stage = path.join(out, '.stage-export');
 rmSync(out, { recursive: true, force: true });
 mkdirSync(stage, { recursive: true });
-execFileSync('sh', ['-c', `git -C "${root}" archive ${ref} | tar -x -C "${stage}"`]);
+// `-f -` is not optional on Windows: bsdtar, which is what `tar` is there,
+// defaults to the tape device and fails with "Failed to open '\\.\tape0'"
+// rather than reading the pipe. GNU tar accepts it too, so one spelling works
+// on the runner and on a maintainer's desktop — and a scan that only runs in CI
+// is a scan nobody performs before pushing the tag.
+execFileSync('sh', ['-c', `git -C "${root}" archive ${ref} | tar -x -f - -C "${stage}"`]);
 
 let copied = 0;
 for (const rel of ALLOWLIST) {

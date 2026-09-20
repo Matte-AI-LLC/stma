@@ -21,6 +21,7 @@ interface Node {
 }
 
 const TRIGGER_SHORT: Record<string, string> = {
+  'pull-request': 'on pull request',
   merge: 'auto on merge',
   tag: 'on version tag',
   manual: 'manual deploy',
@@ -28,6 +29,12 @@ const TRIGGER_SHORT: Record<string, string> = {
 
 function nodesFor(flow: DeliveryFlow): Node[] {
   const nodes: Node[] = [];
+  const environmentNode = (env: DeliveryFlow['environments'][number]): Node => ({
+    title: env.name,
+    sub: TRIGGER_SHORT[env.deployOn] ?? env.deployOn,
+    kind: 'env',
+    badge: env.approval ? 'sign-off' : undefined,
+  });
   if (flow.ticket.system !== 'none') {
     nodes.push({
       title: 'Ticket',
@@ -42,15 +49,13 @@ function nodesFor(flow: DeliveryFlow): Node[] {
     sub: `${flow.checks.length} check${flow.checks.length === 1 ? '' : 's'} · ${flow.review.approvals} approval${flow.review.approvals === 1 ? '' : 's'}`,
     kind: 'gate',
   });
+  nodes.push(
+    ...flow.environments.filter((env) => env.deployOn === 'pull-request').map(environmentNode),
+  );
   nodes.push({ title: `Merge (${flow.mergeStrategy})`, sub: `into ${flow.branch.from}`, kind: 'step' });
-  for (const env of flow.environments) {
-    nodes.push({
-      title: env.name,
-      sub: TRIGGER_SHORT[env.deployOn] ?? env.deployOn,
-      kind: 'env',
-      badge: env.approval ? 'sign-off' : undefined,
-    });
-  }
+  nodes.push(
+    ...flow.environments.filter((env) => env.deployOn !== 'pull-request').map(environmentNode),
+  );
   return nodes;
 }
 
@@ -61,11 +66,12 @@ export const FlowDiagram = ({ flow }: { flow: DeliveryFlow }) => {
   const nodes = nodesFor(flow);
   const width = nodes.length * NODE.w + (nodes.length - 1) * NODE.gap + 8;
   return (
-    <div class="scroll-x">
+    <div class="scroll-x flow-scroll" tabIndex={0} aria-label="Scrollable delivery flow diagram">
       <svg
         class="flowdg"
         viewBox={`0 0 ${width} ${H}`}
-        style={`min-width:${Math.min(width, 980)}px`}
+        preserveAspectRatio="xMinYMid meet"
+        style={`width:100%;min-width:${Math.min(width, 840)}px`}
         xmlns="http://www.w3.org/2000/svg"
         role="img"
         aria-label={`Delivery flow: ${nodes.map((n) => n.title).join(', then ')}`}

@@ -12,11 +12,11 @@ import {
 } from '../domain/savings';
 import { teams } from '../db/schema';
 import { eq } from 'drizzle-orm';
-import { planLimits } from '../lib/entitlements';
+import { effectiveLimits } from '../lib/entitlements';
 import { timeAgo } from '../lib/format';
 import { track } from '../lib/track';
 import type { AppEnv } from '../types';
-import { Band, Field, Inspector, Lead, PageHead, Vr } from '../ui/Console';
+import { Band, Field, Inspector, Lead, PageHead, teamTrail, Vr } from '../ui/Console';
 import { AppLayout } from '../ui/Layout';
 
 /**
@@ -244,7 +244,7 @@ savingsRoutes.get('/app/teams/:slug/savings', async (c) => {
   const found = await teamForUser(db, user.id, c.req.param('slug'));
   if (!found) return c.notFound();
   const { team, role } = found;
-  const limits = planLimits(team.plan, env.hosted);
+  const limits = (await effectiveLimits(db, team, env.hosted));
 
   // Not entitled is a page, not a 404. The reason to upgrade has to be visible
   // from inside the product, the same argument as the read-only agent map.
@@ -330,7 +330,7 @@ savingsRoutes.get('/app/teams/:slug/savings', async (c) => {
       band={band}
       head={
         <PageHead
-          crumb={`/ ${team.slug} / savings`}
+          trail={teamTrail(team, { label: 'Savings' })}
           title="Verified savings"
           sub="What STMA prevented, separated from what somebody confirmed it prevented."
         />
@@ -469,7 +469,7 @@ savingsRoutes.post('/app/teams/:slug/savings/confirm', async (c) => {
   const slug = c.req.param('slug');
   const found = await teamForUser(db, user.id, slug);
   if (!found) return c.notFound();
-  if (!planLimits(found.team.plan, env.hosted).savings) return c.notFound();
+  if (!(await effectiveLimits(db, found.team, env.hosted)).savings) return c.notFound();
 
   const form = await c.req.parseBody();
   const kind = String(form.kind ?? '') as SavingKind;

@@ -1,25 +1,44 @@
+import { membershipUser } from '../lib/securityHooks';
 import { MESSAGE_KINDS } from '@bridge/shared';
-import { and, count, desc, eq, ilike, inArray, or, sql } from 'drizzle-orm';
-import { Hono } from 'hono';
+import { and, count, desc, eq, ilike, inArray, ne, or, sql } from 'drizzle-orm';
+import { Hono, type Context } from 'hono';
 import type { Db } from '../db';
-import { debugSessions, memberships, messages, projects, teams, users } from '../db/schema';
+import {
+  agentInstallations,
+  debugSessions,
+  handoffs,
+  memberships,
+  messages,
+  projects,
+  teams,
+  tokens,
+  users,
+} from '../db/schema';
 import { loginRedirect } from '../auth/session';
 import { fmtDate, initials, timeAgo } from '../lib/format';
 import { notifyTeam } from '../lib/notify';
 import { notifySessionActivity } from '../lib/notifications';
-import { pageHref, pageWindow, slicePage } from '../lib/pagination';
-import { findOrCreateProject } from '../lib/projects';
+import { pageWindow, slicePage } from '../lib/pagination';
 import { redactSecrets } from '../lib/redact';
 import { track } from '../lib/track';
-import {
-  markRead,
-  sessionForMember,
-  sessionStats,
-  type SessionResolution,
-} from '../lib/sessions';
+import { markRead, sessionForMember, sessionStats, type SessionResolution } from '../lib/sessions';
 import type { AppEnv } from '../types';
 import { AppLayout } from '../ui/Layout';
 import { Pager } from '../ui/Pager';
+import { HandoffFlow } from '../ui/HandoffFlow';
+import { transitionHandoff } from '../domain/collaboration';
+import { Band, Inspector, PageHead, scopedTrail, teamTrail, Trail } from '../ui/Console';
+import { ensureRail } from '../lib/rail';
+import { memberByUsername } from '../domain/access';
+import {
+  projectInPath,
+  scopedPersonParam,
+  scopedProjectParam,
+  scopedTeamParam,
+  sectionHref,
+} from '../lib/scope';
+import { FlowEmpty, FlowSection } from '../ui/ProductFlow';
+import { z } from 'zod/v3';
 
 export const sessionsRoutes = new Hono<AppEnv>();
 
@@ -32,16 +51,129 @@ async function myTeams(db: Db, userId: string) {
     .select({ team: teams })
     .from(memberships)
     .innerJoin(teams, eq(memberships.teamId, teams.id))
-    .where(eq(memberships.userId, userId))
+    .where(membershipUser(userId))
     .orderBy(teams.name);
 }
 
 const isKind = (k: unknown): k is (typeof MESSAGE_KINDS)[number] =>
   typeof k === 'string' && (MESSAGE_KINDS as readonly string[]).includes(k);
 
+// ---------------------------------------------------------------- the reader
+
+/**
+ * The scope a sessions list is drawn in.
+ *
+ * `teamIds` is every workspace the reader belongs to — the account-wide list —
+ * and the other three narrow it. Separate fields rather than one union because
+ * the page draws every combination: the account's list, a workspace's, a
+ * project's, and one person's inside either of those.
+ */
+export interface SessionScope {
+  /** Every workspace the reader is a member of. Never empty when a query runs. */
+  teamIds: string[];
+  teamId?: string;
+  projectId?: string;
+  /** Threads this person opened or wrote in — see `personThreads`. */
+  personId?: string;
+}
+
+/**
+ * What "this person's sessions" means, decided in one place.
+ *
+ * **Opened or wrote in**, which is what the page's own heading says out loud.
+ * Either half alone answers a narrower question than anybody asks here:
+ * somebody who starts a thread and never comes back still started it, and
+ * somebody who only ever replied is still in the conversation. Authorship
+ * rather than origin, deliberately — `Viewer` in `lib/sessions.ts` keeps the
+ * two apart because "is this news to me" is a question about the machine a
+ * message arrived on, while this one asks who was in the room. It follows that
+ * a message one of their agents posted counts: `messages.author_id` is the
+ * owning human on every MCP write, and an agent writing under its human's
+ * account is that human at work.
+ *
+ * Two kinds of thread are left out, both because the page that asks already
+ * shows them somewhere else:
+ *
+ *  - **Dispatched work.** A thread carrying a `handoffs` row is an assignment
+ *    or a handoff, not a conversation somebody joined; project pages stopped
+ *    counting it as an open session on 2026-09-19 for exactly this reason. The
+ *    person page has a Work card above this one and `/app/handoffs` has the
+ *    rest, so listing it here would put one brief on one page twice under two
+ *    different labels.
+ *  - **The announcements channel.** It is created lazily by whoever first
+ *    triggered it, so its `opened_by` would file a workspace's broadcast
+ *    stream under one person who never opened a thread at all.
+ *
+ * Both are `exists` predicates rather than joins so that this composes into any
+ * query — the list and its own tab counts are two different shapes, and a
+ * filter that only worked in one of them is how a tab comes to disagree with
+ * what is under it.
+ */
+const personThreads = (personId: string) =>
+  and(
+    ne(debugSessions.kind, 'announcements'),
+    sql`not exists (select 1 from handoffs dispatched where dispatched.session_id = ${debugSessions.id})`,
+    or(
+      eq(debugSessions.openedBy, personId),
+      sql`exists (select 1 from messages wrote where wrote.session_id = ${debugSessions.id} and wrote.author_id = ${personId})`,
+    ),
+  );
+
+/** Everything a sessions list and its tab counts must agree on. */
+export const sessionsInScope = (scope: SessionScope) =>
+  and(
+    scope.teamId
+      ? eq(debugSessions.teamId, scope.teamId)
+      : inArray(debugSessions.teamId, scope.teamIds),
+    scope.projectId ? eq(debugSessions.projectId, scope.projectId) : undefined,
+    scope.personId ? personThreads(scope.personId) : undefined,
+  )!;
+
+/**
+ * The rows of a sessions list.
+ *
+ * Exported because a person's page shows a slice of one. A slice that ran its
+ * own query would be a list the page it links to could not reproduce, which is
+ * the drift the person page was built to avoid — `readActivity` is exported
+ * from `routes/activity.tsx` and shared for the same reason.
+ */
+export async function readSessions(
+  db: Db,
+  scope: SessionScope,
+  opts: { status: 'open' | 'resolved'; q?: string },
+  window: { limit: number; offset: number },
+) {
+  const conds = [sessionsInScope(scope), eq(debugSessions.status, opts.status)];
+  if (opts.status === 'resolved' && opts.q) {
+    const like = `%${opts.q}%`;
+    conds.push(
+      or(ilike(debugSessions.title, like), sql`${debugSessions.resolution}::text ilike ${like}`)!,
+    );
+  }
+  return db
+    .select({ s: debugSessions, projectName: projects.name })
+    .from(debugSessions)
+    .leftJoin(projects, eq(debugSessions.projectId, projects.id))
+    .where(and(...conds))
+    .orderBy(desc(debugSessions.createdAt))
+    .limit(window.limit)
+    .offset(window.offset);
+}
+
 // ---------------------------------------------------------------- list
 
-sessionsRoutes.get('/app/sessions', async (c) => {
+/**
+ * The sessions list, at three addresses: the account's, a workspace's, and a
+ * project's. `/app/teams/:slug/projects/:project/sessions` is what the rail links
+ * to; `?team=` and `?project=` still answer, because the account page, the work
+ * ledger and a good deal of mail point at them.
+ *
+ * `?person=` narrows any of them to one member's threads. It is a filter on this
+ * page rather than a query on theirs: their page shows a slice of this list and
+ * links here, so there is one definition of "their sessions" and one set of rows
+ * behind it.
+ */
+const sessionsPage = async (c: Context<AppEnv>) => {
   const user = c.get('user');
   if (!user) return loginRedirect(c);
   const db = c.get('db');
@@ -52,35 +184,75 @@ sessionsRoutes.get('/app/sessions', async (c) => {
   const mine = await myTeams(db, user.id);
   const teamIds = mine.map((m) => m.team.id);
   const slugById = new Map(mine.map((m) => [m.team.id, m.team.slug]));
+  const requestedTeam = scopedTeamParam(c);
+  const requestedProject = scopedProjectParam(c);
+  const requestedPerson = scopedPersonParam(c);
+  const availableProjects =
+    teamIds.length > 0
+      ? await db
+          .select({ id: projects.id, name: projects.name, teamId: projects.teamId })
+          .from(projects)
+          .where(inArray(projects.teamId, teamIds))
+          .orderBy(projects.name)
+      : [];
 
   const win = pageWindow(c.req.query('page'), LIST_PAGE_SIZE);
-  const filters = { status: status === 'resolved' ? 'resolved' : undefined, q: q || undefined };
+  // The list has a scope like every other page: a workspace, or a project in it.
+  // `team` and `project` used to preselect the New session dialog and nothing
+  // else, so the rail's link to "sessions of this project" showed every thread
+  // in every workspace.
+  const scopeTeam = mine.find((m) => m.team.slug === requestedTeam)?.team;
+  const scopeProject = scopeTeam && user.rail?.team === scopeTeam.slug ? (user.rail.project ?? undefined) : undefined;
+  // In the path the workspace and the project are the page's identity, not a
+  // filter on it: a spelling that names neither is a wrong address.
+  const inPath = projectInPath(c);
+  if (inPath && !scopeProject) return c.notFound();
+  if (c.req.param('slug') !== undefined && !scopeTeam) return c.notFound();
+  // A person filter names a membership, so it needs a workspace to name one in.
+  // Without a workspace in the address there is nothing to check it against, and
+  // a filter that cannot be honoured must not quietly draw every thread in every
+  // workspace under one person's name. The same `notFound` for a member of some
+  // other workspace as for an account that does not exist, which is the rule
+  // `/app/teams/:slug/people/:username` already keeps: `memberByUsername` is the
+  // one lookup, so the two pages cannot start answering differently.
+  const person =
+    requestedPerson && scopeTeam ? await memberByUsername(db, scopeTeam.id, requestedPerson) : undefined;
+  if (requestedPerson && !person) return c.notFound();
+  const personHome = person && scopeTeam
+    ? `/app/teams/${scopeTeam.slug}/people/${encodeURIComponent(person.username)}`
+    : undefined;
+  /** This page's own address, so its tabs, its search and its pager stay in scope. */
+  const here = inPath ? sectionHref(scopeTeam!.slug, scopeProject!.slug, 'sessions') : '/app/sessions';
+  // Only the filter form needs to carry the scope; the path form already does.
+  // The person is never in the path, so it rides along in both spellings.
+  const scopeQuery = inPath ? {} : { team: scopeTeam?.slug, project: scopeProject?.slug };
+  const carried = { ...scopeQuery, person: person?.username };
+  const scoped = (extra: Record<string, string | undefined>) => {
+    const params = new URLSearchParams();
+    for (const [key, value] of Object.entries({ ...carried, ...extra })) if (value) params.set(key, value);
+    const text = params.toString();
+    return text ? `?${text}` : '';
+  };
+  const filters = { ...carried, status: status === 'resolved' ? 'resolved' : undefined, q: q || undefined };
   let sessions: { s: typeof debugSessions.$inferSelect; projectName: string | null }[] = [];
   let paged = slicePage<(typeof sessions)[number]>([], win);
   let openCount = 0;
   let resolvedCount = 0;
+  const scope: SessionScope = {
+    teamIds,
+    teamId: scopeTeam?.id,
+    projectId: scopeProject?.id,
+    personId: person?.id,
+  };
   if (teamIds.length > 0) {
-    const conds = [inArray(debugSessions.teamId, teamIds), eq(debugSessions.status, status)];
-    if (status === 'resolved' && q) {
-      const like = `%${q}%`;
-      conds.push(
-        or(ilike(debugSessions.title, like), sql`${debugSessions.resolution}::text ilike ${like}`)!,
-      );
-    }
-    const fetched = await db
-      .select({ s: debugSessions, projectName: projects.name })
-      .from(debugSessions)
-      .leftJoin(projects, eq(debugSessions.projectId, projects.id))
-      .where(and(...conds))
-      .orderBy(desc(debugSessions.createdAt))
-      .limit(win.limit)
-      .offset(win.offset);
-    paged = slicePage(fetched, win);
+    paged = slicePage(await readSessions(db, scope, { status, q }, win), win);
     sessions = paged.items;
+    // The tabs count what the list under them shows, person filter included:
+    // one number meaning two things is how a page starts arguing with itself.
     const countRows = await db
       .select({ status: debugSessions.status, n: count() })
       .from(debugSessions)
-      .where(inArray(debugSessions.teamId, teamIds))
+      .where(sessionsInScope(scope))
       .groupBy(debugSessions.status);
     openCount = countRows.find((r) => r.status === 'open')?.n ?? 0;
     resolvedCount = countRows.find((r) => r.status === 'resolved')?.n ?? 0;
@@ -114,11 +286,35 @@ sessionsRoutes.get('/app/sessions', async (c) => {
           </button>
         </div>
       ) : null}
+      {/* Narrowed to a person, the way back is their page: that is where the
+          link came from, and the workspace trail alone would strand a reader on
+          a list with somebody's name on it and no step to them. */}
+      <Trail
+        steps={
+          person && scopeTeam
+            ? teamTrail(
+                scopeTeam,
+                { label: 'People and agents', href: `/app/teams/${scopeTeam.slug}/agents` },
+                { label: person.username, href: personHome },
+                { label: 'Sessions' },
+              )
+            : scopedTrail({ team: scopeTeam, project: scopeProject }, 'Sessions')
+        }
+      />
       <div class="page-head">
         <div>
-          <h1 class="title">Debug sessions</h1>
+          <h1 class="title">{person ? `Debug sessions — ${person.username}` : 'Debug sessions'}</h1>
           <p class="sub">
-            Topic-based threads where agents (and humans) debug together, asynchronously.
+            {person ? (
+              <>
+                Threads <b>{person.username}</b> opened or wrote in
+                {scopeProject ? <> in {scopeProject.name}</> : null} — including what their agents
+                posted under their account. Assignments and handoffs are work rather than
+                conversation and are listed separately.
+              </>
+            ) : (
+              'Topic-based threads where agents (and humans) debug together, asynchronously.'
+            )}
           </p>
         </div>
         {mine.length > 0 ? (
@@ -127,6 +323,18 @@ sessionsRoutes.get('/app/sessions', async (c) => {
           </button>
         ) : null}
       </div>
+      <p class="row">
+        <a class="btn" href={scopeTeam ? sectionHref(scopeTeam.slug, scopeProject?.slug, 'work') : '/app/handoffs'}>
+          Work — assignments and handoffs
+        </a>
+        {/* A filter with no way out is a trap: the tabs and the pager all keep
+            the person, so this is the only link on the page that drops it. */}
+        {person ? (
+          <a class="btn" href={`${here}${scoped({ person: undefined, status: status === 'resolved' ? 'resolved' : undefined })}`}>
+            Every thread here
+          </a>
+        ) : null}
+      </p>
 
       {/* Page 1 only — a reader on page 3 should not have the window slide under them. */}
       {win.page === 1 ? <div data-autorefresh="30" style="display:none"></div> : null}
@@ -143,20 +351,26 @@ sessionsRoutes.get('/app/sessions', async (c) => {
       ) : (
         <>
           <div class="tabs">
-            <a class={`tab${status === 'open' ? ' active' : ''}`} href="/app/sessions">
+            <a class={`tab${status === 'open' ? ' active' : ''}`} href={`${here}${scoped({})}`}>
               Open ({openCount})
             </a>
             <a
               class={`tab${status === 'resolved' ? ' active' : ''}`}
-              href="/app/sessions?status=resolved"
+              href={`${here}${scoped({ status: 'resolved' })}`}
             >
               Resolved ({resolvedCount})
             </a>
           </div>
 
           {status === 'resolved' ? (
-            <form class="inline m0" method="get" action="/app/sessions">
+            <form class="inline m0" method="get" action={here}>
               <input type="hidden" name="status" value="resolved" />
+              {scopeTeam && !inPath ? <input type="hidden" name="team" value={scopeTeam.slug} /> : null}
+              {scopeProject && !inPath ? <input type="hidden" name="project" value={scopeProject.slug} /> : null}
+              {/* A search inside one person's threads stays inside them; a GET
+                  form writes the whole query string, so what it leaves out is
+                  dropped. */}
+              {person ? <input type="hidden" name="person" value={person.username} /> : null}
               <input
                 class="in"
                 style="width:320px"
@@ -174,11 +388,28 @@ sessionsRoutes.get('/app/sessions', async (c) => {
           {sessions.length === 0 && win.page === 1 ? (
             <div class="card">
               <div class="empty">
-                <h2>{status === 'open' ? 'No open sessions' : q ? 'No archived match' : 'Nothing resolved yet'}</h2>
+                <h2>
+                  {person
+                    ? status === 'open'
+                      ? `Nothing of ${person.username}'s is open here`
+                      : q
+                        ? 'No archived match'
+                        : `Nothing of ${person.username}'s is resolved here`
+                    : status === 'open'
+                      ? 'No open sessions'
+                      : q
+                        ? 'No archived match'
+                        : 'Nothing resolved yet'}
+                </h2>
                 <p>
-                  {status === 'open'
-                    ? 'When something "works on my machine", open a session here — or let your agent do it with the open_session tool.'
-                    : 'Resolved sessions keep their root cause and fix, searchable for the next time.'}
+                  {person
+                    ? // Pointing them at "open a session" would be advice for
+                      // somebody else's page; what is missing here is rows, and
+                      // the two places the rest of their work is are named.
+                      'A thread counts here once they open it or write in it. Work assigned to or by them is on Work, and everything they did is on their own page.'
+                    : status === 'open'
+                      ? 'When something "works on my machine", open a session here — or let your agent do it with the open_session tool.'
+                      : 'Resolved sessions keep their root cause and fix, searchable for the next time.'}
                 </p>
               </div>
             </div>
@@ -244,7 +475,7 @@ sessionsRoutes.get('/app/sessions', async (c) => {
               ) : null}
               <div class="card">
                 <Pager
-                  path="/app/sessions"
+                  path={here}
                   query={filters}
                   window={win}
                   page={paged}
@@ -254,16 +485,24 @@ sessionsRoutes.get('/app/sessions', async (c) => {
             </div>
           )}
 
-          <dialog id="new-session" class="formdlg">
+          <dialog
+            id="new-session"
+            class="formdlg"
+            data-auto-open={c.req.query('new') === '1' ? 't' : undefined}
+          >
             <h3>New debug session</h3>
-            <p class="dlgsub">Describe the problem — teammates' agents will see it in their inbox.</p>
+            <p class="dlgsub">
+              Describe the problem — teammates' agents will see it in their inbox.
+            </p>
             <form method="post" action="/app/sessions">
               {mine.length > 1 ? (
                 <div class="field">
                   <label>Team</label>
-                  <select class="in" name="team">
+                  <select class="in" name="team" data-session-team>
                     {mine.map((m) => (
-                      <option value={m.team.slug}>{m.team.name}</option>
+                      <option value={m.team.slug} selected={m.team.slug === requestedTeam}>
+                        {m.team.name}
+                      </option>
                     ))}
                   </select>
                 </div>
@@ -282,8 +521,24 @@ sessionsRoutes.get('/app/sessions', async (c) => {
                 />
               </div>
               <div class="field">
-                <label>Project / repo (optional)</label>
-                <input class="in" type="text" name="repo" placeholder="e.g. billing-api" maxlength={120} />
+                <label>Project (optional)</label>
+                <select class="in" name="project" data-session-project>
+                  <option value="">Team-wide / not project-specific</option>
+                  {availableProjects.map((project) => (
+                    <option
+                      value={project.id}
+                      data-team={slugById.get(project.teamId)}
+                      // The project page links here with an id; the rail with a slug.
+                      selected={project.id === scopeProject?.id || project.id === requestedProject}
+                    >
+                      {slugById.get(project.teamId)} / {project.name}
+                    </option>
+                  ))}
+                </select>
+                <span class="help">
+                  Choose an existing project. Creating one from a typo would split its sessions,
+                  activity and conflict history.
+                </span>
               </div>
               <div class="field">
                 <label>First message</label>
@@ -308,7 +563,10 @@ sessionsRoutes.get('/app/sessions', async (c) => {
       )}
     </AppLayout>,
   );
-});
+};
+
+sessionsRoutes.get('/app/sessions', sessionsPage);
+sessionsRoutes.get('/app/teams/:slug/projects/:project/sessions', sessionsPage);
 
 sessionsRoutes.post('/app/sessions', async (c) => {
   const user = c.get('user');
@@ -322,18 +580,27 @@ sessionsRoutes.post('/app/sessions', async (c) => {
     return c.redirect(`/app/sessions?error=${encodeURIComponent('A session needs a title.')}`);
   }
   const mine = await myTeams(db, user.id);
-  const target = mine.find((m) => m.team.slug === teamSlug) ?? (mine.length === 1 ? mine[0] : undefined);
+  const target =
+    mine.find((m) => m.team.slug === teamSlug) ?? (mine.length === 1 ? mine[0] : undefined);
   if (!target) {
-    return c.redirect(`/app/sessions?error=${encodeURIComponent('Pick a team you are a member of.')}`);
+    return c.redirect(
+      `/app/sessions?error=${encodeURIComponent('Pick a team you are a member of.')}`,
+    );
   }
-  const repoName = typeof body.repo === 'string' ? body.repo.trim().slice(0, 120) : '';
+  const requestedProject = typeof body.project === 'string' ? body.project.trim() : '';
   let projectId: string | null = null;
-  if (repoName) {
-    const pr = await findOrCreateProject(db, target.team, repoName, user.id);
-    if ('error' in pr) {
-      return c.redirect(`/app/sessions?error=${encodeURIComponent(pr.error)}`);
+  if (requestedProject) {
+    const selected = await db
+      .select({ id: projects.id })
+      .from(projects)
+      .where(and(eq(projects.id, requestedProject), eq(projects.teamId, target.team.id)))
+      .limit(1);
+    if (!selected[0]) {
+      return c.redirect(
+        `/app/sessions?error=${encodeURIComponent('Pick an existing project from the selected team.')}`,
+      );
     }
-    projectId = pr.project.id;
+    projectId = selected[0].id;
   }
   const inserted = await db
     .insert(debugSessions)
@@ -387,6 +654,54 @@ sessionsRoutes.get('/app/sessions/:id', async (c) => {
     );
   }
   const { session, team } = found;
+  const [offer] = await db.select().from(handoffs).where(eq(handoffs.sessionId, session.id));
+  // Work dispatched from a project page is read from here; without the way back
+  // a lead assigning four tasks walked rail → projects → project each time.
+  const [home] = session.projectId
+    ? await db
+        .select({ name: projects.name, slug: projects.slug })
+        .from(projects)
+        .where(eq(projects.id, session.projectId))
+        .limit(1)
+    : [];
+  const homeUrl = home ? `/app/teams/${team.slug}/projects/${encodeURIComponent(home.slug)}` : undefined;
+  await ensureRail(db, user, team.slug, home?.slug ?? null);
+  const work = offer?.kind === 'assignment' ? 'assignment' : 'handoff';
+  const ended = offer && ['cancelled', 'declined'].includes(offer.state) ? offer.state : undefined;
+  const [assignedTo] = offer?.targetInstallationId
+    ? await db
+        .select({ name: agentInstallations.name, device: agentInstallations.deviceLabel })
+        .from(agentInstallations)
+        .where(eq(agentInstallations.id, offer.targetInstallationId))
+        .limit(1)
+    : [];
+  const receiverId = offer?.acceptedBy ?? offer?.targetUserId;
+  const [receiver] = receiverId
+    ? await db
+        .select({ username: users.username })
+        .from(memberships)
+        .innerJoin(users, eq(users.id, memberships.userId))
+        .where(and(eq(memberships.teamId, team.id), eq(memberships.userId, receiverId)))
+    : [];
+  const [installation] = offer?.installationId
+    ? await db
+        .select({
+          revokedAt: agentInstallations.revokedAt,
+          tokenRevokedAt: tokens.revokedAt,
+          tokenId: tokens.id,
+        })
+        .from(agentInstallations)
+        .leftJoin(tokens, eq(tokens.id, agentInstallations.tokenId))
+        .where(eq(agentInstallations.id, offer.installationId))
+    : [];
+  const unavailable = Boolean(
+    (receiverId && !receiver) ||
+    (offer?.acceptedAt &&
+      (!installation ||
+        installation.revokedAt ||
+        installation.tokenRevokedAt ||
+        !installation.tokenId)),
+  );
   // Paged from the *newest* end: a thread past one page used to render its oldest
   // 500 messages and silently drop everything after them — the resolution included.
   const win = pageWindow(c.req.query('page'), THREAD_PAGE_SIZE);
@@ -413,8 +728,55 @@ sessionsRoutes.get('/app/sessions/:id', async (c) => {
   const resolution = (session.resolution as SessionResolution | null) ?? null;
 
   return c.html(
-    <AppLayout user={user} active="sessions" title={session.title}>
+    <AppLayout
+      user={user}
+      // Dispatched work belongs to its project; a plain thread belongs to Sessions.
+      active={offer && home ? 'projects' : 'sessions'}
+      title={session.title}
+      band={
+        ended && c.req.query('handoff') === ended ? (
+          <Band
+            kind="info"
+            tag={ended}
+            actions={
+              homeUrl ? (
+                <a class="btn btn-sm" href={`${homeUrl}#assigned-work`}>
+                  Back to {home!.name}
+                </a>
+              ) : undefined
+            }
+          >
+            This {work} is {ended}: nobody will be told about it and nobody can accept it any more.
+            The brief stays readable, and the thread below stays open for messages.
+          </Band>
+        ) : undefined
+      }
+      inspector={
+        offer ? (
+          <Inspector>
+            <HandoffFlow
+              offer={offer}
+              sessionId={session.id}
+              userId={user.id}
+              owner={
+                assignedTo
+                  ? `${assignedTo.name} (${receiver?.username ?? 'unknown owner'})`
+                  : (receiver?.username ?? 'Any eligible recipient')
+              }
+              unavailable={unavailable}
+              assignedTo={assignedTo}
+            />
+          </Inspector>
+        ) : undefined
+      }
+    >
       <div class="crumb">
+        {homeUrl ? (
+          <>
+            <a href={offer ? `${homeUrl}#assigned-work` : homeUrl}>← {home!.name}</a>
+            {' · '}
+          </>
+        ) : null}
         <a href="/app/sessions">Sessions</a> / {team.slug}
       </div>
       <div class="card">
@@ -425,6 +787,7 @@ sessionsRoutes.get('/app/sessions/:id', async (c) => {
             </div>
             <div class="card-note mono">
               {team.slug} · opened by {opener ?? 'unknown'} · {fmtDate(session.createdAt)}
+              {offer ? ` · ${work} ${offer.state === 'completed' ? 'completed — reported' : offer.state.replace('_', ' ')}` : ''}
             </div>
           </div>
           {session.kind === 'announcements' ? (
@@ -498,7 +861,11 @@ sessionsRoutes.get('/app/sessions/:id', async (c) => {
         ) : null}
 
         <div class="composer">
-          <form method="post" action={`/app/sessions/${session.id}/messages`} style="display:flex;flex-direction:column;gap:12px">
+          <form
+            method="post"
+            action={`/app/sessions/${session.id}/messages`}
+            style="display:flex;flex-direction:column;gap:12px"
+          >
             <textarea
               class="in"
               name="body"
@@ -530,11 +897,23 @@ sessionsRoutes.get('/app/sessions/:id', async (c) => {
         <form method="post" action={`/app/sessions/${session.id}/resolve`}>
           <div class="field">
             <label>Root cause</label>
-            <textarea class="in" name="root_cause" required maxlength={4000} placeholder="What was actually wrong?"></textarea>
+            <textarea
+              class="in"
+              name="root_cause"
+              required
+              maxlength={4000}
+              placeholder="What was actually wrong?"
+            ></textarea>
           </div>
           <div class="field">
             <label>Fix</label>
-            <textarea class="in" name="fix" required maxlength={4000} placeholder="What did you change? (PR link welcome)"></textarea>
+            <textarea
+              class="in"
+              name="fix"
+              required
+              maxlength={4000}
+              placeholder="What did you change? (PR link welcome)"
+            ></textarea>
           </div>
           <div class="dialog-actions">
             <button class="btn" type="button" data-close-dialog="t">
@@ -548,6 +927,170 @@ sessionsRoutes.get('/app/sessions/:id', async (c) => {
       </dialog>
     </AppLayout>,
   );
+});
+
+/**
+ * The work ledger, at three addresses, the same three the sessions list answers.
+ * `/app/teams/:slug/projects/:project/work` is the rail's; `?team=`/`?project=`
+ * still answer.
+ */
+const workPage = async (c: Context<AppEnv>) => {
+  const user = c.get('user');
+  if (!user) return loginRedirect(c);
+  const db = c.get('db');
+  const mine = await myTeams(db, user.id);
+  const ids = mine.map((m) => m.team.id);
+  const workTeam = mine.find((m) => m.team.slug === scopedTeamParam(c))?.team;
+  const workProject = workTeam && user.rail?.team === workTeam.slug ? (user.rail.project ?? undefined) : undefined;
+  // In the path the scope is the page's identity rather than a filter on it.
+  if (projectInPath(c) && !workProject) return c.notFound();
+  if (c.req.param('slug') !== undefined && !workTeam) return c.notFound();
+  const sessionsHref = workTeam
+    ? sectionHref(workTeam.slug, workProject?.slug, 'sessions')
+    : '/app/sessions';
+  const rows = ids.length
+    ? await db
+        .select({
+          offer: handoffs,
+          session: debugSessions,
+          project: projects.name,
+          agent: agentInstallations.name,
+        })
+        .from(handoffs)
+        .innerJoin(debugSessions, eq(handoffs.sessionId, debugSessions.id))
+        .leftJoin(projects, eq(projects.id, debugSessions.projectId))
+        .leftJoin(agentInstallations, eq(agentInstallations.id, handoffs.targetInstallationId))
+        .where(
+          and(
+            workTeam ? eq(debugSessions.teamId, workTeam.id) : inArray(debugSessions.teamId, ids),
+            workProject ? eq(debugSessions.projectId, workProject.id) : undefined,
+          ),
+        )
+        .orderBy(desc(handoffs.updatedAt))
+        .limit(50)
+    : [];
+  return c.html(
+    <AppLayout
+      user={user}
+      active="work"
+      title="Work"
+      bleed
+      head={
+        <PageHead
+          title="Work"
+          trail={scopedTrail({ team: workTeam, project: workProject }, 'Work')}
+          sub="Assignments and handoffs: work given to an agent or waiting to be picked up, separate from unread messages. The code travels through git; STMA carries the brief and scope."
+          actions={
+            <>
+              {workTeam && workProject ? (
+                <a class="btn btn-primary" href={`/app/teams/${workTeam.slug}/projects/${encodeURIComponent(workProject.slug)}#assigned-work`}>
+                  Assign work
+                </a>
+              ) : null}
+              <a class="btn" href={sessionsHref}>
+                Sessions
+              </a>
+            </>
+          }
+        />
+      }
+      keysNote="Latest 50 handoffs · completion is an agent report"
+    >
+      <FlowSection title="Handoff ledger">
+        {rows.length ? (
+          <div class="scroll-x">
+            <table class="tbl">
+              <thead>
+                <tr>
+                  <th>Task · workspace</th>
+                  <th>Project</th>
+                  <th>Stage</th>
+                  <th>Next action</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map(({ offer, session, project, agent }) => (
+                  <tr>
+                    <td>
+                      <a href={`/app/sessions/${session.id}`}>{session.title}</a>
+                      <div class="small">
+                        {mine.find((m) => m.team.id === session.teamId)?.team.name}
+                        {offer.kind === 'assignment'
+                          ? ` · assigned to ${agent ?? 'a revoked agent'}`
+                          : ''}
+                      </div>
+                    </td>
+                    <td>{project ?? 'Workspace'}</td>
+                    <td>{offer.state === 'completed' ? 'Completed — reported' : offer.state}</td>
+                    <td>
+                      {['completed', 'cancelled', 'declined'].includes(offer.state)
+                        ? 'Sender / reviewer'
+                        : offer.acceptedBy === user.id || offer.targetUserId === user.id
+                          ? 'You / your agent'
+                          : offer.state === 'offered'
+                            ? 'Eligible recipient'
+                            : 'Accepting agent'}{' '}
+                      · <a href={`/app/sessions/${session.id}`}>Inspect</a>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <FlowEmpty title="No tracked handoffs yet">
+            <p>
+              Ask your connected agent to offer a real task using handoff_work. Reading or replying
+              to a message does not accept it.
+            </p>
+            <a href="/app/tokens">Connect an agent</a>
+          </FlowEmpty>
+        )}
+      </FlowSection>
+    </AppLayout>,
+  );
+};
+
+sessionsRoutes.get('/app/handoffs', workPage);
+sessionsRoutes.get('/app/teams/:slug/projects/:project/work', workPage);
+
+sessionsRoutes.post('/app/sessions/:id/handoff/:action', async (c) => {
+  const user = c.get('user');
+  if (!user) return loginRedirect(c);
+  const action = c.req.param('action');
+  if (
+    !z.string().uuid().safeParse(c.req.param('id')).success ||
+    (action !== 'cancel' && action !== 'decline')
+  )
+    return c.notFound();
+  const result = await transitionHandoff(
+    c.get('db'),
+    c.req.param('id'),
+    user.id,
+    undefined,
+    action,
+  );
+  if ('error' in result) return c.text(result.error!, 409);
+  // Answer on the page the button was pressed on, and say what happened: a
+  // reload that looks the same as before reads as "it did not work".
+  const form = await c.req.parseBody().catch(() => ({}) as Record<string, unknown>);
+  if (form.return_to === 'project' && action === 'cancel') {
+    const [home] = await c
+      .get('db')
+      .select({ team: teams.slug, project: projects.slug })
+      .from(debugSessions)
+      .innerJoin(teams, eq(teams.id, debugSessions.teamId))
+      .innerJoin(projects, eq(projects.id, debugSessions.projectId))
+      .where(eq(debugSessions.id, c.req.param('id')))
+      .limit(1);
+    if (home) {
+      return c.redirect(
+        `/app/teams/${home.team}/projects/${encodeURIComponent(home.project)}?cancelled=${c.req.param('id')}#assigned-work`,
+        303,
+      );
+    }
+  }
+  return c.redirect(`/app/sessions/${c.req.param('id')}?handoff=${action === 'cancel' ? 'cancelled' : 'declined'}`, 303);
 });
 
 sessionsRoutes.post('/app/sessions/:id/messages', async (c) => {
@@ -601,7 +1144,8 @@ sessionsRoutes.post('/app/sessions/:id/resolve', async (c) => {
   const found = await sessionForMember(db, c.req.param('id'), user.id);
   if (!found) return c.notFound();
   const body = await c.req.parseBody();
-  const rootCause = typeof body.root_cause === 'string' ? body.root_cause.trim().slice(0, 4000) : '';
+  const rootCause =
+    typeof body.root_cause === 'string' ? body.root_cause.trim().slice(0, 4000) : '';
   const fix = typeof body.fix === 'string' ? body.fix.trim().slice(0, 4000) : '';
   if (
     !rootCause ||

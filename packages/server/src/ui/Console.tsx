@@ -1,6 +1,7 @@
 import type { Child } from 'hono/jsx';
 import { initials } from '../lib/format';
 import { EMPTY_RAIL, type RailCounts } from '../lib/rail';
+import { sectionHref } from '../lib/scope';
 import type { User } from '../types';
 
 /**
@@ -21,11 +22,21 @@ import type { User } from '../types';
  */
 
 export type RailKey =
+  | 'people'
+  | 'work'
+  | 'members'
+  | 'integrations'
+  | 'setup'
+  | 'team'
   | 'agents'
   | 'projects'
+  | 'knowledge'
   | 'savings'
   | 'governance'
   | 'delivery'
+  | 'attention'
+  | 'repositories'
+  | 'receipts'
   | 'environments'
   | 'activity'
   | 'teams'
@@ -62,7 +73,15 @@ export const Logo = ({ inv = false, lg = false }: { inv?: boolean; lg?: boolean 
         stroke-width="0.7"
         opacity="0.45"
       />
-      <circle cx="16" cy="16" r="3.7" fill="none" stroke="currentColor" stroke-width="0.75" opacity="0.9" />
+      <circle
+        cx="16"
+        cy="16"
+        r="3.7"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="0.75"
+        opacity="0.9"
+      />
       <circle cx="16" cy="16" r="1.5" fill="currentColor" />
       <circle cx="16" cy="4.5" r="1.8" fill="currentColor" opacity="0.82" />
       <circle cx="26.94" cy="12.45" r="1.9" fill="currentColor" />
@@ -106,112 +125,314 @@ const teamInitials = (name: string): string =>
     .join('') || '?';
 
 /**
- * Which team the rail is talking about, and the way to another one.
+ * The scope bar: which workspace the page is in, which project inside it, and the
+ * way to another. Two scopes below the account and no third — the cloud consoles'
+ * shape, asked for by the owner on 2026-09-20 because the rail mixed scope with
+ * function and nobody could tell a workspace page from a project page.
  *
- * The rail's links are team-scoped, so before this the only way to read which
- * team you were looking at was the line above the sign-out button — and the only
- * way to change it was to go to the team list and come back. It is a `details`
- * element rather than a scripted menu because the console must work with no
- * script at all; the same reason the project scope filter keeps its View button.
- *
- * With one team there is nothing to switch to, so it renders as a plain label:
- * a control that cannot do anything is worse than no control.
+ * Pickers are `details` elements, not scripted menus: the console must work with
+ * no script at all. With nowhere to switch to, a picker is a plain link — a
+ * control that cannot do anything is worse than no control.
  */
-const TeamSwitch = ({ rail }: { rail: RailCounts }) => {
-  if (!rail.team) return null;
+export const ScopeBar = ({ user }: { user: User }) => {
+  const rail = user.rail ?? EMPTY_RAIL;
   const current = rail.list.find((t) => t.slug === rail.team);
-  const name = current?.name ?? rail.team;
-  const face = (
-    <>
-      <span class="tile tile-28 tile-green" style="width:22px;height:22px;font-size:9px">
-        {teamInitials(name)}
-      </span>
-      <span class="tname">{name}</span>
-    </>
-  );
-  if (rail.list.length < 2) {
-    return (
-      <a class="teamswitch" href={`/app/teams/${rail.team}`} title="This team">
-        {face}
-      </a>
-    );
-  }
+  const workspace = current?.name ?? rail.team;
+  const inWorkspace = rail.scope !== 'account' && Boolean(rail.team);
   return (
-    <details class="teampick">
-      <summary class="teamswitch" title="Switch team">
-        {face}
-        <span class="caret">▾</span>
-      </summary>
-      <div class="teammenu">
-        {rail.list.map((t) => (
-          <a class={t.slug === rail.team ? 'on' : undefined} href={`/app/teams/${t.slug}`}>
-            <span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
-              {t.name}
-            </span>
-            <span class="r">{t.role}</span>
+    <div class="scopebar">
+      <nav class="scope-path" aria-label="Scope">
+        {inWorkspace ? (
+          <>
+            {rail.list.length < 2 && !user.organizationSecurity ? (
+              <a class="scope-at" href={`/app/teams/${rail.team}`} title="This workspace">
+                {workspace}
+              </a>
+            ) : (
+              <details class="scope-pick">
+                <summary class="scope-at" title="Switch workspace">
+                  {workspace}
+                  <span class="caret">▾</span>
+                </summary>
+                <div class="scope-menu">
+                  <span class="scope-cap">Workspaces</span>
+                  {rail.list.map((t) => (
+                    <a class={t.slug === rail.team ? 'on' : undefined} href={`/app/teams/${t.slug}`}>
+                      <span class="grow">{t.name}</span>
+                      <span class="r">{t.role}</span>
+                    </a>
+                  ))}
+                  <span class="sep"></span>
+                  <a href="/app">All workspaces</a>
+                  {user.organizationSecurity ? <a href="/app/organizations">Organizations</a> : null}
+                </div>
+              </details>
+            )}
+            <span class="scope-sep">/</span>
+            <details class="scope-pick">
+              <summary class={`scope-at${rail.project ? ' in' : ' all'}`} title="Switch project">
+                {rail.project?.name ?? 'All projects'}
+                <span class="caret">▾</span>
+              </summary>
+              <div class="scope-menu">
+                <span class="scope-cap">Projects in {workspace}</span>
+                <a class={rail.project ? undefined : 'on'} href={`/app/teams/${rail.team}`}>
+                  All projects
+                </a>
+                {rail.projectList.map((p) => (
+                  <a
+                    class={p.slug === rail.project?.slug ? 'on' : undefined}
+                    href={`/app/teams/${rail.team}/projects/${encodeURIComponent(p.slug)}`}
+                  >
+                    <span class="grow">{p.name}</span>
+                  </a>
+                ))}
+                <span class="sep"></span>
+                <a href={`/app/teams/${rail.team}/projects`}>
+                  Every project{rail.projects > rail.projectList.length ? ` (${rail.projects})` : ''}
+                </a>
+              </div>
+            </details>
+          </>
+        ) : rail.list.length === 0 && !user.organizationSecurity ? (
+          <a class="scope-at all" href="/app">
+            All workspaces
           </a>
-        ))}
-        <span class="sep"></span>
-        <a href="/app">All teams</a>
-      </div>
-    </details>
+        ) : (
+          <details class="scope-pick">
+            <summary class="scope-at all" title="Open a workspace">
+              All workspaces
+              <span class="caret">▾</span>
+            </summary>
+            <div class="scope-menu">
+              <span class="scope-cap">Workspaces</span>
+              {rail.list.map((t) => (
+                <a href={`/app/teams/${t.slug}`}>
+                  <span class="grow">{t.name}</span>
+                  <span class="r">{t.role}</span>
+                </a>
+              ))}
+              <span class="sep"></span>
+              <a class="on" href="/app">
+                All workspaces
+              </a>
+              {user.organizationSecurity ? <a href="/app/organizations">Organizations</a> : null}
+            </div>
+          </details>
+        )}
+      </nav>
+      {/* The account is a scope too, the outermost one, and it is not a place the
+          fleet lives: its pages sit behind the name, not in the rail. */}
+      <details class="scope-pick scope-me">
+        <summary class="scope-at" title="Your account">
+          <span class="avatar light">{initials(user.username)}</span>
+          {user.username}
+          <span class="caret">▾</span>
+        </summary>
+        <div class="scope-menu right">
+          <a href="/app/account">Account</a>
+          <a href="/app/notifications">Notifications</a>
+          <a href="/app/tokens">My agent connections</a>
+          <a href="/docs">Docs</a>
+          {/* Beside Docs rather than in the rail: the rail lists the current
+              scope's sections, and "what went wrong" belongs to no scope. */}
+          <a href="/help">Help</a>
+          <span class="sep"></span>
+          <form method="post" action="/logout" class="m0">
+            <button class="scope-out" type="submit">
+              Sign out
+            </button>
+          </form>
+        </div>
+      </details>
+    </div>
   );
 };
 
+/** `?team=…&project=…` for the list pages that live outside a workspace path. */
+const scopeQuery = (team: string, project?: string | null): string =>
+  `?team=${encodeURIComponent(team)}${project ? `&project=${encodeURIComponent(project)}` : ''}`;
+
+/**
+ * The rail lists the sections of the scope the page is in, and nothing else.
+ *
+ * It used to list three groups — "Current workspace", "Manage workspace",
+ * "Across workspaces" — that mixed where you are with what you can do: the agent
+ * map and the sessions list sat outside every workspace and poured all of them
+ * into one ledger, agent connections hid under personal settings, and a project
+ * had no sections at all, so everything about it was reached by leaving it.
+ * Inside a project the rail is that project's; the way out is its first line.
+ */
 export const Rail = ({ user, active }: { user: User; active?: RailKey }) => {
   const rail = user.rail ?? EMPTY_RAIL;
+  const ws = rail.scope === 'account' ? null : rail.team;
+  const project = rail.project;
+  const owner = rail.role === 'owner';
   return (
     <nav class="rail">
       <a class="rail-brand" href="/app">
         <Logo inv />
         <span class="name">STMA</span>
       </a>
-      <TeamSwitch rail={rail} />
-      <div class="rail-nav">
-        <span class="rail-group">Control</span>
-        <RailLink href="/app/agents" label="Agent map" active={active === 'agents'} badge={rail.runs} />
-        <RailLink
-          href={teamHref(rail.team, '/projects')}
-          label="Projects"
-          active={active === 'projects'}
-          badge={rail.projects}
-        />
-        <RailLink
-          href={teamHref(rail.team, '/governance')}
-          label="Governance"
-          active={active === 'governance'}
-          badge={rail.drift}
-        />
-        <RailLink
-          href={teamHref(rail.team, '/delivery')}
-          label="Delivery"
-          active={active === 'delivery'}
-        />
-        <RailLink
-          href={teamHref(rail.team, '/savings')}
-          label="Savings"
-          active={active === 'savings'}
-        />
-        <RailLink
-          href={teamHref(rail.team, '/compare')}
-          label="Environments"
-          active={active === 'environments'}
-        />
-        <RailLink
-          href={teamHref(rail.team, '/activity')}
-          label="Activity"
-          active={active === 'activity'}
-        />
-
-        <span class="rail-group later">Workspace</span>
-        <RailLink href="/app" label="Teams" active={active === 'teams'} badge={rail.teams > 1 ? rail.teams : undefined} />
-        <RailLink href="/app/sessions" label="Sessions" active={active === 'sessions'} badge={rail.sessions} />
-        <RailLink
-          href="/app/notifications"
-          label="Notifications"
-          active={active === 'notifications'}
-        />
-        <RailLink href="/app/tokens" label="Tokens" active={active === 'tokens'} />
+      <button
+        class="rail-nav-toggle"
+        type="button"
+        aria-expanded="true"
+        aria-controls="rail-destinations"
+      >
+        Menu
+      </button>
+      <div class="rail-nav" id="rail-destinations">
+        {ws && project ? (
+          <>
+            <a class="rail-link rail-up" href={teamHref(ws, '/projects')}>
+              ← {rail.list.find((t) => t.slug === ws)?.name ?? ws}
+            </a>
+            <span class="rail-group">{project.name}</span>
+            <RailLink
+              href={teamHref(ws, `/projects/${encodeURIComponent(project.slug)}`)}
+              label="Overview"
+              active={active === 'projects'}
+            />
+            {/* Every one of these is the project's own address: the person who
+                clicked into a project ends up with the hierarchy in the URL bar,
+                not with a filter on a workspace page. `sectionHref` owns both
+                spellings, so the rail cannot drift from the routes. */}
+            <RailLink
+              href={sectionHref(ws, project.slug, 'agents')}
+              label="Agents"
+              active={active === 'agents' || active === 'tokens'}
+              badge={rail.runs}
+            />
+            <RailLink href={sectionHref(ws, project.slug, 'work')} label="Work" active={active === 'work'} />
+            <RailLink
+              href={sectionHref(ws, project.slug, 'sessions')}
+              label="Sessions"
+              active={active === 'sessions'}
+              badge={rail.sessions}
+            />
+            <RailLink
+              href={sectionHref(ws, project.slug, 'activity')}
+              label="Activity"
+              active={active === 'activity'}
+            />
+            <span class="rail-group later">Rules in effect here</span>
+            <RailLink
+              href={sectionHref(ws, project.slug, 'knowledge')}
+              label="Knowledge"
+              active={active === 'knowledge'}
+            />
+            <RailLink
+              href={sectionHref(ws, project.slug, 'governance')}
+              label="Governance"
+              active={active === 'governance'}
+            />
+            <RailLink
+              href={sectionHref(ws, project.slug, 'delivery')}
+              label="Delivery"
+              active={active === 'delivery'}
+            />
+            <RailLink
+              href={sectionHref(ws, project.slug, 'environments')}
+              label="Environments"
+              active={active === 'environments'}
+            />
+          </>
+        ) : ws ? (
+          <>
+            <span class="rail-group">Workspace</span>
+            <RailLink href={teamHref(ws, '')} label="Overview" active={active === 'team'} />
+            <RailLink
+              href={teamHref(ws, '/projects')}
+              label="Projects"
+              active={active === 'projects'}
+              badge={rail.projects}
+            />
+            <RailLink href={sectionHref(ws, null, 'agents')} label="People and agents" active={active === 'people'} />
+            <RailLink
+              href={`/app/agents${scopeQuery(ws)}`}
+              label="Agent map"
+              active={active === 'agents'}
+              badge={rail.runs}
+            />
+            <RailLink href={sectionHref(ws, null, 'work')} label="Work" active={active === 'work'} />
+            <RailLink
+              href={sectionHref(ws, null, 'sessions')}
+              label="Sessions"
+              active={active === 'sessions'}
+              badge={rail.sessions}
+            />
+            <RailLink href={sectionHref(ws, null, 'activity')} label="Activity" active={active === 'activity'} />
+            <RailLink
+              href={sectionHref(ws, null, 'environments')}
+              label="Environments"
+              active={active === 'environments'}
+            />
+            <RailLink
+              href={teamHref(ws, '/attention')}
+              label="Needs attention"
+              active={active === 'attention'}
+            />
+            <span class="rail-group later">Rules for every project</span>
+            <RailLink href={sectionHref(ws, null, 'knowledge')} label="Knowledge" active={active === 'knowledge'} />
+            <RailLink
+              href={sectionHref(ws, null, 'governance')}
+              label="Governance"
+              active={active === 'governance'}
+              badge={rail.drift}
+            />
+            <RailLink
+              href={sectionHref(ws, null, 'delivery')}
+              label="Delivery"
+              active={active === 'delivery' || active === 'receipts'}
+            />
+            <span class="rail-group later">Workspace settings</span>
+            <RailLink href={teamHref(ws, '?tab=people')} label="Members" active={active === 'members'} />
+            {owner ? (
+              <RailLink
+                href={teamHref(ws, '?tab=integrations')}
+                label="Integrations"
+                active={active === 'integrations'}
+              />
+            ) : null}
+            <RailLink
+              href={teamHref(ws, '/repositories')}
+              label="Repositories"
+              active={active === 'repositories'}
+            />
+            <RailLink
+              href={`/app/tokens${scopeQuery(ws)}`}
+              label="Agent connections"
+              active={active === 'tokens'}
+            />
+            <RailLink href={teamHref(ws, '/setup')} label="Connect & test" active={active === 'setup'} />
+          </>
+        ) : (
+          <>
+            <span class="rail-group">Workspaces</span>
+            <RailLink
+              href="/app"
+              label="All workspaces"
+              // The unscoped map, work and sessions lists left the rail (phase 4) but still
+              // answer their addresses. They are the account-level view of everything, and a
+              // page that lights nothing in the rail reads as a page that is lost.
+              active={active === 'teams' || active === 'agents' || active === 'work' || active === 'sessions'}
+              badge={rail.teams > 1 ? rail.teams : undefined}
+            />
+            {rail.list.map((t) => (
+              <RailLink href={`/app/teams/${t.slug}`} label={t.name} active={false} />
+            ))}
+            <span class="rail-group later">Account</span>
+            <RailLink href="/app/account" label="Account" active={active === 'account'} />
+            <RailLink
+              href="/app/notifications"
+              label="Notifications"
+              active={active === 'notifications'}
+            />
+            <RailLink href="/app/tokens" label="My agent connections" active={active === 'tokens'} />
+          </>
+        )}
+        <span class="rail-group later">Help</span>
         <RailLink href="/docs" label="Docs" active={active === 'docs'} />
         {user.isAdmin ? (
           <>
@@ -221,15 +442,19 @@ export const Rail = ({ user, active }: { user: User; active?: RailKey }) => {
         ) : null}
       </div>
       <div class="rail-foot">
-        {/* Your own name is the way to your own settings: the rail has no Account
-            entry because an account is not a place the fleet lives. */}
+        {/* Your own name is the way to your own settings: an account is not a
+            place the fleet lives. The role under it is where you check your own
+            authority in the workspace on screen. */}
         <a class="railme" href="/app/account" title="Account">
           <span class="avatar">{initials(user.username)}</span>
           <div class="rail-who">
             <div class="n">{user.username}</div>
             <div class="r">
-              {rail.role ? `${rail.role} · ` : ''}
-              {rail.team ?? 'no team yet'}
+              {rail.scope === 'account'
+                ? rail.teams > 0
+                  ? `${rail.teams} workspace${rail.teams === 1 ? '' : 's'}`
+                  : 'no workspace yet'
+                : `${rail.role ? `${rail.role} · ` : ''}${rail.team ?? 'no workspace yet'}`}
             </div>
           </div>
         </a>
@@ -260,7 +485,7 @@ export const ProjectScope = ({
   extra,
 }: {
   path: string;
-  projects: { name: string }[];
+  projects: { id: string; name: string; slug: string; repositoryIdentity?: string | null }[];
   current: string | null;
   /** What the empty choice means on this page — "Global — whole team" on governance. */
   allLabel?: string;
@@ -274,8 +499,11 @@ export const ProjectScope = ({
     <select name="project" aria-label="Project scope">
       <option value="">{allLabel}</option>
       {projects.map((p) => (
-        <option value={p.name} selected={p.name === current}>
+        <option value={p.id} selected={p.id === current}>
           {p.name}
+          {projects.some((other) => other.id !== p.id && other.name === p.name)
+            ? ` — ${p.repositoryIdentity ? 'repository-bound' : p.slug}`
+            : ''}
         </option>
       ))}
     </select>
@@ -295,24 +523,74 @@ export const Lead = ({ text, live = true }: { text: string; live?: boolean }) =>
 
 export const Vr = () => <span class="vr"></span>;
 
+/** One step of the way to a page. The last one is the page itself and carries no link. */
+export type Crumb = { label: string; href?: string };
+
+/** The way to a workspace page, for the common case: workspace, then the steps below it. */
+export const teamTrail = (team: { slug: string; name?: string | null }, ...rest: Crumb[]): Crumb[] => [
+  { label: team.name ?? team.slug, href: `/app/teams/${team.slug}` },
+  ...rest,
+];
+
+/** The linked steps on their own, for a page that draws its own title block. */
+export const Trail = ({ steps }: { steps: Crumb[] }) => (
+  <nav class="crumb" aria-label="Breadcrumb">
+    {steps.map((step, index) => (
+      <>
+        {index > 0 ? <span class="crumb-sep"> / </span> : null}
+        {step.href && index < steps.length - 1 ? (
+          <a href={step.href}>{step.label}</a>
+        ) : (
+          <span aria-current={index === steps.length - 1 ? 'page' : undefined}>{step.label}</span>
+        )}
+      </>
+    ))}
+  </nav>
+);
+
+/** The trail of a list page that takes `?team=` and `?project=`: the scope first, then the page. */
+export const scopedTrail = (
+  scope: { team?: { slug: string; name?: string | null }; project?: { slug: string; name: string } | null },
+  page: string,
+  all: Crumb = { label: 'All workspaces', href: '/app' },
+): Crumb[] =>
+  scope.team && scope.project
+    ? teamTrail(
+        scope.team,
+        { label: 'Projects', href: `/app/teams/${scope.team.slug}/projects` },
+        { label: scope.project.name, href: `/app/teams/${scope.team.slug}/projects/${encodeURIComponent(scope.project.slug)}` },
+        { label: page },
+      )
+    : scope.team
+      ? teamTrail(scope.team, { label: page })
+      : [all, { label: page }];
+
 /**
- * Page header. The crumb is the only place a signed-in page says which team it
- * is about, now that the rail took the horizontal space the old nav used.
+ * Page header. The trail says where this page sits and every step of it is a way
+ * back: it used to be a line of text ("/ across workspaces / agent map") that
+ * named the places and led to none of them. `crumb` stays for a page that has
+ * no place in the hierarchy to link to.
  */
 export const PageHead = ({
   crumb,
+  trail,
   title,
   sub,
   actions,
 }: {
   crumb?: string;
+  trail?: Crumb[];
   title: string;
   sub?: string;
   actions?: Child;
 }) => (
   <div class="pagehead">
     <div style="min-width:0">
-      {crumb ? <span class="crumb">{crumb}</span> : null}
+      {trail && trail.length > 0 ? (
+        <Trail steps={trail} />
+      ) : crumb ? (
+        <span class="crumb">{crumb}</span>
+      ) : null}
       <h1>{title}</h1>
       {sub ? <p>{sub}</p> : null}
     </div>
@@ -441,6 +719,28 @@ export const ConsoleShell = ({
   <div class="console">
     <Rail user={user} active={active} />
     <div class="frame">
+      <ScopeBar user={user} />
+      {/*
+       * Above the page's own band, because it is about the account rather than
+       * about this page, and because the page below it may be a redirect target
+       * whose band is already spoken for. It is not dismissible: the state it
+       * names ends when somebody enters a code, and a notice you can wave away
+       * is one that stops being read the day it starts mattering.
+       */}
+      {user.addressUnconfirmed ? (
+        <Band
+          kind="warn"
+          tag="Email"
+          actions={
+            <a class="btn btn-sm" href="/app/account">
+              Confirm it
+            </a>
+          }
+        >
+          <b>{user.email}</b> has not been confirmed. Sign-in codes and password resets go there and
+          nowhere else, so if it is wrong, nobody can get this account back.
+        </Band>
+      ) : null}
       {strip || scope ? (
         <div class="strip">
           <div class="strip-l">{strip}</div>

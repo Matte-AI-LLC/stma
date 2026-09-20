@@ -1,4 +1,4 @@
-import { z } from 'zod';
+import { z } from 'zod/v3';
 
 /**
  * Environment snapshot, v1. Collected by the agent on the developer's machine

@@ -1,4 +1,5 @@
-import { z } from 'zod';
+import { z } from 'zod/v3';
+import { runCheckpointSchema } from './checkpoints';
 
 export const AGENT_CLIENT_TYPES = [
   'generic',
@@ -37,6 +38,11 @@ export type ClaimResourceType = z.infer<typeof claimResourceTypeSchema>;
 export const CLAIM_ACCESS_MODES = ['read', 'write'] as const;
 export const claimAccessModeSchema = z.enum(CLAIM_ACCESS_MODES);
 export type ClaimAccessMode = z.infer<typeof claimAccessModeSchema>;
+
+/** Planned intent and files later observed dirty are retained independently. */
+export const CLAIM_SOURCES = ['planned', 'observed'] as const;
+export const claimSourceSchema = z.enum(CLAIM_SOURCES);
+export type ClaimSource = z.infer<typeof claimSourceSchema>;
 
 export const workClaimSchema = z.object({
   resourceType: claimResourceTypeSchema,
@@ -121,6 +127,12 @@ export const registerAgentSchema = z.object({
 });
 
 export const startAgentRunSchema = z.object({
+  /**
+   * Logical client operation id. Generate once before the first network call
+   * and reuse only when recovering the same start after a timeout/lost reply.
+   * A new intended run must use a new id. Optional for older clients.
+   */
+  requestId: z.string().uuid().optional(),
   installationId: z.string().uuid(),
   team: z.string().trim().min(1).max(80),
   project: z.string().trim().min(1).max(120).optional(),
@@ -130,6 +142,10 @@ export const startAgentRunSchema = z.object({
   branch: z.string().trim().max(300).optional(),
   worktree: z.string().trim().max(500).optional(),
   baseSha: z.string().trim().max(64).optional(),
+  headSha: z.string().regex(/^[a-f0-9]{40,64}$/i).optional(),
+  /** Canonical origin identity, separate from the project's display name. */
+  repositoryIdentity: z.string().trim().min(1).max(300).optional(),
+  checkpoint: runCheckpointSchema.extend({ kind: z.literal('start') }).optional(),
   claims: z.array(workClaimSchema).max(200).default([]),
   /**
    * Runs that are deliberately parallel attempts at the same task. Agents in one
@@ -143,11 +159,18 @@ export const startAgentRunSchema = z.object({
 export const heartbeatAgentRunSchema = z.object({
   status: z.enum(['active', 'waiting', 'blocked']).optional(),
   claims: z.array(workClaimSchema).max(200).optional(),
+  /** Which claim set this heartbeat replaces. Older clients update planned scope. */
+  claimSource: claimSourceSchema.optional(),
   usage: agentQuotaSchema.optional(),
+  checkpoint: runCheckpointSchema
+    .extend({ kind: z.enum(['delivery', 'tested']) })
+    .optional(),
 });
 
 export const finishAgentRunSchema = z.object({
   status: z.enum(['completed', 'failed']).default('completed'),
   detail: z.string().trim().max(2_000).optional(),
+  checkpoint: runCheckpointSchema
+    .extend({ kind: z.enum(['delivery', 'tested']) })
+    .optional(),
 });
-

@@ -3,7 +3,7 @@
  * The gate the release train runs before it publishes anything.
  *
  * Two questions, both of which have cost somebody an afternoon somewhere:
- *   1. Do all four manifests agree? (`npm run version:check`)
+ *   1. Do all public manifests and private EE when present agree? (`npm run version:check`)
  *   2. Does the git tag being released name that same version?
  *      (`npm run version:check -- v0.11.0`)
  *
@@ -41,7 +41,7 @@ if (tag) {
     console.error(`Either re-tag as v${version}, or bump with: npm run version:set -- ${wanted}`);
     process.exit(1);
   }
-  console.log(`ok: ${tag} matches all four manifests (${version}).`);
+  console.log(`ok: ${tag} matches all ${versions.length} manifests (${version}).`);
 } else {
-  console.log(`ok: all four manifests are ${version}.`);
+  console.log(`ok: all ${versions.length} manifests are ${version}.`);
 }

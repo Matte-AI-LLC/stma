@@ -1,14 +1,16 @@
 import { policyDocumentSchema, type PolicyDocument } from '@bridge/shared';
 import { and, desc, eq, inArray } from 'drizzle-orm';
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import { loginRedirect } from '../auth/session';
 import { agentRuns, policyBundles, projects } from '../db/schema';
 import { projectForTeam, teamForUser } from '../domain/access';
 import { effectivePolicy } from '../domain/policies';
-import { planLimits } from '../lib/entitlements';
+import { effectiveLimits } from '../lib/entitlements';
 import { listToLines, runtimesToLines } from '../lib/policyForm';
+import { sectionHref } from '../lib/scope';
 import type { AppEnv } from '../types';
-import { PageHead } from '../ui/Console';
+import { PageHead, teamTrail } from '../ui/Console';
+import { ensureRail } from '../lib/rail';
 import { AppLayout } from '../ui/Layout';
 
 /**
@@ -59,16 +61,32 @@ function servedText(doc: PolicyDocument, team: string, version: number | null): 
   return out.join('\n');
 }
 
-policyEditorRoutes.get('/app/teams/:slug/policy', async (c) => {
+policyEditorRoutes.get('/app/teams/:slug/policy', (c) => renderPolicyEditor(c));
+
+/**
+ * The editor, drawn for a GET or handed back by a refused publish.
+ *
+ * A refused publish used to redirect to the governance page with the reason in a
+ * band, and everything typed was gone: the usual refusal is one malformed
+ * `content:` line at the end of a long rulebook, so the person who made one typo
+ * was sent away to retype eight lists. `refused` carries the posted form back into
+ * the fields, in the scope it was posted for, with the reason above them. It is the
+ * other half of "no stale values" in the navigation contract: what you typed is not
+ * lost either.
+ */
+export async function renderPolicyEditor(
+  c: Context<AppEnv>,
+  refused?: { typed: Record<string, unknown>; error: string },
+) {
   const user = c.get('user');
   if (!user) return loginRedirect(c);
   const db = c.get('db');
-  const found = await teamForUser(db, user.id, c.req.param('slug'));
+  const found = await teamForUser(db, user.id, c.req.param('slug') ?? '');
   if (!found) return c.notFound();
   const { team, role } = found;
   // The same door as the governance page and the publish handler: a gate on one
   // of the three is not a gate.
-  if (!planLimits(team.plan, c.get('env').hosted).governance) return c.notFound();
+  if (!(await effectiveLimits(db, team, c.get('env').hosted)).governance) return c.notFound();
   if (role !== 'owner') {
     return c.html(
       <AppLayout user={user} active="governance" title="Policy">
@@ -88,10 +106,20 @@ policyEditorRoutes.get('/app/teams/:slug/policy', async (c) => {
     );
   }
 
-  const projectQuery = (c.req.query('project') ?? '').trim();
+  // A refused publish names its scope in the form; a GET names it in the address.
+  const postedScope = typeof refused?.typed.scope === 'string' ? refused.typed.scope.trim() : '';
+  const projectQuery = refused
+    ? postedScope && postedScope !== 'team' ? postedScope : ''
+    : (c.req.query('project') ?? '').trim();
   const scopeProject = projectQuery ? await projectForTeam(db, team.id, projectQuery) : undefined;
+  // A POST that answers with a page draws its own rail, in the scope it was posted for.
+  if (refused) await ensureRail(db, user, team.slug, scopeProject?.slug);
+  const typed = (name: string, live: string): string => {
+    const held = refused?.typed[name];
+    return typeof held === 'string' ? held : live;
+  };
   const teamProjects = await db
-    .select({ name: projects.name })
+    .select({ id: projects.id, name: projects.name, slug: projects.slug, repositoryIdentity: projects.repositoryIdentity })
     .from(projects)
     .where(eq(projects.teamId, team.id))
     .orderBy(projects.name)
@@ -126,8 +154,12 @@ policyEditorRoutes.get('/app/teams/:slug/policy', async (c) => {
     .from(agentRuns)
     .where(and(eq(agentRuns.teamId, team.id), inArray(agentRuns.status, ['active', 'waiting', 'blocked'])));
 
-  const error = c.req.query('error');
+  const error = refused?.error ?? c.req.query('error');
   const scopeLabel = scopeProject ? `project: ${scopeProject.name}` : 'team-wide';
+  // The way back is the governance page this editor was opened from, which for a
+  // project scope is that project's. It used to be the workspace's in both cases:
+  // "Add for this project only", then Discard, and you were somewhere else.
+  const governance = sectionHref(team.slug, scopeProject?.slug, 'governance');
 
   return c.html(
     <AppLayout
@@ -136,12 +168,22 @@ policyEditorRoutes.get('/app/teams/:slug/policy', async (c) => {
       title={`Edit policy — ${team.name}`}
       head={
         <PageHead
-          crumb={`/ ${team.slug} / governance / policy`}
+          trail={
+            scopeProject
+              ? teamTrail(
+                  team,
+                  { label: 'Projects', href: `/app/teams/${team.slug}/projects` },
+                  { label: scopeProject.name, href: `/app/teams/${team.slug}/projects/${encodeURIComponent(scopeProject.slug)}` },
+                  { label: 'Governance', href: governance },
+                  { label: 'Policy' },
+                )
+              : teamTrail(team, { label: 'Governance', href: governance }, { label: 'Policy' })
+          }
           title={`Edit policy — ${scopeLabel}`}
           sub="A document, not a dialog: write on the left, read what every agent will receive on the right."
           actions={
             <>
-              <a class="btn btn-sm" href={`/app/teams/${team.slug}/governance`}>
+              <a class="btn btn-sm" href={governance}>
                 Discard
               </a>
               <button class="btn btn-sm btn-primary" type="submit" form="policy-form">
@@ -154,7 +196,12 @@ policyEditorRoutes.get('/app/teams/:slug/policy', async (c) => {
       keys={[{ k: 'Esc', label: 'back to governance' }]}
       keysNote="publishing writes a new version — the old one is archived, never deleted"
     >
-      {error ? <div class="banner banner-error">{error}</div> : null}
+      {error ? (
+        <div class="banner banner-error" id="publish-refused">
+          {error}
+          {refused ? ' Nothing was published, and what you typed is still below.' : ''}
+        </div>
+      ) : null}
 
       <div class="edgrid">
         <form
@@ -171,8 +218,12 @@ policyEditorRoutes.get('/app/teams/:slug/policy', async (c) => {
                 Team-wide — applies to every run
               </option>
               {teamProjects.map((p) => (
-                <option value={p.name} selected={p.name === scopeProject?.name}>
-                  Project: {p.name} — merged on top of team policy
+                <option value={p.id} selected={p.id === scopeProject?.id}>
+                  Project: {p.name}
+                  {teamProjects.some((other) => other.id !== p.id && other.name === p.name)
+                    ? ` — ${p.repositoryIdentity ? 'repository-bound' : p.slug}`
+                    : ''}{' '}
+                  — merged on top of team policy
                 </option>
               ))}
             </select>
@@ -191,7 +242,7 @@ policyEditorRoutes.get('/app/teams/:slug/policy', async (c) => {
               rows={3}
               placeholder="Keep migrations backwards compatible.&#10;Never touch another agent's branch — open a debug session instead."
             >
-              {draft ? listToLines(draft.guidance) : ''}
+              {typed('guidance', draft ? listToLines(draft.guidance) : '')}
             </textarea>
             <span class="help">Plain sentences the agent reads before it plans.</span>
           </div>
@@ -203,10 +254,18 @@ policyEditorRoutes.get('/app/teams/:slug/policy', async (c) => {
               id="pf-deny"
               name="deny"
               rows={3}
-              placeholder="read secret values&#10;push to main"
+              placeholder="read secret values&#10;push to main&#10;content: &quot;Comic Sans&quot; in public/** — not in the design system"
+              aria-describedby="pf-deny-help"
             >
-              {draft ? listToLines(draft.permissions.deny) : ''}
+              {typed('deny', draft ? listToLines(draft.permissions.deny) : '')}
             </textarea>
+            <span class="help" id="pf-deny-help">
+              Sentences the agent must not do. A line shaped{' '}
+              <code>content: "text" in path/** — reason</code> is also checked by the local file
+              guard: an edit that would add that text there is stopped on the agent's machine and
+              shows up under Governance → Policy violations with the agent's name. The text is a
+              plain, case-insensitive match; the content itself never leaves the machine.
+            </span>
           </div>
 
           <div class="field">
@@ -218,7 +277,7 @@ policyEditorRoutes.get('/app/teams/:slug/policy', async (c) => {
               rows={2}
               placeholder="production changes&#10;schema migrations"
             >
-              {draft ? listToLines(draft.permissions.requireApproval) : ''}
+              {typed('requireApproval', draft ? listToLines(draft.permissions.requireApproval) : '')}
             </textarea>
             <span class="help">The agent must ask its human before doing these.</span>
           </div>
@@ -232,7 +291,7 @@ policyEditorRoutes.get('/app/teams/:slug/policy', async (c) => {
               rows={2}
               placeholder="npm test&#10;npm run typecheck"
             >
-              {draft ? listToLines(draft.requiredChecks) : ''}
+              {typed('requiredChecks', draft ? listToLines(draft.requiredChecks) : '')}
             </textarea>
           </div>
 
@@ -245,7 +304,7 @@ policyEditorRoutes.get('/app/teams/:slug/policy', async (c) => {
               rows={2}
               placeholder="db/migrations/**&#10;.github/workflows/**"
             >
-              {draft ? listToLines(draft.protectedPaths) : ''}
+              {typed('protectedPaths', draft ? listToLines(draft.protectedPaths) : '')}
             </textarea>
           </div>
 
@@ -258,7 +317,7 @@ policyEditorRoutes.get('/app/teams/:slug/policy', async (c) => {
               rows={2}
               placeholder="DATABASE_URL&#10;PAYMENTS_WEBHOOK_SECRET"
             >
-              {draft ? listToLines(draft.environment.requiredEnvVarNames) : ''}
+              {typed('requiredEnvVarNames', draft ? listToLines(draft.environment.requiredEnvVarNames) : '')}
             </textarea>
             <span class="help">Names only — STMA never carries a value.</span>
           </div>
@@ -272,7 +331,7 @@ policyEditorRoutes.get('/app/teams/:slug/policy', async (c) => {
               rows={2}
               placeholder="node=22.14.0&#10;python=3.12.4"
             >
-              {draft ? runtimesToLines(draft.environment.runtimes) : ''}
+              {typed('runtimes', draft ? runtimesToLines(draft.environment.runtimes) : '')}
             </textarea>
             <span class="help">
               One <code>name=version</code> per line. Preflight calls a mismatch critical.
@@ -288,7 +347,7 @@ policyEditorRoutes.get('/app/teams/:slug/policy', async (c) => {
               rows={2}
               placeholder="migration&#10;contract"
             >
-              {draft ? listToLines(draft.autonomy.requireApprovalFor) : ''}
+              {typed('requireApprovalFor', draft ? listToLines(draft.autonomy.requireApprovalFor) : '')}
             </textarea>
             <span class="help">
               Claim types that need a human before a run takes write access to them.
@@ -304,7 +363,7 @@ policyEditorRoutes.get('/app/teams/:slug/policy', async (c) => {
                 type="number"
                 name="maxScopeItems"
                 min={0}
-                value={draft?.changeBudget.maxScopeItems || ''}
+                value={typed('maxScopeItems', String(draft?.changeBudget.maxScopeItems || ''))}
                 placeholder="0 = unset"
               />
             </div>
@@ -316,7 +375,7 @@ policyEditorRoutes.get('/app/teams/:slug/policy', async (c) => {
                 type="number"
                 name="maxPaths"
                 min={0}
-                value={draft?.changeBudget.maxPaths || ''}
+                value={typed('maxPaths', String(draft?.changeBudget.maxPaths || ''))}
                 placeholder="0 = unset"
               />
             </div>
@@ -366,5 +425,6 @@ policyEditorRoutes.get('/app/teams/:slug/policy', async (c) => {
         </div>
       </div>
     </AppLayout>,
+    refused ? 422 : 200,
   );
-});
+}

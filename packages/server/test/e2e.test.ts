@@ -1,4 +1,5 @@
 import { mkdtempSync, rmSync } from 'node:fs';
+import { createHmac } from 'node:crypto';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -50,7 +51,7 @@ beforeAll(async () => {
   srv = await startServer(
     loadEnv({
       port: 0,
-      host: 'localhost',
+      host: '127.0.0.1',
       nodeEnv: 'test',
       devMode: true,
       databaseUrl: undefined,
@@ -84,14 +85,15 @@ it('serves landing page and health check', async () => {
   expect(health.status).toBe(200);
   // `version` rides along so a client can tell an old server from a broken one
   // without a second round trip (see test/layers.test.ts).
-  expect(await health.json()).toEqual({ ok: true, version: expect.any(String) });
+  expect(await health.json()).toEqual({ ok: true, version: expect.any(String), buildSha: null });
 
   const docs = await fetch(`${srv.url}/docs`);
   expect(docs.status).toBe(200);
   const docsHtml = await docs.text();
   expect(docsHtml).toContain('How to use STMA');
   expect(docsHtml).toContain('compare_env');
-  expect(docsHtml).toContain('/api/invites/redeem');
+  expect(docsHtml).toContain('Sign in with your own account and review membership there');
+  expect(docsHtml).toContain('Joining installs no MCP connection');
   expect(docsHtml).toContain('Paste-ready prompts');
   expect(docsHtml).toContain('Sort it out between your two agents');
   // Anonymous visitors get the marketing shell (the page is public and shareable).
@@ -109,8 +111,12 @@ it('runs the full flow: login → team → invite → join → token → MCP', a
   // The chrome is the console rail now; what this asserts is unchanged —
   // navigation must still be on the page.
   expect(docsSignedInHtml).toContain('class="rail"');
-  expect(docsSignedInHtml).toContain('href="/app/sessions"');
-  expect(docsSignedInHtml).toContain('href="/app/agents"');
+  // The guide is an account page. Alice has no workspace yet, so its rail offers
+  // the way to make one and her own pages: there is no fleet to map.
+  expect(docsSignedInHtml).toContain('class="scopebar"');
+  expect(docsSignedInHtml).toContain('class="rail-link" href="/app"');
+  expect(docsSignedInHtml).toContain('href="/app/tokens"');
+  expect(docsSignedInHtml).toContain('no workspace yet');
   expect(docsSignedInHtml).toContain('How to use STMA');
   expect(docsSignedInHtml).not.toContain('class="site-head"');
 
@@ -603,7 +609,8 @@ it('runs the full flow: login → team → invite → join → token → MCP', a
   expect(cliInvJson.result.isError).toBeFalsy();
   const cliInv = JSON.parse(cliInvJson.result.content[0].text);
   expect(cliInv.code).toBeTruthy();
-  expect(cliInv.teammateInstructions).toContain('/api/invites/redeem');
+  expect(cliInv.teammateInstructions).toContain('let the user finish sign-in and membership consent');
+  expect(cliInv.teammateInstructions).not.toContain('/api/invites/redeem');
 
   const redeem = await fetch(`${srv.url}/api/invites/redeem`, {
     method: 'POST',
@@ -616,6 +623,11 @@ it('runs the full flow: login → team → invite → join → token → MCP', a
   expect(redeemJson.email).toBe('dave@example.com');
   expect(redeemJson.token).toMatch(/^stma_[0-9a-f]{40}$/);
   expect(redeemJson.team.slug).toBe('acme-dev');
+  expect(redeem.headers.get('cache-control')).toBe('no-store');
+  expect(redeemJson.connect.claudeCode).not.toContain('claude mcp add');
+  expect(redeemJson.connect.claudeCode).not.toContain(redeemJson.token);
+  expect(JSON.stringify(redeemJson.connect.cursor)).not.toContain(redeemJson.token);
+  expect(JSON.stringify(redeemJson).split(redeemJson.token)).toHaveLength(2);
 
   const daveWho = await rpc(
     { jsonrpc: '2.0', id: 41, method: 'tools/call', params: { name: 'whoami', arguments: {} } },
@@ -691,16 +703,21 @@ it('runs the full flow: login → team → invite → join → token → MCP', a
   });
   expect(hookPost.status).toBe(200);
 
+  const ghBody = JSON.stringify({
+    ref: 'refs/heads/main',
+    pusher: { name: 'alice' },
+    repository: { name: 'demo' },
+    commits: [{}, {}],
+    head_commit: { message: 'feat: new thing\n\ndetails' },
+  });
   const ghPost = await fetch(`${srv.url}/api/hooks/github/${hookTok}`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', 'x-github-event': 'push' },
-    body: JSON.stringify({
-      ref: 'refs/heads/main',
-      pusher: { name: 'alice' },
-      repository: { name: 'demo' },
-      commits: [{}, {}],
-      head_commit: { message: 'feat: new thing\n\ndetails' },
-    }),
+    headers: {
+      'content-type': 'application/json',
+      'x-github-event': 'push',
+      'x-hub-signature-256': `sha256=${createHmac('sha256', hookTok!).update(ghBody).digest('hex')}`,
+    },
+    body: ghBody,
   });
   expect(ghPost.status).toBe(200);
 

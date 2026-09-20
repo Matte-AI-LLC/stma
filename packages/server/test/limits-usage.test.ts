@@ -1,13 +1,31 @@
+import { randomUUID } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, expect, it } from 'vitest';
 import { eq } from 'drizzle-orm';
-import { teams, users } from '../src/db/schema';
+import {
+  agentEvents,
+  agentInstallations,
+  agentRuns,
+  debugSessions,
+  handoffs,
+  launchAttempts,
+  teams,
+  users,
+} from '../src/db/schema';
 import { hitCounter, readCounter, sweepCounters } from '../src/lib/counters';
 import { PLANS } from '../src/lib/entitlements';
 import { DAY_MS } from '../src/lib/counters';
-import { activationFunnel, teamUsage, usageWindows } from '../src/lib/usage';
+import {
+  activationFunnel,
+  calculateContribution,
+  ECONOMIC_SOURCE_COVERAGE,
+  economicObservation,
+  PILOT_OBSERVATION_WEEKS,
+  teamUsage,
+  usageWindows,
+} from '../src/lib/usage';
 import { loadEnv } from '../src/env';
 import { startServer, type StartedServer } from '../src/server';
 
@@ -79,7 +97,7 @@ beforeAll(async () => {
   srv = await startServer(
     loadEnv({
       port: 0,
-      host: 'localhost',
+      host: '127.0.0.1',
       nodeEnv: 'test',
       devMode: true,
       databaseUrl: undefined,
@@ -230,4 +248,232 @@ it('shows per-team usage with the same call count the quota enforces', async () 
   // reads that very counter — the two must not disagree.
   expect(limits.callsToday).toBeGreaterThanOrEqual(PLANS.free.maxToolCallsPerDay);
   expect(limits.lastActiveAt).toBeInstanceOf(Date);
+});
+
+it('reports retained value signals and keeps measured, estimated and missing run cost apart', async () => {
+  const db = srv.db;
+  const team = (await db.select().from(teams)).find((row) => row.slug === 'limits')!;
+  const owner = (await db.select().from(users)).find((row) => row.username === 'quinn')!;
+  const [installation] = await db
+    .insert(agentInstallations)
+    .values({
+      userId: owner.id,
+      name: 'economics-fixture',
+      deviceLabel: 'economics-fixture',
+      clientType: 'generic',
+      deviceFingerprint: randomUUID(),
+    })
+    .returning();
+  const now = new Date();
+  const [measured, estimated, unreported] = await db
+    .insert(agentRuns)
+    .values([
+      {
+        teamId: team.id,
+        installationId: installation!.id,
+        status: 'completed',
+        costCents: 125,
+        costSource: 'measured',
+        endedAt: now,
+        lastHeartbeatAt: now,
+      },
+      {
+        teamId: team.id,
+        installationId: installation!.id,
+        status: 'completed',
+        costCents: 475,
+        costSource: 'estimate',
+        endedAt: now,
+        lastHeartbeatAt: now,
+      },
+      {
+        teamId: team.id,
+        installationId: installation!.id,
+        status: 'completed',
+        endedAt: now,
+        lastHeartbeatAt: now,
+      },
+    ])
+    .returning();
+  await db.insert(agentEvents).values([
+    { runId: measured!.id, type: 'pr_opened', createdAt: now },
+    // Several events on one run remain one review-signal run.
+    { runId: measured!.id, type: 'pr_merged', createdAt: now },
+    { runId: measured!.id, type: 'ci_completed', detail: { conclusion: 'success' }, createdAt: now },
+    { runId: estimated!.id, type: 'pr_opened', createdAt: now },
+  ]);
+  await db.insert(launchAttempts).values({
+    teamId: team.id,
+    userId: owner.id,
+    exchangeConfirmedAt: new Date(now.getTime() - 1_000),
+    firstRealResultAt: now,
+  });
+  const sessions = await db
+    .insert(debugSessions)
+    .values([
+      { teamId: team.id, openedBy: owner.id, title: 'Economic handoff one' },
+      { teamId: team.id, openedBy: owner.id, title: 'Economic handoff two' },
+    ])
+    .returning();
+  await db.insert(handoffs).values([
+    {
+      sessionId: sessions[0]!.id,
+      offeredBy: owner.id,
+      state: 'completed',
+      resumedAt: now,
+      completedAt: now,
+      updatedAt: now,
+    },
+    {
+      sessionId: sessions[1]!.id,
+      offeredBy: owner.id,
+      state: 'in_progress',
+      resumedAt: now,
+      updatedAt: now,
+    },
+  ]);
+
+  const report = await economicObservation(db, 400);
+  expect(report.days, 'operator windows are bounded').toBe(90);
+  expect(report.firstRealResults).toMatchObject({ reports: 1, teams: 1 });
+  expect(report.handoffs).toMatchObject({ offered: 2, resumed: 2, completed: 1, repeatTeams: 1 });
+  expect(report.reviewSignals).toMatchObject({ runs: 2, mergedRuns: 1, ciRuns: 1, repeatTeams: 1 });
+  expect(report.runCosts).toEqual({
+    measuredRuns: 1,
+    measuredCents: 125,
+    estimatedRuns: 1,
+    estimatedCents: 475,
+    unreportedRuns: 1,
+  });
+  expect(report.firstRealResults.latestAt).toBeInstanceOf(Date);
+  expect(report.handoffs.latestAt).toBeInstanceOf(Date);
+  expect(report.reviewSignals.latestAt).toBeInstanceOf(Date);
+  expect(ECONOMIC_SOURCE_COVERAGE.filter((row) => row.status === 'unknown').map((row) => row.key))
+    .toEqual(['support', 'direct_service', 'managed_job']);
+  expect(PILOT_OBSERVATION_WEEKS.map((row) => row.week)).toEqual([1, 2, 3, 4]);
+  expect(unreported!.costCents).toBeNull();
+});
+
+const estimated = (cents: number) => ({ cents, source: 'estimated' as const });
+const measured = (cents: number) => ({ cents, source: 'measured' as const });
+const unknown = () => ({ cents: null, source: 'unknown' as const });
+
+it('calculates the small pilot case without inventing a managed-usage line', () => {
+  const result = calculateContribution({
+    cash: { subscriptionCollected: estimated(1_900), managedUsageCollected: estimated(0) },
+    coreSubscriptionRevenue: estimated(1_900),
+    consumption: {
+      includedManagedUsageValue: estimated(0),
+      purchasedManagedUsageRevenue: estimated(0),
+    },
+    expenses: [
+      { id: 'small-direct', lane: 'core', kind: 'direct_service', amount: estimated(300) },
+      {
+        id: 'small-support',
+        lane: 'core',
+        kind: 'support',
+        minutes: { value: 10, source: 'estimated' },
+        hourlyCostCents: estimated(6_000),
+      },
+    ],
+  });
+  expect(result.cash.totalCollected).toEqual(estimated(1_900));
+  expect(result.core.contribution).toEqual(estimated(600));
+  expect(result.managed.contribution).toEqual(estimated(0));
+  expect(result.totalContribution).toEqual(estimated(600));
+
+  const lowerPrice = calculateContribution({
+    cash: { subscriptionCollected: estimated(900), managedUsageCollected: estimated(0) },
+    coreSubscriptionRevenue: estimated(900),
+    consumption: {
+      includedManagedUsageValue: estimated(0),
+      purchasedManagedUsageRevenue: estimated(0),
+    },
+    expenses: [
+      { id: 'small-low-direct', lane: 'core', kind: 'direct_service', amount: estimated(300) },
+      {
+        id: 'small-low-support',
+        lane: 'core',
+        kind: 'support',
+        minutes: { value: 10, source: 'estimated' },
+        hourlyCostCents: estimated(6_000),
+      },
+    ],
+  });
+  expect(lowerPrice.totalContribution).toEqual(estimated(-400));
+});
+
+it('calculates the heavy pilot case with cash and included consumption kept separate', () => {
+  const result = calculateContribution({
+    cash: {
+      subscriptionCollected: estimated(4_900),
+      managedUsageCollected: estimated(2_000),
+    },
+    coreSubscriptionRevenue: estimated(4_900),
+    consumption: {
+      includedManagedUsageValue: estimated(500),
+      purchasedManagedUsageRevenue: estimated(2_000),
+    },
+    expenses: [
+      { id: 'heavy-services', lane: 'core', kind: 'direct_service', amount: estimated(300) },
+      { id: 'heavy-core-collection', lane: 'core', kind: 'collection', amount: estimated(190) },
+      {
+        id: 'heavy-support',
+        lane: 'core',
+        kind: 'support',
+        minutes: { value: 10, source: 'estimated' },
+        hourlyCostCents: estimated(6_000),
+      },
+      // Allocate the provider invoice once: the cost behind included usage
+      // belongs to core; only purchased consumption belongs to managed.
+      { id: 'heavy-included-jobs', lane: 'core', kind: 'managed_job', amount: estimated(100) },
+      { id: 'heavy-managed-collection', lane: 'managed', kind: 'collection', amount: estimated(77) },
+      { id: 'heavy-purchased-jobs', lane: 'managed', kind: 'managed_job', amount: estimated(400) },
+    ],
+  });
+
+  expect(result.cash.totalCollected).toEqual(estimated(6_900));
+  expect(result.consumption.totalManagedUsageValue).toEqual(estimated(2_500));
+  // The included $5 remains consumption. It is not added to $49 + $20 revenue.
+  expect(result.core.revenue.cents! + result.managed.revenue.cents!).toBe(6_900);
+  expect(result.core.contribution).toEqual(estimated(3_310));
+  expect(result.managed.contribution).toEqual(estimated(1_523));
+  expect(result.totalContribution).toEqual(estimated(4_833));
+});
+
+it('refuses a shared expense twice and keeps missing cost inputs unknown', () => {
+  const base = {
+    cash: { subscriptionCollected: measured(1_900), managedUsageCollected: measured(0) },
+    coreSubscriptionRevenue: measured(1_900),
+    consumption: {
+      includedManagedUsageValue: measured(0),
+      purchasedManagedUsageRevenue: measured(0),
+    },
+  };
+  expect(() =>
+    calculateContribution({
+      ...base,
+      expenses: [
+        { id: 'shared-bill', lane: 'core', kind: 'direct_service', amount: measured(300) },
+        { id: 'shared-bill', lane: 'managed', kind: 'managed_job', amount: measured(300) },
+      ],
+    }),
+  ).toThrow('allocated more than once');
+
+  const result = calculateContribution({
+    ...base,
+    expenses: [
+      { id: 'support-time', lane: 'core', kind: 'support', minutes: { value: null, source: 'unknown' }, hourlyCostCents: unknown() },
+      { id: 'direct-service', lane: 'core', kind: 'direct_service', amount: unknown() },
+      { id: 'optional-managed-job', lane: 'managed', kind: 'managed_job', amount: unknown() },
+    ],
+  });
+  expect(result.core.contribution).toEqual(unknown());
+  expect(result.managed.contribution).toEqual(unknown());
+  expect(result.totalContribution).toEqual(unknown());
+  expect(result.unknownExpenseIds).toEqual([
+    'support-time',
+    'direct-service',
+    'optional-managed-job',
+  ]);
 });

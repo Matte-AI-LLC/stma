@@ -93,7 +93,7 @@ export function serveEnv(options: ServeOptions): NodeJS.ProcessEnv {
 }
 
 export function connectSnippet(base: string): string {
-  return `claude mcp add --scope user --transport http stma ${base}/mcp --header "Authorization: Bearer stma_YOUR_TOKEN"`;
+  return `Open ${base}/app/tokens, copy the Codex or Claude setup request into that agent, then approve its agent, machine and exact scope in the STMA browser page. The request uses the client's native MCP command for ${base}/mcp and carries no credential.`;
 }
 
 async function waitForHealth(base: string, child: ChildProcess): Promise<boolean> {
@@ -150,8 +150,8 @@ export async function serve(options: ServeOptions): Promise<void> {
       `  STMA is running at ${base}`,
       '',
       `  1. Create your account   ${base}/signup`,
-      `  2. Create a token        ${base}/app/tokens`,
-      '  3. Connect your agent:',
+      `  2. Open Agent connections ${base}/app/tokens`,
+      '  3. Connect your agent through client-managed MCP OAuth:',
       '',
       `     ${connectSnippet(base)}`,
       '',

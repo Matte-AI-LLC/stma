@@ -1,3 +1,4 @@
+import { membershipUser } from '../lib/securityHooks';
 /**
  * `GET /app/stream` — the server-sent-events channel the console's watch pages
  * listen on instead of reloading on a timer.
@@ -33,7 +34,7 @@ streamRoutes.get('/app/stream', async (c) => {
     .get('db')
     .select({ teamId: memberships.teamId })
     .from(memberships)
-    .where(eq(memberships.userId, user.id));
+    .where(membershipUser(user.id));
   const teams = new Set(rows.map((r) => r.teamId));
 
   return streamSSE(c, async (stream) => {
@@ -80,6 +81,13 @@ streamRoutes.get('/app/stream', async (c) => {
           if (timer) clearTimeout(timer);
         }
         if (aborted) break;
+        // Do not retain even activity timing after membership or SSO proof loss.
+        const current = await c
+          .get('db')
+          .select({ teamId: memberships.teamId })
+          .from(memberships)
+          .where(membershipUser(user.id));
+        if (current.length !== teams.size || current.some((row) => !teams.has(row.teamId))) break;
         if (queue.length === 0) {
           await stream.writeSSE({ event: 'ping', data: String(Date.now()) });
           continue;

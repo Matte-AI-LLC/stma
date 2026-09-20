@@ -1,3 +1,4 @@
+import { membershipUser } from '../lib/securityHooks';
 import {
   compareSnapshots,
   snapshotSchema,
@@ -5,15 +6,18 @@ import {
   type DiffEntry,
 } from '@bridge/shared';
 import { and, desc, eq } from 'drizzle-orm';
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import type { Db } from '../db';
 import { memberships, projects, snapshots, teams, users } from '../db/schema';
 import { loginRedirect } from '../auth/session';
 import { projectForTeam } from '../domain/access';
+import { activeBaselines } from '../domain/environments';
 import { devicesByMember, type DeviceSummary } from '../lib/devices';
 import { timeAgo } from '../lib/format';
+import { snapshotProjectLabel, snapshotsShareProject } from '../lib/projects';
+import { projectInPath, scopedProjectParam, sectionHref } from '../lib/scope';
 import type { AppEnv } from '../types';
-import { PageHead, ProjectScope } from '../ui/Console';
+import { PageHead, ProjectScope, scopedTrail } from '../ui/Console';
 import { AppLayout } from '../ui/Layout';
 
 export const compareRoutes = new Hono<AppEnv>();
@@ -36,7 +40,7 @@ async function teamForMember(db: Db, slug: string, userId: string) {
     .select({ team: teams, role: memberships.role })
     .from(teams)
     .innerJoin(memberships, eq(memberships.teamId, teams.id))
-    .where(and(eq(teams.slug, slug), eq(memberships.userId, userId)))
+    .where(and(eq(teams.slug, slug), membershipUser(userId)))
     .limit(1);
   return rows[0];
 }
@@ -93,11 +97,18 @@ function cellValue(section: string, e: DiffEntry, side: 'a' | 'b'): string {
 const isHot = (e: DiffEntry, side: 'a' | 'b'): boolean =>
   e.kind === 'mismatch' ? side === 'b' : e.kind === 'only_a' ? side === 'b' : side === 'a';
 
-compareRoutes.get('/app/teams/:slug/compare', async (c) => {
+/**
+ * One page, two addresses: the workspace's environments and one project's.
+ *
+ * `/app/teams/:slug/projects/:project/environments` is what the rail links to —
+ * the page has been called Environments since it stopped being one diff of two
+ * machines. `/compare?project=…` is the address it replaces and still answers.
+ */
+const environmentsPage = async (c: Context<AppEnv>) => {
   const user = c.get('user');
   if (!user) return loginRedirect(c);
   const db = c.get('db');
-  const found = await teamForMember(db, c.req.param('slug'), user.id);
+  const found = await teamForMember(db, c.req.param('slug') ?? '', user.id);
   if (!found) {
     return c.html(
       <AppLayout user={user} active="environments" title="Not found">
@@ -114,12 +125,18 @@ compareRoutes.get('/app/teams/:slug/compare', async (c) => {
     );
   }
   const { team } = found;
-  const projectQuery = (c.req.query('project') ?? '').trim();
+  // Named in the path the project is the page's identity, so a spelling that
+  // matches nothing is a wrong address; as `?project=` it stays a filter.
+  const projectQuery = scopedProjectParam(c);
+  const inPath = projectInPath(c);
   const scopeProject = projectQuery
     ? await projectForTeam(db, team.id, projectQuery)
     : undefined;
+  if (inPath && !scopeProject) return c.notFound();
+  /** This page's own address: swapping sides and picking machines stay where the reader is. */
+  const here = sectionHref(team.slug, inPath ? scopeProject!.slug : null, 'environments');
   const teamProjects = await db
-    .select({ name: projects.name })
+    .select({ id: projects.id, name: projects.name, slug: projects.slug, repositoryIdentity: projects.repositoryIdentity })
     .from(projects)
     .where(eq(projects.teamId, team.id))
     .orderBy(projects.name)
@@ -131,6 +148,17 @@ compareRoutes.get('/app/teams/:slug/compare', async (c) => {
     .where(eq(memberships.teamId, team.id))
     .orderBy(users.username);
   const devicesByUser = await devicesByMember(db, team.id);
+  // Where the baseline on this page comes from.
+  //
+  // Policy, Knowledge and Delivery each say whether a rule is the workspace's or
+  // the project's; a baseline never inherits at all — `activeBaselines` joins
+  // `projects` on a NOT NULL column, so there is no workspace-wide row to fall
+  // back to — and this page said nothing, which reads as the same silence a page
+  // with an inherited rule would produce. It is the one scope question a reader
+  // here actually has: preflight can only report what a baseline claims, so a
+  // project without one tells its agents nothing about their machines.
+  const baselines = await activeBaselines(db, team.id, scopeProject ? 1 : 25, scopeProject?.id);
+  const projectsWithBaseline = new Set(baselines.map((row) => row.baseline.projectId));
 
   // One option per member *machine*, so a solo developer can diff their own two.
   const options: Array<Side & { label: string }> = [];
@@ -198,7 +226,11 @@ compareRoutes.get('/app/teams/:slug/compare', async (c) => {
         }
       }
     }
-    if (aSnap && bSnap) {
+    if (aSnap && bSnap && !scopeProject && !snapshotsShareProject(aSnap, bSnap)) {
+      problems.push(
+        `These machines' newest snapshots belong to different projects (${snapshotProjectLabel(aSnap)} and ${snapshotProjectLabel(bSnap)}). Pick one project above before comparing them.`,
+      );
+    } else if (aSnap && bSnap) {
       const aParsed = snapshotSchema.safeParse(aSnap.data);
       const bParsed = snapshotSchema.safeParse(bSnap.data);
       if (!aParsed.success || !bParsed.success) {
@@ -225,10 +257,12 @@ compareRoutes.get('/app/teams/:slug/compare', async (c) => {
           <span class="chip">
             team <b>{team.slug}</b>
           </span>
+          {/* Posts to the workspace address: its options carry project ids, and a
+              GET form can only write a query string. Links carry the path form. */}
           <ProjectScope
-            path={`/app/teams/${team.slug}/compare`}
+            path={sectionHref(team.slug, null, 'environments')}
             projects={teamProjects}
-            current={scopeProject?.name ?? null}
+            current={scopeProject?.id ?? null}
             allLabel="Any project — newest snapshot"
             extra={{ a: aValue, b: bValue }}
           />
@@ -236,12 +270,12 @@ compareRoutes.get('/app/teams/:slug/compare', async (c) => {
       }
       head={
         <PageHead
-          crumb={`/ ${team.slug} / environments`}
+          trail={scopedTrail({ team, project: scopeProject }, 'Environments')}
           title="Compare environments"
           sub={
             scopeProject
               ? `Two machines, one mechanical diff — comparing each side's newest ${scopeProject.name} snapshot.`
-              : 'Two machines, one mechanical diff — the same comparison your agents get from compare_env.'
+              : 'Two machines, one mechanical diff — their newest snapshots must belong to the same project.'
           }
           actions={
             <>
@@ -251,26 +285,37 @@ compareRoutes.get('/app/teams/:slug/compare', async (c) => {
               {bSide ? (
                 <a
                   class="btn btn-sm"
-                  href={`/app/teams/${team.slug}/compare?a=${encodeURIComponent(
+                  href={`${here}?a=${encodeURIComponent(
                     sideValue(bSide),
                   )}&b=${encodeURIComponent(sideValue(aSide))}${
-                    scopeProject ? `&project=${encodeURIComponent(scopeProject.name)}` : ''
+                    scopeProject && !inPath ? `&project=${encodeURIComponent(scopeProject.name)}` : ''
                   }`}
                 >
                   ⇄ Swap sides
                 </a>
               ) : null}
-              <a class="btn btn-sm" href={`/app/teams/${team.slug}`}>
-                Back to {team.slug}
-              </a>
+              {/* Back to where this page was opened from: a project's environments
+                  belong to the project, and its trail is the only other way there. */}
+              {scopeProject ? (
+                <a
+                  class="btn btn-sm"
+                  href={`/app/teams/${team.slug}/projects/${encodeURIComponent(scopeProject.slug)}`}
+                >
+                  Back to {scopeProject.name}
+                </a>
+              ) : (
+                <a class="btn btn-sm" href={`/app/teams/${team.slug}`}>
+                  Back to {team.slug}
+                </a>
+              )}
             </>
           }
         />
       }
     >
 
-      <form class="card card-pad compare-pick" method="get" action={`/app/teams/${team.slug}/compare`}>
-        {scopeProject ? <input type="hidden" name="project" value={scopeProject.name} /> : null}
+      <form class="card card-pad compare-pick" method="get" action={here}>
+        {scopeProject && !inPath ? <input type="hidden" name="project" value={scopeProject.name} /> : null}
         <div class="field">
           <label>Side A</label>
           <select class="in" name="a">
@@ -300,6 +345,47 @@ compareRoutes.get('/app/teams/:slug/compare', async (c) => {
           <span class="mono">push_snapshot</span>.
         </p>
       </form>
+
+      <div class="card card-pad" style="margin-top:12px;display:flex;flex-direction:column;gap:8px">
+        <div class="row" style="justify-content:space-between;gap:12px;align-items:flex-start">
+          <div>
+            <div class="card-title">{scopeProject ? `Baseline for ${scopeProject.name}` : 'Baselines'}</div>
+            <div class="card-note">
+              A baseline belongs to one project. There is no workspace-wide one to fall back on, so
+              a project without its own is a project whose agents are told nothing about their
+              machines.
+            </div>
+          </div>
+          <a class="btn btn-sm" href={sectionHref(team.slug, scopeProject?.slug, 'governance')}>
+            {scopeProject && baselines.length === 0 ? 'Record one' : 'Update baseline'}
+          </a>
+        </div>
+        {baselines.length === 0 ? (
+          <p class="m0 small muted">
+            {scopeProject
+              ? `No baseline recorded for ${scopeProject.name}. Promote one from a snapshot this team already pushed — from the machine that works, not the one being debugged.`
+              : 'No project in this workspace has a baseline yet.'}
+          </p>
+        ) : (
+          <>
+            {baselines.map((row) => (
+              <div class="factrow">
+                <span class="n">·</span>
+                <span style="flex:1">
+                  <b>{row.projectName}</b> only · recorded by {row.author ?? 'a deleted account'}{' '}
+                  {timeAgo(row.baseline.createdAt)}
+                </span>
+              </div>
+            ))}
+            {!scopeProject && teamProjects.length > projectsWithBaseline.size ? (
+              <p class="m0 small muted">
+                {teamProjects.length - projectsWithBaseline.size} other project
+                {teamProjects.length - projectsWithBaseline.size === 1 ? ' has' : 's have'} none.
+              </p>
+            ) : null}
+          </>
+        )}
+      </div>
 
       {problems.map((p) => (
         <div class="banner banner-warn">
@@ -398,4 +484,7 @@ compareRoutes.get('/app/teams/:slug/compare', async (c) => {
       ) : null}
     </AppLayout>,
   );
-});
+};
+
+compareRoutes.get('/app/teams/:slug/compare', environmentsPage);
+compareRoutes.get('/app/teams/:slug/projects/:project/environments', environmentsPage);

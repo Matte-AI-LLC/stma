@@ -1,7 +1,8 @@
 // Creates the throwaway org the multi-machine lab runs against: an account, a
-// team, a personal token, a project policy and an environment baseline. The
-// baseline deliberately records a lockfile hash that no runner will match, so
-// preflight has something true to say on every machine.
+// team, its explicit Team evaluation, a personal token, a project policy and
+// an environment baseline. The baseline deliberately records a lockfile hash
+// that no runner will match, so preflight has something true to say on every
+// machine.
 
 import { base, form, jar, labIdentity, mask, mintToken, output } from './lab-common.mjs';
 
@@ -20,6 +21,16 @@ if (signup.status !== 302) {
 
 const created = await form(session, '/app/teams', { name: `Lab ${stamp}` });
 if (created.status !== 302) throw new Error(`team create failed: ${created.status}`);
+
+// Hosted workspaces begin on Free, where governance is deliberately unavailable.
+// Exercise the same explicit, no-card evaluation action a real owner uses; never
+// mutate the stored plan or add a lab-only entitlement bypass.
+const evaluation = await form(session, `/app/teams/${team}/evaluation`, {});
+if (evaluation.status !== 303) {
+  throw new Error(
+    `Team evaluation failed (${evaluation.status}): ${await evaluation.text()}`,
+  );
+}
 
 const token = await mintToken(session, 'lab-bootstrap');
 

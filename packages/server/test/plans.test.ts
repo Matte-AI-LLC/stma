@@ -5,7 +5,7 @@ import { eq } from 'drizzle-orm';
 import { afterAll, beforeAll, expect, it } from 'vitest';
 import { teams } from '../src/db/schema';
 import { loadEnv } from '../src/env';
-import { PLANS, planLimits } from '../src/lib/entitlements';
+import { effectivePlanLabel, PLANS, planLimits } from '../src/lib/entitlements';
 import { startServer, type StartedServer } from '../src/server';
 
 /**
@@ -93,7 +93,7 @@ beforeAll(async () => {
   ownDir = mkdtempSync(path.join(tmpdir(), 'stma-plans-own-'));
   const base = {
     port: 0,
-    host: 'localhost',
+    host: '127.0.0.1',
     nodeEnv: 'test' as const,
     devMode: true,
     databaseUrl: undefined,
@@ -215,7 +215,7 @@ it('prints demo logins only from configuration, and only when configured', async
   const demoSrv = await startServer(
     loadEnv({
       port: 0,
-      host: 'localhost',
+      host: '127.0.0.1',
       nodeEnv: 'test',
       devMode: false,
       databaseUrl: undefined,
@@ -261,6 +261,25 @@ it('does not send a free team at a tool that will refuse it', async () => {
   expect(paid).not.toContain('read-only on your plan');
 });
 
+it('labels the effective evaluation instead of the persisted free plan', () => {
+  const now = new Date('2026-09-04T12:00:00.000Z');
+  expect(
+    effectivePlanLabel(
+      'free',
+      { evaluationEndsAt: '2026-09-06T11:59:59.000Z', readOnly: false },
+      now,
+    ),
+  ).toBe('Team evaluation · 2 days left');
+  expect(
+    effectivePlanLabel(
+      'free',
+      { evaluationEndsAt: '2026-09-04T11:59:59.000Z', readOnly: true },
+      now,
+    ),
+  ).toBe('Team evaluation ended');
+  expect(effectivePlanLabel('solo', {})).toBe('solo');
+});
+
 it('gates governance at the same line for a person as for an agent', async () => {
   // get_policy and check_environment were gated when the plan reached the
   // product; the page was not. An agent refused the rulebook while its human
@@ -291,4 +310,3 @@ it('gates governance at the same line for a person as for an agent', async () =>
   const paid = await fetch(`${hostedSrv.url}/app/teams/flush/governance`, { headers: k.header() });
   expect(paid.status).toBe(200);
 });
-

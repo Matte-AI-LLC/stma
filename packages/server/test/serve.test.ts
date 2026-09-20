@@ -42,8 +42,8 @@ it('names localhost in the connect snippet rather than a bind address', () => {
   const env = serveEnv({ port: 8080, host: '0.0.0.0', dataDir: '/tmp/x' });
   // 0.0.0.0 is a thing to listen on, not a thing to connect to.
   expect(env.BASE_URL).toBe('http://localhost:8080');
-  expect(connectSnippet('http://localhost:8080')).toContain('http://localhost:8080/mcp');
-  expect(connectSnippet('http://localhost:8080')).toContain('Authorization: Bearer stma_YOUR_TOKEN');
+  expect(connectSnippet('http://localhost:8080')).toContain('http://localhost:8080/app/tokens');
+  expect(connectSnippet('http://localhost:8080')).not.toContain('Authorization');
 });
 
 it('finds the server that ships with this checkout', () => {

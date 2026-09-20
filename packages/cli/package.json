@@ -1,6 +1,6 @@
 {
   "name": "@matteai/stma",
-  "version": "0.11.2",
+  "version": "0.15.0",
   "description": "STMA (Speak to my Agent) CLI — local-first agent fleet control plane: run lifecycle, work claims, policy publish/pull, environment baseline/preflight, and native lifecycle adapters for Claude Code, Codex and Cursor",
   "type": "module",
   "license": "Elastic-2.0",
@@ -42,10 +42,11 @@
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
+    "smol-toml": "1.8.0",
     "@bridge/shared": "*",
-    "@types/node": "^22.10.0",
+    "@types/node": "^22.20.2",
     "tsup": "^8.3.5",
-    "tsx": "^4.19.2",
+    "tsx": "^4.23.13",
     "typescript": "^7.0.2"
   },
   "bugs": {

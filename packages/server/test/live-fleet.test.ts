@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -90,7 +91,7 @@ beforeAll(async () => {
   srv = await startServer(
     loadEnv({
       port: 0,
-      host: 'localhost',
+      host: '127.0.0.1',
       nodeEnv: 'test',
       devMode: true,
       databaseUrl: undefined,
@@ -240,11 +241,36 @@ it('treats one person\'s parallel attempts as a fan-out, not a collision', async
   const page = await (await fetch(`${srv.url}/app/agents`, { headers: aliceCookie })).text();
   expect(page).toContain('attempt 1 of 3');
   expect(page).toContain('attempt 3 of 3');
+  const attentionWhileLive = await (
+    await fetch(`${srv.url}/app/teams/live/attention`, { headers: aliceCookie })
+  ).text();
+  expect(attentionWhileLive).toContain('Recorded scope overlap');
+  expect(attentionWhileLive).toContain(`/app/agents?run=${other.data.runId}`);
 
   for (const run of [first, second, third]) {
     await call('finish_run', { run_id: run.data.runId }, alice);
   }
   await call('finish_run', { run_id: other.data.runId }, bob);
+  const attentionAfterFinish = await (
+    await fetch(`${srv.url}/app/teams/live/attention`, { headers: aliceCookie })
+  ).text();
+  expect(attentionAfterFinish).not.toContain('Recorded scope overlap');
+  expect(attentionAfterFinish).not.toContain(`/app/agents?run=${other.data.runId}`);
+
+  // The newest ended run of an agent stays on the map for a day, so its exact link
+  // opens that run and says it ended. It is still never swapped for another one.
+  const remembered = await (
+    await fetch(`${srv.url}/app/agents?run=${other.data.runId}`, { headers: aliceCookie })
+  ).text();
+  expect(remembered).toContain('This run ended');
+  expect(remembered).not.toContain('That exact run is no longer active');
+  // A run the map does not hold — long gone, or never this member's to see — is
+  // still answered with nothing rather than with somebody else's run.
+  const staleDeepLink = await (
+    await fetch(`${srv.url}/app/agents?run=${randomUUID()}`, { headers: aliceCookie })
+  ).text();
+  expect(staleDeepLink).toContain('That exact run is no longer active');
+  expect(staleDeepLink).toContain('STMA did not substitute another agent');
 });
 
 it('still warns when one person runs two agents in the SAME worktree', async () => {
@@ -255,6 +281,7 @@ it('still warns when one person runs two agents in the SAME worktree', async () 
       project: 'storefront',
       task: 'SHOP-7',
       worktree: '/tmp/shop-main',
+      attempt_group: 'SHOP-7-fanout',
       agent: 'a1',
       scope: [{ type: 'migration', key: 'orders-table' }],
     },
@@ -267,6 +294,7 @@ it('still warns when one person runs two agents in the SAME worktree', async () 
       project: 'storefront',
       task: 'SHOP-7',
       worktree: '/tmp/shop-main',
+      attempt_group: 'SHOP-7-fanout',
       agent: 'a2',
       scope: [{ type: 'migration', key: 'orders-table' }],
     },

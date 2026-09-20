@@ -1,17 +1,35 @@
+import { AGENT_CLIENT_TYPES, AGENT_ROLES, type AgentClientType, type AgentRole } from '@bridge/shared';
 import { createHmac, timingSafeEqual } from 'node:crypto';
-import { and, count, eq, gt, sql } from 'drizzle-orm';
+import { and, eq, gt } from 'drizzle-orm';
 import { Hono } from 'hono';
 import type { Context } from 'hono';
-import { invites, memberships, messages, teams, tokens, users } from '../db/schema';
-import { generatePat } from '../auth/pat';
-import { recordRunOutcome } from '../domain/agents';
-import { hashPassword, verifyPassword } from '../lib/crypto';
+import { invites, messages, repositoryBindings, teams, tokens, users } from '../db/schema';
+import { z } from 'zod/v3';
+import { generatePat, mcpAuth } from '../auth/pat';
+import {
+  clearLoginFailures,
+  LOGIN_FAIL_WINDOW_MS,
+  loginGate,
+  lockedMessage,
+  recordLoginFailure,
+} from '../auth/attempts';
+import { failedSignInsEmail, sendMail } from '../lib/mailer';
+import { recordRunOutcome, revokeAgentInstallation } from '../domain/agents';
+import { recordProviderObservation } from '../domain/providerEvidence';
+import { observeAdoBuild } from '../domain/adoEvidence';
+import { claimInviteMembership } from '../domain/invites';
+import {
+  createAgentEnrollment,
+  previewAgentEnrollment,
+  redeemAgentEnrollment,
+} from '../domain/enrollments';
+import { burnPasswordCheck, hashPassword, verifyPassword } from '../lib/crypto';
 import { emailIsFree, isEmail, maskEmail, normalizeEmail, usernameFromEmail } from '../lib/email';
-import { planLimits } from '../lib/entitlements';
 import { logLine } from '../lib/log';
 import { notifyTeam } from '../lib/notify';
 import { notifyAnnouncement, notifyTeamJoined } from '../lib/notifications';
 import { redactSecrets } from '../lib/redact';
+import { normalizeDeviceLabel } from '../lib/devices';
 import { getAnnouncementsSession } from '../lib/sessions';
 import { track } from '../lib/track';
 import type { AppEnv } from '../types';
@@ -19,15 +37,185 @@ import type { AppEnv } from '../types';
 export const apiRoutes = new Hono<AppEnv>();
 
 /**
- * Terminal-first onboarding: redeem an invite code with an email+password and
- * receive a personal access token — no browser involved. Creates the account
- * when the email is new; verifies the password when it already exists.
+ * One-time agent activation. The short-lived code in the copied prompt is
+ * exchanged for the long-lived, server-scoped PAT the client stores locally.
+ */
+/** Read-only: what `stma connect` shows its human before it asks y/N. */
+apiRoutes.post('/api/agent-enrollments/preview', async (c) => {
+  let body: { code?: unknown };
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: 'send JSON: {"code":"stma_enroll_..."}' }, 400);
+  }
+  const code = typeof body.code === 'string' ? body.code.trim() : '';
+  const preview =
+    code.startsWith('stma_enroll_') && code.length <= 100
+      ? await previewAgentEnrollment(c.get('db'), code)
+      : null;
+  c.header('Cache-Control', 'no-store');
+  if (!preview) {
+    return c.json({ error: 'invalid, expired, already used or revoked enrollment code' }, 404);
+  }
+  return c.json({ ok: true, endpoint: `${c.get('env').baseUrl}/mcp`, ...preview });
+});
+
+apiRoutes.post('/api/agent-enrollments/redeem', async (c) => {
+  let body: { code?: unknown };
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: 'send JSON: {"code":"stma_enroll_..."}' }, 400);
+  }
+  const code = typeof body.code === 'string' ? body.code.trim() : '';
+  if (!code.startsWith('stma_enroll_') || code.length > 100) {
+    return c.json({ error: 'invalid, expired, already used or revoked enrollment code' }, 404);
+  }
+  const terminal = (body as { via?: unknown }).via === 'terminal';
+  const redeemed = await redeemAgentEnrollment(c.get('db'), code, terminal);
+  if (!redeemed.ok) {
+    return c.json({ error: 'invalid, expired, already used or revoked enrollment code' }, 404);
+  }
+  const { value } = redeemed;
+  logLine({
+    evt: 'agent_enrollment',
+    a: 'redeemed',
+    via: terminal ? 'terminal' : 'agent',
+    enrollment: value.enrollment.id,
+    installation: value.installation.id,
+    installationName: value.installation.name,
+    device: value.installation.deviceLabel,
+    client: value.installation.clientType,
+    role: value.installation.role,
+    scope: value.enrollment.scope,
+    team: value.team?.slug,
+    project: value.project?.slug,
+    credentialExpiresAt: value.credentialExpiresAt,
+    credentialLifetime: value.credentialExpiresAt ? 'time_limited' : 'until_revoked',
+  });
+  c.header('Cache-Control', 'no-store');
+  const endpoint = `${c.get('env').baseUrl}/mcp`;
+  const selfRevokeEndpoint = `${c.get('env').baseUrl}/api/agent-enrollments/self-revoke`;
+  return c.json({
+    ok: true,
+    protocolVersion: 2,
+    enrollmentId: value.enrollment.id,
+    token: value.token,
+    endpoint,
+    installation: {
+      id: value.installation.id,
+      name: value.installation.name,
+      device: value.installation.deviceLabel,
+      clientType: value.installation.clientType,
+      role: value.installation.role,
+    },
+    grant: {
+      scope: value.enrollment.scope,
+      team: value.team ? { slug: value.team.slug, name: value.team.name } : null,
+      project: value.project ? { slug: value.project.slug, name: value.project.name } : null,
+    },
+    credential: {
+      expiresAt: value.credentialExpiresAt?.toISOString() ?? null,
+      lifetime: value.credentialExpiresAt ? 'time_limited' : 'until_revoked',
+    },
+    activation: {
+      state: 'awaiting_client',
+      expiresAt: value.setupExpiresAt.toISOString(),
+      confirmTool: 'whoami',
+    },
+    // A deliberately flat, exact-equality receipt for generated connection
+    // helpers. The nested objects above remain the API's descriptive shape;
+    // this block prevents clients from guessing aliases or normalizing null.
+    validation: {
+      endpoint,
+      enrollmentId: value.enrollment.id,
+      installationName: value.installation.name,
+      device: value.installation.deviceLabel,
+      clientType: value.installation.clientType,
+      role: value.installation.role ?? 'generalist',
+      grantScope: value.enrollment.scope,
+      teamSlug: value.team?.slug ?? null,
+      projectName: value.project?.name ?? null,
+    },
+    cleanup: {
+      endpoint: selfRevokeEndpoint,
+      method: 'POST',
+    },
+    note:
+      'The enrollment code is now consumed. Keep the token value secret, but show the user the HTTP status, non-secret metadata, user-level configuration target and redacted outcome.',
+  });
+});
+
+/**
+ * The route a credential uses to end itself. Two things arrive here and they
+ * are not the same event: an agent that redeemed successfully but could not
+ * validate or persist its local configuration, and a person running
+ * `stma adapter disconnect` on a connection they are done with. Until
+ * 2026-09-20 both were written as `self_revoked_after_setup_failure`, so the
+ * log said an installer had failed every time somebody tidied up.
+ *
+ * The bearer can revoke only its own enrollment-bound installation; no target
+ * id is accepted from the body. `reason` is a closed set and nothing else, so
+ * the caller chooses between two recorded events and can never write a sentence
+ * into the operator's log. Absent or unrecognised keeps the old meaning,
+ * because an already-shipped installer sends no body at all.
+ */
+const SELF_REVOKE_ACTIONS = {
+  setup_failed: 'self_revoked_after_setup_failure',
+  disconnected: 'disconnected_by_user',
+} as const;
+
+apiRoutes.post('/api/agent-enrollments/self-revoke', mcpAuth, async (c) => {
+  const user = c.get('mcpUser');
+  const grant = c.get('mcpGrant');
+  if (!grant.installationId) {
+    return c.json({ error: 'not_enrollment_connection' }, 409);
+  }
+  let reason: keyof typeof SELF_REVOKE_ACTIONS = 'setup_failed';
+  try {
+    const body: unknown = await c.req.json();
+    const asked = (body as { reason?: unknown } | null)?.reason;
+    if (typeof asked === 'string' && asked in SELF_REVOKE_ACTIONS) {
+      reason = asked as keyof typeof SELF_REVOKE_ACTIONS;
+    }
+  } catch {
+    /* No body is the installer's shape, and it means the original reason. */
+  }
+  const revoked = await revokeAgentInstallation(c.get('db'), user.id, grant.installationId);
+  if ('error' in revoked) {
+    return c.json({ error: 'connection_not_active' }, 409);
+  }
+  logLine({
+    evt: 'agent_enrollment',
+    a: SELF_REVOKE_ACTIONS[reason],
+    installation: grant.installationId,
+    scope: grant.scope,
+    team: grant.teamSlug,
+    project: grant.projectSlug,
+  });
+  c.header('Cache-Control', 'no-store');
+  return c.json({ ok: true, installationId: grant.installationId, revoked: true });
+});
+
+/**
+ * Terminal-first onboarding: redeem an invite code with email+password and
+ * receive a team-scoped credential — no browser involved. Agent identity fields
+ * additionally bind it to one installation. Creates the account when the email
+ * is new; verifies the password when it already exists.
  */
 apiRoutes.post('/api/invites/redeem', async (c) => {
   const env = c.get('env');
   if (!env.localAuth) return c.json({ error: 'local accounts are disabled on this server' }, 403);
 
-  let body: { code?: unknown; email?: unknown; password?: unknown };
+  let body: {
+    code?: unknown;
+    email?: unknown;
+    password?: unknown;
+    agent_name?: unknown;
+    device?: unknown;
+    client?: unknown;
+    role?: unknown;
+  };
   try {
     body = await c.req.json();
   } catch {
@@ -36,10 +224,37 @@ apiRoutes.post('/api/invites/redeem', async (c) => {
   const code = typeof body.code === 'string' ? body.code.trim() : '';
   const email = normalizeEmail(body.email);
   const password = typeof body.password === 'string' ? body.password : '';
+  const rawAgentName = typeof body.agent_name === 'string' ? body.agent_name.trim() : '';
+  const agentName = rawAgentName.slice(0, 80);
+  const device = normalizeDeviceLabel(typeof body.device === 'string' ? body.device : undefined);
+  const wantsAgent = Boolean(body.agent_name || body.device || body.client || body.role);
+  const client =
+    typeof body.client === 'string' && (AGENT_CLIENT_TYPES as readonly string[]).includes(body.client)
+      ? (body.client as AgentClientType)
+      : 'generic';
+  const role =
+    typeof body.role === 'string' && (AGENT_ROLES as readonly string[]).includes(body.role)
+      ? (body.role as AgentRole)
+      : 'generalist';
   if (!code) return c.json({ error: 'missing invite code' }, 400);
   if (!isEmail(email)) return c.json({ error: 'email must be a valid address' }, 400);
   if (password.length < 8 || password.length > 128) {
     return c.json({ error: 'password must be 8-128 characters' }, 400);
+  }
+  if (wantsAgent && (!agentName || !device)) {
+    return c.json({ error: 'agent_name and a valid device are both required to connect an agent' }, 400);
+  }
+  if (rawAgentName.length > 80) {
+    return c.json({ error: 'agent_name must be 80 characters or fewer' }, 400);
+  }
+  if (
+    typeof body.client === 'string' &&
+    !(AGENT_CLIENT_TYPES as readonly string[]).includes(body.client)
+  ) {
+    return c.json({ error: `client must be one of: ${AGENT_CLIENT_TYPES.join(', ')}` }, 400);
+  }
+  if (typeof body.role === 'string' && !(AGENT_ROLES as readonly string[]).includes(body.role)) {
+    return c.json({ error: `role must be one of: ${AGENT_ROLES.join(', ')}` }, 400);
   }
 
   const db = c.get('db');
@@ -56,96 +271,184 @@ apiRoutes.post('/api/invites/redeem', async (c) => {
   }
 
   const existingRows = await db.select().from(users).where(eq(users.email, email)).limit(1);
-  let user = existingRows[0];
-  if (user) {
-    if (!user.passwordHash) {
-      logLine({ evt: 'auth', a: 'redeem_fail', u: user.username, why: 'passwordless_account' });
+  const existingUser = existingRows[0];
+  let username: string;
+  let newUser: { username: string; email: string; passwordHash: string } | undefined;
+  if (existingUser) {
+    if (!existingUser.passwordHash) {
+      logLine({ evt: 'auth', a: 'redeem_fail', u: existingUser.username, why: 'passwordless_account' });
       return c.json(
         { error: 'that email belongs to an account without a password — join via the web instead' },
         409,
       );
     }
-    if (!(await verifyPassword(password, user.passwordHash))) {
-      logLine({ evt: 'auth', a: 'redeem_fail', u: user.username, why: 'wrong_password' });
-      return c.json({ error: 'wrong password for existing user' }, 401);
+    // Everything the sign-in form does around a password, this door has to do
+    // too. It was the only other place in the tree that verifies one, and it had
+    // none of it: no lockout, so an invite holder could guess a teammate's
+    // password without limit; no notice, so the account holder was never told;
+    // and no second factor, so a hit returned a working credential while the
+    // front door would have asked for an emailed code. The lock is checked
+    // before the password and enforced even when the password turns out to be
+    // right, for the same reason it is at the form — a throttle a correct guess
+    // walks through is not one.
+    const gate = await loginGate(db, email);
+    if (gate.locked) {
+      logLine({ evt: 'auth', a: 'redeem_locked', em: maskEmail(email) });
+      return c.json({ error: lockedMessage(gate.resetAt) }, 429);
     }
+    if (!(await verifyPassword(password, existingUser.passwordHash))) {
+      const failed = await recordLoginFailure(db, email);
+      logLine({
+        evt: 'auth',
+        a: 'redeem_fail',
+        u: existingUser.username,
+        why: 'wrong_password',
+        n: failed.attempts,
+      });
+      if (failed.justLocked) {
+        // The row was found by this address, so mailing it reaches the account
+        // holder and reveals nothing a guesser did not already supply.
+        void sendMail(env, {
+          to: email,
+          ...failedSignInsEmail(env.baseUrl, Math.round(LOGIN_FAIL_WINDOW_MS / 60_000)),
+        });
+      }
+      return c.json(
+        { error: failed.locked ? lockedMessage(failed.resetAt) : 'wrong password for existing user' },
+        failed.locked ? 429 : 401,
+      );
+    }
+    await clearLoginFailures(db, email);
+    username = existingUser.username;
   } else {
     if (!(await emailIsFree(db, email))) {
       return c.json({ error: 'that email is already registered' }, 409);
     }
-    try {
-      const inserted = await db
-        .insert(users)
-        .values({
-          username: await usernameFromEmail(db, email),
-          email,
-          passwordHash: await hashPassword(password),
-        })
-        .returning();
-      user = inserted[0]!;
-    } catch {
+    username = await usernameFromEmail(db, email);
+    newUser = { username, email, passwordHash: await hashPassword(password) };
+  }
+
+  let claimed: Awaited<ReturnType<typeof claimInviteMembership>>;
+  try {
+    claimed = existingUser
+      ? await claimInviteMembership(db, { code, userId: existingUser.id })
+      : await claimInviteMembership(db, { code, newUser: newUser! });
+  } catch (error) {
+    // A same-email request may have won while this request was hashing the
+    // password. Preserve the existing conflict contract; surface unrelated DB
+    // failures instead of disguising them as an account collision.
+    const raced = await db.select({ id: users.id }).from(users).where(eq(users.email, email)).limit(1);
+    if (!existingUser && raced[0]) {
       return c.json({ error: 'that email is already registered' }, 409);
     }
+    throw error;
   }
-  const username = user.username;
 
-  const already = await db
-    .select({ userId: memberships.userId })
-    .from(memberships)
-    .where(and(eq(memberships.teamId, row.team.id), eq(memberships.userId, user.id)))
-    .limit(1);
-  if (already.length === 0) {
-    const [{ n }] = await db
-      .select({ n: count() })
-      .from(memberships)
-      .where(eq(memberships.teamId, row.team.id));
-    if (n >= planLimits(row.team.plan).maxMembers) {
+  if (!claimed.ok) {
+    if (claimed.reason === 'member_limit') {
       return c.json(
-        { error: `team member limit reached (${planLimits(row.team.plan).maxMembers} on the ${row.team.plan} plan)` },
+        { error: `team member limit reached (${claimed.maxMembers} on the ${claimed.plan} plan)` },
         403,
       );
     }
+    logLine({ evt: 'auth', a: 'redeem_fail', em: maskEmail(email), why: 'bad_code_race' });
+    return c.json({ error: 'invite code is invalid, expired or used up' }, 404);
   }
-  const joined = await db
-    .insert(memberships)
-    .values({ teamId: row.team.id, userId: user.id, role: 'member' })
-    .onConflictDoNothing()
-    .returning();
-  if (joined.length > 0) {
-    await db
-      .update(invites)
-      .set({ uses: sql`${invites.uses} + 1` })
-      .where(eq(invites.id, row.invite.id));
+  if (claimed.joined) {
     // Terminal onboarding: the agent got the token, but this is often the only
     // thing that tells the human their account now exists and where it lives.
-    await notifyTeamJoined(db, env, { teamId: row.team.id, userId: user.id });
+    await notifyTeamJoined(db, env, { teamId: claimed.team.id, userId: claimed.userId });
+    await c.get('lifecycle').teamMemberCountChanged?.({ db, teamId: claimed.team.id });
   }
 
-  const pat = generatePat();
-  await db.insert(tokens).values({
-    userId: user.id,
-    name: `${username}-cli`,
-    tokenHash: pat.hash,
-    prefix: pat.prefix,
-  });
+  let activated: Awaited<ReturnType<typeof redeemAgentEnrollment>> | undefined;
+  if (wantsAgent) {
+    const enrollment = await createAgentEnrollment(db, {
+      userId: claimed.userId,
+      name: agentName,
+      deviceLabel: device!,
+      clientType: client,
+      role,
+      scope: 'team',
+      teamId: claimed.team.id,
+    });
+    activated = await redeemAgentEnrollment(db, enrollment.code);
+    if (!activated.ok) throw new Error('Fresh teammate agent enrollment could not be activated');
+  }
+  const pat = activated?.ok ? null : generatePat();
+  if (pat) {
+    // Backward-compatible terminal clients that send only code/email/password
+    // still receive a PAT, but it is team-scoped instead of silently following
+    // every future membership. The current generated prompt always supplies an
+    // agent identity and gets the stronger one-token/one-installation path.
+    await db.insert(tokens).values({
+      userId: claimed.userId,
+      name: `${username}-cli`,
+      scope: 'team',
+      teamId: claimed.team.id,
+      tokenHash: pat.hash,
+      prefix: pat.prefix,
+    });
+  }
 
-  logLine({ evt: 'auth', a: 'redeem', u: username, team: row.team.slug });
-  void track(db, { teamId: row.team.id, userId: user.id, action: 'member_joined', detail: username });
+  logLine({ evt: 'auth', a: 'redeem', u: username, team: claimed.team.slug });
+  if (claimed.joined) {
+    void track(db, {
+      teamId: claimed.team.id,
+      userId: claimed.userId,
+      action: 'member_joined',
+      detail: username,
+    });
+  }
   const mcpUrl = `${env.baseUrl}/mcp`;
+  const token = activated?.ok ? activated.value.token : pat!.token;
+  c.header('Cache-Control', 'no-store');
   return c.json({
     ok: true,
     username,
     email,
-    team: { slug: row.team.slug, name: row.team.name },
-    token: pat.token,
-    note: 'Store this token like a password — it is shown only once.',
-    connect: {
-      claudeCode: `claude mcp add --scope user --transport http stma ${mcpUrl} --header "Authorization: Bearer ${pat.token}"`,
-      cursor: {
-        mcpServers: { stma: { url: mcpUrl, headers: { Authorization: `Bearer ${pat.token}` } } },
-      },
-      firstSteps: 'Call whoami, then get_snapshot_checklist → push_snapshot. Check inbox for open debug sessions.',
+    team: { slug: claimed.team.slug, name: claimed.team.name },
+    token,
+    installation: activated?.ok
+      ? {
+          id: activated.value.installation.id,
+          name: activated.value.installation.name,
+          device: activated.value.installation.deviceLabel,
+          clientType: activated.value.installation.clientType,
+          role: activated.value.installation.role,
+        }
+      : null,
+    grant: { scope: 'team', team: claimed.team.slug, project: null },
+    credential: {
+      expiresAt: activated?.ok ? activated.value.credentialExpiresAt?.toISOString() ?? null : null,
+      lifetime:
+        activated?.ok && activated.value.credentialExpiresAt ? 'time_limited' : 'until_revoked',
     },
+    note: 'Store this token like a password — it is shown only once.',
+    connect: activated?.ok
+      ? {
+          endpoint: mcpUrl,
+          firstSteps:
+            'Install the token once in this client\'s user-level Authorization header, call whoami, then get_snapshot_checklist → push_snapshot. Check inbox for open debug sessions.',
+        }
+      : {
+          // Compatibility response for terminal clients that did not send an
+          // agent identity. Keep the only plaintext secret in `token` above;
+          // never repeat it inside an argv-ready command or config fragment.
+          claudeCode: `Semantically merge mcpServers.stma into ~/.claude.json with type=http, url=${mcpUrl}, and Authorization="Bearer [USE_TOP_LEVEL_TOKEN]". Never put the token in argv or shell history.`,
+          cursor: {
+            mcpServers: {
+              stma: {
+                url: mcpUrl,
+                headers: { Authorization: 'Bearer [USE_TOP_LEVEL_TOKEN]' },
+              },
+            },
+          },
+          secretHandling:
+            'Consume the top-level token only inside one local process that validates and atomically merges configuration; never print it or pass it through argv, environment, clipboard or a response file.',
+          firstSteps:
+            'Call whoami, then get_snapshot_checklist → push_snapshot. Check inbox for open debug sessions.',
+        },
   });
 });
 
@@ -187,8 +490,20 @@ async function postAnnouncement(
     actorId: null,
     at: posted[0]!.at,
   });
-  notifyTeam(c.get('env'), team, `Announcement in ${team.slug}: ${body.slice(0, 140)}`);
-  void track(db, { teamId: team.id, action: 'announce', detail: `${via}: ${body.slice(0, 140)}` });
+  // Redacted, and without the body on the webhook at all.
+  //
+  // `messages.body` above is scrubbed; these two were not, so a secret pasted
+  // into an announcement was cleaned inside STMA and then posted verbatim to
+  // the team's Slack channel and written into the activity feed, which the
+  // page renders and the CSV exports. The webhook also contradicted its own
+  // contract — notifyTeam is documented to carry event metadata and never
+  // message bodies, and every other caller honours that.
+  notifyTeam(c.get('env'), team, `New announcement in ${team.slug} (via ${via}).`);
+  void track(db, {
+    teamId: team.id,
+    action: 'announce',
+    detail: `${via}: ${redactSecrets(body.slice(0, 140))}`,
+  });
 }
 
 /** Generic CI hook: POST {"text": "...", "repo": "optional"} */
@@ -219,13 +534,23 @@ function validGithubSignature(rawBody: string, header: string, secret: string): 
 apiRoutes.post('/api/hooks/github/:token', async (c) => {
   const team = await teamByInboundToken(c);
   if (!team) return c.json({ error: 'unknown hook token' }, 404);
-  // Verify against the raw body bytes when GitHub sends a signature (webhook
-  // "secret" = this team's inbound token); URL secrecy remains the baseline.
+  // GitHub supports an HMAC secret, so URL secrecy is not an adequate fallback:
+  // a copied proxy log or browser history entry must not be enough to forge a
+  // push, issue or workflow outcome. Generic CI systems that cannot sign use
+  // the separate /announce hook whose contract is explicitly token-only.
   const raw = await c.req.text();
   const signature = c.req.header('x-hub-signature-256');
-  if (signature && !validGithubSignature(raw, signature, team.inboundToken ?? '')) {
-    logLine({ evt: 'auth', a: 'github_hook_fail', team: team.slug, why: 'bad_signature' });
-    return c.json({ error: 'X-Hub-Signature-256 mismatch' }, 401);
+  if (!signature || !validGithubSignature(raw, signature, team.inboundToken ?? '')) {
+    logLine({
+      evt: 'auth',
+      a: 'github_hook_fail',
+      team: team.slug,
+      why: signature ? 'bad_signature' : 'missing_signature',
+    });
+    return c.json(
+      { error: signature ? 'X-Hub-Signature-256 mismatch' : 'X-Hub-Signature-256 required' },
+      401,
+    );
   }
   const event = c.req.header('x-github-event') ?? 'unknown';
   if (!['push', 'issues', 'pull_request', 'workflow_run'].includes(event)) {
@@ -235,7 +560,7 @@ apiRoutes.post('/api/hooks/github/:token', async (c) => {
     ref?: string;
     action?: string;
     pusher?: { name?: string };
-    repository?: { name?: string; full_name?: string };
+    repository?: { id?: number; name?: string; full_name?: string };
     commits?: unknown[];
     head_commit?: { message?: string };
     issue?: { number?: number; title?: string; html_url?: string; user?: { login?: string } };
@@ -245,9 +570,14 @@ apiRoutes.post('/api/hooks/github/:token', async (c) => {
       title?: string;
       html_url?: string;
       merged?: boolean;
-      head?: { ref?: string };
+      updated_at?: string;
+      head?: { ref?: string; sha?: string };
     };
     workflow_run?: {
+      id?: number;
+      run_attempt?: number;
+      head_sha?: string;
+      updated_at?: string;
       head_branch?: string;
       conclusion?: string;
       name?: string;
@@ -294,9 +624,10 @@ apiRoutes.post('/api/hooks/github/:token', async (c) => {
     const headBranch = pr?.head?.ref;
     if (!pr?.number || !headBranch) return c.json({ error: 'invalid payload' }, 400);
     const state = action === 'closed' ? (pr.merged ? 'merged' : 'closed') : 'open';
+    await recordProviderObservation(c.get('db'), team.id, 'github', { repositoryId: p.repository?.id?.toString(), deliveryId: c.req.header('x-github-delivery'), subjectId: `pr:${pr.number}`, commitSha: pr.head?.sha, kind: 'pull_request', state, observedAt: pr.updated_at });
     const outcome = await recordRunOutcome(c.get('db'), team.id, {
       branch: headBranch,
-      repoName: p.repository?.name,
+      repoName: p.repository?.full_name ?? p.repository?.name,
       pr: { number: pr.number, url: pr.html_url ?? '', state, title: pr.title },
     });
     return c.json({ ok: true, linked: outcome.linked });
@@ -312,9 +643,10 @@ apiRoutes.post('/api/hooks/github/:token', async (c) => {
     }
     const outcome = await recordRunOutcome(c.get('db'), team.id, {
       branch: wr.head_branch,
-      repoName: p.repository?.name,
+      repoName: p.repository?.full_name ?? p.repository?.name,
       ci: { conclusion, workflow: wr.name },
     });
+    await recordProviderObservation(c.get('db'), team.id, 'github', { repositoryId: p.repository?.id?.toString(), deliveryId: c.req.header('x-github-delivery'), subjectId: wr.id ? `workflow:${wr.id}` : undefined, commitSha: wr.head_sha, kind: 'workflow', state: conclusion, attempt: wr.run_attempt, observedAt: wr.updated_at });
     return c.json({ ok: true, linked: outcome.linked });
   }
 
@@ -338,29 +670,60 @@ apiRoutes.post('/api/hooks/github/:token', async (c) => {
  * baseline every inbound hook here starts from — ADO offers no HMAC header
  * to verify on top of it the way GitHub does.
  */
-apiRoutes.post('/api/hooks/azure-devops/:token', async (c) => {
+const adoHookPayload = z.object({
+  eventType: z.string().max(100).optional(),
+  resource: z.object({
+    id: z.number().int().positive().optional(),
+    pullRequestId: z.number().int().positive().optional(),
+    title: z.string().optional(), status: z.string().optional(),
+    sourceRefName: z.string().optional(), sourceBranch: z.string().optional(),
+    result: z.string().optional(),
+    repository: z.object({ id: z.string().optional(), name: z.string().optional(), webUrl: z.string().optional() }).optional(),
+    definition: z.object({ name: z.string().optional() }).optional(),
+  }).optional(),
+});
+apiRoutes.on('POST', ['/api/hooks/azure-devops/:token', '/api/hooks/azure-devops/:token/:binding'], async (c) => {
   const team = await teamByInboundToken(c);
   if (!team) return c.json({ error: 'unknown hook token' }, 404);
   let p: {
     eventType?: string;
     resource?: {
+      id?: number;
       pullRequestId?: number;
       title?: string;
       status?: string;
       sourceRefName?: string;
-      repository?: { name?: string; webUrl?: string };
+      repository?: { id?: string; name?: string; webUrl?: string };
       result?: string;
       sourceBranch?: string;
       definition?: { name?: string };
     };
   };
   try {
-    p = await c.req.json();
+    p = adoHookPayload.parse(await c.req.json());
   } catch {
     return c.json({ error: 'invalid payload' }, 400);
   }
   const eventType = p.eventType ?? '';
   const resource = p.resource ?? {};
+
+  // Scoped hooks support ADO's minimal build.complete payload (no repository
+  // or commit fields). Never follow resource.url or trust its result/SHA.
+  const scopedBinding = c.req.param('binding');
+  if (scopedBinding && !z.string().uuid().safeParse(scopedBinding).success)
+    return c.json({ error: 'unknown repository binding' }, 404);
+  if (eventType === 'build.complete' && (scopedBinding || resource.repository?.id)) {
+    const [binding] = await c.get('db').select().from(repositoryBindings).where(and(
+      eq(repositoryBindings.teamId, team.id), eq(repositoryBindings.provider, 'azure-devops'),
+      scopedBinding ? eq(repositoryBindings.id, scopedBinding) : eq(repositoryBindings.repositoryId, resource.repository!.id!),
+    ));
+    if (!binding) return c.json({ ok: true, evidence: { recorded: false, reason: 'repository_not_verified' } });
+    if (!z.number().int().positive().max(2_147_483_647).safeParse(resource.id).success)
+      return c.json({ error: 'a numeric build ID is required' }, 400);
+    const evidence = await observeAdoBuild(c.get('db'), c.get('env'), team.id, binding.id, resource.id!);
+    return c.json({ ok: true, evidence }, evidence.reason === 'provider_unavailable' ? 503 : 200);
+  }
+  if (scopedBinding) return c.json({ ok: true, ignored: eventType || 'unknown' });
 
   if (eventType === 'git.pullrequest.created' || eventType === 'git.pullrequest.updated') {
     const number = resource.pullRequestId;

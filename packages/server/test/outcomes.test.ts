@@ -1,4 +1,5 @@
 import { mkdtempSync, rmSync } from 'node:fs';
+import { createHmac } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -61,12 +62,18 @@ async function call(tool: string, args: Record<string, unknown>) {
   return { text, data, isError: json.result?.isError === true };
 }
 
-const githubHook = (event: string, payload: unknown) =>
-  fetch(`${server.url}/api/hooks/github/${hookToken}`, {
+const githubHook = (event: string, payload: unknown) => {
+  const body = JSON.stringify(payload);
+  return fetch(`${server.url}/api/hooks/github/${hookToken}`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', 'x-github-event': event },
-    body: JSON.stringify(payload),
+    headers: {
+      'content-type': 'application/json',
+      'x-github-event': event,
+      'x-hub-signature-256': `sha256=${createHmac('sha256', hookToken).update(body).digest('hex')}`,
+    },
+    body,
   });
+};
 
 const adoHook = (payload: unknown) =>
   fetch(`${server.url}/api/hooks/azure-devops/${hookToken}`, {
@@ -95,7 +102,7 @@ beforeAll(async () => {
   server = await startServer(
     loadEnv({
       port: 0,
-      host: 'localhost',
+      host: '127.0.0.1',
       nodeEnv: 'test',
       devMode: true,
       databaseUrl: undefined,
@@ -177,7 +184,8 @@ describe('GitHub outcome linkage', () => {
     const pack = await evidence(runId);
     expect(pack.run.pr.state).toBe('merged');
     const outcome = pack.checks.find((c: any) => c.key === 'outcome');
-    expect(outcome.state).toBe('ok');
+    expect(outcome.state).toBe('unknown');
+    expect(outcome.coverage).toBe('legacy');
     expect(outcome.detail).toContain('PR #5 merged');
     // "The change merged" is the feed-worthy line.
     const feed = await (

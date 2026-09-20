@@ -13,6 +13,7 @@
  *
  * The target instance must run with SIGNUPS_OPEN=1 and AUTH_2FA=0.
  */
+import { createHmac } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 // ---------------------------------------------------------------- options
@@ -664,21 +665,27 @@ async function main(): Promise<void> {
   await push(mert.token, teamSlug, REPO_STOREFRONT, 'macbook', MERT_MACBOOK);
   await push(deniz.token, teamSlug, REPO_INFRA, 'wsl', DENIZ_WSL);
 
+  // Both sides scoped to one project on purpose. A diff between two projects is
+  // real data and not evidence of a machine mismatch, so the tools refuse it —
+  // and this script used to ask for exactly that: mert is on storefront-web
+  // while ayse is on payments-api, so the teammate check failed and left the
+  // instance half-seeded. The two people who share a project are gorkem and ayse.
   const fleet = await mcpJson<{ totalDifferences: number; summary: string[] }>(
     ayse.tokens['macbook']!,
     'compare_env',
-    { team: teamSlug, device: 'macbook', their_device: 'linux-desktop' },
+    { team: teamSlug, repo: REPO_PAYMENTS, device: 'macbook', their_device: 'linux-desktop' },
   );
   if (fleet.totalDifferences < 3) {
     fail(`Ayse's own two machines only differ in ${fleet.totalDifferences} places — expected 3+`);
   }
-  const crossCheck = await mcpJson<{ totalDifferences: number }>(mert.token, 'compare_env', {
+  const crossCheck = await mcpJson<{ totalDifferences: number }>(gorkem.token, 'compare_env', {
     team: teamSlug,
+    repo: REPO_PAYMENTS,
     teammate: ayse.username,
   });
   done(
     `5 snapshots; ayse macbook vs linux-desktop: ${fleet.totalDifferences} differences, ` +
-      `mert vs ayse: ${crossCheck.totalDifferences}`,
+      `gorkem vs ayse on payments-api: ${crossCheck.totalDifferences}`,
   );
 
   // -------------------------------------------------------------- 5. policy + baseline
@@ -925,8 +932,11 @@ async function main(): Promise<void> {
       'failover on staging; production is untouched. I will post here when it is done.',
   });
 
-  const teamPage = await get(`/app/teams/${teamSlug}`, gorkem.jar);
-  expectStatus(teamPage, 200, 'Loading the team page');
+  // The v2 team page is four tabs, and the inbound hook lives on the owner-only
+  // Integrations one. Asking for the default overview returns 200 with no token
+  // in it, which reads as "the hook is gone" rather than "wrong tab".
+  const teamPage = await get(`/app/teams/${teamSlug}?tab=integrations`, gorkem.jar);
+  expectStatus(teamPage, 200, 'Loading the team integrations tab');
   const inboundToken = /\/api\/hooks\/announce\/([A-Za-z0-9_-]+)/.exec(teamPage.body)?.[1];
   if (!inboundToken) {
     fail('Could not read the inbound hook token from the team page', teamPage);
@@ -936,15 +946,23 @@ async function main(): Promise<void> {
     text: 'build #1482 green on main (3m12s) and deployed to staging — 214 tests, 0 flakes',
   });
   expectJson(ciHook, 'Posting to the inbound CI hook');
+  // Signed, because the product requires it: an unsigned GitHub event is refused
+  // so that a copied URL is not enough to forge a push. The hook token is the
+  // HMAC secret, exactly as the team page tells somebody to configure it.
+  const ghBody = JSON.stringify({
+    ref: 'refs/heads/main',
+    pusher: { name: gorkem.username },
+    repository: { name: REPO_PAYMENTS },
+    commits: [{}, {}, {}],
+    head_commit: { message: 'feat(refunds): partial refunds behind a flag\n\nCloses PAY-418' },
+  });
   const ghHook = await request('POST', `/api/hooks/github/${inboundToken}`, {
-    headers: { 'content-type': 'application/json', 'x-github-event': 'push' },
-    body: JSON.stringify({
-      ref: 'refs/heads/main',
-      pusher: { name: gorkem.username },
-      repository: { name: REPO_PAYMENTS },
-      commits: [{}, {}, {}],
-      head_commit: { message: 'feat(refunds): partial refunds behind a flag\n\nCloses PAY-418' },
-    }),
+    headers: {
+      'content-type': 'application/json',
+      'x-github-event': 'push',
+      'x-hub-signature-256': `sha256=${createHmac('sha256', inboundToken!).update(ghBody).digest('hex')}`,
+    },
+    body: ghBody,
   });
   expectJson(ghHook, 'Posting a GitHub push event to the inbound hook');
   done('2 agent announcements + 1 CI hook + 1 GitHub push event');

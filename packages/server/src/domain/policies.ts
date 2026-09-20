@@ -1,8 +1,4 @@
-import {
-  mergePolicyDocuments,
-  policyDocumentSchema,
-  type PolicyDocument,
-} from '@bridge/shared';
+import { mergePolicyDocuments, policyDocumentSchema, type PolicyDocument } from '@bridge/shared';
 import { and, desc, eq, max, or, sql } from 'drizzle-orm';
 import type { Db } from '../db';
 import {
@@ -11,50 +7,75 @@ import {
   policyBundles,
   policyReceipts,
   projects,
+  teams,
   users,
 } from '../db/schema';
 import { fingerprintJson } from '../lib/canonical';
-import { findOrCreateProject } from '../lib/projects';
+import { resolveProjectForWrite } from '../lib/projects';
 import { projectForTeam, teamForUser } from './access';
 import { runForOwner } from './agents';
+import { effectiveLimits } from '../lib/entitlements';
+import { criticalAudit } from '../lib/securityHooks';
 
-const EMPTY_POLICY = policyDocumentSchema.parse({});
+export const EMPTY_POLICY = policyDocumentSchema.parse({});
 
 export async function publishPolicy(
   db: Db,
   userId: string,
   input: { team: string; project?: string; document: PolicyDocument },
+  fixedProjectId?: string | null,
 ) {
   const access = await teamForUser(db, userId, input.team);
-  if (!access || access.role !== 'owner') return { error: 'Only a team owner can publish policies.' } as const;
+  if (!access || access.role !== 'owner')
+    return { error: 'Only a team owner can publish policies.' } as const;
+  const limits = await effectiveLimits(db, access.team);
+  if (!limits.governance || limits.readOnly)
+    return {
+      error:
+        'Publishing policy requires an active governance entitlement. Reading existing policy remains available.',
+    } as const;
   let projectId: string | null = null;
   if (input.project) {
-    const found = await findOrCreateProject(db, access.team, input.project, userId);
+    // Policy publishing selects an existing project (including a repository-bound
+    // project's slug); it must not silently create a same-named legacy sibling.
+    const selected = fixedProjectId ? undefined : await projectForTeam(db, access.team.id, input.project);
+    const found = await resolveProjectForWrite(db, access.team, input.project, userId, {
+      fixedProjectId: fixedProjectId ?? selected?.id,
+    });
     if ('error' in found) return { error: found.error } as const;
     projectId = found.project.id;
   }
   const scopeKey = projectId ? `project:${projectId}` : 'team';
-  const versionRows = await db
-    .select({ version: max(policyBundles.version) })
-    .from(policyBundles)
-    .where(and(eq(policyBundles.teamId, access.team.id), eq(policyBundles.scopeKey, scopeKey)));
-  const version = (versionRows[0]?.version ?? 0) + 1;
   const document = policyDocumentSchema.parse(input.document);
   const hash = fingerprintJson(document);
-  const rows = await db
-    .insert(policyBundles)
-    .values({
+  return db.transaction(async (tx) => {
+    await tx.select({ id: teams.id }).from(teams).where(eq(teams.id, access.team.id)).for('update');
+    const versionRows = await tx
+      .select({ version: max(policyBundles.version) })
+      .from(policyBundles)
+      .where(and(eq(policyBundles.teamId, access.team.id), eq(policyBundles.scopeKey, scopeKey)));
+    const version = (versionRows[0]?.version ?? 0) + 1;
+    const rows = await tx
+      .insert(policyBundles)
+      .values({
+        teamId: access.team.id,
+        projectId,
+        scopeKey,
+        version,
+        status: 'active',
+        document,
+        hash,
+        createdBy: userId,
+      })
+      .returning();
+    await criticalAudit(tx as unknown as Db, {
       teamId: access.team.id,
-      projectId,
-      scopeKey,
-      version,
-      status: 'active',
-      document,
-      hash,
-      createdBy: userId,
-    })
-    .returning();
-  return { policy: rows[0]! } as const;
+      actorId: userId,
+      action: 'policy_published',
+      subjectId: rows[0]!.id,
+    });
+    return { policy: rows[0]! } as const;
+  });
 }
 
 async function latestAtScope(db: Db, teamId: string, scopeKey: string) {
@@ -76,21 +97,19 @@ async function latestAtScope(db: Db, teamId: string, scopeKey: string) {
 export async function effectivePolicy(
   db: Db,
   userId: string,
-  input: { team: string; project?: string },
+  input: { team: string; project?: string; projectId?: string | null },
 ) {
   const access = await teamForUser(db, userId, input.team);
   if (!access) return { error: `You are not a member of team "${input.team}".` } as const;
   const teamPolicy = await latestAtScope(db, access.team.id, 'team');
   let projectPolicy: typeof teamPolicy | undefined;
   let projectId: string | null = null;
-  if (input.project) {
-    const project = await projectForTeam(db, access.team.id, input.project);
+  if (input.project || input.projectId) {
+    const project = await projectForTeam(db, access.team.id, input.projectId ?? input.project!);
     projectId = project?.id ?? null;
     if (project) projectPolicy = await latestAtScope(db, access.team.id, `project:${project.id}`);
   }
-  const teamDocument = teamPolicy
-    ? policyDocumentSchema.parse(teamPolicy.document)
-    : EMPTY_POLICY;
+  const teamDocument = teamPolicy ? policyDocumentSchema.parse(teamPolicy.document) : EMPTY_POLICY;
   const projectDocument = projectPolicy
     ? policyDocumentSchema.parse(projectPolicy.document)
     : undefined;
@@ -114,6 +133,22 @@ export async function effectivePolicy(
 }
 
 /**
+ * The two published documents an effective policy is merged from, unmerged: what
+ * a page needs to say where each rule comes from (`lib/policyOrigin.ts`). Same
+ * rows `effectivePolicy` reads; the caller has already checked membership.
+ */
+export async function policyDocumentsFor(db: Db, teamId: string, projectId: string) {
+  const workspace = await latestAtScope(db, teamId, 'team');
+  const project = await latestAtScope(db, teamId, `project:${projectId}`);
+  return {
+    workspace: workspace ? policyDocumentSchema.parse(workspace.document) : EMPTY_POLICY,
+    project: project ? policyDocumentSchema.parse(project.document) : undefined,
+    workspaceVersion: workspace?.version ?? null,
+    projectVersion: project?.version ?? null,
+  };
+}
+
+/**
  * The newest active bundle of every scope in one team — team policy plus each
  * project override — with the merged document an agent in that scope actually gets.
  *
@@ -134,7 +169,7 @@ export async function policyScopes(db: Db, teamId: string, limit = 12) {
     .limit(limit);
   if (latest.length === 0) return [];
   const rows = await db
-    .select({ bundle: policyBundles, author: users.username, projectName: projects.name })
+    .select({ bundle: policyBundles, author: users.username, projectName: projects.name, projectSlug: projects.slug })
     .from(policyBundles)
     .leftJoin(users, eq(policyBundles.createdBy, users.id))
     .leftJoin(projects, eq(policyBundles.projectId, projects.id))
@@ -164,6 +199,9 @@ export async function policyScopes(db: Db, teamId: string, limit = 12) {
         author: row.author,
         label: row.bundle.scopeKey === 'team' ? 'Team' : (row.projectName ?? 'project'),
         isTeam: row.bundle.scopeKey === 'team',
+        projectSlug: row.projectSlug,
+        /** What this scope itself published, before the merge: the page derives rule origin from it. */
+        own,
         document,
         hash: fingerprintJson(document),
       };
@@ -172,12 +210,7 @@ export async function policyScopes(db: Db, teamId: string, limit = 12) {
 }
 
 /** Recent policy receipts for a team's runs — what each agent said it applied. */
-export async function recentPolicyReceipts(
-  db: Db,
-  teamId: string,
-  limit = 25,
-  projectId?: string,
-) {
+export async function recentPolicyReceipts(db: Db, teamId: string, limit = 25, projectId?: string) {
   return db
     .select({
       receipt: policyReceipts,
@@ -192,10 +225,7 @@ export async function recentPolicyReceipts(
     .innerJoin(users, eq(agentInstallations.userId, users.id))
     .leftJoin(projects, eq(agentRuns.projectId, projects.id))
     .where(
-      and(
-        eq(agentRuns.teamId, teamId),
-        projectId ? eq(agentRuns.projectId, projectId) : undefined,
-      ),
+      and(eq(agentRuns.teamId, teamId), projectId ? eq(agentRuns.projectId, projectId) : undefined),
     )
     .orderBy(desc(policyReceipts.createdAt))
     .limit(limit);
@@ -242,7 +272,10 @@ export async function recordPolicyReceipt(
         createdAt: new Date(),
       },
     });
-  await db.update(agentRuns).set({ policyHash: reportedHash ?? null }).where(eq(agentRuns.id, runId));
+  await db
+    .update(agentRuns)
+    .set({ policyHash: reportedHash ?? null })
+    .where(eq(agentRuns.id, runId));
   return {
     runId,
     expectedHash: authoritativeExpectedHash,

@@ -140,7 +140,7 @@ beforeAll(async () => {
   srv = await startServer(
     loadEnv({
       port: 0,
-      host: 'localhost',
+      host: '127.0.0.1',
       nodeEnv: 'test',
       devMode: true,
       databaseUrl: undefined,
@@ -588,7 +588,7 @@ describe('ownership transfer', () => {
       redirect: 'manual',
     });
     expect(settings.status).toBe(302);
-    expect(settings.headers.get('location')).toBe(`/app/teams/${slug}`);
+    expect(settings.headers.get('location')).toBe(`/app/teams/${slug}?tab=integrations`);
 
     // And the founder is no longer trapped.
     const left = await fetch(`${srv.url}/app/teams/${slug}/leave`, {

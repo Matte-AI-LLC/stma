@@ -1,4 +1,4 @@
-import { z } from 'zod';
+import { z } from 'zod/v3';
 import { CLAIM_RESOURCE_TYPES } from './agents';
 
 export const policyDocumentSchema = z.object({
@@ -108,4 +108,3 @@ export function mergePolicyDocuments(
     },
   };
 }
-

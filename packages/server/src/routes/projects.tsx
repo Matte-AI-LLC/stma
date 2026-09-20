@@ -4,27 +4,61 @@ import {
   type ConflictClaim,
   type ConflictSeverity,
 } from '@bridge/shared';
-import { and, count, countDistinct, desc, eq, gt, inArray, max } from 'drizzle-orm';
+import { and, count, countDistinct, desc, eq, gt, inArray, isNull, max } from 'drizzle-orm';
 import { Hono } from 'hono';
+import { randomUUID } from 'node:crypto';
 import { loginRedirect } from '../auth/session';
+import type { Db } from '../db';
 import {
   activity,
-  agentRuns,
+  agentInstallations,
   debugSessions,
   deliveryFlows,
   environmentBaselines,
+  handoffs,
   policyBundles,
   projects,
   snapshots,
 } from '../db/schema';
-import { teamForUser } from '../domain/access';
-import { activeRunsForMember, claimsForRuns, recentAgentEvents } from '../domain/agents';
+import { projectForTeam, teamForUser } from '../domain/access';
+import { activeRunsForMember, claimsForRuns } from '../domain/agents';
+import { recentAgentEvents } from '../domain/fleetReaders';
+import {
+  announceAssignment,
+  assignableAgents,
+  handoffAllowance,
+  writeAssignment,
+  type AssignmentDraft,
+} from '../domain/assignments';
+import { agentsHeardIn } from '../domain/companions';
+import {
+  briefWithTicket,
+  JIRA_PICK_NOTE,
+  listTicketsFor,
+  pickableTrackers,
+  readNamedTicket,
+  ticketExamples,
+  ticketPlaceholder,
+  TICKET_PICKER_LIMIT,
+  trackersFor,
+  TRACKER_NAMES,
+  type Tracker,
+} from '../domain/tickets';
 import { activeBaselines, recentEnvironmentChecks } from '../domain/environments';
-import { effectivePolicy, recentPolicyReceipts } from '../domain/policies';
+import { effectivePolicy, policyDocumentsFor, recentPolicyReceipts } from '../domain/policies';
+import { knowledgeReachingProject } from '../domain/knowledge';
+import { activeFlowFor } from '../domain/delivery';
+import { policyOrigins } from '../lib/policyOrigin';
 import { timeAgo } from '../lib/format';
+import { logLine } from '../lib/log';
+import { findOrCreateProject } from '../lib/projects';
+import { authorizeSecurity } from '../lib/securityHooks';
+import { track } from '../lib/track';
 import type { AppEnv } from '../types';
-import { Band, Lead, PageHead, Vr } from '../ui/Console';
+import { sectionHref, type SectionKey } from '../lib/scope';
+import { Band, Field, Lead, PageHead, teamTrail, Vr } from '../ui/Console';
 import { AppLayout } from '../ui/Layout';
+import { ProjectCreateBar } from '../ui/ProjectCreate';
 
 /**
  * The project, as a place.
@@ -45,6 +79,17 @@ export const projectsRoutes = new Hono<AppEnv>();
 
 const RUNS_SHOWN = 6;
 const SESSIONS_SHOWN = 5;
+/** Dispatched work shown on the project it was dispatched from; the full ledger is /app/handoffs. */
+const ASSIGNED_SHOWN = 8;
+const HANDOFF_STAGE: Record<string, string> = {
+  offered: 'waiting for the agent',
+  accepted: 'accepted',
+  in_progress: 'in progress',
+  completed: 'completed — reported',
+  cancelled: 'cancelled',
+  declined: 'declined',
+  needs_attention: 'needs attention',
+};
 const TRAIL_SHOWN = 8;
 const WEEK = 7 * 24 * 60 * 60 * 1000;
 
@@ -112,6 +157,88 @@ async function severityByRun(
 const claimLabel = (type: string, key: string, access: string) =>
   `${access === 'write' ? 'w' : 'r'}:${type}:${key}`;
 
+const ProjectBanner = ({ kind, text }: { kind: 'error' | 'success'; text: string }) => (
+  <div class={`banner banner-${kind}`}>
+    <span class="ic">{kind === 'error' ? '!' : '✓'}</span>
+    <span>{text}</span>
+    <button class="x" type="button" data-dismiss="t">
+      ×
+    </button>
+  </div>
+);
+
+const projectCreateRedirect = (
+  teamSlug: string,
+  returnTo: string,
+  kind: 'error' | 'ok',
+  message: string,
+  project?: { slug: string },
+) => {
+  const params = new URLSearchParams({ team: teamSlug, [kind]: message });
+  if (project) params.set('project', project.slug);
+  return returnTo === 'tokens'
+    ? `/app/tokens?${params}`
+    : `/app/teams/${encodeURIComponent(teamSlug)}/projects?${params}`;
+};
+
+projectsRoutes.post('/app/projects', async (c) => {
+  const user = c.get('user');
+  if (!user) return loginRedirect(c);
+  const db = c.get('db');
+  const body = await c.req.parseBody();
+  const teamSlug = typeof body.team === 'string' ? body.team.trim() : '';
+  const input = typeof body.project === 'string' ? body.project.trim() : '';
+  const returnTo = body.return_to === 'tokens' ? 'tokens' : 'projects';
+  const access = teamSlug ? await teamForUser(db, user.id, teamSlug) : undefined;
+  if (!access || access.role !== 'owner') return c.notFound();
+
+  // /app/projects is intentionally team-agnostic so Agent connections can offer
+  // one workspace picker. Re-run the EE browser guard with the submitted team:
+  // the outer session middleware cannot infer a workspace from this URL alone.
+  const denied = await authorizeSecurity(db, 'browser', { team: teamSlug });
+  if (denied) return c.text(denied, 403);
+  if (!input || input.length > 500) {
+    return c.redirect(
+      projectCreateRedirect(
+        teamSlug,
+        returnTo,
+        'error',
+        'Enter a project name or repository identifier (500 characters maximum).',
+      ),
+    );
+  }
+
+  const result = await findOrCreateProject(db, access.team, input, user.id);
+  if ('error' in result) {
+    return c.redirect(projectCreateRedirect(teamSlug, returnTo, 'error', result.error));
+  }
+  if (result.created) {
+    await track(db, {
+      teamId: access.team.id,
+      projectId: result.project.id,
+      userId: user.id,
+      action: 'project_created',
+      detail: result.project.slug,
+    });
+    logLine({
+      evt: 'project',
+      a: 'created',
+      u: user.username,
+      team: access.team.slug,
+      project: result.project.slug,
+    });
+  }
+  return c.redirect(
+    projectCreateRedirect(
+      teamSlug,
+      returnTo,
+      'ok',
+      result.created ? 'Project created and selected.' : 'Project already existed and is selected.',
+      result.project,
+    ),
+  );
+});
+
 // ---------------------------------------------------------------- list
 
 projectsRoutes.get('/app/teams/:slug/projects', async (c) => {
@@ -138,7 +265,8 @@ projectsRoutes.get('/app/teams/:slug/projects', async (c) => {
     for (const r of await db
       .select({ pid: debugSessions.projectId, n: count() })
       .from(debugSessions)
-      .where(and(inArray(debugSessions.projectId, ids), eq(debugSessions.status, 'open')))
+      .leftJoin(handoffs, eq(handoffs.sessionId, debugSessions.id))
+      .where(and(inArray(debugSessions.projectId, ids), eq(debugSessions.status, 'open'), isNull(handoffs.id)))
       .groupBy(debugSessions.projectId)) {
       if (r.pid) openSessions.set(r.pid, r.n);
     }
@@ -209,19 +337,29 @@ projectsRoutes.get('/app/teams/:slug/projects', async (c) => {
       scope={<span class="mono muted">team {team.slug}</span>}
       head={
         <PageHead
-          crumb={`/ ${team.slug} / projects`}
+          trail={teamTrail(team, { label: 'Projects' })}
           title="Projects"
-          sub="Born automatically from the repo identifier agents send. Each one owns its policy, baseline, flow and sessions."
+          sub="Create a project before connecting a scoped agent, or let an agent discover one from its repository identifier. Each project owns its policy, baseline, flow and sessions."
         />
       }
       keys={[{ k: 'G', label: 'agent map' }]}
-      keysNote="a project appears the first time an agent names its repo — there is nothing to create"
+      keysNote="repository identifiers keep the project your agent discovers aligned with the one you create"
     >
+      {c.req.query('error') ? <ProjectBanner kind="error" text={c.req.query('error')!} /> : null}
+      {c.req.query('ok') ? <ProjectBanner kind="success" text={c.req.query('ok')!} /> : null}
+      {access.role === 'owner' ? (
+        <ProjectCreateBar
+          workspaces={[{ name: team.name, slug: team.slug }]}
+          selectedWorkspace={team.slug}
+          returnTo="projects"
+          open={rows.length === 0 || Boolean(c.req.query('error'))}
+        />
+      ) : null}
       {rows.length === 0 ? (
         <div class="card card-pad muted small">
-          No projects yet. One appears the first time an agent names its repository — through{' '}
-          <code>start_run</code>, a snapshot, or a session opened with a repo name. Nothing to
-          create here.
+          No projects yet. A workspace owner can create one above before connecting an agent. A
+          project can also appear when an agent first names its repository through{' '}
+          <code>start_run</code>, a snapshot, or a session.
         </div>
       ) : (
         <div class="card scroll-x">
@@ -245,9 +383,14 @@ projectsRoutes.get('/app/teams/:slug/projects', async (c) => {
               return (
                 <tr>
                   <td class="name">
-                    <a href={`/app/teams/${team.slug}/projects/${encodeURIComponent(p.name)}`}>
+                    <a href={`/app/teams/${team.slug}/projects/${encodeURIComponent(p.slug)}`}>
                       {p.name}
                     </a>
+                    {rows.some((other) => other.id !== p.id && other.name === p.name) ? (
+                      <div class="mono muted small">
+                        {p.repositoryIdentity ? 'repository-bound' : p.slug}
+                      </div>
+                    ) : null}
                   </td>
                   <td>
                     {mine.length}
@@ -298,17 +441,15 @@ projectsRoutes.get('/app/teams/:slug/projects/:project', async (c) => {
   const user = c.get('user');
   if (!user) return loginRedirect(c);
   const db = c.get('db');
+  const env = c.get('env');
   const access = await teamForUser(db, user.id, c.req.param('slug'));
   if (!access) return c.notFound();
   const team = access.team;
-  const name = c.req.param('project');
-
-  const found = await db
-    .select()
-    .from(projects)
-    .where(and(eq(projects.teamId, team.id), eq(projects.name, name)))
-    .limit(1);
-  const project = found[0];
+  // The list links by slug — the one handle two same-named projects cannot
+  // share — and older links carry the name. Looking up by name alone answered
+  // 404 for every project whose slug differs from its name, and picked either
+  // one of a repository-bound project and its same-named legacy sibling.
+  const project = await projectForTeam(db, team.id, c.req.param('project'));
   if (!project) return c.notFound();
 
   const live = (await activeRunsForMember(db, user.id, team.slug)).filter(
@@ -324,18 +465,46 @@ projectsRoutes.get('/app/teams/:slug/projects/:project', async (c) => {
     live.map((r) => r.run.id),
   );
 
+  // A thread that carries an assignment or a handoff is dispatched work, listed
+  // below with its own state. Counted as an "open session" it never closed:
+  // cancelling or completing the work leaves the thread open, so a lead who
+  // cancelled a mistaken assignment still read "open" beside it (2026-09-19).
+  const threads = and(eq(debugSessions.projectId, project.id), eq(debugSessions.status, 'open'), isNull(handoffs.id));
   const sessions = await db
     .select({ session: debugSessions })
     .from(debugSessions)
-    .where(and(eq(debugSessions.projectId, project.id), eq(debugSessions.status, 'open')))
+    .leftJoin(handoffs, eq(handoffs.sessionId, debugSessions.id))
+    .where(threads)
     .orderBy(desc(debugSessions.createdAt))
     .limit(SESSIONS_SHOWN);
   const openCount = (
     await db
       .select({ n: count() })
       .from(debugSessions)
-      .where(and(eq(debugSessions.projectId, project.id), eq(debugSessions.status, 'open')))
+      .leftJoin(handoffs, eq(handoffs.sessionId, debugSessions.id))
+      .where(threads)
   )[0]?.n ?? 0;
+  const dispatched = await db
+    .select({ offer: handoffs, title: debugSessions.title, agent: agentInstallations.name, device: agentInstallations.deviceLabel })
+    .from(handoffs)
+    .innerJoin(debugSessions, eq(handoffs.sessionId, debugSessions.id))
+    .leftJoin(agentInstallations, eq(agentInstallations.id, handoffs.targetInstallationId))
+    .where(eq(debugSessions.projectId, project.id))
+    .orderBy(desc(handoffs.createdAt))
+    .limit(ASSIGNED_SHOWN);
+  /** `?team=…&project=…`: how the agent map opens in this scope — it has no address of its own under a project. */
+  const inProject = `?team=${encodeURIComponent(team.slug)}&project=${encodeURIComponent(project.slug)}`;
+  /** One of this project's sections, at its own address. */
+  const section = (key: SectionKey) => sectionHref(team.slug, project.slug, key);
+  // What the last form post on this page did, named back to the person who did it.
+  const noticeFor = (key: 'assigned' | 'cancelled') => {
+    const id = c.req.query(key);
+    return id ? dispatched.find((row) => row.offer.sessionId === id) : undefined;
+  };
+  const justAssigned = noticeFor('assigned');
+  const justCancelled = noticeFor('cancelled');
+  const whom = (row: (typeof dispatched)[number]) =>
+    row.agent ? `${row.agent}${row.device ? ` on ${row.device}` : ''}` : 'the team';
 
   const agents7d =
     (
@@ -357,7 +526,11 @@ projectsRoutes.get('/app/teams/:slug/projects/:project', async (c) => {
       .where(eq(snapshots.projectId, project.id))
   )[0]?.last;
 
-  const policy = await effectivePolicy(db, user.id, { team: team.slug, project: project.name });
+  const policy = await effectivePolicy(db, user.id, {
+    team: team.slug,
+    project: project.name,
+    projectId: project.id,
+  });
   const baselines = await activeBaselines(db, team.id, 1, project.id);
   const checks = await recentEnvironmentChecks(db, team.id, 5, project.id);
   const criticalChecks = checks.filter((row) => row.check.status === 'critical').length;
@@ -373,20 +546,93 @@ projectsRoutes.get('/app/teams/:slug/projects/:project', async (c) => {
         }
       : null;
 
+  // Who work can be assigned to from here. The same list assign_work resolves a
+  // name against, so the form and the tool cannot disagree about who exists.
+  const assignable = await assignableAgents(db, team.id);
+  // "Adapter paired" on this page means a hook that hears work filed *here* —
+  // the same answer assign_work gives as hookWillAnnounce for this project.
+  const heardHere = await agentsHeardIn(
+    db,
+    assignable.map((a) => a.installationId),
+    team.id,
+    project.id,
+  );
+  const assignError = c.req.query('assign_error') ?? null;
+  // Which trackers can pull a ticket into an assignment at all. Only the
+  // connections are read here — no issue is fetched to draw the page, because a
+  // tracker being slow must not make the project page slow.
+  const trackers = await trackersFor(db, team.id, project.id);
+  const pickable = pickableTrackers(trackers);
+  /**
+   * The picker is a link, like `?run=` on the map and `?tab=` on the team page:
+   * it survives a refresh, the back button undoes it, and no script is needed
+   * to draw a list. The alternative considered was a submit button with
+   * `formmethod="get"`, which would carry everything already typed into the
+   * dialog — it lost because a `maxlength=8000` brief through a query string is
+   * a 431 from Node's 16 KiB header cap, and the Ticket field is the *first*
+   * field: the order here is pick, then write.
+   */
+  const asked = c.req.query('pick');
+  const picking = pickable.find((t) => t === asked) ?? null;
+  // The one fetch on this page, and only because somebody clicked for it.
+  const listed = picking ? await listTicketsFor(db, env, team.id, project.id, picking) : null;
+  /**
+   * The reference in the Ticket field: what the picker just chose, or what a
+   * refused assignment was carrying. Without the second, a lead who picked a
+   * ticket and then mistyped the agent lost the pick as well as the answer.
+   */
+  const ticketField = (c.req.query('ticket') ?? '').slice(0, 200);
+  // Open, because a person who clicked Browse or hit a refusal must not have to
+  // find the dialog again. An empty `pick` counts: that is what **Close list**
+  // links to, and closing the list must not also close the dialog around it.
+  // `data-auto-open` alongside it upgrades this to a real modal where there is
+  // script; showModal() refuses an already-open element, so client.ts closes it
+  // first.
+  const assignOpen = asked !== undefined || Boolean(ticketField || assignError);
+  /** This page, plus the picker's own selection. */
+  const pickHref = (query: { pick?: Tracker | null; ticket?: string }) => {
+    const parts = [`pick=${query.pick ?? ''}`];
+    if (query.ticket) parts.push(`ticket=${encodeURIComponent(query.ticket)}`);
+    return `/app/teams/${team.slug}/projects/${encodeURIComponent(project.slug)}?${parts.join('&')}#assign-work`;
+  };
+
   const policyDoc = 'error' in policy ? null : policy;
   // The merged document, read the way get_policy serves it — so the card and the
   // agent are quoting one answer rather than two summaries of it.
-  const rules: string[] = [];
   const projectScope = policyDoc?.sources.find((source) => source.scope.startsWith('project:'));
-  if (policyDoc) {
-    const doc = policyDoc.document;
-    for (const rule of doc.autonomy?.requireApprovalFor ?? []) rules.push(`Needs a person: ${rule}`);
-    for (const rule of doc.permissions?.requireApproval ?? []) rules.push(`Requires approval: ${rule}`);
-    for (const key of doc.environment?.requiredEnvVarNames ?? []) rules.push(`Required env var: ${key}`);
-    for (const check of doc.requiredChecks ?? []) rules.push(`Check: ${check}`);
-    for (const path of doc.protectedPaths ?? []) rules.push(`Protected: ${path}`);
-    for (const line of doc.permissions?.deny ?? []) rules.push(`Denied: ${line}`);
-  }
+  // Where each rule comes from, derived from the two published documents. What
+  // this project adds leads: it is what is different here, and the workspace's
+  // rules are one click away on the page that owns them.
+  const documents = await policyDocumentsFor(db, team.id, project.id);
+  const origins = policyOrigins(documents.workspace, documents.project);
+  const PREFIX: Record<string, string> = {
+    autonomy: 'Needs a person',
+    approval: 'Requires approval',
+    env: 'Required env var',
+    checks: 'Check',
+    paths: 'Protected',
+    deny: 'Denied',
+    runtimes: 'Runtime',
+    budget: 'Budget',
+  };
+  const rules = origins.sections
+    .filter((section) => PREFIX[section.key])
+    .flatMap((section) => section.rules.map((rule) => ({ ...rule, text: `${PREFIX[section.key]}: ${rule.text}` })))
+    .sort((a, b) => (a.origin === b.origin ? 0 : a.origin === 'project' ? -1 : 1));
+  // Six lines, and both origins get a say: a project that adds ten rules must not
+  // push the workspace's off the card, or the card reads as if nothing is inherited.
+  const RULES_SHOWN = 6;
+  const ownRules = rules.filter((rule) => rule.origin === 'project');
+  const inheritedRules = rules.filter((rule) => rule.origin === 'workspace');
+  const shownRules = [
+    ...ownRules.slice(0, Math.max(4, RULES_SHOWN - inheritedRules.length)),
+    ...inheritedRules.slice(0, Math.max(2, RULES_SHOWN - ownRules.length)),
+  ].slice(0, RULES_SHOWN);
+  // The other two things in effect here, each with the same question answered.
+  const knowledgeHere = await knowledgeReachingProject(db, team.id, project.id);
+  const flowHere = await activeFlowFor(db, team.id, project.id);
+  /** Governance twice, at two anchors: same address, different place on it. */
+  const governanceHere = section('governance');
 
   return c.html(
     <AppLayout
@@ -420,21 +666,33 @@ projectsRoutes.get('/app/teams/:slug/projects/:project', async (c) => {
       }
       head={
         <PageHead
-          crumb={`/ ${team.slug} / projects / ${project.name}`}
+          trail={teamTrail(team, { label: 'Projects', href: `/app/teams/${team.slug}/projects` }, { label: project.name })}
           title={project.name}
           sub="Everything about this project on one page: live runs, sessions, policy, environment and delivery — with the way to change each."
           actions={
             <>
               <a
                 class="btn btn-sm"
-                href={`/app/teams/${team.slug}/compare?project=${encodeURIComponent(project.name)}`}
+                href={`/app/tokens?team=${encodeURIComponent(team.slug)}&project=${encodeURIComponent(project.slug)}`}
+              >
+                Connect agent
+              </a>
+              <a
+                class="btn btn-sm"
+                href={section('environments')}
               >
                 Compare machines
               </a>
-              <a class="btn btn-sm" href="/app/sessions">
+              <a
+                class="btn btn-sm"
+                href={`/app/sessions?new=1&team=${encodeURIComponent(team.slug)}&project=${encodeURIComponent(project.id)}`}
+              >
                 Open a session
               </a>
-              <a class="btn btn-sm btn-primary" href="/app/agents">
+              <button class="btn btn-sm" type="button" data-open-dialog="#assign-work">
+                Assign work
+              </button>
+              <a class="btn btn-sm btn-primary" href={`/app/agents${inProject}`}>
                 View on agent map
               </a>
             </>
@@ -442,12 +700,39 @@ projectsRoutes.get('/app/teams/:slug/projects/:project', async (c) => {
         />
       }
       band={
-        worst === 'critical' ? (
+        assignError ? (
+          <Band kind="danger" tag="not assigned">
+            {assignError}
+          </Band>
+        ) : justAssigned ? (
+          <Band
+            kind="info"
+            tag="assigned"
+            actions={
+              <>
+                <a class="btn btn-sm" href={`/app/sessions/${justAssigned.offer.sessionId}`}>
+                  Open the brief
+                </a>
+                <button class="btn btn-sm" type="button" data-open-dialog="#assign-work">
+                  Assign another
+                </button>
+              </>
+            }
+          >
+            “{justAssigned.title}” went to <b>{whom(justAssigned)}</b>. It hears it the next time
+            somebody types to it. Wrong agent? Cancel it under Assigned work below.
+          </Band>
+        ) : justCancelled ? (
+          <Band kind="info" tag="cancelled">
+            “{justCancelled.title}” is cancelled: <b>{whom(justCancelled)}</b> will not be told about
+            it and can no longer accept it. The brief stays readable.
+          </Band>
+        ) : worst === 'critical' ? (
           <Band
             kind="danger"
             tag="critical"
             actions={
-              <a class="btn btn-sm" href="/app/agents">
+              <a class="btn btn-sm" href={`/app/agents${inProject}`}>
                 Open in inspector
               </a>
             }
@@ -493,7 +778,7 @@ projectsRoutes.get('/app/teams/:slug/projects/:project', async (c) => {
                 <div class="card-title">Active runs</div>
                 <div class="card-note">This project only — the same rows as the agent map.</div>
               </div>
-              <a class="btn btn-sm" href="/app/agents">
+              <a class="btn btn-sm" href={`/app/agents${inProject}`}>
                 Agent map
               </a>
             </div>
@@ -530,13 +815,72 @@ projectsRoutes.get('/app/teams/:slug/projects/:project', async (c) => {
             )}
           </div>
 
+          <div class="card" id="assigned-work">
+            <div class="card-head">
+              <div>
+                <div class="card-title">Assigned work</div>
+                <div class="card-note">
+                  What was dispatched on {project.name}, to whom, and where it stands.
+                </div>
+              </div>
+              <div style="display:flex;gap:8px">
+                <button class="btn btn-sm" type="button" data-open-dialog="#assign-work">
+                  Assign work
+                </button>
+                <a class="btn btn-sm" href={section('work')}>
+                  All handoffs
+                </a>
+              </div>
+            </div>
+            {dispatched.length === 0 ? (
+              <div class="card-pad muted small">
+                Nothing dispatched on this project yet. Assign work names an agent; only that agent
+                can accept it.
+              </div>
+            ) : (
+              dispatched.map((row) => {
+                const live = !['completed', 'cancelled', 'declined'].includes(row.offer.state);
+                return (
+                  <div class="introw">
+                    <div class="who">
+                      <div class="t">
+                        <a href={`/app/sessions/${row.offer.sessionId}`}>{row.title}</a>
+                      </div>
+                      <div class="s">
+                        {row.offer.kind === 'assignment' ? 'assigned to' : 'handed to'} {whom(row)} ·{' '}
+                        {timeAgo(row.offer.createdAt) ?? 'just now'}
+                      </div>
+                    </div>
+                    <div style="display:flex;gap:8px;align-items:center">
+                      <span class={`pill ${live ? 'pill-active' : 'pill-muted'}`}>
+                        {HANDOFF_STAGE[row.offer.state] ?? row.offer.state}
+                      </span>
+                      {live && row.offer.offeredBy === user.id ? (
+                        <form method="post" action={`/app/sessions/${row.offer.sessionId}/handoff/cancel`}>
+                          <input type="hidden" name="return_to" value="project" />
+                          <button
+                            class="btn btn-sm"
+                            type="submit"
+                            data-confirm={`Cancel “${row.title}”? ${whom(row)} will not be told about it. This does not stop work an agent already started.`}
+                          >
+                            Cancel
+                          </button>
+                        </form>
+                      ) : null}
+                    </div>
+                  </div>
+                );
+              })
+            )}
+          </div>
+
           <div class="card">
             <div class="card-head">
               <div>
                 <div class="card-title">Open sessions</div>
                 <div class="card-note">Debug threads tagged {project.name}.</div>
               </div>
-              <a class="btn btn-sm" href="/app/sessions">
+              <a class="btn btn-sm" href={section('sessions')}>
                 All sessions
               </a>
             </div>
@@ -554,7 +898,7 @@ projectsRoutes.get('/app/teams/:slug/projects/:project', async (c) => {
                     </div>
                     <div class="s">opened {timeAgo(session.createdAt) ?? 'just now'}</div>
                   </div>
-                  <span class="pill pill-ok">open</span>
+                  <span class="pill pill-open">open</span>
                 </div>
               ))
             )}
@@ -566,7 +910,7 @@ projectsRoutes.get('/app/teams/:slug/projects/:project', async (c) => {
                 <div class="card-title">Recent activity</div>
                 <div class="card-note">The run trail for this project, newest first.</div>
               </div>
-              <a class="btn btn-sm" href={`/app/teams/${team.slug}/activity?project=${encodeURIComponent(project.name)}`}>
+              <a class="btn btn-sm" href={section('activity')}>
                 Activity
               </a>
             </div>
@@ -583,7 +927,9 @@ projectsRoutes.get('/app/teams/:slug/projects/:project', async (c) => {
                 {trail.map((row) => (
                   <tr>
                     <td class="muted">{timeAgo(row.event.createdAt) ?? 'just now'}</td>
-                    <td class="mono">{row.event.type}</td>
+                    <td>
+                      <span class="pill pill-member">{row.event.type.replaceAll('_', ' ')}</span>
+                    </td>
                     <td class="mono">{row.run.taskKey ?? '—'}</td>
                     <td>{row.owner}</td>
                   </tr>
@@ -597,8 +943,11 @@ projectsRoutes.get('/app/teams/:slug/projects/:project', async (c) => {
           <div class="card card-pad" style="display:flex;flex-direction:column;gap:12px">
             <div class="row" style="justify-content:space-between">
               <div>
-                <div class="card-title">Policy</div>
-                <div class="card-note">This project's additions, merged onto team rules.</div>
+                <div class="card-title">Rules in effect here</div>
+                <div class="card-note">
+                  {origins.inherited} from the workspace · {origins.own} this project adds. A project can
+                  add a rule or tighten one, never remove one.
+                </div>
               </div>
               {projectScope ? (
                 <span class="pill pill-active">
@@ -606,22 +955,55 @@ projectsRoutes.get('/app/teams/:slug/projects/:project', async (c) => {
                   {confirmed !== null ? ' · confirmed' : ''}
                 </span>
               ) : (
-                <span class="pill">team only</span>
+                <span class="pill">workspace only</span>
               )}
             </div>
             {rules.length === 0 ? (
               <p class="m0 small muted">
-                No rules in force for {project.name} beyond the team's. A project policy adds to
-                the team document; it never replaces it.
+                No policy rule is in force for {project.name}: neither the workspace nor this project
+                has published one.
               </p>
             ) : (
-              rules.slice(0, 5).map((rule) => (
-                <div class="factrow">
-                  <span class="y">✓</span>
-                  <span>{rule}</span>
-                </div>
-              ))
+              <>
+                {shownRules.map((rule) => (
+                  <div class="factrow">
+                    <span class="y">✓</span>
+                    <span style="flex:1">{rule.text}</span>
+                    <span class={`origin origin-${rule.origin}`} style="flex:0 0 auto">
+                      {rule.origin === 'project' ? 'this project' : 'workspace'}
+                    </span>
+                  </div>
+                ))}
+                {rules.length > shownRules.length ? (
+                  <a class="small" href={`${governanceHere}#effective-policy`}>
+                    +{rules.length - shownRules.length} more, each with where it comes from
+                  </a>
+                ) : null}
+              </>
             )}
+            <div class="factrow" id="knowledge-here">
+              <span class={knowledgeHere.workspace + knowledgeHere.project > 0 ? 'y' : 'n'}>
+                {knowledgeHere.workspace + knowledgeHere.project > 0 ? '✓' : '·'}
+              </span>
+              <span style="flex:1">
+                <a href={section('knowledge')}>Knowledge</a>:{' '}
+                {knowledgeHere.workspace + knowledgeHere.project === 0
+                  ? 'no record reaches this project yet'
+                  : `${knowledgeHere.workspace} from the workspace · ${knowledgeHere.project} addressed to this project`}
+              </span>
+            </div>
+            <div class="factrow" id="delivery-here">
+              <span class={flowHere ? 'y' : 'n'}>{flowHere ? '✓' : '·'}</span>
+              <span style="flex:1">
+                <a href={section('delivery')}>Delivery</a>:{' '}
+                {flowHere ? `${flowHere.flow.name} v${flowHere.flow.version}` : 'no flow published'}
+              </span>
+              {flowHere ? (
+                <span class={`origin origin-${flowHere.projectName ? 'project' : 'workspace'}`} style="flex:0 0 auto">
+                  {flowHere.projectName ? 'this project' : 'workspace'}
+                </span>
+              ) : null}
+            </div>
             {policyDoc ? (
               <div class="factrow">
                 {/* Silence is not agreement: a receipt nobody answered is unconfirmed,
@@ -638,16 +1020,10 @@ projectsRoutes.get('/app/teams/:slug/projects/:project', async (c) => {
               </div>
             ) : null}
             <div class="row" style="gap:8px">
-              <a
-                class="btn btn-sm"
-                href={`/app/teams/${team.slug}/governance?project=${encodeURIComponent(project.name)}`}
-              >
-                Edit policy
+              <a class="btn btn-sm" href={`${governanceHere}#effective-policy`}>
+                Where each rule comes from
               </a>
-              <a
-                class="btn btn-sm"
-                href={`/app/teams/${team.slug}/governance?project=${encodeURIComponent(project.name)}`}
-              >
+              <a class="btn btn-sm" href={`${governanceHere}#policy-receipts`}>
                 Receipts
               </a>
             </div>
@@ -695,17 +1071,370 @@ projectsRoutes.get('/app/teams/:slug/projects/:project', async (c) => {
             <div class="row" style="gap:8px">
               <a
                 class="btn btn-sm"
-                href={`/app/teams/${team.slug}/compare?project=${encodeURIComponent(project.name)}`}
+                href={section('environments')}
               >
                 Compare machines
               </a>
-              <a class="btn btn-sm" href={`/app/teams/${team.slug}/governance`}>
+              {/* A baseline belongs to one project, so the page it is recorded on
+                  opens in this one rather than across the workspace. */}
+              <a class="btn btn-sm" href={governanceHere}>
                 Update baseline
               </a>
             </div>
           </div>
         </div>
       </div>
+
+      <dialog
+        id="assign-work"
+        class="formdlg wide"
+        open={assignOpen}
+        data-auto-open={assignOpen ? 't' : undefined}
+      >
+        <h3>Assign work to an agent</h3>
+        <p class="dlgsub">
+          Name the agent and say what to do. It picks the task up from its own inbox, and only
+          the agent you name can accept it. An agent marked <b>adapter paired</b> has a local
+          adapter in this project, so its own prompt hook tells it the next time anyone types to
+          it; for any other, one sentence on its machine is enough — "read your STMA inbox and do
+          what is assigned to you". Local adapters are not listed: they are a checkout's ears and
+          cannot accept work.
+        </p>
+        {/* Also inside the dialog, because a modal covers the page's own band:
+            the lead reopened on a refusal and would otherwise read a filled-in
+            form with nothing saying why it came back. */}
+        {assignError ? <div class="banner banner-error">{assignError}</div> : null}
+        {assignable.length === 0 ? (
+          <>
+            <p class="m0 sub">
+              No agents are connected to this workspace yet. Connect one first; the name you give
+              it at consent is the name you assign work to.
+            </p>
+            <div class="dialog-actions">
+              <a
+                class="btn"
+                href={`/app/tokens?team=${encodeURIComponent(team.slug)}&project=${encodeURIComponent(project.slug)}`}
+              >
+                Connect agent
+              </a>
+              <button class="btn" type="button" data-close-dialog="t">
+                Close
+              </button>
+            </div>
+          </>
+        ) : (
+          <form
+            method="post"
+            action={`/app/teams/${team.slug}/projects/${encodeURIComponent(project.slug)}/assign`}
+          >
+            {trackers.length ? (
+              <>
+                <Field
+                  id="assign-ticket"
+                  label="Ticket"
+                  help={`${ticketExamples(trackers)}. STMA reads it and fills anything you leave empty below, and the brief carries the link. Leave it blank to write the task yourself.`}
+                >
+                  <input
+                    class="in"
+                    id="assign-ticket"
+                    name="ticket"
+                    maxlength={200}
+                    value={ticketField}
+                    placeholder={ticketPlaceholder(trackers)}
+                    aria-describedby="assign-ticket-help"
+                  />
+                </Field>
+                <div class="row" style="flex-wrap:wrap;gap:8px">
+                  {pickable.map((tracker) => (
+                    // `aria-controls` only while the list is on the page: a
+                    // control pointing at an id that is not there is worse than
+                    // no pointer at all.
+                    <a
+                      class="btn btn-sm"
+                      href={pickHref({ pick: tracker, ticket: ticketField })}
+                      aria-expanded={picking === tracker ? 'true' : 'false'}
+                      aria-controls={listed ? 'ticket-list' : undefined}
+                    >
+                      Browse {TRACKER_NAMES[tracker]}
+                    </a>
+                  ))}
+                  {trackers.includes('jira') ? (
+                    <span class="card-note" style="margin:0">
+                      {JIRA_PICK_NOTE}
+                    </span>
+                  ) : null}
+                </div>
+                {listed ? (
+                  <div id="ticket-list" style="display:flex;flex-direction:column;gap:10px">
+                    {!listed.ok ? (
+                      // Named, the way the paste path names a refusal: an empty
+                      // list and no explanation reads as "nothing to do here".
+                      <div class="banner banner-error">{listed.error}</div>
+                    ) : listed.value.length === 0 ? (
+                      <p class="m0 sub">
+                        Nothing open in {TRACKER_NAMES[picking!]} right now. Paste a reference above
+                        if you know one.
+                      </p>
+                    ) : (
+                      <div class="tickets">
+                        {listed.value.map((row) =>
+                          row.ref === ticketField ? (
+                            <div class="introw" aria-current="true">
+                              <div class="who">
+                                <div class="t">{row.summary}</div>
+                                <div class="s">
+                                  {row.key} · {row.status}
+                                  {timeAgo(row.updatedAt) ? ` · ${timeAgo(row.updatedAt)}` : ''}
+                                </div>
+                              </div>
+                              <span class="pill pill-active">chosen</span>
+                            </div>
+                          ) : (
+                            <a class="introw" href={pickHref({ pick: picking, ticket: row.ref })}>
+                              <div class="who">
+                                <div class="t">{row.summary}</div>
+                                <div class="s">
+                                  {row.key} · {row.status}
+                                  {timeAgo(row.updatedAt) ? ` · ${timeAgo(row.updatedAt)}` : ''}
+                                </div>
+                              </div>
+                              <span class="chev">›</span>
+                            </a>
+                          ),
+                        )}
+                      </div>
+                    )}
+                    {/* Outside the three cases above, so a refusing tracker and
+                        an empty list have the way back that a full one has. */}
+                    <div class="row" style="flex-wrap:wrap;gap:8px">
+                      {listed.ok && listed.value.length ? (
+                        <span class="card-note" style="margin:0">
+                          The {TICKET_PICKER_LIMIT} most recently updated open{' '}
+                          {picking === 'github' ? 'issues' : 'tasks'}. Older ones are still
+                          reachable by pasting the reference.
+                        </span>
+                      ) : null}
+                      <a
+                        class="btn btn-sm"
+                        style="margin-left:auto"
+                        href={pickHref({ ticket: ticketField })}
+                      >
+                        Close list
+                      </a>
+                    </div>
+                  </div>
+                ) : null}
+              </>
+            ) : null}
+            <Field
+              id="assign-agent"
+              label="Agent"
+              required
+              help="Every agent connected to this workspace, newest-seen first. One connected to a different project only cannot take work here."
+            >
+              <select
+                class="in"
+                id="assign-agent"
+                name="agent"
+                aria-describedby="assign-agent-help"
+                required
+              >
+                <option value="" selected disabled>
+                  Choose an agent…
+                </option>
+                {assignable.map((a) => (
+                  <option
+                    value={a.installationId}
+                    disabled={a.projectId !== null && a.projectId !== project.id}
+                  >
+                    {a.name} · {a.owner}
+                    {a.device ? `@${a.device}` : ''} · {a.client} · seen {timeAgo(a.lastSeenAt)}
+                    {heardHere.has(a.installationId) ? ' · adapter paired' : ''}
+                  </option>
+                ))}
+              </select>
+            </Field>
+            <Field
+              id="assign-task"
+              label="Task"
+              required={!trackers.length}
+              help={
+                trackers.length
+                  ? 'A short title or task key. It becomes the run task and the ledger line. Leave it empty to use the ticket above.'
+                  : 'A short title or task key. It becomes the run task and the ledger line.'
+              }
+            >
+              <input
+                class="in"
+                id="assign-task"
+                name="task"
+                maxlength={120}
+                required={!trackers.length}
+                aria-describedby="assign-task-help"
+              />
+            </Field>
+            <Field
+              id="assign-brief"
+              label="Brief"
+              required={!trackers.length}
+              help={
+                trackers.length
+                  ? "What to do and why, in your words. The first line becomes the run intent. Leave it empty to use the ticket's own summary. Never put a credential here."
+                  : 'What to do and why, in your words. The first line becomes the run intent. Never put a credential here.'
+              }
+            >
+              <textarea
+                class="in"
+                id="assign-brief"
+                name="brief"
+                rows={6}
+                maxlength={8000}
+                required={!trackers.length}
+                aria-describedby="assign-brief-help"
+              ></textarea>
+            </Field>
+            <Field id="assign-steps" label="Steps" help="One per line, in order.">
+              <textarea
+                class="in"
+                id="assign-steps"
+                name="steps"
+                rows={4}
+                aria-describedby="assign-steps-help"
+              ></textarea>
+            </Field>
+            <Field
+              id="assign-branch"
+              label="Branch"
+              help="Only if you already have one in mind; otherwise the agent starts from the default branch."
+            >
+              <input
+                class="in"
+                id="assign-branch"
+                name="branch"
+                maxlength={300}
+                aria-describedby="assign-branch-help"
+              />
+            </Field>
+            <div class="dialog-actions">
+              <button class="btn" type="button" data-close-dialog="t">
+                Cancel
+              </button>
+              <button class="btn btn-primary" type="submit">
+                Assign
+              </button>
+            </div>
+          </form>
+        )}
+      </dialog>
     </AppLayout>,
   );
+});
+
+/**
+ * The browser half of assign_work. Same draft, same record, same rules — a
+ * lead at a browser and a lead's agent create indistinguishable assignments,
+ * which is what lets the receiving agent treat both the same way.
+ */
+projectsRoutes.post('/app/teams/:slug/projects/:project/assign', async (c) => {
+  const user = c.get('user');
+  if (!user) return loginRedirect(c);
+  const db = c.get('db');
+  const env = c.get('env');
+  const access = await teamForUser(db, user.id, c.req.param('slug'));
+  if (!access) return c.notFound();
+  const team = access.team;
+  // The same lookup as the page the form sits on, so the assignment is filed
+  // under the project the lead is looking at — never a same-named sibling.
+  const project = await projectForTeam(db, team.id, c.req.param('project'));
+  if (!project) return c.notFound();
+
+  const body = await c.req.parseBody();
+  const str = (key: string) => (typeof body[key] === 'string' ? (body[key] as string).trim() : '');
+  const back = `/app/teams/${team.slug}/projects/${encodeURIComponent(project.slug)}`;
+  // The reference comes back with the refusal: picking a ticket and then
+  // mistyping the agent used to cost the pick as well as the answer, and the
+  // field the picker fills is the one it would be most annoying to lose.
+  const refuse = (message: string) => {
+    const ticket = str('ticket');
+    return c.redirect(
+      `${back}?assign_error=${encodeURIComponent(message)}${ticket ? `&ticket=${encodeURIComponent(ticket)}` : ''}#assign-work`,
+    );
+  };
+
+  let task = str('task');
+  let brief = str('brief');
+  const branch = str('branch');
+
+  /**
+   * A ticket the lead named, pulled in before anything is validated. Which
+   * tracker it belongs to is read off the shape they typed; `guessTracker`
+   * also decides what the refusal is able to say.
+   */
+  const typedTicket = str('ticket');
+  if (typedTicket) {
+    const ticket = await readNamedTicket(db, env, team.id, project.id, typedTicket);
+    if (!ticket.ok) return refuse(ticket.error);
+    // The tracker's own reference becomes the task so the run, the ledger line
+    // and the ticket all say the same thing, and the link rides in the brief,
+    // which is the part the receiving agent is given to read. The *reference*
+    // rather than the key: for ClickUp they differ, and the reference is the
+    // form `commentOnRunTracker` can route back to — an assignment made from a
+    // picked ClickUp ticket used to finish in silence because the human-facing
+    // key was what got stored.
+    if (!task) task = ticket.value.reference;
+    brief = briefWithTicket(brief, ticket.value);
+  }
+
+  if (task.length < 3 || task.length > 120) return refuse('The task needs 3 to 120 characters.');
+  if (brief.length < 10 || brief.length > 8000) {
+    return refuse('The brief needs 10 to 8000 characters.');
+  }
+  if (branch.length > 300) return refuse('The branch name is too long.');
+  const steps = str('steps')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .slice(0, 20);
+  const agent = (await assignableAgents(db, team.id)).find(
+    (a) => a.installationId === str('agent'),
+  );
+  if (!agent) return refuse('Choose an agent that is connected to this workspace.');
+  if (agent.projectId && agent.projectId !== project.id) {
+    return refuse(`${agent.name} is connected to a different project only and cannot take work here.`);
+  }
+  const allowance = await handoffAllowance(db, env, team);
+  if ('error' in allowance) return refuse(allowance.error);
+
+  const draft: AssignmentDraft = {
+    team: { id: team.id, slug: team.slug },
+    project: { id: project.id, name: project.name, repositoryIdentity: project.repositoryIdentity },
+    agent,
+    assignedBy: { id: user.id, username: user.username, tokenId: null, via: null },
+    task,
+    brief,
+    steps,
+    branch: branch || null,
+    scope: [],
+  };
+  const ids = { sessionId: randomUUID(), handoffId: randomUUID() };
+  const created = await db.transaction(async (tx) =>
+    writeAssignment(tx as unknown as Db, env, draft, ids),
+  );
+  try {
+    await announceAssignment(db, env, team, draft, created);
+  } catch {
+    logLine({ evt: 'handoff', a: 'external_notification_failed' });
+  }
+  logLine({
+    evt: 'handoff',
+    a: 'assigned',
+    session: created.sessionId,
+    handoff: created.handoffId,
+    team: team.slug,
+    via: 'browser',
+  });
+  // Back to the project, not into the thread: the lead is dispatching, the next
+  // thing they do is assign again or check whom this one went to, and the thread
+  // lives under another part of the console with no way back here.
+  return c.redirect(`${back}?assigned=${created.sessionId}#assigned-work`);
 });

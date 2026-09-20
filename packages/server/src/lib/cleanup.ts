@@ -1,7 +1,8 @@
-import { and, eq, inArray, lt, notInArray, or, type SQL } from 'drizzle-orm';
+import { and, eq, inArray, isNull, lt, notInArray, or, type SQL } from 'drizzle-orm';
 import { rowsAffected, type Db } from '../db';
 import {
   activity,
+  agentEnrollments,
   agentEvents,
   agentRuns,
   authCodes,
@@ -9,7 +10,11 @@ import {
   environmentChecks,
   errorEvents,
   invites,
+  loadSamples,
   notificationQueue,
+  oauthAuthorizationCodes,
+  oauthClients,
+  oauthRefreshTokens,
   snapshots,
   teams,
   webSessions,
@@ -18,7 +23,9 @@ import { PLANS, PLAN_IDS } from './entitlements';
 import type { Env } from '../env';
 import { markStaleAgentRuns, trimAgentEvents } from '../domain/agents';
 import { trimEnvironmentChecks } from '../domain/environments';
+import { trimCeilingChanges } from './ceilings';
 import { trimErrorEvents } from './errors';
+import { startLoadHistory, trimLoadSamples } from './loadHistory';
 import { sweepCounters } from './counters';
 import { logLine } from './log';
 import { flushNotificationsOnce } from './notifications';
@@ -76,6 +83,40 @@ export async function runCleanupOnce(db: Db, env: Env): Promise<void> {
   // consumed and expired rows alike) is never shortened by the sweep.
   await db.delete(authCodes).where(lt(authCodes.expiresAt, new Date(now.getTime() - HOUR)));
   await db.delete(invites).where(lt(invites.expiresAt, new Date(now.getTime() - 30 * DAY)));
+  // The raw enrollment secret was never stored, but old hashes and activation
+  // envelopes have no operational value after a short audit window.
+  const enrollmentsPurged = await db
+    .delete(agentEnrollments)
+    .where(lt(agentEnrollments.expiresAt, new Date(now.getTime() - 30 * DAY)));
+  counts.enrollments = rowsAffected(enrollmentsPurged);
+  // OAuth authorization codes are short-lived transport state, not audit data.
+  // Rotated/revoked refresh-token hashes are retained briefly for reuse
+  // detection, then removed; the live token and installation remain the audit
+  // identity and are never swept here.
+  counts.oauthCodes = rowsAffected(
+    await db
+      .delete(oauthAuthorizationCodes)
+      .where(lt(oauthAuthorizationCodes.expiresAt, new Date(now.getTime() - DAY))),
+  );
+  counts.oauthRefreshGrants = rowsAffected(
+    await db
+      .delete(oauthRefreshTokens)
+      .where(or(
+        lt(oauthRefreshTokens.usedAt, new Date(now.getTime() - 30 * DAY)),
+        lt(oauthRefreshTokens.revokedAt, new Date(now.getTime() - 30 * DAY)),
+      )),
+  );
+  // DCR is intentionally unauthenticated for public native clients. Bound its
+  // storage cost by removing registrations that never completed a token
+  // exchange. Used clients retain lastUsedAt and are not swept here.
+  counts.oauthUnusedClients = rowsAffected(
+    await db
+      .delete(oauthClients)
+      .where(and(
+        isNull(oauthClients.lastUsedAt),
+        lt(oauthClients.createdAt, new Date(now.getTime() - 7 * DAY)),
+      )),
+  );
   if (env.snapshotRetentionDays > 0) {
     await db
       .delete(snapshots)
@@ -106,6 +147,20 @@ export async function runCleanupOnce(db: Db, env: Env): Promise<void> {
   }
   // Age alone cannot bound an error storm, so the operator log is also row-capped.
   await trimErrorEvents(db);
+  // The persisted load picture. An instance fact, not a tenant one, so a single
+  // environment number decides it everywhere — hosted included — and the row cap
+  // catches a writer that one day runs in more than one process.
+  if (env.loadRetentionDays > 0) {
+    counts.loadSamples = rowsAffected(
+      await db
+        .delete(loadSamples)
+        .where(lt(loadSamples.bucketAt, new Date(now.getTime() - env.loadRetentionDays * DAY))),
+    );
+  }
+  counts.loadSamplesCapped = await trimLoadSamples(db);
+  // Ceiling changes have no age sweep on purpose (see lib/ceilings): the row
+  // somebody opens this table for is the old one. The cap is the whole bound.
+  counts.ceilingChangesCapped = await trimCeilingChanges(db);
   // Preflight verdicts describe a machine at a moment, so they age out with the
   // snapshots they compare against — and, like the error log, a burst between
   // sweeps is caught by a row cap (per team, so a busy team evicts only itself).
@@ -176,9 +231,11 @@ export function startCleanup(db: Db, env: Env): () => void {
   const timer = setInterval(run, SWEEP_INTERVAL);
   timer.unref?.();
   const presenceRun = () =>
-    markStaleAgentRuns(db, env.agentStaleMinutes).catch((err) =>
-      console.error('[stma] agent presence sweep failed:', err),
-    );
+    markStaleAgentRuns(
+      db,
+      env.agentStaleMinutes,
+      Math.max(env.agentClaimLeaseMinutes, env.agentWaitingLeaseMinutes),
+    ).catch((err) => console.error('[stma] agent presence sweep failed:', err));
   presenceRun();
   const presenceTimer = setInterval(presenceRun, PRESENCE_SWEEP_INTERVAL);
   presenceTimer.unref?.();
@@ -193,9 +250,14 @@ export function startCleanup(db: Db, env: Env): () => void {
           );
         }, NOTIFY_SWEEP_INTERVAL);
   notifyTimer?.unref?.();
+  // The load rollup. Here rather than in its own starter because it is the same
+  // shape as the sweeps above — a timer that turns something in memory into
+  // something on disk, bounded by the retention pass in this very function.
+  const stopLoadHistory = startLoadHistory(db, env);
   return () => {
     clearInterval(timer);
     clearInterval(presenceTimer);
     if (notifyTimer) clearInterval(notifyTimer);
+    stopLoadHistory();
   };
 }

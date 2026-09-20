@@ -14,8 +14,9 @@ import {
   users,
 } from '../db/schema';
 import { fingerprintJson } from '../lib/canonical';
-import { findOrCreateProject } from '../lib/projects';
+import { resolveProjectForWrite } from '../lib/projects';
 import { projectForTeam, teamForUser } from './access';
+import { effectiveLimits } from '../lib/entitlements';
 import { runForOwner } from './agents';
 import { effectivePolicy } from './policies';
 
@@ -23,12 +24,16 @@ export async function setEnvironmentBaseline(
   db: Db,
   userId: string,
   input: { team: string; project: string; snapshot: Snapshot },
+  fixedProjectId?: string | null,
 ) {
   const access = await teamForUser(db, userId, input.team);
+  if (access) { const limits = await effectiveLimits(db, access.team); if (!limits.governance || limits.readOnly) return { error: 'Changing a baseline requires an active governance entitlement.' } as const; }
   if (!access || access.role !== 'owner') {
     return { error: 'Only a team owner can set an environment baseline.' } as const;
   }
-  const projectResult = await findOrCreateProject(db, access.team, input.project, userId);
+  const projectResult = await resolveProjectForWrite(db, access.team, input.project, userId, {
+    fixedProjectId,
+  });
   if ('error' in projectResult) return { error: projectResult.error } as const;
   const snapshot = snapshotSchema.parse(input.snapshot);
   await db

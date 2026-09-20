@@ -3,6 +3,51 @@
  * Geist / Geist Mono, light theme, green accent #00915A, dark app nav & command blocks.
  */
 export const css = /* css */ `
+/* Product-flow layouts share the live console, never the design prototype runtime. */
+.flow-section { padding:24px; border-bottom:1px solid var(--line); min-width:0; }
+.flow-section h2 { margin:0 0 12px; font-size:15px; font-weight:600; }
+.flow-section p { color:var(--txt-2); }
+.flow-section p:first-child { margin-top:0; }
+.flow-section form { display:flex; flex-direction:column; gap:16px; align-items:stretch; }
+.flow-section form .btn { align-self:flex-start; }
+.flow-section .btn { white-space:normal; height:auto; min-height:38px; max-width:100%; text-align:center; }
+.flow-section pre { max-width:100%; overflow:auto; white-space:pre-wrap; overflow-wrap:anywhere; }
+.flow-steps { margin:0; padding:0; list-style:none; display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:20px; }
+.flow-steps li { display:flex; gap:10px; color:var(--txt-2); font-size:12px; }
+.flow-steps b { display:block; color:var(--ink); font-size:13px; }
+.flow-steps p { margin:4px 0; }
+.flow-steps time { font:10px var(--mono); overflow-wrap:anywhere; }
+.flow-step-number { border:1px solid var(--ctl-border); border-radius:50%; width:24px; height:24px; display:inline-flex; align-items:center; justify-content:center; flex:none; }
+.flow-steps .current .flow-step-number { background:var(--ink); color:white; border-color:var(--ink); }
+.flow-steps .done .flow-step-number { color:var(--green-ink); border-color:var(--green-line); background:var(--green-bg); }
+.flow-scope,.flow-device { display:inline-block; border:1px solid var(--line); padding:4px 7px; font:11px var(--mono); overflow-wrap:anywhere; }
+.flow-scope { border-radius:99px; }
+.flow-identity { display:flex; flex-wrap:wrap; align-items:center; gap:7px; font-size:12px; }
+.flow-empty { padding:28px 0; color:var(--txt-2); }
+.flow-empty h3 { margin-top:0; color:var(--ink); font-size:15px; }
+.flow-columns { display:grid; grid-template-columns:minmax(200px,.85fr) minmax(0,1.6fr); }
+.flow-columns > :first-child { border-right:1px solid var(--line); }
+.flow-facts { margin:0; display:grid; grid-template-columns:90px minmax(0,1fr); gap:10px; font-size:12px; }
+.flow-facts dt { color:var(--txt-2); }
+.flow-facts dd { margin:0; overflow-wrap:anywhere; }
+.flow-record { padding:14px 0; border-bottom:1px solid var(--line); overflow-wrap:anywhere; }
+.flow-record:last-child { border-bottom:0; }
+.flow-record summary { cursor:pointer; font-weight:500; }
+.flow-status { display:inline-block; padding:3px 7px; border:1px solid var(--line); border-radius:4px; font:11px var(--mono); background:var(--line-2); }
+.flow-modes { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+.flow-form-row { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+@media(max-width:600px) { .flow-form-row { grid-template-columns:1fr; } }
+.flow-mode { display:block; border:1px solid var(--ctl-border); padding:14px; border-radius:6px; cursor:pointer; }
+.flow-mode:has(input:checked) { border-color:var(--green); background:var(--green-bg); }
+.flow-mode p { margin-bottom:0; font-size:12px; }
+.flow-timeline { display:flex; flex-direction:column; gap:18px; }
+.flow-timeline .flow-steps { grid-template-columns:1fr; }
+.flow-timeline .flow-step-number { margin-top:1px; }
+.flow-actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:16px; }
+.flow-actions form { margin:0; }
+.flow-prose { max-width:70ch; }
+@media(max-width:900px) { .flow-columns { grid-template-columns:1fr; } .flow-columns > :first-child { border-right:0; } }
+@media(max-width:600px) { .flow-section { padding:18px 16px; } .flow-steps,.flow-modes { grid-template-columns:1fr; } .flow-steps { gap:14px; } .flow-facts { grid-template-columns:75px minmax(0,1fr); } .flow-actions > .btn { white-space:normal; height:auto; min-height:38px; } }
 :root {
   --ink: #16181a;
   --ink-2: #2b2f33;
@@ -134,6 +179,17 @@ h1.title, h2.title { margin: 0; font: 600 26px/1.2 var(--sans); letter-spacing: 
 .linklike:hover { text-decoration: underline; }
 .linklike.plain { color: var(--ink); }
 .btn.off { color: var(--mut-2); background: #fafaf9; cursor: default; pointer-events: none; }
+.btn:disabled {
+  color: var(--mut-2); background: #fafaf9; border-color: var(--line);
+  cursor: not-allowed; opacity: .75;
+}
+
+/* Plan cards are peers. The general .grid2 is intentionally asymmetric for
+   content+sidebar pages, so pricing needs its own equal comparison grid. */
+.pricing-grid {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px; align-items: stretch;
+}
 
 /* ---------- pagination ---------- */
 .pager { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; padding: 12px 18px; }
@@ -148,6 +204,39 @@ h1.title, h2.title { margin: 0; font: 600 26px/1.2 var(--sans); letter-spacing: 
 .card-head { padding: 14px 18px; border-bottom: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .card-title { font: 600 15px/1.2 var(--sans); }
 .card-note { font: 400 12px/1.4 var(--sans); color: var(--mut); margin-top: 3px; }
+.fold-card > summary { cursor: pointer; list-style: none; border-bottom: 0; }
+.fold-card > summary::-webkit-details-marker { display: none; }
+.fold-card > summary::after {
+  content: '+'; flex: none; margin-left: 6px; color: var(--mut);
+  font: 500 18px/1 var(--mono);
+}
+.fold-card[open] > summary { border-bottom: 1px solid var(--line); }
+.fold-card[open] > summary::after { content: '−'; }
+.section-jump {
+  display: flex; gap: 8px; flex-wrap: wrap; padding: 12px 16px;
+  background: #fff; border: 1px solid var(--line); border-radius: 10px;
+}
+.section-jump a {
+  display: inline-flex; align-items: center; gap: 7px; padding: 7px 9px;
+  border: 1px solid var(--line); border-radius: 6px; color: var(--txt-2);
+  font: 500 12px/1 var(--sans);
+}
+.section-jump a:hover { border-color: var(--green); color: var(--green-strong); text-decoration: none; }
+.section-jump span { color: var(--mut); font: 400 11px/1 var(--mono); }
+.activity-filters {
+  display: grid; grid-template-columns: repeat(4, minmax(140px, 1fr));
+  gap: 12px; align-items: end;
+}
+.activity-filters label { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+.activity-filters label > span {
+  color: var(--mut); font: 500 10px/1 var(--mono); letter-spacing: .06em; text-transform: uppercase;
+}
+.activity-filters input, .activity-filters select {
+  width: 100%; height: 34px; padding: 0 9px; border: 1px solid var(--ctl-border);
+  border-radius: 6px; background: #fff; color: var(--ink); font: 400 13px/1 var(--sans);
+}
+.activity-search { grid-column: span 2; }
+.activity-filter-actions { display: flex; gap: 8px; align-items: center; }
 .scroll-x { overflow-x: auto; }
 
 /* ---------- tables ---------- */
@@ -176,6 +265,23 @@ table.tbl { width: 100%; border-collapse: collapse; }
 .pill-danger { background: #fff0ed; border: 1px solid #e8a89b; color: #9a2c1a; }
 .pill-active { background: var(--green-bg); border: 1px solid var(--green-line); color: var(--green-strong); }
 .pill-muted { background: #f7f7f5; border: 1px solid var(--line); color: var(--mut); }
+/* Where a rule comes from (phase 3 of the console plan): what the workspace gives every
+   project stays neutral, what one project adds carries the accent. The origin is also
+   written in words beside each group: colour alone must not carry it. */
+.pill-own { background: var(--green-bg); border: 1px solid var(--green-line); color: var(--green-strong); }
+/* A rule is a sentence, not a label: the base pill is one fixed-height line and pushed a long
+   rule off a narrow screen. This one wraps and keeps the rule's own capitals. */
+.pill-rule {
+  height: auto; min-height: 22px; padding: 4px 9px; border-radius: 11px;
+  white-space: normal; overflow-wrap: anywhere; line-height: 1.35;
+  text-transform: none; letter-spacing: 0;
+}
+.origin-row { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+.origin-row + .origin-row { margin-top: 6px; }
+.origin { flex: 0 0 132px; font: 500 11px/1.4 var(--mono); letter-spacing: .04em; color: var(--mut); }
+.origin-project { color: var(--green-strong); }
+.origin-note { color: var(--mut); font-weight: 400; }
+@media (max-width: 640px) { .origin { flex-basis: 100%; } }
 .pill-beta {
   display: inline-flex; align-items: center; gap: 8px; height: 26px; padding: 0 10px;
   border-radius: 99px; background: var(--green-bg); border: 1px solid var(--green-line);
@@ -279,6 +385,9 @@ form.inline { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 }
 .copybtn.solid { height: 44px; padding: 0 18px; border-radius: 7px; background: var(--green); border-color: var(--green-border); color: #fff; font: 500 14px/1 var(--sans); letter-spacing: 0; }
 .copybtn.solid:hover { background: var(--green-strong); }
+.setup-prompt { max-height: 430px; overflow-y: auto; }
+.setup-prompt code { word-break: break-word; }
+.setup-prompt .copybtn { position: sticky; top: 0; }
 
 /* ---------- invites ---------- */
 .invrow { padding: 16px 18px; display: flex; flex-direction: column; gap: 10px; border-bottom: 1px solid var(--line-2); }
@@ -574,8 +683,82 @@ td.val.hot { color: #8a5a12; font-weight: 500; }
 .dg-cell-s { font: 400 11px var(--mono); fill: var(--dark-mut-2); }
 .dg-foot { font: 400 12px var(--sans); fill: var(--txt-3); }
 
+/* ---------- scope graph (agent map) ---------- */
+/* Capped in height: the graph is the glance and the ledger underneath is the
+   detail, so it must never push the rows it summarises off the screen. */
+.sg-wrap { border-bottom: 1px solid var(--line); }
+.sg-wrap .sg-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 16px 0; flex-wrap: wrap; }
+.sg-cap { font: 500 10px var(--sans); letter-spacing: .1em; text-transform: uppercase; color: var(--mut); white-space: nowrap; }
+.sg-key { display: flex; gap: 14px; font: 400 11px var(--sans); color: var(--txt-3); white-space: nowrap; flex-wrap: wrap; }
+.sg-key span { display: inline-flex; align-items: center; gap: 6px; }
+.sg-key i { display: inline-block; font-style: normal; }
+.sg-key i.w { width: 18px; border-top: 2.5px solid var(--txt-2); }
+.sg-key i.r { width: 18px; border-top: 1.5px dashed var(--mut-2); }
+.sg-key i.c { width: 10px; height: 10px; border-radius: 99px; background: var(--red); }
+.sg-key i.g { width: 16px; height: 12px; border: 1.5px dashed var(--mut-2); border-radius: 3px; }
+.sg-scroll { overflow-x: auto; padding: 0 10px 4px; }
+.sg { display: block; width: 100%; min-width: 660px; max-width: 900px; height: auto; }
+.sg a { cursor: pointer; text-decoration: none; }
+.sg-node, .sg-link, .sg-task, .sg-who { transition: opacity .15s; }
+.sg-node.off { opacity: .25; }
+.sg-link { fill: none; stroke: var(--txt-2); stroke-width: 2.5; }
+.sg-link.read { stroke: var(--mut-2); stroke-width: 1.5; stroke-dasharray: 4 4; }
+.sg-link.hot { stroke: var(--red); }
+.sg-link.off { opacity: .12; }
+.sg-link.past { stroke: var(--mut-2); stroke-width: 1.5; stroke-dasharray: 1 5; stroke-linecap: round; opacity: .7; }
+.sg-link.past.off { opacity: .1; }
+.sg-node.ended { opacity: .5; }
+.sg-node.past { opacity: .55; }
+.sg-node.ended.off, .sg-node.past.off { opacity: .2; }
+.sg-node.past .sg-box { stroke-dasharray: 3 3; }
+.sg-key i.p { width: 18px; border-top: 2px dotted var(--mut-2); }
+.lrow.ended { opacity: .62; }
+.lrow.ended:hover, .lrow.ended.sel { opacity: 1; }
+.sg-ring { fill: none; stroke: var(--line); stroke-width: 3; }
+.sg-quota { fill: none; stroke-width: 3; }
+.sg-quota.ok { stroke: var(--green); }
+.sg-quota.warn { stroke: var(--amber-ink); }
+.sg-quota.bad { stroke: var(--red); }
+.sg-pulse { fill: none; stroke: var(--green); stroke-width: 1.5; animation: sg-pulse 1.8s ease-out infinite; }
+@keyframes sg-pulse { 0% { opacity: .55; r: 18px; } 100% { opacity: 0; r: 30px; } }
+/* A map that breathes is pleasant; a map that breathes at somebody who asked it
+   not to is not. The ring stays, it just stops moving. */
+@media (prefers-reduced-motion: reduce) { .sg-pulse { animation: none; opacity: .4; } }
+.sg-face { fill: #fff; stroke: var(--ctl-border); stroke-width: 2.5; }
+.sg-face.live { stroke: var(--green); }
+.sg-init { font: 600 8px var(--sans); fill: var(--ink); }
+.sg-task { font: 500 12.5px var(--sans); fill: var(--ink); }
+.sg-who { font: 400 11px var(--sans); fill: var(--mut); }
+.sg-box { fill: #fff; stroke: var(--ctl-border); stroke-width: 1.2; }
+.sg-box.hot { fill: var(--red-bg); stroke: var(--red); stroke-width: 1.8; }
+.sg-box.sel { stroke: var(--ink); stroke-width: 1.8; }
+.sg-kind { font: 500 9.5px var(--sans); letter-spacing: .06em; fill: var(--mut); }
+.sg-kind.hot { fill: #b87565; }
+.sg-label { font: 400 11px var(--mono); fill: var(--ink); }
+.sg-label.hot { fill: var(--red-ink); }
+.sg-badge { stroke: #fff; stroke-width: 1.5; fill: var(--ink); }
+.sg-badge.ok { fill: var(--ink); }
+.sg-badge.warn { fill: var(--amber-ink); }
+.sg-badge.bad { fill: var(--red); }
+.sg-badge-t { font: 700 8px var(--mono); fill: #fff; }
+.sg-sel-ring { fill: none; stroke: var(--ink); stroke-width: 1.5; stroke-dasharray: 2 3; }
+.sg-group { fill: none; stroke: var(--mut-2); stroke-width: 1.2; stroke-dasharray: 4 4; }
+.sg-group-t { font: 500 10px var(--sans); letter-spacing: .08em; fill: var(--mut); }
+.sg-col { font: 500 10px var(--sans); letter-spacing: .1em; fill: var(--mut); }
+.sg-over { padding: 0 16px 10px; font: 400 12px var(--sans); color: var(--mut); }
+
+/* The critical count in the status strip doubles as its own filter. */
+.stripfilter { display: inline-flex; align-items: center; gap: 6px; height: 22px; padding: 0 8px; border-radius: 99px; border: 1px solid var(--red-bg-line); background: var(--red-bg); color: var(--red-ink); font: 500 11px/1 var(--sans); text-decoration: none; }
+.stripfilter .d { width: 6px; height: 6px; border-radius: 99px; background: var(--red); flex: none; }
+.stripfilter:hover { border-color: var(--red); }
+.stripfilter.on { background: var(--red); border-color: var(--red); color: #fff; }
+.stripfilter.on .d { background: #fff; }
+.tab-n { margin-left: 6px; font: 400 11px var(--mono); color: var(--mut); }
+
 /* ---------- delivery flow diagram (ui/FlowDiagram) ---------- */
 .flowdg { display: block; height: 128px; }
+.flow-scroll { scrollbar-gutter: stable; padding-bottom: 4px; }
+.flow-scroll:focus-visible { outline: 2px solid var(--green); outline-offset: 2px; border-radius: 4px; }
 .fd-node { fill: #fff; stroke: var(--line-frame); stroke-width: 1; }
 .fd-gate { stroke: var(--ink-2); }
 .fd-env { fill: var(--green-bg); stroke: var(--green-line); }
@@ -688,6 +871,7 @@ td.val.hot { color: #8a5a12; font-weight: 500; }
 .rail-brand .name { font: 600 15px/1 var(--sans); letter-spacing: -.01em; color: #fff; }
 a.rail-brand:hover { text-decoration: none; }
 .rail-nav { flex: 1; min-height: 0; overflow-y: auto; padding: 14px 10px; display: flex; flex-direction: column; gap: 2px; }
+.rail-nav-toggle { display:none; }
 .rail-group {
   font: 500 10px/1 var(--sans); letter-spacing: .12em; text-transform: uppercase;
   color: #5f666c; padding: 8px 8px 6px;
@@ -738,6 +922,49 @@ html.modal-open { overflow: hidden; }
 /* ---- frame */
 .frame { flex: 1; min-width: 0; display: flex; flex-direction: column; min-height: 100vh; }
 
+/* ---- scope bar (where: workspace, then project; and the account) */
+.scopebar {
+  min-height: 40px; flex: none; background: #fff; border-bottom: 1px solid var(--line);
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 0 12px; font: 400 13px/1 var(--sans); color: var(--txt-2); flex-wrap: wrap;
+}
+.scope-path { display: flex; align-items: center; gap: 6px; min-width: 0; flex-wrap: wrap; }
+.scope-sep { color: var(--mut-2); }
+.scope-pick { position: relative; }
+.scope-at {
+  display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 9px; max-width: 320px;
+  border: 1px solid var(--line); border-radius: 6px; background: #fff; color: var(--ink);
+  font: 500 13px/1 var(--sans); cursor: pointer; list-style: none; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis;
+}
+a.scope-at:hover, .scope-at:hover { border-color: var(--ctl-border); text-decoration: none; }
+.scope-at.all { color: var(--txt-3); font-weight: 400; }
+.scope-at.in { border-color: var(--green); color: var(--green-strong); }
+.scope-at::-webkit-details-marker { display: none; }
+.scope-at::marker { content: ''; }
+.scope-at .caret { color: var(--mut-2); font-size: 10px; }
+.scope-pick[open] > .scope-at { border-color: var(--ink); }
+.scope-pick[open] > .scope-at .caret { transform: rotate(180deg); }
+.scope-menu {
+  position: absolute; top: calc(100% + 4px); left: 0; z-index: 40; min-width: 240px; max-width: 360px;
+  max-height: 60vh; overflow-y: auto; padding: 4px; display: flex; flex-direction: column; gap: 1px;
+  background: #fff; border: 1px solid var(--ctl-border); border-radius: 6px;
+}
+.scope-menu.right { left: auto; right: 0; min-width: 200px; }
+.scope-menu a, .scope-out {
+  display: flex; align-items: baseline; gap: 8px; padding: 7px 9px; border-radius: 4px; width: 100%;
+  font: 400 13px/1.2 var(--sans); color: var(--txt-2); background: none; border: none; text-align: left; cursor: pointer;
+}
+.scope-menu a:hover, .scope-out:hover { background: #f4f4f1; color: var(--ink); text-decoration: none; }
+.scope-menu a.on { color: var(--ink); font-weight: 500; }
+.scope-menu .grow { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.scope-menu .r { font: 400 11px/1 var(--mono); color: var(--mut); }
+.scope-menu .sep { height: 1px; margin: 3px 2px; background: var(--line); }
+.scope-cap { padding: 6px 9px 4px; font: 500 10px/1 var(--sans); letter-spacing: .1em; text-transform: uppercase; color: var(--mut); }
+.scope-me .scope-at { border-color: transparent; font-weight: 400; color: var(--txt-2); }
+.scope-me .avatar { width: 20px; height: 20px; font-size: 9px; }
+.rail-up { color: var(--dark-mut-2); }
+
 /* ---- status strip (truth) */
 .strip {
   height: 34px; flex: none; background: #fff; border-bottom: 1px solid var(--line);
@@ -762,7 +989,7 @@ a.chip:hover { border-color: var(--green); color: var(--green-strong); text-deco
 .chip b { color: var(--ink); font-weight: 500; }
 .scopeform { display: inline-flex; align-items: center; gap: 6px; }
 .scopeform select {
-  height: 24px; max-width: 200px; padding: 0 6px; border: 1px solid var(--line-frame);
+  height: 24px; max-width: 260px; padding: 0 6px; border: 1px solid var(--line-frame);
   border-radius: 4px; font: 400 11px/1 var(--mono); color: var(--ink); background: #fff;
 }
 .scopeform .btn { height: 24px; padding: 0 9px; }
@@ -780,6 +1007,9 @@ a.chip:hover { border-color: var(--green); color: var(--green-strong); text-deco
 .pagehead h1 { margin: 0; font: 600 22px/1.2 var(--sans); letter-spacing: -.02em; }
 .pagehead p { margin: 5px 0 0; font: 400 13px/1.5 var(--sans); color: var(--txt-3); max-width: 78ch; }
 .pagehead .crumb { display: block; margin-bottom: 7px; font: 400 11px/1 var(--mono); color: var(--mut); }
+.pagehead .crumb a { color: var(--txt-2); text-decoration: underline; text-decoration-color: var(--line); text-underline-offset: 3px; }
+.pagehead .crumb a:hover { color: var(--ink); text-decoration-color: var(--ink); }
+.crumb-sep { color: var(--mut-2); }
 .headacts { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 
 /* ---- alert band */
@@ -804,6 +1034,11 @@ a.chip:hover { border-color: var(--green); color: var(--green-strong); text-deco
 .cbody { flex: 1; min-height: 0; display: flex; align-items: stretch; }
 .cmain { flex: 1; min-width: 0; display: flex; flex-direction: column; background: #fff; }
 .cpad { padding: 24px 20px 40px; display: flex; flex-direction: column; gap: 20px; }
+.readiness-stack { display: flex; flex-direction: column; gap: 14px; max-width: 960px; min-width: 0; }
+.readiness-stack > h1, .readiness-stack > h2, .readiness-stack > p, .readiness-stack > ol { margin-top: 0; margin-bottom: 0; }
+.readiness-stack code { overflow-wrap: anywhere; }
+.readiness-stack input, .readiness-stack select, .readiness-stack textarea { max-width: 100%; box-sizing: border-box; }
+.rail-nav details > summary { cursor: pointer; }
 .inspector {
   width: 392px; flex: none; background: #fff; border-left: 1px solid var(--line);
   display: flex; flex-direction: column; min-height: 0;
@@ -842,7 +1077,12 @@ a.lrow.sel:hover { background: #eef5f1; }
 
 /* ---- inspector sections */
 .ins-head { padding: 14px 18px; border-bottom: 1px solid var(--line); }
-.ins-title { font: 600 17px/1.25 var(--sans); letter-spacing: -.01em; }
+.ins-title { font: 600 17px/1.25 var(--sans); letter-spacing: -.01em; overflow-wrap: anywhere; }
+/* A path is read character by character, so the inspector shows one in mono. */
+.ins-title.mono { font: 600 15px/1.3 var(--mono); letter-spacing: 0; }
+.ins-kicker { display: block; margin-bottom: 6px; font: 500 10px/1 var(--sans); letter-spacing: .1em; text-transform: uppercase; color: var(--mut); }
+a.holds { text-decoration: none; color: inherit; }
+a.holds:hover { border-color: var(--ctl-border); background: #fff; }
 .ins-meta { margin-top: 7px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font: 400 12px/1 var(--mono); color: var(--txt-3); }
 .ins-acts { padding: 12px 18px; border-bottom: 1px solid var(--line); display: flex; flex-wrap: wrap; gap: 8px; }
 .ins-sec { padding: 16px 18px; border-bottom: 1px solid var(--line); display: flex; flex-direction: column; gap: 10px; }
@@ -870,6 +1110,8 @@ a.lrow.sel:hover { background: #eef5f1; }
 .keys .note { margin-left: auto; }
 
 @media (max-width: 900px) {
+  .activity-filters { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .activity-search { grid-column: span 2; }
   /* A ledger is a desktop instrument. On a phone it becomes a list: identity,
      when, and the one verdict that matters — the rest is in the inspector,
      which now sits directly underneath. */
@@ -880,8 +1122,8 @@ a.lrow.sel:hover { background: #eef5f1; }
   /* The rail lies down, and then it has to WRAP. Left as one row it gave the
      brand and the identity the width they asked for and squeezed the whole of
      the navigation into what was left — 59px at 375px, holding 580px of links,
-     scrollable with nothing on screen saying so. Two rows: who and where on
-     top, every destination underneath, none of them hidden. */
+     scrollable with nothing on screen saying so. The no-script fallback wraps
+     destinations; enhanced mobile navigation uses the labelled Menu control. */
   .rail { width: 100%; height: auto; position: static; flex-direction: row; align-items: center; flex-wrap: wrap; }
   .rail-brand { border-bottom: none; border-right: 1px solid var(--dark-line); }
   .rail-nav {
@@ -890,6 +1132,7 @@ a.lrow.sel:hover { background: #eef5f1; }
   }
   .rail-link { flex: none; height: 28px; padding: 0 9px; font-size: 12px; background: #1c2023; }
   .rail-group { display: none; }
+  .rail-nav details > summary.rail-group { display: block; padding: 8px 9px; margin: 0; color: var(--dark-txt-2); }
   .rail-foot { border-top: none; border-left: 1px solid var(--dark-line); margin-left: auto; }
   .frame { min-height: 0; }
   .cbody { flex-direction: column; }
@@ -903,10 +1146,14 @@ a.lrow.sel:hover { background: #eef5f1; }
   .how-grid { grid-template-columns: 1fr; }
   .features-grid { grid-template-columns: repeat(2, 1fr); }
   .grid2 { grid-template-columns: 1fr; }
+  .pricing-grid { grid-template-columns: 1fr; }
 }
 @media (max-width: 640px) {
   .features-grid { grid-template-columns: 1fr; }
   .appnav-user { display: none; }
+  .scopeform select { max-width: 200px; }
+  .activity-filters { grid-template-columns: 1fr; }
+  .activity-search { grid-column: auto; }
 }
 
 /* ---------- v2: the team switcher, page tabs, stat strips and reading layouts ---------- */
@@ -916,28 +1163,21 @@ a.lrow.sel:hover { background: #eef5f1; }
    floating screen switcher and the padding it needed — because that exists to
    demo twenty screens in one file, not to ship. */
 
-.teamswitch { margin: 10px 10px 0; display: flex; align-items: center; gap: 8px; padding: 7px 9px; border: 1px solid var(--dark-line-2); border-radius: 6px; background: #1c2023; cursor: pointer; width: calc(100% - 20px); }
-.teamswitch:hover { border-color: #4a5157; }
-.teamswitch .tname { flex: 1; min-width: 0; text-align: left; font: 500 13px/1 var(--sans); color: #fff; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.teamswitch .caret { color: var(--dark-mut-2); font-size: 10px; }
-/* The open state the prototype had no need for: a real switcher has to list the
-   teams. A details/summary pair, so it works with no script at all. */
-.teamswitch::-webkit-details-marker { display: none; }
-.teamswitch::marker { content: ''; }
-.teampick[open] .teamswitch { border-color: #4a5157; }
-.teampick[open] .teamswitch .caret { transform: rotate(180deg); }
-.teammenu { margin: 4px 10px 0; padding: 4px; border: 1px solid var(--dark-line-2); border-radius: 6px; background: #1c2023; display: flex; flex-direction: column; gap: 1px; }
-.teammenu a { display: flex; align-items: baseline; gap: 6px; padding: 6px 8px; border-radius: 4px; font: 400 13px/1.2 var(--sans); color: var(--dark-txt-2); }
-.teammenu a:hover { background: #22262a; color: #fff; text-decoration: none; }
-.teammenu a.on { color: #fff; }
-.teammenu a .r { font: 400 11px/1 var(--mono); color: var(--dark-mut-2); }
-.teammenu .sep { height: 1px; margin: 3px 2px; background: var(--dark-line-2); }
 
 .railme { display: flex; align-items: center; gap: 9px; flex: 1; min-width: 0; }
 .railme:hover { text-decoration: none; }
 .railme:hover .n { color: #fff; }
 
 .pagetabs { background: #fff; border-bottom: 1px solid var(--line); padding: 0 20px; display: flex; gap: 2px; }
+
+/* The Assign work ticket picker. A bounded list inside a dialog that already
+   scrolls, so it scrolls itself instead: twenty rows at the ledger's own row
+   height would push Agent and Brief off the bottom of the dialog. */
+.tickets { border: 1px solid var(--line); border-radius: 9px; max-height: 250px; overflow-y: auto; background: #fff; }
+.tickets .introw { padding: 9px 12px; }
+.tickets a.introw { color: inherit; text-decoration: none; }
+.tickets a.introw:hover { background: var(--line-2); text-decoration: none; }
+.tickets .introw[aria-current] { background: var(--green-bg); }
 
 .introw { display: flex; align-items: center; gap: 12px; padding: 14px 18px; border-bottom: 1px solid var(--line-2); }
 .introw:last-child { border-bottom: none; }
@@ -966,6 +1206,26 @@ a.lrow.sel:hover { background: #eef5f1; }
 /* Editor layout: the document on the left, what it will produce on the right. */
 .edgrid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(300px, 380px); gap: 20px; align-items: start; }
 
+/* Wide screens (phase 4 of the console plan; measured at 1920 and 2560, 2026-09-20).
+   Cards and tables are fluid and should be: a ledger wants the room. What must not grow
+   with them is a line of prose or a form field — the sweep found 1607px inputs and
+   200-character lines on seven pages. Text keeps a readable measure and a field a usable
+   width however wide the card around it gets; the room goes to tables, ledgers and second
+   columns, never to centring the content. An inline max-width still wins where a page
+   means it. */
+:root { --measure: 88ch; --field-max: 720px; }
+.cpad p, .cpad li, .card-note, .field .help, .dlgsub, .doc-col p, .doc-col li { max-width: var(--measure); }
+.field, input.in, textarea.in, select.in { max-width: var(--field-max); }
+
+/* Past about 2300px the agent map's graph (capped at 900px, because an SVG that scales with
+   width draws glyphs the size of a fist) left a thousand pixels of nothing beside it. There
+   the graph and the ledger stand side by side; below it they stack as before. */
+@media (min-width: 2300px) {
+  .map-split { display: grid; grid-template-columns: minmax(660px, 900px) minmax(0, 1fr); align-items: start; }
+  .map-split > .sg-wrap { border-bottom: none; border-right: 1px solid var(--line); }
+  .map-split.solo { display: block; }
+}
+
 /* The ledger stops being squeezed before the inspector does. */
 .cbody .cmain { min-width: 520px; }
 @media (max-width: 1200px) {
@@ -980,5 +1240,22 @@ a.lrow.sel:hover { background: #eef5f1; }
   .sidetoc { position: static; flex-direction: row; flex-wrap: wrap; }
   .edgrid { grid-template-columns: 1fr; }
   .toolrow { grid-template-columns: 1fr; gap: 4px; }
+}
+@media (max-width: 640px) {
+  .cbody .cmain { min-width: 0; width: 100%; }
+  .cpad { padding: 20px 14px 32px; }
+  .readiness-stack .btn { white-space: normal; text-align: left; }
+}
+@media(max-width:900px) {
+  /* Progressive enhancement: without JS every destination remains visible. */
+  .rail.nav-ready:not(.nav-open) .rail-nav { display:none; }
+  .rail.nav-ready .rail-nav-toggle { display:block; order:1; margin:10px; padding:8px 12px; border:1px solid var(--dark-line-2); border-radius:5px; color:#fff; background:#1c2023; font:500 12px var(--sans); }
+  .rail .rail-brand,.rail .rail-foot { order:0; }
+  .rail .rail-foot { padding:10px; max-width:calc(100% - 106px); }
+  .scopebar { padding: 6px 10px; }
+  .scope-at { max-width: 46vw; }
+  .scope-menu { max-width: calc(100vw - 24px); }
+  .rail .rail-nav { order:2; }
+  .inspector { width:100%; min-width:0; }
 }
 `;

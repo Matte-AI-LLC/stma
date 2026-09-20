@@ -12,8 +12,35 @@ import type { Env } from '../env';
 import { maskEmail } from './email';
 import { logLine } from './log';
 
+/**
+ * What a message is for — a stable label, so the operator log never has to
+ * carry the subject line to say which mail this was.
+ *
+ * Every code email puts its six digits in the subject on purpose: that is what
+ * shows in a phone's notification preview, and it is the difference between
+ * reading the code and opening the mail. But `sendMail` logged `subject` on
+ * every send, so `123456 is your STMA sign-in code` went to stdout, and in
+ * production stdout is Log Analytics with thirty-day retention — a second
+ * factor readable by anybody with log access, and by the operator console if
+ * this label had not been introduced before the mail card was. The subject
+ * stays as it is; the log carries this instead, and it is the better field to
+ * query by anyway, because it does not vary per code.
+ */
+export type MailKind =
+  | 'login_code'
+  | 'password_change_code'
+  | 'password_reset_code'
+  | 'email_verify_code'
+  | 'email_change_code'
+  | 'email_changed_notice'
+  | 'password_changed'
+  | 'failed_sign_ins'
+  | 'activity'
+  | 'billing';
+
 export interface MailMessage {
   to: string;
+  kind: MailKind;
   subject: string;
   text: string;
   html: string;
@@ -61,6 +88,64 @@ export function mailTransport(env: Env): MailTransport {
   return env.resendApiKey ? 'resend' : 'memory';
 }
 
+// ------------------------------------------------------------- what went wrong
+
+/**
+ * Recent send failures, for the operator console.
+ *
+ * A failed send never throws and never reaches `recordErrorEvent`, which is
+ * only wired to the Hono error handler and the process monitor — so until this
+ * existed, a provider refusing every message left `/admin/ops` completely
+ * green. That is the exact shape of a launch-night outage: the sending domain
+ * is not verified, Resend answers 403 to all of it, sign-in codes and password
+ * resets silently do not arrive, and the person who could fix it has nothing
+ * on any screen to look at.
+ *
+ * In process and bounded, like `lib/metrics.ts` and for the same reason: it
+ * describes one process rather than the tenant, it needs no database (error
+ * handling that writes to a database is one more thing that can fail at the
+ * moment everything else is failing), and the structured `evt=mail` line
+ * remains the durable record. Production runs one replica, so one process is
+ * the whole service.
+ *
+ * `reason` is the provider's own words, which for an unverified domain names
+ * the problem outright. The subject is deliberately absent: it carries the
+ * code (see `MailKind`), and this is rendered on a page.
+ */
+export interface MailFailure {
+  at: Date;
+  kind: MailKind;
+  /** Masked — enough to tell one person's failures from another's. */
+  to: string;
+  reason: string;
+}
+
+const FAILURE_CAP = 20;
+const failures: MailFailure[] = [];
+let sentCount = 0;
+let failedCount = 0;
+
+export const mailHealth = {
+  /** Newest first, bounded by FAILURE_CAP. */
+  failures(): readonly MailFailure[] {
+    return [...failures].reverse();
+  },
+  counts(): { sent: number; failed: number } {
+    return { sent: sentCount, failed: failedCount };
+  },
+  reset(): void {
+    failures.length = 0;
+    sentCount = 0;
+    failedCount = 0;
+  },
+};
+
+function recordFailure(msg: MailMessage, to: string, reason: string): void {
+  failedCount += 1;
+  failures.push({ at: new Date(), kind: msg.kind, to, reason: reason.slice(0, 300) });
+  if (failures.length > FAILURE_CAP) failures.splice(0, failures.length - FAILURE_CAP);
+}
+
 /**
  * Deliver one message. Returns a result instead of throwing: every caller is in a
  * request path where a mail provider hiccup must not become a 500.
@@ -68,9 +153,11 @@ export function mailTransport(env: Env): MailTransport {
 export async function sendMail(env: Env, msg: MailMessage): Promise<MailResult> {
   const transport = mailTransport(env);
   const to = maskEmail(msg.to);
+  // `kind`, never `subject`: the subject of every code email contains the code.
   if (transport === 'memory') {
     record(msg, transport);
-    logLine({ evt: 'mail', a: 'send', transport, to, subject: msg.subject, ok: true });
+    sentCount += 1;
+    logLine({ evt: 'mail', a: 'send', transport, to, kind: msg.kind, ok: true });
     return { ok: true, transport };
   }
   try {
@@ -96,19 +183,24 @@ export async function sendMail(env: Env, msg: MailMessage): Promise<MailResult> 
         a: 'send',
         transport,
         to,
-        subject: msg.subject,
+        kind: msg.kind,
         ok: false,
         s: res.status,
         why: detail,
       });
+      // The provider's own words, kept verbatim: an unverified sending domain
+      // says so here and nowhere else the operator can see.
+      recordFailure(msg, to, `${res.status} ${detail}`.trim());
       return { ok: false, transport, error: `provider responded ${res.status}` };
     }
     record(msg, transport);
-    logLine({ evt: 'mail', a: 'send', transport, to, subject: msg.subject, ok: true });
+    sentCount += 1;
+    logLine({ evt: 'mail', a: 'send', transport, to, kind: msg.kind, ok: true });
     return { ok: true, transport };
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
-    logLine({ evt: 'mail', a: 'send', transport, to, subject: msg.subject, ok: false, why: error });
+    logLine({ evt: 'mail', a: 'send', transport, to, kind: msg.kind, ok: false, why: error });
+    recordFailure(msg, to, error);
     return { ok: false, transport, error };
   }
 }
@@ -142,6 +234,7 @@ function esc(value: string): string {
 
 export function loginCodeEmail(code: string, minutes: number): Omit<MailMessage, 'to'> {
   return {
+    kind: 'login_code',
     subject: `${code} is your STMA sign-in code`,
     text: [
       `Your STMA sign-in code is ${code}.`,
@@ -159,6 +252,7 @@ export function loginCodeEmail(code: string, minutes: number): Omit<MailMessage,
 
 export function passwordChangeCodeEmail(code: string, minutes: number): Omit<MailMessage, 'to'> {
   return {
+    kind: 'password_change_code',
     subject: `${code} confirms your STMA password change`,
     text: [
       `Enter ${code} in STMA to confirm your new password.`,
@@ -174,20 +268,96 @@ export function passwordChangeCodeEmail(code: string, minutes: number): Omit<Mai
   };
 }
 
-export function passwordResetCodeEmail(code: string, minutes: number): Omit<MailMessage, 'to'> {
+/**
+ * The reset code, and the link that lets it be used where it is read.
+ *
+ * The pending challenge lived only in the asking browser's cookie, so opening
+ * this mail on a phone and typing the code there was answered "that code is not
+ * right", which is false and sends the person round the loop. The link carries
+ * the challenge id, not the code: whoever follows it still has to type the six
+ * digits that are in the same message, so it is exactly as strong as the cookie
+ * and works on the device the mail was actually opened on.
+ */
+export function passwordResetCodeEmail(
+  code: string,
+  minutes: number,
+  link?: string,
+): Omit<MailMessage, 'to'> {
+  const terms = `It expires in ${minutes} minutes and can be used once. Setting a new password signs you out of every browser; your agent connections keep working.`;
+  const here = link ? 'Reading this on another device? Open this link there and enter the code:' : '';
   return {
+    kind: 'password_reset_code',
     subject: `${code} is your STMA password reset code`,
     text: [
       `Enter ${code} in STMA to choose a new password.`,
-      `It expires in ${minutes} minutes and can be used once. Setting a new password signs you out everywhere.`,
+      terms,
+      link ? `${here}\n${link}` : '',
       SIGNOFF,
-    ].join('\n\n'),
+    ]
+      .filter(Boolean)
+      .join('\n\n'),
+    html: wrap(
+      [
+        'Enter this code in STMA to choose a new password:',
+        codeBlock(code),
+        terms,
+        link
+          ? `<span style="color:#6b7075;font-size:13px">${here} <a href="${esc(link)}">${esc(link)}</a></span>`
+          : '',
+        SIGNOFF,
+      ].filter(Boolean),
+    ),
+  };
+}
+
+export function emailVerifyCodeEmail(code: string, minutes: number): Omit<MailMessage, 'to'> {
+  const why =
+    'Confirming it matters more than it sounds: with sign-in codes on, this address is where your second factor and any password reset go. An address nobody has proved is an account nobody can get back into.';
+  return {
+    kind: 'email_verify_code',
+    subject: `${code} confirms your STMA email address`,
+    text: [`Enter ${code} in STMA to confirm this address.`, why, `It expires in ${minutes} minutes.`, SIGNOFF].join(
+      '\n\n',
+    ),
     html: wrap([
-      'Enter this code in STMA to choose a new password:',
+      'Enter this code in STMA to confirm this address:',
       codeBlock(code),
-      `It expires in ${minutes} minutes and can be used once. Setting a new password signs you out everywhere.`,
+      why,
+      `It expires in ${minutes} minutes.`,
       SIGNOFF,
     ]),
+  };
+}
+
+/** Sent to the address somebody wants to move TO, so only its owner can finish. */
+export function emailChangeCodeEmail(code: string, minutes: number): Omit<MailMessage, 'to'> {
+  const why =
+    'Somebody asked to move an STMA account to this address. If that was not you, ignore this — nothing changes until the code is entered.';
+  return {
+    kind: 'email_change_code',
+    subject: `${code} confirms your new STMA email address`,
+    text: [`Enter ${code} in STMA to finish moving the account to this address.`, why, `It expires in ${minutes} minutes.`, SIGNOFF].join(
+      '\n\n',
+    ),
+    html: wrap([
+      'Enter this code in STMA to finish moving the account to this address:',
+      codeBlock(code),
+      why,
+      `It expires in ${minutes} minutes.`,
+      SIGNOFF,
+    ]),
+  };
+}
+
+/** Sent to the address being left behind, which is the only warning it will get. */
+export function emailChangedNotice(next: string, baseUrl: string): Omit<MailMessage, 'to'> {
+  const line = `Your STMA account now signs in as ${next}. This address will no longer receive its sign-in codes or password resets.`;
+  const act = `If this was not you, act from the new address or write to support immediately — whoever holds ${next} now controls recovery for this account.`;
+  return {
+    kind: 'email_changed_notice',
+    subject: 'Your STMA email address was changed',
+    text: [line, act, `${baseUrl}/login`, SIGNOFF].join('\n\n'),
+    html: wrap([line, act, `<a href="${esc(`${baseUrl}/login`)}">${esc(`${baseUrl}/login`)}</a>`, SIGNOFF]),
   };
 }
 
@@ -231,7 +401,7 @@ export function activityEmail(input: {
     `<a href="${esc(actionUrl)}">${esc(actionLabel)}</a>`,
     `<span style="color:#6b7075;font-size:13px">Choose which emails you get: <a href="${esc(manageUrl)}" style="color:#6b7075">notification settings</a>.</span>`,
   ]);
-  return { subject, text, html };
+  return { kind: 'activity', subject, text, html };
 }
 
 /**
@@ -250,31 +420,69 @@ export function failedSignInsEmail(
     'Several sign-in attempts for your STMA account failed in a row, so further attempts are ' +
     `being refused for the next ${minutes} minutes.`;
   return {
+    kind: 'failed_sign_ins',
     subject: 'Failed sign-in attempts on your STMA account',
+    // `/forgot`, not `/login`: while the throttle holds, the account holder's
+    // own correct password is refused too, so the sign-in page cannot help
+    // either of the two people who might read this.
     text: [
       line,
       'If this was you, wait and try again, or reset your password.',
-      `If it was not, change your password at ${baseUrl}/login and revoke any agent tokens you do not recognise.`,
+      `If it was not, change your password at ${baseUrl}/forgot and revoke any agent tokens you do not recognise.`,
     ].join('\n\n'),
     html: wrap([
       line,
       'If this was you, wait and try again, or reset your password.',
-      `If it was not, change your password at <a href="${baseUrl}/login">${baseUrl}/login</a> and revoke any agent tokens you do not recognise.`,
+      `If it was not, change your password at <a href="${esc(`${baseUrl}/forgot`)}">${esc(`${baseUrl}/forgot`)}</a> and revoke any agent tokens you do not recognise.`,
     ]),
   };
 }
 
-export function passwordChangedEmail(baseUrl: string): Omit<MailMessage, 'to'> {
-  const line = 'Your STMA password was changed and every other browser session was signed out.';
+/**
+ * Your password was just changed.
+ *
+ * The one email here whose reader may be locked out of the account it is about,
+ * so it must not send them to the sign-in page: if somebody else made this
+ * change, the old password no longer works and `/login` is a wall. `/forgot` is
+ * the door that still opens, because it proves the mailbox rather than the
+ * password, and this message is already in that mailbox.
+ *
+ * The text and HTML parts said different things until 2026-09-20 — one "reset
+ * it immediately", the other "sign in" — and both pointed at `/login`. Say one
+ * thing, in one place, and let both parts render it.
+ */
+export function passwordChangedEmail(
+  baseUrl: string,
+  supportEmail = '',
+): Omit<MailMessage, 'to'> {
+  // "Every *other*" was true of the account page's change and wrong of a reset,
+  // which ends all of them; one string served both. And a password never
+  // reached an agent credential, so saying "signed out everywhere" told somebody
+  // whose account was taken over that the incident was closed while the
+  // attacker's agent kept full access. Both parts say what actually happened.
+  const line =
+    'Your STMA password was changed, and every browser session was signed out. Agent connections are not affected by a password change.';
+  const act =
+    'If this was not you, reset your password now, then open Agent connections and revoke anything you do not recognise.';
+  const reset = `${baseUrl}/forgot`;
+  const connections = `${baseUrl}/app/tokens`;
+  const help = supportEmail
+    ? `If you cannot get back in, write to ${supportEmail} from this address.`
+    : '';
   return {
+    kind: 'password_changed',
     subject: 'Your STMA password was changed',
-    text: [
-      line,
-      `If this was not you, reset it immediately at ${baseUrl}/login and revoke your agent tokens.`,
-    ].join('\n\n'),
-    html: wrap([
-      line,
-      `If this was not you, sign in at <a href="${baseUrl}/login">${baseUrl}/login</a> and revoke your agent tokens.`,
-    ]),
+    text: [line, act, reset, connections, help].filter(Boolean).join('\n\n'),
+    html: wrap(
+      [
+        line,
+        act,
+        `<a href="${esc(reset)}">${esc(reset)}</a>`,
+        `<a href="${esc(connections)}">${esc(connections)}</a>`,
+        help
+          ? `<span style="color:#6b7075;font-size:13px">If you cannot get back in, write to <a href="mailto:${esc(supportEmail)}" style="color:#6b7075">${esc(supportEmail)}</a> from this address.</span>`
+          : '',
+      ].filter(Boolean),
+    ),
   };
 }

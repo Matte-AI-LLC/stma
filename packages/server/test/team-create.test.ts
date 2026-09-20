@@ -42,7 +42,7 @@ beforeAll(async () => {
   srv = await startServer(
     loadEnv({
       port: 0,
-      host: 'localhost',
+      host: '127.0.0.1',
       nodeEnv: 'test',
       devMode: true,
       databaseUrl: undefined,
@@ -78,7 +78,8 @@ it('makes a team from one dialog, with optional fields marked as optional', asyn
 
   // Required and optional are both marked: "unmarked means optional" is a
   // convention no reader has agreed to.
-  expect(html).toMatch(/for="team-name"[^>]*>Team name\s*<span class="fmark fmark-req">required</);
+  expect(html).toMatch(/for="team-name"[^>]*>Workspace name\s*<span class="fmark fmark-req">required</);
+  expect(html).toContain('Advanced settings (optional)');
   expect(html).toMatch(/for="team-tag"[^>]*>Tag\s*<span class="fmark fmark-opt">optional</);
   expect(html).toMatch(
     /for="team-webhook"[^>]*>Team chat webhook\s*<span class="fmark fmark-opt">optional</,

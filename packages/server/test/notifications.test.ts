@@ -2,11 +2,11 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { eq } from 'drizzle-orm';
-import { afterAll, beforeAll, expect, it } from 'vitest';
-import { notificationQueue, users } from '../src/db/schema';
+import { afterAll, beforeAll, expect, it, vi } from 'vitest';
+import { debugSessions, messages, notificationQueue, users } from '../src/db/schema';
 import { loadEnv, type Env } from '../src/env';
 import { mailOutbox } from '../src/lib/mailer';
-import { flushNotificationsOnce } from '../src/lib/notifications';
+import { flushNotificationsOnce, queueHandoffNotification } from '../src/lib/notifications';
 import { startServer, type StartedServer } from '../src/server';
 
 /**
@@ -124,6 +124,42 @@ async function queueRowsFor(email: string) {
   return srv.db.select().from(notificationQueue).where(eq(notificationQueue.userId, found[0]!.id));
 }
 
+async function userIdFor(email: string): Promise<string> {
+  const [found] = await srv.db.select({ id: users.id }).from(users).where(eq(users.email, email)).limit(1);
+  return found!.id;
+}
+
+async function queueCriticalHandoff(title: string): Promise<string> {
+  const sessionId = await openSession(adaPat, title, 'Continue from the recorded checkpoint.');
+  const [session] = await srv.db
+    .select({ teamId: debugSessions.teamId, openedBy: debugSessions.openedBy })
+    .from(debugSessions)
+    .where(eq(debugSessions.id, sessionId))
+    .limit(1);
+  const [message] = await srv.db
+    .select({ createdAt: messages.createdAt })
+    .from(messages)
+    .where(eq(messages.sessionId, sessionId))
+    .limit(1);
+  await queueHandoffNotification(srv.db, env, {
+    sessionId,
+    teamId: session!.teamId,
+    recipientId: await userIdFor(BOB),
+    actorId: session!.openedBy,
+    at: message!.createdAt,
+  });
+  return sessionId;
+}
+
+async function queueRowForSession(sessionId: string) {
+  const [row] = await srv.db
+    .select()
+    .from(notificationQueue)
+    .where(eq(notificationQueue.sessionId, sessionId))
+    .limit(1);
+  return row!;
+}
+
 let ada: Jar;
 let bob: Jar;
 let adaPat: string;
@@ -133,7 +169,7 @@ beforeAll(async () => {
   dataDir = mkdtempSync(path.join(tmpdir(), 'stma-notify-'));
   env = loadEnv({
     port: 0,
-    host: 'localhost',
+    host: '127.0.0.1',
     nodeEnv: 'test',
     devMode: true,
     databaseUrl: undefined,
@@ -381,4 +417,117 @@ it('leaves announcements alone unless someone opts in', async () => {
   const mail = inbox(BOB).at(-1)!;
   expect(mail.subject).toContain('Announcement in Notify Co');
   expect(mail.text).toContain('deploy window is 16:00 UTC');
+});
+
+// ------------------------------------------------------- leases and retries
+
+it('claims one due row once across concurrent sweepers', async () => {
+  const sessionId = await queueCriticalHandoff('one owner per delivery');
+  const before = inbox(BOB).length;
+  const now = new Date(Date.now() + 1_000);
+
+  const results = await Promise.all([flush({}, now), flush({}, now)]);
+  expect(results.reduce((sum, n) => sum + n, 0)).toBe(1);
+  expect(inbox(BOB)).toHaveLength(before + 1);
+  const row = await queueRowForSession(sessionId);
+  expect(row.status).toBe('sent');
+  expect(row.attempts).toBe(1);
+  expect(row.leaseOwner).toBeNull();
+});
+
+it('leaves an active worker lease alone and reclaims an expired critical lease', async () => {
+  const sessionId = await queueCriticalHandoff('lease-owned handoff');
+  const row = await queueRowForSession(sessionId);
+  const now = new Date(Date.now() + 1_000);
+
+  await srv.db
+    .update(notificationQueue)
+    .set({
+      status: 'sending',
+      attempts: 1,
+      leaseOwner: 'other-worker',
+      leaseUntil: new Date(now.getTime() + 60_000),
+    })
+    .where(eq(notificationQueue.id, row.id));
+
+  expect(await flush({}, now)).toBe(0);
+  expect((await queueRowForSession(sessionId)).leaseOwner).toBe('other-worker');
+
+  await srv.db
+    .update(notificationQueue)
+    .set({ leaseUntil: new Date(now.getTime() - 1) })
+    .where(eq(notificationQueue.id, row.id));
+  expect(await flush({}, now)).toBe(1);
+
+  const delivered = await queueRowForSession(sessionId);
+  expect(delivered.status).toBe('sent');
+  expect(delivered.attempts).toBe(2);
+  expect(delivered.leaseOwner).toBeNull();
+  expect(delivered.leaseUntil).toBeNull();
+  expect(delivered.reason).toBeNull();
+});
+
+it('retries a directed handoff at most three times and keeps the failure visible', async () => {
+  const sessionId = await queueCriticalHandoff('retry-bounded handoff');
+  expect((await queueRowForSession(sessionId)).critical).toBe(true);
+  const firstAt = new Date(Date.now() + 1_000);
+  const provider = vi
+    .spyOn(globalThis, 'fetch')
+    .mockResolvedValue(new Response('temporarily unavailable', { status: 503 }));
+
+  try {
+    expect(await flush({ resendApiKey: 'test-provider-key' }, firstAt)).toBe(0);
+    let row = await queueRowForSession(sessionId);
+    expect(row.status).toBe('pending');
+    expect(row.attempts).toBe(1);
+    expect(row.reason).toContain('attempt_1_failed: mail: provider responded 503');
+
+    // Backoff is part of the durable row; a busy sweep cannot spin on failure.
+    expect(await flush({ resendApiKey: 'test-provider-key' }, new Date(firstAt.getTime() + 29_999))).toBe(0);
+    expect(provider).toHaveBeenCalledTimes(1);
+
+    const secondAt = new Date(firstAt.getTime() + 30_000);
+    expect(await flush({ resendApiKey: 'test-provider-key' }, secondAt)).toBe(0);
+    row = await queueRowForSession(sessionId);
+    expect(row.status).toBe('pending');
+    expect(row.attempts).toBe(2);
+    expect(row.reason).toContain('attempt_2_failed: mail: provider responded 503');
+
+    const thirdAt = new Date(secondAt.getTime() + 60_000);
+    expect(await flush({ resendApiKey: 'test-provider-key' }, thirdAt)).toBe(0);
+    row = await queueRowForSession(sessionId);
+    expect(row.status).toBe('failed');
+    expect(row.attempts).toBe(3);
+    expect(row.reason).toContain('attempt_3_failed: mail: provider responded 503');
+    expect(row.leaseOwner).toBeNull();
+    expect(row.leaseUntil).toBeNull();
+
+    expect(await flush({ resendApiKey: 'test-provider-key' }, new Date(thirdAt.getTime() + 360_000))).toBe(0);
+    expect(provider).toHaveBeenCalledTimes(3);
+  } finally {
+    provider.mockRestore();
+  }
+});
+
+it('keeps routine activity single-attempt when delivery fails', async () => {
+  const sessionId = await openSession(adaPat, 'routine failure stays quiet', 'starting');
+  await reply(bobPat, sessionId, 'this is ordinary thread activity');
+  const firstAt = new Date(Date.now() + 1_000);
+  const provider = vi
+    .spyOn(globalThis, 'fetch')
+    .mockResolvedValue(new Response('temporarily unavailable', { status: 503 }));
+
+  try {
+    expect(await flush({ resendApiKey: 'test-provider-key' }, firstAt)).toBe(0);
+    const failed = await queueRowForSession(sessionId);
+    expect(failed.critical).toBe(false);
+    expect(failed.status).toBe('failed');
+    expect(failed.attempts).toBe(1);
+    expect(failed.reason).toBe('mail: provider responded 503');
+
+    expect(await flush({ resendApiKey: 'test-provider-key' }, new Date(firstAt.getTime() + 360_000))).toBe(0);
+    expect(provider).toHaveBeenCalledTimes(1);
+  } finally {
+    provider.mockRestore();
+  }
 });

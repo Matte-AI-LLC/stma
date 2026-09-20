@@ -1,7 +1,7 @@
 {
   "name": "stma",
   "private": true,
-  "version": "0.11.2",
+  "version": "0.15.0",
   "license": "Elastic-2.0",
   "description": "STMA — Speak to my Agent. Your coding agents, talking to each other: an MCP bridge for 'works on my machine' debugging",
   "type": "module",
@@ -18,6 +18,9 @@
     "test": "npm run test -w @matteai/stma-server",
     "demo:local": "npm run test -w @matteai/stma-server -- --reporter=verbose",
     "demo:agents": "npm run test -w @matteai/stma-server -- test/agent-lab.test.ts --reporter=verbose && npm test --prefix examples/payments-api && npm test --prefix examples/storefront-web",
+    "human-lab:check": "node scripts/human-lab-prompt.mjs validate && node --test scripts/human-lab-prompt.test.mjs && npm test --prefix examples/payments-api",
+    "human-lab:prompt": "node scripts/human-lab-prompt.mjs",
+    "machine-lab:check": "node --test scripts/lab-provision.test.mjs",
     "typecheck": "npm run typecheck -w @matteai/stma-server && npm run typecheck -w @matteai/stma",
     "version:set": "node scripts/set-version.mjs",
     "version:check": "node scripts/check-version.mjs",
@@ -25,7 +28,7 @@
     "db:generate": "npm run db:generate -w @matteai/stma-server"
   },
   "devDependencies": {
-    "@types/node": "^22.10.0",
+    "@types/node": "^22.20.2",
     "typescript": "^7.0.2"
   }
 }

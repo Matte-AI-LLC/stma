@@ -140,7 +140,7 @@ beforeAll(async () => {
   srv = await startServer(
     loadEnv({
       port: 0,
-      host: 'localhost',
+      host: '127.0.0.1',
       nodeEnv: 'test',
       devMode: true,
       databaseUrl: undefined,
@@ -185,6 +185,7 @@ it('changes the password, rejects a wrong current password, and signs out other 
     redirect: 'manual',
   });
   expect(wrong.status).toBe(302);
+  expect(wrong.headers.get('location')).toContain('/app/account?');
   expect(wrong.headers.get('location')).toContain('error=');
   expect(decodeURIComponent(wrong.headers.get('location')!)).toContain(
     'Current password is incorrect',

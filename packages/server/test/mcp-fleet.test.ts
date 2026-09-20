@@ -1,6 +1,7 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, expect, it } from 'vitest';
 import { loadEnv } from '../src/env';
 import { startServer, type StartedServer } from '../src/server';
@@ -82,6 +83,15 @@ const control = (endpoint: string, body: unknown, tok: string) =>
     body: JSON.stringify(body),
   });
 
+const testedCheckpoint = (commit = 'b'.repeat(40)) => ({
+  request_id: randomUUID(),
+  kind: 'tested' as const,
+  repository_identity: 'https://github.com/acme/payments-api.git',
+  commit_sha: commit,
+  worktree_clean: true,
+  tests: [{ name: 'npm test', state: 'passed' as const }],
+});
+
 async function tokenFor(cookie: Record<string, string>, name: string) {
   const res = await fetch(`${srv.url}/app/tokens`, {
     method: 'POST',
@@ -98,7 +108,7 @@ beforeAll(async () => {
   srv = await startServer(
     loadEnv({
       port: 0,
-      host: 'localhost',
+      host: '127.0.0.1',
       nodeEnv: 'test',
       devMode: true,
       databaseUrl: undefined,
@@ -184,6 +194,30 @@ it('starts a run and claims scope with no CLI and no installation id', async () 
   expect(started.data.policy.hash).toMatch(/^[0-9a-f]{64}$/);
   expect(started.data.hint).toContain('update_run');
   aliceRun = started.data.runId;
+});
+
+it('replays one logical MCP start and rejects request_id reuse for new work', async () => {
+  const requestId = randomUUID();
+  const args = {
+    request_id: requestId,
+    team: 'fleet',
+    project: 'retry-project',
+    task: 'RETRY-1',
+    agent: 'claude-code',
+    scope: [{ type: 'path', key: 'src/retry.ts' }],
+  };
+  const first = await call('start_run', args, alice);
+  const replay = await call('start_run', args, alice);
+  expect(first.isError, first.text).toBe(false);
+  expect(replay.isError, replay.text).toBe(false);
+  expect(first.data.replayed).toBe(false);
+  expect(replay.data.replayed).toBe(true);
+  expect(replay.data.runId).toBe(first.data.runId);
+
+  const changed = await call('start_run', { ...args, task: 'RETRY-2' }, alice);
+  expect(changed.isError).toBe(true);
+  expect(changed.text).toContain('different arguments');
+  await call('finish_run', { run_id: first.data.runId }, alice);
 });
 
 it('warns the second agent about the collision, in words it can act on', async () => {
@@ -278,17 +312,54 @@ it('pulls policy and preflights the machine over MCP', async () => {
 // ---------------------------------------------------------------- handoff
 
 it('hands the work over: brief in the inbox, scope released, run closed', async () => {
-  const handed = await call(
-    'handoff_work',
-    {
+  const args = {
+      request_id: randomUUID(),
       branch: 'feat/refunds',
       summary:
         'Ledger table and the write path are done and pushed. The refund API still returns the pre-refund balance because the read model is not updated yet.',
-      next_steps: ['Update the read model in src/payments/read.ts', 'Add a test for partial refunds'],
+      next_steps: [
+        'Update the read model in src/payments/read.ts',
+        'Add a test for partial refunds',
+        'Ask the source machine to run any credential-dependent check and return only a non-secret pass/fail result.',
+      ],
       reason: 'usage_limit',
       to: 'bob',
       via: 'claude-code',
+  };
+  const refused = await call('handoff_work', args, alice);
+  expect(refused.isError).toBe(true);
+  expect(refused.text).toContain('requires an immutable delivery/tested checkpoint');
+  const stillHeld = await call('list_active_agents', { team: 'fleet' }, alice);
+  expect(stillHeld.data.activeRuns.some((item: any) => item.runId === aliceRun)).toBe(true);
+
+  const dirtyCheckpoint = { ...testedCheckpoint('9'.repeat(40)), worktree_clean: false };
+  const dirtyRefused = await call('handoff_work', { ...args, checkpoint: dirtyCheckpoint }, alice);
+  expect(dirtyRefused.isError).toBe(true);
+  expect(dirtyRefused.text).toContain('requires a clean source checkpoint');
+  const stillHeldAfterDirty = await call('list_active_agents', { team: 'fleet' }, alice);
+  expect(stillHeldAfterDirty.data.activeRuns.some((item: any) => item.runId === aliceRun)).toBe(true);
+
+  const checkpoint = testedCheckpoint('a'.repeat(40));
+  const unsafeCredentialBrief = await call(
+    'handoff_work',
+    {
+      ...args,
+      request_id: randomUUID(),
+      checkpoint,
+      next_steps: [
+        'Run npm run setup:local on your own machine and use your own .private/carrier-sandbox.key.',
+      ],
     },
+    alice,
+  );
+  expect(unsafeCredentialBrief.isError).toBe(true);
+  expect(unsafeCredentialBrief.text).toContain('cannot tell the receiver to obtain, create, copy, use or configure a credential');
+  const stillHeldAfterUnsafeBrief = await call('list_active_agents', { team: 'fleet' }, alice);
+  expect(stillHeldAfterUnsafeBrief.data.activeRuns.some((item: any) => item.runId === aliceRun)).toBe(true);
+
+  const handed = await call(
+    'handoff_work',
+    { ...args, checkpoint },
     alice,
   );
   expect(handed.isError, handed.text).toBe(false);
@@ -297,6 +368,11 @@ it('hands the work over: brief in the inbox, scope released, run closed', async 
   // The scope it was holding is released, and the brief says how to re-claim it.
   expect(handed.data.scopeReleased).toBe(2);
   expect(handed.data.runFinished).toBe(aliceRun);
+  expect(handed.data.checkpoint).toMatchObject({
+    kind: 'tested',
+    commitSha: 'a'.repeat(40),
+    sourceWorktreeClean: true,
+  });
   expect(handed.data.pickUpWith).toContain('refunds-ledger');
   expect(handed.data.pickUpWith).toContain('feat/refunds');
 
@@ -309,7 +385,12 @@ it('hands the work over: brief in the inbox, scope released, run closed', async 
   expect(thread.text).toContain('feat/refunds');
   expect(thread.text).toContain('read model is not updated');
   expect(thread.text).toContain('Update the read model');
-  expect(thread.text).toContain('git fetch && git checkout feat/refunds');
+  expect(thread.text).not.toContain('git fetch && git checkout feat/refunds');
+  expect(thread.text).toContain('Inspect the repository remote, commit and dirty worktree');
+  expect(thread.text).toContain('exact checkpoint');
+  expect(thread.text).toContain('Do not copy, reveal or recreate a source-machine credential');
+  const handoffMessage = thread.data.messages.find((message: any) => message.kind === 'handoff');
+  expect(handoffMessage.resume.safety).toContain('Never copy, reveal or recreate');
   expect(thread.text).toContain('handoff');
 
   // Alice's run is gone from the map, so nobody is warned about a run that ended.
@@ -319,6 +400,24 @@ it('hands the work over: brief in the inbox, scope released, run closed', async 
   // And bob no longer collides with a ghost.
   const beat = await call('update_run', { status: 'active' }, bob);
   expect(beat.data.conflicts).toEqual([]);
+
+  const replay = await call('handoff_work', { ...args, checkpoint }, alice);
+  expect(replay.isError, replay.text).toBe(false);
+  expect(replay.data.sessionId).toBe(handed.data.sessionId);
+  expect(replay.data.replayed).toBe(true);
+  const changed = await call('handoff_work', { ...args, checkpoint, summary: 'Different work must not reuse this request.' }, alice);
+  expect(changed.isError).toBe(true);
+  expect(changed.text).toContain('different arguments');
+  const retriedThread = await call('get_session', { session_id: handed.data.sessionId }, bob);
+  expect(retriedThread.data.messages.filter((m: any) => m.kind === 'handoff')).toHaveLength(1);
+});
+
+it('serializes concurrent runless handoffs from one credential', async () => {
+  const args = { request_id: randomUUID(), team: 'fleet', summary: 'Review the release notes when a human asks you to continue.' };
+  const replies = await Promise.all([call('handoff_work', args, alice), call('handoff_work', args, alice)]);
+  expect(replies.every((reply) => !reply.isError)).toBe(true);
+  expect(replies[0].data.sessionId).toBe(replies[1].data.sessionId);
+  expect(replies.filter((reply) => reply.data.replayed)).toHaveLength(1);
 });
 
 it('refuses a handoff addressed to someone who is not there', async () => {
@@ -376,6 +475,7 @@ it('shows me my own handoff — the case the unread rule used to hide', async ()
       next_steps: ['Finish writeRefund() in src/solo.ts'],
       reason: 'usage_limit',
       via: 'my-codex',
+      checkpoint: testedCheckpoint(),
     },
     alice,
   );
@@ -391,8 +491,8 @@ it('shows me my own handoff — the case the unread rule used to hide', async ()
   expect(waiting, 'my own handoff must be visible to me').toBeTruthy();
   expect(waiting.from).toBe('alice');
   // And it is told what to do with it, not merely that it exists.
-  expect(inbox.data.hint).toContain('start_run');
-  expect(inbox.data.hint).toContain('reply in the thread');
+  expect(inbox.data.hint).toContain('update_handoff');
+  expect(inbox.data.hint).toContain('A chat reply does not accept');
   // Written by this very account on another machine — the case an agent is
   // likeliest to mistake for a stranger's message and refuse to act on.
   expect(waiting.yours).toBe(true);
@@ -415,7 +515,7 @@ it('shows me my own handoff — the case the unread rule used to hide', async ()
   expect(thread.data.notice).toContain('written by your own account');
 });
 
-it('clears a handoff from the queue the moment somebody takes it', async () => {
+it('does not mistake a chat reply for an explicit handoff transition', async () => {
   const before = await call('inbox', { team: 'fleet' }, alice);
   const mine = before.data.pendingHandoffs.find((h: any) => h.title.includes('SOLO-1'));
   expect(mine, 'a handoff to pick up').toBeTruthy();
@@ -429,9 +529,9 @@ it('clears a handoff from the queue the moment somebody takes it', async () => {
   // No state column decides this: the newest message in that thread is no longer
   // the handoff, so the work is no longer waiting — and both sides agree.
   const after = await call('inbox', { team: 'fleet' }, alice);
-  expect(after.data.pendingHandoffs.map((h: any) => h.title)).not.toContain(mine.title);
+  expect(after.data.pendingHandoffs.map((h: any) => h.title)).toContain(mine.title);
   const theirs = await call('inbox', { team: 'fleet' }, bob);
-  expect(theirs.data.pendingHandoffs.map((h: any) => h.title)).not.toContain(mine.title);
+  expect(theirs.data.pendingHandoffs.map((h: any) => h.title)).toContain(mine.title);
 });
 
 it('offers a teammate handoff to the whole team until one is claimed', async () => {
@@ -442,7 +542,12 @@ it('offers a teammate handoff to the whole team until one is claimed', async () 
   );
   const handed = await call(
     'handoff_work',
-    { branch: 'feat/solo-2', summary: 'Handing this to whoever picks it up first.', via: 'my-codex' },
+    {
+      branch: 'feat/solo-2',
+      summary: 'Handing this to whoever picks it up first.',
+      via: 'my-codex',
+      checkpoint: testedCheckpoint('c'.repeat(40)),
+    },
     alice,
   );
   expect(handed.isError, handed.text).toBe(false);

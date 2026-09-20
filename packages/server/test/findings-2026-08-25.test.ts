@@ -1,12 +1,14 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, expect, it } from 'vitest';
 import { loadEnv } from '../src/env';
+import { agentConnectPrompt } from '../src/lib/agentConnect';
 import { startServer, type StartedServer } from '../src/server';
 
 /**
- * Regressions from the 2026-08-25 Mac pass (docs/test-raporu-2026-08-25.md), where a
+ * Regressions from the 2026-08-25 Mac pass (docs/arsiv/test-raporu-2026-08-25.md), where a
  * real MCP client drove the product instead of a fixture. Each of these was found by
  * watching an agent or a browser do something ordinary.
  */
@@ -76,7 +78,7 @@ beforeAll(async () => {
   srv = await startServer(
     loadEnv({
       port: 0,
-      host: 'localhost',
+      host: '127.0.0.1',
       nodeEnv: 'test',
       devMode: true,
       databaseUrl: undefined,
@@ -105,6 +107,71 @@ it('the token page rendered by POST still knows which team you are in', async ()
   const html = await res.text();
   expect(html).toContain('rail-team');
   expect(html).not.toContain('no team yet');
+});
+
+it('turns a new agent enrollment into one client-aware setup prompt', async () => {
+  const code = `stma_enroll_${'a'.repeat(40)}`;
+  const prompt = agentConnectPrompt({
+    baseUrl: 'https://stma.example/',
+    enrollmentId: '00000000-0000-4000-8000-000000000001',
+    enrollmentCode: code,
+    enrollmentExpiresAt: '2026-09-07T12:15:00.000Z',
+    scope: 'team',
+    agentName: 'codex-reviewer',
+    deviceLabel: 'macbook',
+    clientType: 'codex',
+    role: 'reviewer',
+    teamSlug: 'prompt-team',
+  });
+  expect(prompt.match(new RegExp(code, 'g'))).toHaveLength(1);
+  expect(prompt).toContain('"STMA_TARGET_TEAM": "prompt-team"');
+  expect(prompt).toContain('~/.codex/config.toml');
+  expect(prompt).not.toContain('Claude Code user-scope MCP configuration');
+  expect(prompt).not.toContain('~/.cursor/mcp.json');
+  expect(prompt).toContain('Stop and wait. Pasting this block is not approval.');
+  expect(prompt).toContain('Do not hide the operation.');
+  expect(prompt).toContain('No repository file is modified');
+  expect(prompt).toContain('whoami');
+
+  const j = await devLogin('prompt-owner');
+  await form(j, `${srv.url}/app/teams`, { name: 'Prompt Alpha' });
+  await form(j, `${srv.url}/app/teams`, { name: 'Prompt Beta' });
+
+  const overview = await fetch(`${srv.url}/app/teams/prompt-beta`, { headers: j.header() });
+  expect(await overview.text()).toContain('/app/tokens?team=prompt-beta');
+
+  const picker = await fetch(`${srv.url}/app/tokens?team=prompt-beta`, { headers: j.header() });
+  const pickerHtml = await picker.text();
+  const selectedAccess = /<option value="(team:[0-9a-f-]{36})" selected="">Entire workspace — prompt-beta<\/option>/.exec(
+    pickerHtml,
+  )?.[1];
+  expect(selectedAccess).toBeTruthy();
+  expect(pickerHtml).toContain('Any client · OAuth');
+  expect(pickerHtml).toContain(`${srv.url}/mcp`);
+  expect(pickerHtml).toContain('Legacy setup prompt (compatibility)');
+  expect(pickerHtml).toContain('Create legacy one-time prompt');
+  expect(pickerHtml).not.toContain('STMA_PERSONAL_TOKEN=stma_');
+
+  const created = await fetch(`${srv.url}/app/tokens`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded', ...j.header() },
+    body: new URLSearchParams({
+      name: 'new-codex',
+      device: 'macbook-pro',
+      client: 'codex',
+      role: 'reviewer',
+      access: selectedAccess!,
+    }),
+  });
+  const html = await created.text();
+  expect(created.status).toBe(200);
+  expect(html).toContain('Setup prompt ready');
+  expect(html).toContain('STMA_TARGET_TEAM&quot;: &quot;prompt-beta');
+  expect(html).toContain('STMA_GRANT_SCOPE&quot;: &quot;team');
+  expect(html).toContain('Copy prompt');
+  expect(html).toContain('one-time enrollment');
+  expect(/stma_enroll_[0-9a-f]{40}/.test(html)).toBe(true);
+  expect(/stma_[0-9a-f]{40}/.test(html)).toBe(false);
 });
 
 it('a revoked token is told it was revoked, not to send a token', async () => {
@@ -412,7 +479,7 @@ it('acts on a measured allowance and only records a guessed one', async () => {
   await callTool(pat, 'finish_run', { run_id: guessRun.runId });
 });
 
-it('collapses the spellings of one repository onto one project, and warns about a second name', async () => {
+it('keys projects by full repository identity without relabelling a bare legacy name', async () => {
   const j = await devLogin('project-truth');
   const created = await form(j, `${srv.url}/app/teams`, { name: 'Project Truth' });
   const slug = created.headers.get('location')!.split('/').pop()!;
@@ -426,8 +493,8 @@ it('collapses the spellings of one repository onto one project, and warns about 
   const first = parse(
     await callTool(pat, 'start_run', {
       team: slug,
-      project: 'payments-api',
-      intent: 'the name from the origin remote',
+      project: 'https://github.com/acme/payments-api.git',
+      intent: 'the HTTPS spelling of the origin remote',
       scope: [{ type: 'path', key: 'src/config.js', access: 'write' }],
     }),
   );
@@ -436,10 +503,9 @@ it('collapses the spellings of one repository onto one project, and warns about 
   // Every spelling of the same repository lands on the same project, so the two
   // runs can still see each other.
   for (const spelling of [
-    'acme/payments-api',
     'git@github.com:acme/payments-api.git',
-    'https://github.com/acme/payments-api',
-    'Payments-API',
+    'ssh://git@github.com:22/acme/payments-api.git/',
+    'HTTPS://GITHUB.COM/ACME/PAYMENTS-API/',
   ]) {
     const same = parse(
       await callTool(pat, 'start_run', {
@@ -455,22 +521,47 @@ it('collapses the spellings of one repository onto one project, and warns about 
   }
 
   const projects = parse(await callTool(pat, 'list_projects', { team: slug }));
-  expect(projects.projects.map((p: { slug: string }) => p.slug)).toEqual(['payments-api']);
+  expect(projects.projects.map((p: { slug: string }) => p.slug)).toEqual([
+    'payments-api',
+  ]);
 
-  // A genuinely different name is allowed — monorepos are real — but the agent is
-  // told what it just did, at the only moment it can still fix it.
-  const forked = parse(
+  // A same-basename repository under another owner is a different repository,
+  // not an alias. It gets its own policy/history/conflict scope.
+  const otherOwner = parse(
     await callTool(pat, 'start_run', {
       team: slug,
-      project: 'payments',
-      intent: 'the name from package.json',
+      project: 'https://github.com/other/payments-api.git',
+      intent: 'a fork owned by another organization',
       scope: [{ type: 'path', key: 'src/config.js', access: 'write' }],
     }),
   );
-  expect(forked.projectNote).toContain('"payments-api"');
-  expect(forked.projectNote).toContain('scoped per project');
-  expect(forked.conflicts).toEqual([]);
-  await callTool(pat, 'finish_run', { run_id: forked.runId });
+  expect(otherOwner.projectNote).toContain('"payments-api"');
+  expect(otherOwner.projectNote).toContain('scoped per project');
+  expect(otherOwner.conflicts).toEqual([]);
+
+  // A historical basename has no trustworthy host/owner association. Keep it
+  // as a third explicit identity instead of silently attaching old evidence.
+  const legacy = parse(
+    await callTool(pat, 'start_run', {
+      team: slug,
+      project: 'payments-api',
+      intent: 'an unresolved legacy project name',
+      scope: [{ type: 'path', key: 'src/config.js', access: 'write' }],
+    }),
+  );
+  expect(legacy.projectNote).toContain('bare legacy name');
+  expect(legacy.conflicts).toEqual([]);
+
+  const separated = parse(await callTool(pat, 'list_projects', { team: slug }));
+  expect(new Set(separated.projects.map((p: { slug: string }) => p.slug))).toEqual(
+    new Set([
+      'payments-api',
+      'payments-api-090293e5',
+      'payments-api-legacy',
+    ]),
+  );
+  await callTool(pat, 'finish_run', { run_id: legacy.runId });
+  await callTool(pat, 'finish_run', { run_id: otherOwner.runId });
   await callTool(pat, 'finish_run', { run_id: first.runId });
 });
 
@@ -487,6 +578,18 @@ it('does not claim a teammate\'s handoff was written by you', async () => {
 
   const mate = await devLogin('handoff-mate');
   expect((await form(mate, `${srv.url}/join/${code}`, {})).status).toBe(302);
+
+  // Invite links grant team access: members may neither see nor mutate them.
+  const memberPeople = await (
+    await fetch(`${srv.url}/app/teams/${slug}?tab=people`, { headers: mate.header() })
+  ).text();
+  expect(memberPeople).not.toContain('Generate link');
+  expect(memberPeople).not.toContain('>Integrations</a>');
+  expect(memberPeople).not.toContain(`/app/teams/${slug}/invites/`);
+  expect((await form(mate, `${srv.url}/app/teams/${slug}/invites`, {})).status).toBe(404);
+  expect(
+    (await form(mate, `${srv.url}/app/teams/${slug}/invites/not-theirs/revoke`, {})).status,
+  ).toBe(404);
 
   const tokens = async (jj: ReturnType<typeof jar>, name: string) => {
     const res = await fetch(`${srv.url}/app/tokens`, {
@@ -513,6 +616,14 @@ it('does not claim a teammate\'s handoff was written by you', async () => {
     branch: 'fix/theirs',
     summary: 'Half of it is done: the parser lands, the writer does not.',
     next_steps: ['Finish writeTheirs and cover the empty case'],
+    checkpoint: {
+      request_id: randomUUID(),
+      kind: 'tested',
+      repository_identity: 'https://github.com/acme/shared-repo.git',
+      commit_sha: 'e'.repeat(40),
+      worktree_clean: true,
+      tests: [{ name: 'fixture test', state: 'passed' }],
+    },
   });
 
   const inbox = parse(await callTool(ownerPat, 'inbox', { team: slug }));
@@ -650,4 +761,3 @@ it('does not let the back button hand back a page it already cleared', async () 
   expect(clientJs).toContain("addEventListener('pageshow'");
   expect(clientJs).toContain('e.persisted');
 });
-

@@ -30,6 +30,18 @@ export interface GithubConfig {
   token: string;
 }
 
+/** Read-only provider identity; an inaccessible repository stays unknown. */
+export async function readGithubRepository(env: Env, config: GithubConfig) {
+  const result = await request<{ id: number; full_name: string }>(env, config, 'GET', `/repos/${config.repo}`);
+  if (!result.ok || !Number.isSafeInteger(result.value.id) || result.value.full_name?.toLowerCase() !== config.repo.toLowerCase()) return { ok: false, error: 'Repository identity could not be verified.' } as const;
+  return { ok: true, value: { id: String(result.value.id), fullName: result.value.full_name } } as const;
+}
+
+/** One workflow is one fact, not the repository's entire required-check verdict. */
+export async function readGithubWorkflow(env: Env, config: GithubConfig, runId: number) {
+  return request<{ id: number; head_sha: string; run_attempt: number; updated_at: string; conclusion: string | null; repository: { id: number } }>(env, config, 'GET', `/repos/${config.repo}/actions/runs/${runId}`);
+}
+
 export interface GithubIssue {
   number: number;
   title: string;
@@ -91,6 +103,8 @@ interface RecordedCall {
 
 const calls: RecordedCall[] = [];
 let seeded: GithubIssue[] = [];
+/** When set, the fake answers the way GitHub answers a dead or unscoped token. */
+let authFails = false;
 const CALL_CAP = 200;
 
 /**
@@ -107,9 +121,14 @@ export const githubOutbox = {
   seedIssues(issues: GithubIssue[]): void {
     seeded = issues;
   },
+  /** Mirrors `jiraOutbox.seedAuthFailure`: a tracker that refuses is a case. */
+  seedAuthFailure(fail: boolean): void {
+    authFails = fail;
+  },
   clear(): void {
     calls.length = 0;
     seeded = [];
+    authFails = false;
   },
 };
 
@@ -125,6 +144,7 @@ async function request<T>(
   if (githubTransport(env) === 'memory') {
     calls.push({ method, path, body, at: new Date() });
     if (calls.length > CALL_CAP) calls.splice(0, calls.length - CALL_CAP);
+    if (authFails) return { ok: false, error: 'bad_token' };
     // Answers in GitHub's wire shape, not ours, so the mapping below is under
     // test too — a fake that returns the already-parsed type would have hidden
     // exactly the field-name bug it exists to catch.
@@ -213,11 +233,15 @@ export async function listOpenIssues(
   config: GithubConfig,
   limit = ISSUE_PAGE_SIZE,
 ): Promise<GithubResult<GithubIssue[]>> {
-  const path = `/repos/${config.repo}/issues?state=open&sort=updated&direction=desc&per_page=${Math.min(limit, ISSUE_PAGE_SIZE)}`;
+  const capped = Math.min(limit, ISSUE_PAGE_SIZE);
+  const path = `/repos/${config.repo}/issues?state=open&sort=updated&direction=desc&per_page=${capped}`;
   const res = await request<RawIssue[]>(env, config, 'GET', path);
   if (!res.ok) return res;
   const rows = Array.isArray(res.value) ? res.value : [];
-  return { ok: true, value: rows.filter((r) => !r.pull_request).map(toIssue) };
+  // Bounded here as well as in the query, the way `listClickupTasks` is: the
+  // caller draws a picker and tells somebody it is the newest N, and a promise
+  // that rests on a remote honouring `per_page` is not one this side can keep.
+  return { ok: true, value: rows.filter((r) => !r.pull_request).slice(0, capped).map(toIssue) };
 }
 
 export async function getIssue(

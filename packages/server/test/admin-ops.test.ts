@@ -48,7 +48,7 @@ beforeAll(async () => {
   srv = await startServer(
     loadEnv({
       port: 0,
-      host: 'localhost',
+      host: '127.0.0.1',
       nodeEnv: 'test',
       devMode: true,
       databaseUrl: undefined,
@@ -103,8 +103,13 @@ it('renders the tiles for an admin and counts the requests it has served', async
   ]) {
     expect(html).toContain(label);
   }
-  // The sparkline is 60 plain divs/spans, no chart library.
-  expect(html.match(/class="spark-bar/g)?.length).toBe(60);
+  // The live sparkline is 60 plain divs/spans, no chart library. It is no longer
+  // the only chart on the page — the persisted load history draws its own below
+  // — so count the bars of the one this test means rather than every bar in the
+  // document.
+  const live = /data-spark="live"[\s\S]*?<\/div>/.exec(html)?.[0] ?? '';
+  expect(live.match(/class="spark-bar/g)?.length).toBe(60);
+  expect(html).toContain('data-spark="history"');
   expect(html).toContain('data-autorefresh="30"');
 
   const requests = Number(

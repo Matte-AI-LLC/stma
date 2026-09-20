@@ -88,3 +88,19 @@ export function applyPolicy(
   }
   return appliedPolicyHash(root);
 }
+
+/**
+ * The hash of a policy document as this machine reads it.
+ *
+ * Recomputed, never echoed. Reporting back the number the server sent would
+ * make every receipt green by construction, which is worse than the `?` it
+ * replaces: a governance page that says a rule was followed because the run
+ * repeated the question. Recomputing catches a document that does not hash to
+ * what the server says it does, and — because run start pins the expected hash
+ * — a run whose rules were republished under it.
+ *
+ * Separate from applyPolicy because attesting and installing are different
+ * acts: this writes nothing into the checkout, so a connection that was never
+ * authorized to touch the repository's rules file can still answer for itself.
+ */
+export const readPolicyHash = (document: PolicyDocument): string => fingerprintJson(document);

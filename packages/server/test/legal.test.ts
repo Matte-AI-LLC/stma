@@ -18,7 +18,7 @@ beforeAll(async () => {
   srv = await startServer(
     loadEnv({
       port: 0,
-      host: 'localhost',
+      host: '127.0.0.1',
       nodeEnv: 'test',
       devMode: true,
       databaseUrl: undefined,
@@ -52,7 +52,9 @@ it('states the privacy claims the product actually implements', async () => {
   // The names-only guarantee is the product's central promise; if the page ever
   // stops saying it, either the page or the product has drifted.
   expect(html).toContain('names');
-  expect(html).toContain('North Europe');
+  expect(html).toContain('residency must be confirmed');
+  expect(html).toContain('Provider credentials');
+  expect(html).toContain('redaction is not exhaustive');
   expect(html).toContain('privacy@stma.ai');
 });
 

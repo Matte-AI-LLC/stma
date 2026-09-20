@@ -1,9 +1,11 @@
-import { eq } from 'drizzle-orm';
+import { membershipUser } from '../lib/securityHooks';
+import { and, eq } from 'drizzle-orm';
 import type { Db } from '../db';
 import { memberships, teams } from '../db/schema';
 import { DAY_MS, hitCounter } from '../lib/counters';
 import type { Env } from '../env';
-import { cheapestWith, planLimits, type PlanLimits } from '../lib/entitlements';
+import { cheapestWith, effectiveLimits, type PlanLimits } from '../lib/entitlements';
+import type { AgentGrant } from '../lib/grants';
 
 /**
  * Reply shape and team resolution, shared by every MCP tool module. Extracted
@@ -28,12 +30,20 @@ export function err(message: string): ToolText {
   return { ...text(message), isError: true };
 }
 
-export async function teamsOf(db: Db, userId: string) {
-  return db
+export async function teamsOf(db: Db, userId: string, grant?: AgentGrant) {
+  const rows = await db
     .select({ team: teams, role: memberships.role })
     .from(memberships)
     .innerJoin(teams, eq(memberships.teamId, teams.id))
-    .where(eq(memberships.userId, userId));
+    .where(
+      and(
+        membershipUser(userId),
+        grant && grant.scope !== 'personal' && grant.teamId
+          ? eq(memberships.teamId, grant.teamId)
+          : undefined,
+      ),
+    );
+  return rows;
 }
 
 export type TeamRow = { team: typeof teams.$inferSelect; role: string };
@@ -51,15 +61,16 @@ export async function resolveTeam(
   userId: string,
   slug?: string,
   hosted = true,
+  grant?: AgentGrant,
 ): Promise<TeamRow | { error: string }> {
-  const mine = await teamsOf(db, userId);
+  const mine = await teamsOf(db, userId, grant);
   const target = slug
     ? mine.find((m) => m.team.slug === slug)
     : mine.length === 1
       ? mine[0]
       : undefined;
   if (target) {
-    const allowance = planLimits(target.team.plan, hosted).maxToolCallsPerDay;
+    const allowance = (await effectiveLimits(db, target.team, hosted)).maxToolCallsPerDay;
     const used = await hitCounter(db, 'team-day', target.team.id, DAY_MS, allowance);
     if (used.exceeded) {
       return {
@@ -95,13 +106,14 @@ export async function resolveTeam(
  * work: an agent reads the refusal out loud to its human, and "not on your plan"
  * with no way forward is a dead end rather than an answer.
  */
-export function requireFeature(
+export async function requireFeature(
+  db: Db,
   env: Pick<Env, 'hosted'>,
-  team: { plan: string | null; slug: string },
+  team: { id: string; plan: string | null; slug: string },
   pick: (limits: PlanLimits) => boolean,
   what: string,
-): { error: string } | null {
-  const limits = planLimits(team.plan, env.hosted);
+): Promise<{ error: string } | null> {
+  const limits = await effectiveLimits(db, team, env.hosted);
   if (pick(limits)) return null;
   const upgrade = cheapestWith(pick);
   return {

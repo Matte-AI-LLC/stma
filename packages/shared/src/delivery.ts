@@ -1,4 +1,4 @@
-import { z } from 'zod';
+import { z } from 'zod/v3';
 
 /**
  * The delivery-flow document: how work is supposed to move in this team, from
@@ -8,8 +8,9 @@ import { z } from 'zod';
  * branch named after it → PR → approval → merge → stage → UAT → prod" in a
  * markdown file and every new person (and now every agent) is expected to obey
  * it. This schema is that page as data, so STMA can hand agents the same rules
- * as prose, draw them as a picture, and render the matching CI pipeline —
- * three views of one document instead of three documents that drift.
+ * as prose, draw them as a picture, render the matching CI pipeline, and build
+ * an agent setup handoff — four views of one document instead of four documents
+ * that drift.
  *
  * It lives in the shared package for the same reason the policy schema does:
  * the server stores and serves it, agents receive it over MCP, and the CLI may
@@ -19,7 +20,7 @@ import { z } from 'zod';
 export const TICKET_SYSTEMS = ['jira', 'github', 'azure-boards', 'none'] as const;
 export type TicketSystem = (typeof TICKET_SYSTEMS)[number];
 
-export const DEPLOY_TRIGGERS = ['merge', 'tag', 'manual'] as const;
+export const DEPLOY_TRIGGERS = ['pull-request', 'merge', 'tag', 'manual'] as const;
 export type DeployTrigger = (typeof DEPLOY_TRIGGERS)[number];
 
 export const MERGE_STRATEGIES = ['merge', 'squash', 'rebase'] as const;
@@ -37,10 +38,12 @@ export const flowEnvironmentSchema = z.object({
     .min(1)
     .max(40)
     .regex(/^[a-zA-Z0-9._-]+$/, 'letters, digits, dots, dashes'),
-  /** What sends a build here: every merge, a version tag, or a person. */
+  /** What sends a build here: a pull request, every merge, a version tag, or a person. */
   deployOn: z.enum(DEPLOY_TRIGGERS).default('manual'),
   /** Somebody signs off before the deploy runs (approval gate on the CI environment). */
   approval: z.boolean().default(false),
+  /** Real command CI runs; empty keeps this environment an explicit scaffold. */
+  command: z.string().trim().max(300).default(''),
 });
 export type FlowEnvironment = z.infer<typeof flowEnvironmentSchema>;
 

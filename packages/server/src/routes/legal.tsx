@@ -12,7 +12,7 @@ import { Head, Logo } from '../ui/Layout';
  */
 export const legalRoutes = new Hono<AppEnv>();
 
-const UPDATED = '22 August 2026';
+const UPDATED = '2 September 2026';
 
 const Shell = ({
   title,
@@ -68,6 +68,10 @@ const Shell = ({
         <div class="container site-foot-inner">
           <span>© 2026 STMA · Speak to my Agent — private beta</span>
           <span>
+            <a class="plain" href="/help" style="color:var(--mut)">
+              Help
+            </a>{' '}
+            ·{' '}
             <a class="plain" href="/terms" style="color:var(--mut)">
               Terms
             </a>{' '}
@@ -135,8 +139,7 @@ legalRoutes.get('/terms', (c) =>
 
       <Clause n={5} head="Privacy by design">
         <p class="m0">
-          The Service is built so that environment variable <i>values</i> and source code are not
-          collected — snapshots carry names, versions, hashes and git metadata only. See the{' '}
+          The snapshot collector sends names, versions, hashes and git metadata, not environment values or source contents. Messages and attachments may contain content you submit, including code; provider integrations store reusable credentials. See the{' '}
           <a href="/privacy">privacy policy</a>.
         </p>
       </Clause>
@@ -220,10 +223,7 @@ legalRoutes.get('/privacy', (c) =>
 
       <Clause n={2} head="What we deliberately do not collect">
         <p class="m0">
-          Environment variable values. Source code and file contents. Secrets of any kind. This is
-          a structural property of how snapshots are built, not a promise about handling. Message
-          bodies, attachments and error records additionally pass through server-side redaction
-          for common credential shapes before storage.
+          The snapshot collector does not read environment variable values or source file contents. This is not a guarantee about user-submitted messages or attachments, which can contain code or secrets. Common credential shapes are redacted, but redaction is not exhaustive. Provider credentials supplied through integration forms are stored for provider access. Application-layer encryption is available when the operator configures its key store; legacy credentials require an explicit migration.
         </p>
       </Clause>
 
@@ -237,14 +237,13 @@ legalRoutes.get('/privacy', (c) =>
 
       <Clause n={4} head="Where it lives">
         <p class="m0">
-          The European Union — Microsoft Azure, North Europe. Backups stay in the same region.
+          Managed hosting location, backup geography and contracted residency must be confirmed in the service order. Self-hosted storage and backup locations are controlled by the instance operator. Do not infer a residency guarantee from a region label alone.
         </p>
       </Clause>
 
       <Clause n={5} head="Who else touches it">
         <p class="m0">
-          Microsoft Azure (hosting and database) and Resend (notification email). If billing
-          launches, Stripe will handle payments and card details will never reach our servers. We
+          Microsoft Azure (hosting and database), Resend (notification email), and Stripe for enabled managed billing. Card entry takes place on Stripe-hosted Checkout, not STMA. We
           do not sell data and there are no advertising trackers.
         </p>
       </Clause>
@@ -255,6 +254,8 @@ legalRoutes.get('/privacy', (c) =>
           <li>Resolved debug sessions: kept as your team's archive until you delete them.</li>
           <li>Operational logs and error records: 30 days.</li>
           <li>Account data: until you delete the account.</li>
+          <li>Activity and agent events: plan-dependent age limits and row caps. No age-based expiry does not mean unlimited capacity.</li>
+          <li>Launch milestones, repository bindings, provider observations and delivery receipts: workspace-scoped records retained until workspace deletion; they are not the bounded activity feed. Operator retention and backup obligations must be agreed separately.</li>
         </ul>
       </Clause>
 

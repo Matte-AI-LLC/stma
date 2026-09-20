@@ -87,7 +87,7 @@ beforeAll(async () => {
   srv = await startServer(
     loadEnv({
       port: 0,
-      host: 'localhost',
+      host: '127.0.0.1',
       nodeEnv: 'test',
       devMode: true,
       databaseUrl: undefined,
@@ -264,7 +264,8 @@ it('assembles the evidence pack from what was recorded, and names what was not',
   expect(byKey.environment.state).toBe('unknown');
   expect(byKey.environment.detail).toContain('No preflight');
   expect(byKey.scope.state).toBe('ok');
-  expect(byKey.collisions.state).toBe('ok');
+  expect(byKey.collisions.state).toBe('unknown');
+  expect(byKey.collisions.coverage).toBe('bounded');
   // Still running, so the outcome is not a verdict yet.
   expect(byKey.outcome.state).toBe('unknown');
   expect(pack.data.unconfirmed).toEqual(expect.arrayContaining(['policy', 'environment', 'outcome']));
@@ -278,7 +279,9 @@ it('assembles the evidence pack from what was recorded, and names what was not',
   const after = await call('get_evidence', { run_id: started.data.runId }, alice);
   const now = Object.fromEntries(after.data.checks.map((c: any) => [c.key, c]));
   expect(now.policy.state).toBe('ok');
-  expect(now.outcome.state).toBe('ok');
+  expect(now.outcome.state).toBe('unknown');
+  expect(now.policy.detail).toContain('does not prove compliance');
+  expect(after.data.schemaVersion).toBe(2);
   expect(after.data.blocking).not.toContain('policy');
 });
 

@@ -4,19 +4,20 @@ import {
   type DeliveryFlow,
   type FlowProvider,
 } from '@bridge/shared';
-import { and, desc, eq, isNull, sql } from 'drizzle-orm';
+import { and, desc, eq, isNull, ne, sql } from 'drizzle-orm';
 import type { Db } from '../db';
-import { deliveryFlows, projects, users } from '../db/schema';
-import { findOrCreateProject } from '../lib/projects';
-import { projectForTeam, teamForUser } from './access';
+import { deliveryFlows, projects, teams, users } from '../db/schema';
+import { namedProject, projectForTeam, teamForUser } from './access';
+import { effectiveLimits } from '../lib/entitlements';
 
 /**
  * Delivery flows: the team's "how work moves here" document as data.
  *
- * One document, three renderings — prose for agents (the brief), a picture for
- * people (ui/FlowDiagram), and YAML for the CI provider — all derived on read.
- * The rule that keeps this honest is the same one policy follows: what is
- * stored is what somebody decided, never a cached rendering of it.
+ * One document, four renderings — prose for agents (the brief), a picture for
+ * people (ui/FlowDiagram), YAML for the CI provider, and an English setup pack
+ * for a receiving agent — all derived on read. The rule that keeps this honest
+ * is the same one policy follows: what is stored is what somebody decided,
+ * never a cached rendering of it.
  */
 
 export type FlowRow = typeof deliveryFlows.$inferSelect;
@@ -43,6 +44,7 @@ export async function saveDeliveryFlow(
   },
 ) {
   const access = await teamForUser(db, userId, input.team);
+  if (access && (await effectiveLimits(db, access.team)).readOnly) return { error: 'Evaluation ended. Existing flows remain readable; upgrade explicitly to publish new work.' } as const;
   if (!access || access.role !== 'owner') {
     return { error: 'Only a team owner can publish a delivery flow.' } as const;
   }
@@ -60,57 +62,78 @@ export async function saveDeliveryFlow(
 
   let projectId: string | null = null;
   if (input.project) {
-    const found = await findOrCreateProject(db, access.team, input.project, userId);
+    // Browser forms carry the durable project id. Older callers and MCP clients
+    // may still send a name/slug, so resolve that before lazy creation. This is
+    // important for repository-backed projects: findOrCreateProject(name)
+    // deliberately creates a legacy/name-only project, which used to leave the
+    // delivery flow beside (rather than inside) the bound repository project.
+    const found = await namedProject(db, access.team, input.project, userId);
     if ('error' in found) return { error: found.error } as const;
     projectId = found.project.id;
   }
 
   if (input.flowId) {
-    const rows = await db
-      .update(deliveryFlows)
-      .set({
-        name,
-        provider,
-        document: parsed.data,
-        projectId,
-        updatedAt: new Date(),
-        // A cheap edit counter, not a history: the activity feed carries the trail.
-        version: (await currentVersion(db, input.flowId, access.team.id)) + 1,
-      })
-      .where(and(eq(deliveryFlows.id, input.flowId), eq(deliveryFlows.teamId, access.team.id)))
-      .returning();
-    const row = rows[0];
-    return row ? ({ flow: row } as const) : ({ error: 'That flow is not in this team.' } as const);
+    return db.transaction(async (tx) => {
+      // Serialize all scope changes for this team. The unique expression index
+      // is the final backstop; this lock lets concurrent saves finish cleanly
+      // instead of surfacing a constraint error to one owner.
+      await tx.execute(sql`select ${teams.id} from ${teams} where ${teams.id} = ${access.team.id} for update`);
+      const currentRows = await tx
+        .select()
+        .from(deliveryFlows)
+        .where(and(eq(deliveryFlows.id, input.flowId!), eq(deliveryFlows.teamId, access.team.id)))
+        .limit(1);
+      const current = currentRows[0];
+      if (!current) return { error: 'That flow is not in this team.' } as const;
+
+      // Moving an active flow into another scope must preserve the same invariant
+      // as creating one there: one active answer to "how does work move here".
+      // Previously the update path skipped this archive and could leave two.
+      if (current.status === 'active') {
+        await tx
+          .update(deliveryFlows)
+          .set({ status: 'archived', updatedAt: new Date() })
+          .where(and(sameScope(access.team.id, projectId), ne(deliveryFlows.id, current.id)));
+      }
+      const rows = await tx
+        .update(deliveryFlows)
+        .set({
+          name,
+          provider,
+          document: parsed.data,
+          projectId,
+          updatedAt: new Date(),
+          // A cheap edit counter, not a history: the activity feed carries the trail.
+          version: current.version + 1,
+        })
+        .where(eq(deliveryFlows.id, current.id))
+        .returning();
+      return { flow: rows[0]! } as const;
+    });
   }
 
   // One active flow per scope: the previous answer to "how does work move
   // here" is archived, not deleted — it stays readable in the table.
-  await db
-    .update(deliveryFlows)
-    .set({ status: 'archived', updatedAt: new Date() })
-    .where(sameScope(access.team.id, projectId));
-  const rows = await db
-    .insert(deliveryFlows)
-    .values({
-      teamId: access.team.id,
-      projectId,
-      name,
-      templateKey: input.templateKey,
-      provider,
-      document: parsed.data,
-      createdBy: userId,
-    })
-    .returning();
-  return { flow: rows[0]! } as const;
-}
-
-async function currentVersion(db: Db, flowId: string, teamId: string): Promise<number> {
-  const rows = await db
-    .select({ version: deliveryFlows.version })
-    .from(deliveryFlows)
-    .where(and(eq(deliveryFlows.id, flowId), eq(deliveryFlows.teamId, teamId)))
-    .limit(1);
-  return rows[0]?.version ?? 1;
+  return db.transaction(async (tx) => {
+    await tx.execute(sql`select ${teams.id} from ${teams} where ${teams.id} = ${access.team.id} for update`);
+    await tx
+      .update(deliveryFlows)
+      .set({ status: 'archived', updatedAt: new Date() })
+      .where(sameScope(access.team.id, projectId));
+    const rows = await tx
+      .insert(deliveryFlows)
+      .values({
+        teamId: access.team.id,
+        projectId,
+        name,
+        templateKey: input.templateKey,
+        provider,
+        document: parsed.data,
+        createdBy: userId,
+      })
+      .returning();
+    return { flow: rows[0]! } as const;
+  });
 }
 
 export async function archiveDeliveryFlow(db: Db, userId: string, team: string, flowId: string) {
@@ -185,6 +208,7 @@ const TICKET_WORDS: Record<string, string> = {
 };
 
 const TRIGGER_WORDS: Record<string, string> = {
+  'pull-request': 'for each pull request',
   merge: 'automatically on merge',
   tag: 'on a version tag',
   manual: 'manually',
@@ -229,6 +253,13 @@ export function flowBrief(
         )
         .join(' → ')}.`,
     );
+    for (const env of flow.environments) {
+      lines.push(
+        env.command
+          ? `Deploy command for ${env.name}: ${env.command}.`
+          : `Deploy command for ${env.name} is not configured; the rendered pipeline is a scaffold there.`,
+      );
+    }
   }
   for (const note of flow.notes) lines.push(`- ${note}`);
   return lines.join('\n');
@@ -236,6 +267,16 @@ export function flowBrief(
 
 /** Double-quoted YAML scalar — JSON string escaping is valid YAML, so borrow it. */
 const y = (value: string): string => JSON.stringify(value);
+
+/** Marker deliberately emitted for an environment whose real command is still blank. */
+export const DEPLOY_PLACEHOLDER = 'replace with your deploy step';
+export const CHECKS_PLACEHOLDER = 'add your checks in STMA';
+
+/** A scaffold may be committed explicitly, but must never masquerade as a working deployment. */
+export function pipelineIsScaffold(pipeline: { yaml: string } | string): boolean {
+  const yaml = typeof pipeline === 'string' ? pipeline : pipeline.yaml;
+  return yaml.includes(DEPLOY_PLACEHOLDER) || yaml.includes(CHECKS_PLACEHOLDER);
+}
 
 const slug = (value: string): string =>
   value.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '') || 'step';
@@ -246,23 +287,27 @@ export function pipelinePath(provider: FlowProvider): string {
 }
 
 /**
- * The flow as CI configuration. A scaffold with the flow's real shape — the
- * checks are the flow's checks, the stages are the flow's environments in
- * order — and honest placeholders where only the team knows the command. The
- * header says a machine wrote it and where to change it.
+ * The flow as CI configuration. Checks and per-environment commands are real
+ * when the owner supplied them; otherwise the output keeps the real shape and
+ * carries honest placeholders. The header says a machine wrote it and where
+ * to change it.
  */
 export function renderPipeline(
   flow: DeliveryFlow,
   provider: FlowProvider,
-  ctx: { name: string; version: number },
+  ctx: { name: string; version?: number; purpose?: 'stored-flow' | 'agent-setup' },
 ): { path: string; yaml: string } {
+  const source = ctx.version === undefined ? 'an unpublished blueprint' : `v${ctx.version}`;
   const header = [
-    `# Generated by STMA from the delivery flow ${y(ctx.name)} (v${ctx.version}).`,
-    '# Edit the flow in STMA and re-render rather than letting this file drift.',
+    `# Generated by STMA from the delivery flow ${y(ctx.name)} (${source}).`,
+    ctx.purpose === 'agent-setup'
+      ? '# Starting candidate for an agent setup pack. Report every repository-specific adaptation in the STMA completion receipt.'
+      : '# Edit the flow in STMA and re-render rather than letting this file drift.',
   ];
   const from = flow.branch.from;
   if (provider === 'azure-devops') {
     const lines = [...header, ''];
+    const previousByTrigger = new Map<string, string>();
     lines.push('trigger:', '  branches:', `    include: [${y(from)}]`);
     if (flow.environments.some((e) => e.deployOn === 'tag')) {
       lines.push('  tags:', "    include: ['v*']");
@@ -276,16 +321,22 @@ export function renderPipeline(
     lines.push('        pool:');
     lines.push('          vmImage: ubuntu-latest');
     lines.push('        steps:');
-    for (const check of flow.checks.length > 0 ? flow.checks : ['echo "add your checks in STMA"']) {
+    for (const check of flow.checks.length > 0 ? flow.checks : [`echo "${CHECKS_PLACEHOLDER}"`]) {
       lines.push(`          - script: ${y(check)}`);
       lines.push(`            displayName: ${y(check.slice(0, 60))}`);
     }
     for (const env of flow.environments) {
       const stage = slug(env.name);
+      const stageName = `deploy_${stage}`;
       lines.push(`  - stage: deploy_${stage}`);
       lines.push(`    displayName: ${y(`Deploy ${env.name}`)}`);
+      // A tag/manual run must not depend on a merge-only stage that is skipped
+      // in that run. Preserve ordering only inside the same trigger lane.
+      lines.push(`    dependsOn: ${previousByTrigger.get(env.deployOn) ?? 'checks'}`);
       lines.push(
-        env.deployOn === 'tag'
+        env.deployOn === 'pull-request'
+          ? `    condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))`
+          : env.deployOn === 'tag'
           ? `    condition: and(succeeded(), startsWith(variables['Build.SourceBranch'], 'refs/tags/v'))`
           : env.deployOn === 'merge'
             ? `    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/${from}'))`
@@ -301,8 +352,13 @@ export function renderPipeline(
       lines.push('          runOnce:');
       lines.push('            deploy:');
       lines.push('              steps:');
-      lines.push(`                - script: echo ${y(`deploy to ${env.name} — replace with your deploy step`)}`);
+      // Deployment jobs do not implicitly fetch the repository.
+      lines.push('                - checkout: self');
+      lines.push(
+        `                - script: ${y(env.command || `echo deploy to ${env.name} — ${DEPLOY_PLACEHOLDER}`)}`,
+      );
       lines.push(`                  displayName: ${y(`Deploy ${env.name}`)}`);
+      previousByTrigger.set(env.deployOn, stageName);
     }
     return { path: pipelinePath(provider), yaml: `${lines.join('\n')}\n` };
   }
@@ -326,17 +382,21 @@ export function renderPipeline(
   lines.push('    runs-on: ubuntu-latest');
   lines.push('    steps:');
   lines.push('      - uses: actions/checkout@v4');
-  for (const check of flow.checks.length > 0 ? flow.checks : ['echo "add your checks in STMA"']) {
+  for (const check of flow.checks.length > 0 ? flow.checks : [`echo "${CHECKS_PLACEHOLDER}"`]) {
     lines.push(`      - name: ${y(check.slice(0, 60))}`);
     lines.push(`        run: ${y(check)}`);
   }
-  let previous = 'checks';
+  const previousByTrigger = new Map<string, string>();
   for (const env of flow.environments) {
     const job = `deploy_${slug(env.name)}`;
     lines.push(`  ${job}:`);
-    lines.push(`    needs: ${previous}`);
+    // A workflow_dispatch/tag job cannot depend on a merge job: that job is
+    // skipped for the event and GitHub would skip every dependent job too.
+    lines.push(`    needs: ${previousByTrigger.get(env.deployOn) ?? 'checks'}`);
     lines.push(
-      env.deployOn === 'tag'
+      env.deployOn === 'pull-request'
+        ? `    if: github.event_name == 'pull_request'`
+        : env.deployOn === 'tag'
         ? `    if: startsWith(github.ref, 'refs/tags/v')`
         : env.deployOn === 'merge'
           ? `    if: github.event_name == 'push' && github.ref == 'refs/heads/${from}'`
@@ -346,8 +406,9 @@ export function renderPipeline(
     // Approvals live on the GitHub environment ("required reviewers").
     lines.push(`    environment: ${y(env.name)}${env.approval ? ' # add required reviewers to this environment in repo settings' : ''}`);
     lines.push('    steps:');
-    lines.push(`      - run: echo ${y(`deploy to ${env.name} — replace with your deploy step`)}`);
-    previous = job;
+    lines.push('      - uses: actions/checkout@v4');
+    lines.push(`      - run: ${y(env.command || `echo deploy to ${env.name} — ${DEPLOY_PLACEHOLDER}`)}`);
+    previousByTrigger.set(env.deployOn, job);
   }
   return { path: pipelinePath(provider), yaml: `${lines.join('\n')}\n` };
 }

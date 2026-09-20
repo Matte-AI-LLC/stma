@@ -1,0 +1,3 @@
+ALTER TABLE "handoffs" ADD COLUMN "resumed_knowledge_context_id" uuid;--> statement-breakpoint
+ALTER TABLE "knowledge_contexts" ADD COLUMN "response" jsonb;--> statement-breakpoint
+ALTER TABLE "handoffs" ADD CONSTRAINT "handoffs_resumed_knowledge_context_id_knowledge_contexts_id_fk" FOREIGN KEY ("resumed_knowledge_context_id") REFERENCES "public"."knowledge_contexts"("id") ON DELETE set null ON UPDATE no action;

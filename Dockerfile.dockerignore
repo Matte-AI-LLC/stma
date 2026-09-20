@@ -1,0 +1,28 @@
+# Public image context. Keep this in addition to .dockerignore: Docker selects
+# the Dockerfile-specific file for `docker build -f Dockerfile`, while the
+# hosted build uses the root ignore file and therefore receives ee/.
+node_modules
+**/node_modules
+dist
+**/dist
+.data
+**/.data
+coverage
+**/coverage
+.git
+.github
+docs
+examples
+**/*.md
+.claude
+.vscode
+.idea
+.env
+.env.*
+**/.env
+**/.env.*
+.stma
+**/.stma
+ee
+Dockerfile.hosted
+run-*.bat

@@ -4,6 +4,7 @@ import path from 'node:path';
 import { afterAll, beforeAll, expect, it } from 'vitest';
 import { loadEnv } from '../src/env';
 import { startServer, type StartedServer } from '../src/server';
+import { agentInstallations, projects, tokens } from '../src/db/schema';
 
 /** Server booted WITHOUT ADMIN_USERNAMES — the /admin area must not exist. */
 let plain: StartedServer;
@@ -57,7 +58,7 @@ beforeAll(async () => {
   plain = await startServer(
     loadEnv({
       port: 0,
-      host: 'localhost',
+      host: '127.0.0.1',
       nodeEnv: 'test',
       devMode: true,
       databaseUrl: undefined,
@@ -70,9 +71,10 @@ beforeAll(async () => {
   srv = await startServer(
     loadEnv({
       port: 0,
-      host: 'localhost',
+      host: '127.0.0.1',
       nodeEnv: 'test',
       devMode: true,
+      hosted: true,
       databaseUrl: undefined,
       pgliteDir: dataDir,
     }),
@@ -91,6 +93,8 @@ afterAll(async () => {
 let root: ReturnType<typeof jar>;
 let mallory: ReturnType<typeof jar>;
 let teamId: string;
+let rootId: string;
+let malloryId: string;
 let contactId: string;
 
 it('returns 404 for the whole /admin area when ADMIN_USERNAMES is unset', async () => {
@@ -101,6 +105,8 @@ it('returns 404 for the whole /admin area when ADMIN_USERNAMES is unset', async 
   expect((await fetch(`${plain.url}/admin/crm`, { headers: j.header() })).status).toBe(404);
   const appHtml = await (await fetch(`${plain.url}/app`, { headers: j.header() })).text();
   expect(appHtml).not.toContain('href="/admin"');
+  const docsHtml = await (await fetch(`${plain.url}/docs`, { headers: j.header() })).text();
+  expect(docsHtml).not.toContain('id="instance-admin"');
 });
 
 it('returns 404 for anonymous visitors and signed-in non-admins', async () => {
@@ -111,6 +117,8 @@ it('returns 404 for anonymous visitors and signed-in non-admins', async () => {
   }
   const appHtml = await (await fetch(`${srv.url}/app`, { headers: mallory.header() })).text();
   expect(appHtml).not.toContain('href="/admin"');
+  const docsHtml = await (await fetch(`${srv.url}/docs`, { headers: mallory.header() })).text();
+  expect(docsHtml).not.toContain('id="instance-admin"');
 });
 
 it('shows the overview with instance stats to an admin', async () => {
@@ -145,6 +153,9 @@ it('shows the overview with instance stats to an admin', async () => {
   ]) {
     expect(html).toContain(label);
   }
+  const docsHtml = await (await fetch(`${srv.url}/docs`, { headers: root.header() })).text();
+  expect(docsHtml).toContain('id="instance-admin"');
+  expect(docsHtml).toContain('workspace → project → scoped agent connection');
 });
 
 it('renders the teams page and persists a plan switch to a paid rung', async () => {
@@ -182,14 +193,156 @@ it('rejects an invalid plan', async () => {
   expect(html).toContain('value="team" selected'); // unchanged
 });
 
-it('renders the users page with badges', async () => {
+it('renders filterable users with clickable workspace-plan memberships', async () => {
   const res = await fetch(`${srv.url}/admin/users`, { headers: root.header() });
   expect(res.status).toBe(200);
   const html = await res.text();
   expect(html).toContain('mallory');
   expect(html).toContain('root');
   expect(html).toContain('>admin<'); // admin badge on root's row
-  expect(html).toContain('Growth Lab'); // team membership listed
+  expect(html).toContain('Growth Lab · owner · team');
+  expect(html).toContain('Workspace plan');
+  expect(html).toContain('Workspace memberships');
+  rootId = /data-user-row="root"[\s\S]{0,200}?\/admin\/users\/([0-9a-f-]{36})/.exec(html)?.[1] ?? '';
+  malloryId = /data-user-row="mallory"[\s\S]{0,200}?\/admin\/users\/([0-9a-f-]{36})/.exec(html)?.[1] ?? '';
+  expect(rootId).toBeTruthy();
+  expect(malloryId).toBeTruthy();
+
+  const userSearch = await (
+    await fetch(`${srv.url}/admin/users?q=mallory`, { headers: root.header() })
+  ).text();
+  expect(userSearch).toContain('data-user-row="mallory"');
+  expect(userSearch).not.toContain('data-user-row="root"');
+  const paidUsers = await (
+    await fetch(`${srv.url}/admin/users?plan=team`, { headers: root.header() })
+  ).text();
+  expect(paidUsers).toContain('data-user-row="root"');
+  expect(paidUsers).not.toContain('data-user-row="mallory"');
+
+  const workspaceSearch = await (
+    await fetch(`${srv.url}/admin/teams?q=growth&plan=team`, { headers: root.header() })
+  ).text();
+  expect(workspaceSearch).toContain('Growth Lab');
+  const noWorkspace = await (
+    await fetch(`${srv.url}/admin/teams?q=growth&plan=free`, { headers: root.header() })
+  ).text();
+  expect(noWorkspace).toContain('No matching workspaces');
+});
+
+it('drills into workspace hierarchy and manages a user membership without losing the last owner', async () => {
+  const [project] = await srv.db
+    .insert(projects)
+    .values({
+      teamId,
+      name: 'Checkout Service',
+      slug: 'checkout-service',
+      repositoryIdentity: 'github.com/acme/checkout-service',
+      createdBy: rootId,
+    })
+    .returning();
+  const [token] = await srv.db
+    .insert(tokens)
+    .values({
+      userId: rootId,
+      name: 'checkout-agent credential',
+      scope: 'project',
+      teamId,
+      projectId: project!.id,
+      tokenHash: 'admin-fixture-project-token-hash',
+      prefix: 'stma_admin_fixture',
+    })
+    .returning();
+  await srv.db.insert(agentInstallations).values({
+    userId: rootId,
+    tokenId: token!.id,
+    name: 'checkout-agent',
+    deviceLabel: 'qa-laptop',
+    clientType: 'claude-code',
+    deviceFingerprint: 'admin-fixture-device',
+  });
+  const workspace = await (
+    await fetch(`${srv.url}/admin/teams/${teamId}`, { headers: root.header() })
+  ).text();
+  expect(workspace).toContain('Workspace → projects → scoped agent connections');
+  expect(workspace).toContain('Applies to this workspace, not directly to a user');
+  expect(workspace).toContain(`/admin/users/${rootId}`);
+  expect(workspace).toContain('Agent connections');
+  expect(workspace).toContain('Checkout Service');
+  expect(workspace).toContain('github.com/acme/checkout-service');
+  expect(workspace).toContain('checkout-agent');
+  expect(workspace).toContain('qa-laptop');
+  expect(workspace).toContain('name="return_to" value="detail"');
+
+  const before = await (
+    await fetch(`${srv.url}/admin/users/${malloryId}`, { headers: root.header() })
+  ).text();
+  expect(before).toContain('Add workspace membership');
+  expect(before).toContain(`value="${teamId}"`);
+
+  const added = await fetch(
+    `${srv.url}/admin/users/${malloryId}/memberships`,
+    form({ team_id: teamId, role: 'member' }, root.header()),
+  );
+  expect(added.status).toBe(302);
+  expect(added.headers.get('location')).toContain('ok=');
+  const afterAdd = await (
+    await fetch(`${srv.url}/admin/users/${malloryId}`, { headers: root.header() })
+  ).text();
+  expect(afterAdd).toContain('Growth Lab');
+  expect(afterAdd).toContain('value="member" selected');
+
+  const promoted = await fetch(
+    `${srv.url}/admin/users/${malloryId}/memberships/${teamId}/role`,
+    form({ role: 'owner' }, root.header()),
+  );
+  expect(promoted.headers.get('location')).toContain('ok=');
+  const afterRole = await (
+    await fetch(`${srv.url}/admin/users/${malloryId}`, { headers: root.header() })
+  ).text();
+  expect(afterRole).toContain('value="owner" selected');
+
+  const removed = await fetch(
+    `${srv.url}/admin/users/${malloryId}/memberships/${teamId}/remove`,
+    { method: 'POST', headers: root.header(), redirect: 'manual' },
+  );
+  expect(removed.headers.get('location')).toContain('ok=');
+  const afterRemove = await (
+    await fetch(`${srv.url}/admin/users/${malloryId}`, { headers: root.header() })
+  ).text();
+  expect(afterRemove).toContain('No workspace memberships');
+
+  const lastOwner = await fetch(
+    `${srv.url}/admin/users/${rootId}/memberships/${teamId}/role`,
+    form({ role: 'member' }, root.header()),
+  );
+  expect(decodeURIComponent(lastOwner.headers.get('location') ?? '')).toContain(
+    'A workspace needs at least one owner',
+  );
+  const lastOwnerRemove = await fetch(
+    `${srv.url}/admin/users/${rootId}/memberships/${teamId}/remove`,
+    { method: 'POST', headers: root.header(), redirect: 'manual' },
+  );
+  expect(decodeURIComponent(lastOwnerRemove.headers.get('location') ?? '')).toContain(
+    'The last workspace owner cannot be removed',
+  );
+
+  const freeWorkspace = await fetch(
+    `${srv.url}/app/teams`,
+    form({ name: 'Free Capacity Lab' }, root.header()),
+  );
+  expect(freeWorkspace.status).toBe(302);
+  const freeList = await (
+    await fetch(`${srv.url}/admin/teams?q=Free+Capacity`, { headers: root.header() })
+  ).text();
+  const freeTeamId = /\/admin\/teams\/([0-9a-f-]{36})\/plan/.exec(freeList)?.[1] ?? '';
+  expect(freeTeamId).toBeTruthy();
+  const overCapacity = await fetch(
+    `${srv.url}/admin/users/${malloryId}/memberships`,
+    form({ team_id: freeTeamId, role: 'member' }, root.header()),
+  );
+  expect(decodeURIComponent(overCapacity.headers.get('location') ?? '')).toContain(
+    'free plan member limit',
+  );
 });
 
 it('creates a CRM contact and persists a status change', async () => {
@@ -277,12 +430,17 @@ it('edits and deletes a CRM contact', async () => {
   expect(after).not.toContain('Jane Smith');
 });
 
-it('returns 404 for non-admin POSTs to plan and CRM routes', async () => {
+it('returns 404 for non-admin POSTs to plan, membership and CRM routes', async () => {
   const planRes = await fetch(
     `${srv.url}/admin/teams/${teamId}/plan`,
     form({ plan: 'free' }, mallory.header()),
   );
   expect(planRes.status).toBe(404);
+  const memberRes = await fetch(
+    `${srv.url}/admin/users/${malloryId}/memberships`,
+    form({ team_id: teamId, role: 'member' }, mallory.header()),
+  );
+  expect(memberRes.status).toBe(404);
   const crmRes = await fetch(`${srv.url}/admin/crm`, form({ name: 'Sneaky' }, mallory.header()));
   expect(crmRes.status).toBe(404);
   const delRes = await fetch(`${srv.url}/admin/crm/${contactId}/delete`, {

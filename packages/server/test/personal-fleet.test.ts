@@ -98,7 +98,7 @@ beforeAll(async () => {
   srv = await startServer(
     loadEnv({
       port: 0,
-      host: 'localhost',
+      host: '127.0.0.1',
       nodeEnv: 'test',
       devMode: true,
       databaseUrl: undefined,
@@ -382,4 +382,42 @@ it('retains snapshots per device, not per user', async () => {
   expect(win.snapshot.runtimes.node).toBe('20.11.0');
   const mac = toolJson(await callTool(aliceToken, 'get_snapshot', { device: 'macbook' }));
   expect(mac.snapshot.runtimes.node).toBe('24.1.20');
+});
+
+it('refuses to diff the newest snapshots when they belong to different projects', async () => {
+  await callTool(aliceToken, 'push_snapshot', {
+    repo: 'demo',
+    device: 'macbook',
+    snapshot: snapshotOf({ runtimes: { node: '24.2.0' } }),
+  });
+  await callTool(aliceToken, 'push_snapshot', {
+    repo: 'other-service',
+    device: 'win-desktop',
+    snapshot: snapshotOf({ runtimes: { node: '20.12.0' } }),
+  });
+
+  const unsafe = await callTool(aliceToken, 'compare_env', {
+    device: 'macbook',
+    their_device: 'win-desktop',
+  });
+  expect(unsafe.isError).toBe(true);
+  expect(toolText(unsafe)).toContain('different projects');
+  expect(toolText(unsafe)).toContain('Pass "repo"');
+
+  // Explicitly scoping both lookups to the same repo remains valid and reaches
+  // the older demo snapshot on the Windows machine.
+  const scoped = await callTool(aliceToken, 'compare_env', {
+    repo: 'demo',
+    device: 'macbook',
+    their_device: 'win-desktop',
+  });
+  expect(scoped.isError).toBeFalsy();
+
+  const web = await fetch(
+    `${srv.url}${TEAM_PATH}/compare?a=alice%40macbook&b=alice%40win-desktop`,
+    { headers: aliceJar.header() },
+  );
+  const html = await web.text();
+  expect(html).toContain('newest snapshots belong to different projects');
+  expect(html).not.toContain('20.12.0');
 });

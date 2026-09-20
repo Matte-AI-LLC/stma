@@ -1,4 +1,9 @@
-import { policyDocumentSchema, type PolicyDocument } from '@bridge/shared';
+import {
+  looksLikeContentRule,
+  parseContentRule,
+  policyDocumentSchema,
+  type PolicyDocument,
+} from '@bridge/shared';
 
 /**
  * Policy as a form rather than a JSON file on somebody's laptop.
@@ -70,6 +75,17 @@ export function policyFromForm(
     const issue = parsed.error.issues[0];
     const where = issue?.path.join('.') || 'the document';
     return { error: `${where}: ${issue?.message ?? 'is not valid'}` };
+  }
+  // A line that is trying to be a machine-checked rule and is not one would be
+  // published as prose and guard nothing — the owner would believe the font was
+  // blocked and it would not be. Refuse the typo rather than the rule.
+  const malformed = parsed.data.permissions.deny.find(
+    (line) => looksLikeContentRule(line) && !parseContentRule(line),
+  );
+  if (malformed) {
+    return {
+      error: `permissions.deny: "${malformed.slice(0, 80)}" starts with content: but is not a valid content rule. Use: content: "text to forbid" in path/** — reason (the quotes are required; "in path" and the reason are optional).`,
+    };
   }
   return { document: parsed.data };
 }

@@ -17,7 +17,15 @@ import { authCodes } from '../db/schema';
 import { sha256hex } from '../lib/crypto';
 import type { AppEnv } from '../types';
 
-export const AUTH_CODE_PURPOSES = ['login', 'password_change', 'password_reset'] as const;
+export const AUTH_CODE_PURPOSES = [
+  'login',
+  'password_change',
+  'password_reset',
+  /** Proving the address already on the account. */
+  'email_verify',
+  /** Proving a different address before it replaces the one on the account. */
+  'email_change',
+] as const;
 export type AuthCodePurpose = (typeof AUTH_CODE_PURPOSES)[number];
 
 /** How long an emailed code stays usable. */

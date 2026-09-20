@@ -12,12 +12,8 @@ export const Head = ({ title }: { title?: string }) => (
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>{title ? `${title} — STMA` : 'STMA — Speak to my Agent'}</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="" />
-    <link
-      href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500;600&display=swap"
-      rel="stylesheet"
-    />
+    {/* The console must render on restricted/offline networks. Use the local
+        system-font fallbacks; no third-party render-blocking font stylesheet. */}
     <link rel="icon" type="image/svg+xml" href={FAVICON_URL} />
     <link rel="stylesheet" href={CSS_URL} />
     <script src={JS_URL} defer></script>

@@ -18,6 +18,7 @@ concurrency:
 
 jobs:
   test:
+    # macOS/Windows live in the nightly/manual cross-platform workflow.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -26,6 +27,20 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - if: hashFiles('ee/package-lock.json') != ''
+        run: npm ci --prefix ee
       - run: npm run typecheck
+      - if: hashFiles('ee/package-lock.json') != ''
+        run: npm run typecheck --prefix ee
       - run: npm test
+      - run: npm run human-lab:check
+      - run: npm run machine-lab:check
+      # The private acceptance map: which change owes a two-device round, and that the
+      # real-agent lab still loads and still types the guide's own sentences.
+      - if: hashFiles('acceptance/owed.test.mjs') != ''
+        run: node --test acceptance/owed.test.mjs acceptance/agent-lab/lab.test.mjs
+      - if: hashFiles('ee/package-lock.json') != ''
+        run: npm test --prefix ee
       - run: npm run build
+      - if: hashFiles('ee/package-lock.json') != ''
+        run: npm run build --prefix ee && npm run smoke:bundle --prefix ee

@@ -14,6 +14,8 @@ import { startServer, type StartedServer } from '../src/server';
 
 let srv: StartedServer;
 let dataDir: string;
+let adaToken = '';
+let adaIdleId = '';
 
 function jar() {
   const cookies = new Map<string, string>();
@@ -83,6 +85,10 @@ async function runClaiming(token: string, agent: string, client: string, task: s
       claims: [
         { resourceType: 'migration', resourceKey: 'refunds-ledger', access: 'write' },
         { resourceType: 'path', resourceKey: 'src/payments/refund.ts', access: 'write' },
+        // Read-only, and keyed per run so it can never overlap: reading a
+        // contract is not changing it, and the graph has to draw that
+        // difference or the picture says every line is a claim on the ground.
+        { resourceType: 'path', resourceKey: `docs/${task.toLowerCase()}.md`, access: 'read' },
       ],
     },
     token,
@@ -97,7 +103,7 @@ beforeAll(async () => {
   srv = await startServer(
     loadEnv({
       port: 0,
-      host: 'localhost',
+      host: '127.0.0.1',
       nodeEnv: 'test',
       devMode: true,
       databaseUrl: undefined,
@@ -107,7 +113,7 @@ beforeAll(async () => {
 
   const ada = await signIn('ada');
   await form(`${srv.url}/app/teams`, { name: 'Pictures' }, ada.header());
-  const adaToken = await tokenFor(ada.header(), 'ada-macbook');
+  adaToken = await tokenFor(ada.header(), 'ada-macbook');
 
   // A second human in the same team, so the map has two people to draw.
   const invite = await form(`${srv.url}/app/teams/pictures/invites`, {}, ada.header());
@@ -125,6 +131,18 @@ beforeAll(async () => {
 
   await runClaiming(adaToken, 'ada-claude', 'claude-code', 'PAY-1');
   await runClaiming(boToken, 'bo-cursor', 'cursor', 'PAY-2');
+  const idle = await api(
+    `${srv.url}/api/agent/installations/register`,
+    {
+      name: 'ada-reviewer-idle',
+      clientType: 'codex',
+      deviceFingerprint: 'device-ada-reviewer-idle',
+      role: 'reviewer',
+    },
+    adaToken,
+  );
+  expect(idle.status).toBe(200);
+  adaIdleId = ((await idle.json()) as { installation: { id: string } }).installation.id;
 });
 
 afterAll(async () => {
@@ -202,6 +220,100 @@ it('lays the runs out as a ledger with an inspector on the selected one', async 
   expect(html).toContain('+1 more');
 });
 
+it('keeps idle agent identities visible and lets only their owner disable them durably', async () => {
+  const ada = await signIn('ada');
+  // The inventory is the map's second tab now: it used to sit under every live
+  // run, where reaching an idle identity meant scrolling past the whole fleet.
+  const before = await (
+    await fetch(`${srv.url}/app/agents?tab=identities`, { headers: ada.header() })
+  ).text();
+  expect(before).toContain('Agent inventory');
+  expect(before).toContain('ada-reviewer-idle');
+  expect(before).toContain('Registered; no run yet');
+  expect(before).toContain('>idle</span>');
+  const inventory = before.slice(before.indexOf('Agent inventory'));
+  expect(inventory.indexOf('ada-claude')).toBeLessThan(inventory.indexOf('ada-reviewer-idle'));
+  expect(inventory.indexOf('bo-cursor')).toBeLessThan(inventory.indexOf('ada-reviewer-idle'));
+
+  const bo = await signIn('bo');
+  const outsiderAttempt = await form(
+    `${srv.url}/app/agents/installations/${adaIdleId}/revoke`,
+    {},
+    bo.header(),
+  );
+  expect(outsiderAttempt.status).toBe(302);
+  expect(decodeURIComponent(outsiderAttempt.headers.get('location') ?? '')).toContain('not yours');
+
+  const disabled = await form(
+    `${srv.url}/app/agents/installations/${adaIdleId}/revoke`,
+    {},
+    ada.header(),
+  );
+  expect(disabled.status).toBe(302);
+  expect(decodeURIComponent(disabled.headers.get('location') ?? '')).toContain(
+    'Disabled ada-reviewer-idle',
+  );
+
+  // Repeating registration with the same device identity must not undo a
+  // human's decision — otherwise the next lifecycle hook re-enables it.
+  const retry = await api(
+    `${srv.url}/api/agent/installations/register`,
+    {
+      name: 'ada-reviewer-idle',
+      clientType: 'codex',
+      deviceFingerprint: 'device-ada-reviewer-idle',
+      role: 'reviewer',
+    },
+    adaToken,
+  );
+  expect(retry.status).toBe(409);
+  expect((await retry.json()) as object).toMatchObject({ error: 'installation_revoked' });
+
+  const after = await (
+    await fetch(`${srv.url}/app/agents?tab=identities`, { headers: ada.header() })
+  ).text();
+  const row = after.split('<tr').find((part) => part.includes('ada-reviewer-idle')) ?? '';
+  expect(row).toContain('>disabled</span>');
+  expect(row).not.toContain('>Disable</button>');
+});
+
+it('draws the scope graph from the same conflict result the ledger badges use', async () => {
+  const html = await (
+    await fetch(`${srv.url}/app/agents`, { headers: (await signIn('ada')).header() })
+  ).text();
+  // The picture and the words come from one detection pass. If the graph ever
+  // recomputed "contested" for itself, this is the assertion that would catch a
+  // red box next to a clear badge.
+  expect(html).toContain('Scope graph');
+  expect(html).toContain('class="sg"');
+  expect(html).toContain('sg-link hot');
+  expect(html).toContain('sg-box hot');
+  // Read claims are drawn, and drawn differently from writes.
+  expect(html).toContain('sg-link read');
+
+  // A scope is selectable, and selecting one answers "who else is on this".
+  const scope = /href="([^"]*scope=[^"]*)"/.exec(html)?.[1];
+  expect(scope).toBeTruthy();
+  const picked = await (
+    await fetch(`${srv.url}${scope!.replace(/&amp;/g, '&')}`, {
+      headers: (await signIn('ada')).header(),
+    })
+  ).text();
+  expect(picked).toContain('Held by');
+  expect(picked).toContain('Held for write by more than one live run');
+});
+
+it('filters the map to critical without changing what the strip counts', async () => {
+  const html = await (
+    await fetch(`${srv.url}/app/agents?only=critical`, { headers: (await signIn('ada')).header() })
+  ).text();
+  expect(html).toContain('showing only');
+  expect(html).toContain('critical only');
+  // The counts describe the team, not the filter: a status strip that changed
+  // with the view would make "1 critical" mean two different things.
+  expect(html).toContain('2 runs');
+});
+
 it('counts each collision once, in the number the strip reports', async () => {
   const html = await (
     await fetch(`${srv.url}/app/agents`, { headers: (await signIn('ada')).header() })
@@ -241,7 +353,8 @@ it('renders the usage console: windows, funnel and per-team activity', async () 
   ).text();
   expect(html).toContain('Monthly active humans');
   expect(html).toContain('data-metric="mau"');
-  expect(html).toContain('Activation funnel');
+  expect(html).toContain('Independent feature adoption counts');
+  expect(html).toContain('Launch cohorts');
   // The funnel steps carry prose, not just bars — a number nobody can interpret
   // is a number nobody acts on.
   expect(html).toContain('Second member');
@@ -249,6 +362,15 @@ it('renders the usage console: windows, funnel and per-team activity', async () 
   expect(html).toContain('funnelnote');
   expect(html).toContain('Teams by activity');
   expect(html).toContain('Calls today');
+  expect(html).toContain('Pilot value and cost signals');
+  expect(html).toContain('data-metric="first-real-results"');
+  expect(html).toContain('data-metric="measured-run-cost"');
+  expect(html).toContain('Estimated run cost');
+  expect(html).toContain('Economic source coverage');
+  expect(html).toContain('Support time by workspace / project');
+  expect(html).toContain('No managed-job cost source');
+  expect(html).toContain('Four-week pilot observation plan');
+  expect(html).toContain('W4');
   // And it is behind the same operator gate as the rest of /admin.
   const bo = await signIn('bo');
   expect((await fetch(`${srv.url}/admin/usage`, { headers: bo.header() })).status).toBe(404);
@@ -261,8 +383,12 @@ it('draws the same console chrome on every signed-in page', async () => {
   for (const path of ['/app', '/app/agents', '/app/tokens', '/app/sessions', '/docs']) {
     const html = await (await fetch(`${srv.url}${path}`, { headers: ada.header() })).text();
     expect(html, `${path} lost the rail`).toContain('class="rail"');
-    // The rail is the whole navigation now, so every destination must be on it.
-    for (const link of ['/app/agents', '/app/sessions', '/app/tokens', '/docs']) {
+    expect(html, `${path} lost the scope bar`).toContain('class="scopebar"');
+    // Rail and scope bar are the whole navigation, so every destination must be
+    // on one of them. These are account pages: they offer the workspaces and the
+    // person's own pages, and no longer a map or a sessions list that mixes every
+    // workspace (phase 4 of the console plan) — those numbers are on /app, per workspace.
+    for (const link of ['/app', '/app/teams/pictures', '/app/tokens', '/docs']) {
       expect(html, `${path} lost the ${link} link`).toContain(`href="${link}"`);
     }
     // The old top nav must be gone, not merely hidden.
@@ -271,11 +397,13 @@ it('draws the same console chrome on every signed-in page', async () => {
 });
 
 it('counts on the rail agree with the pages behind them', async () => {
-  const html = await (
-    await fetch(`${srv.url}/app/agents`, { headers: (await signIn('ada')).header() })
-  ).text();
+  const ada = await signIn('ada');
+  const html = await (await fetch(`${srv.url}/app/agents?team=pictures`, { headers: ada.header() })).text();
   // Two runs are live in this fixture, and the rail says so next to Agent map.
   expect(/Agent map<span class="rail-badge">2<\/span>/.test(html)).toBe(true);
+  // The list of workspaces says the same number for the same workspace, as a link to that map.
+  const home = await (await fetch(`${srv.url}/app`, { headers: ada.header() })).text();
+  expect(home).toContain('<a href="/app/agents?team=pictures">2</a>');
   expect(html).toContain('2 runs');
   // A badge is only drawn when there is something to report.
   expect(html).not.toContain('rail-badge">0<');
@@ -285,15 +413,20 @@ it('gives the team-scoped rail links a team, and the picker when there is none',
   const withTeam = await (
     await fetch(`${srv.url}/app/agents`, { headers: (await signIn('ada')).header() })
   ).text();
-  expect(withTeam).toContain('/app/teams/pictures/governance');
-  expect(withTeam).toContain('/app/teams/pictures/activity');
+  // Unscoped, the map is an account page: it offers the workspace, not its sections.
+  expect(withTeam).toContain('href="/app/teams/pictures"');
+  const inside = await (
+    await fetch(`${srv.url}/app/agents?team=pictures`, { headers: (await signIn('ada')).header() })
+  ).text();
+  expect(inside).toContain('/app/teams/pictures/governance');
+  expect(inside).toContain('/app/teams/pictures/activity');
 
   // Somebody with no team must not be handed a link to /app/teams/null/...
   const loner = await signIn('loner');
   const html = await (await fetch(`${srv.url}/app/tokens`, { headers: loner.header() })).text();
   expect(html).not.toContain('teams/null');
   expect(html).not.toContain('teams/undefined');
-  expect(html).toContain('no team yet');
+  expect(html).toContain('no workspace yet');
 });
 
 it('exports the activity log as a real file, not a dead button', async () => {
@@ -357,10 +490,18 @@ it('serves the stylesheet from a URL that changes when the stylesheet does', asy
 it('highlights the rail item you are actually on', async () => {
   const ada = await signIn('ada');
   const expected: Array<[string, string]> = [
-    ['/app', 'Teams'],
-    ['/app/agents', 'Agent map'],
-    ['/app/tokens', 'Tokens'],
-    ['/app/sessions', 'Sessions'],
+    ['/app', 'All workspaces'],
+    ['/app/teams/pictures', 'Overview'],
+    // Unscoped, the map and the lists are the account-level view of everything.
+    ['/app/agents', 'All workspaces'],
+    ['/app/tokens', 'My agent connections'],
+    ['/app/tokens?team=pictures', 'Agent connections'],
+    ['/app/agents?team=pictures', 'Agent map'],
+    ['/app/sessions?team=pictures', 'Sessions'],
+    ['/app/handoffs?team=pictures', 'Work'],
+    ['/app/teams/pictures?tab=people', 'Members'],
+    ['/app/notifications', 'Notifications'],
+    ['/app/sessions', 'All workspaces'],
     ['/app/teams/pictures/governance', 'Governance'],
     ['/app/teams/pictures/activity', 'Activity'],
     // This one was wrong: the environment diff highlighted Teams, so the rail
@@ -375,6 +516,20 @@ it('highlights the rail item you are actually on', async () => {
     );
     expect(active, `${path} highlights the wrong rail item`).toEqual([label]);
   }
+});
+
+it('groups personal controls under Account instead of presenting notifications as an inbox', async () => {
+  const ada = await signIn('ada');
+  const page = await (
+    await fetch(`${srv.url}/app/notifications`, { headers: ada.header() })
+  ).text();
+  // An account page draws the account's rail: the person's own pages, and the
+  // workspaces they can open — not the sections of whichever workspace is newest.
+  expect(page).toContain('<span class="rail-group later">Account</span>');
+  expect(page).not.toContain('class="rail-group">Workspace</span>');
+  expect(page).toContain('Notification settings');
+  expect(page).toContain('not a notification inbox');
+  expect(page).toContain('Back to account');
 });
 
 it('keeps every class in the stylesheet defined exactly once', async () => {

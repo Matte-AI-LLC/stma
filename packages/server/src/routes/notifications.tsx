@@ -8,6 +8,7 @@ import {
 } from '../lib/notifications';
 import { deliverWebhook, isSafeWebhookUrl } from '../lib/notify';
 import type { AppEnv, User } from '../types';
+import { PageHead } from '../ui/Console';
 import { AppLayout } from '../ui/Layout';
 
 export const notificationsRoutes = new Hono<AppEnv>();
@@ -63,18 +64,15 @@ const NotificationsPage = (props: {
 }) => {
   const { user, prefs, canSend, maxPerHour, notice, error } = props;
   return (
-    <AppLayout user={user} active="tokens" title="Notifications">
+    <AppLayout user={user} active="notifications" title="Notifications">
       {notice ? <Banner kind="success" text={notice} /> : null}
       {error ? <Banner kind="error" text={error} /> : null}
-      <div class="page-head">
-        <div>
-          <h1 class="title">Notifications</h1>
-          <p class="sub">
-            STMA answers asynchronously — your teammate's agent replies the next time it runs. These
-            are what tell you it happened, by email or in your chat client.
-          </p>
-        </div>
-      </div>
+      <PageHead
+        crumb="/ settings / notifications"
+        title="Notification settings"
+        sub="Choose which asynchronous replies reach you by email or personal webhook. This page configures delivery; it is not a notification inbox."
+        actions={<a class="btn btn-sm" href="/app/account">Back to account</a>}
+      />
 
       {user.email || prefs.webhookUrl ? null : (
         <div class="banner banner-warn">

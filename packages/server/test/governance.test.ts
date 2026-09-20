@@ -1,9 +1,17 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { eq } from 'drizzle-orm';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { connectDb } from '../src/db';
-import { environmentChecks, projects, teams, users } from '../src/db/schema';
+import {
+  environmentBaselines,
+  environmentChecks,
+  projects,
+  snapshots,
+  teams,
+  users,
+} from '../src/db/schema';
 import { trimEnvironmentChecks } from '../src/domain/environments';
 import { loadEnv } from '../src/env';
 import { startServer, type StartedServer } from '../src/server';
@@ -159,7 +167,7 @@ beforeAll(async () => {
   server = await startServer(
     loadEnv({
       port: 0,
-      host: 'localhost',
+      host: '127.0.0.1',
       nodeEnv: 'test',
       devMode: true,
       databaseUrl: undefined,
@@ -232,6 +240,20 @@ beforeAll(async () => {
   );
   expect(((await cleanReceipt.json()) as any).receipt.drift).toBe(false);
 
+  // A third run receives the policy but never acknowledges it. Silence must
+  // remain visible as "not reported", never be promoted to a clean match.
+  const silentRunResponse = await control('/api/agent/runs/start', ownerToken, {
+    installationId: ownerInstallation,
+    team: 'governance-lab',
+    project: 'billing-api',
+    taskKey: 'GOV-SILENT',
+    intent: 'Inspect the invoice export',
+    repo: 'billing-api',
+    branch: 'feat/export-audit',
+    claims: [{ resourceType: 'path', resourceKey: 'src/export/**', access: 'read' }],
+  });
+  expect(silentRunResponse.status).toBe(200);
+
   // The member's agent reports a policy nobody published: drift.
   const memberRunResponse = await control('/api/agent/runs/start', memberToken, {
     installationId: memberInstallation,
@@ -303,6 +325,11 @@ describe('governance page', () => {
   it('shows the effective policy per scope with version, hash and author', async () => {
     const { status, html } = await page('/app/teams/governance-lab/governance', ownerJar);
     expect(status).toBe(200);
+    expect(html).toContain('aria-label="Governance sections"');
+    expect(html).toContain('<details class="card fold-card" id="effective-policy">');
+    expect(html).toContain('<details class="card fold-card" id="environment-baselines">');
+    expect(html).not.toContain('<details class="card fold-card" id="effective-policy" open');
+    expect(html).toContain('data-open-details="environment-baselines"');
     const policy = section(html, 'Effective policy', 'Policy receipts');
     expect(policy).toContain('billing-api');
     expect(policy).toContain('v1');
@@ -337,10 +364,17 @@ describe('governance page', () => {
     expect(cleanRow[0]).not.toContain('class="warm"');
     expect(cleanRow[0]).toContain('match');
 
+    const silentRow = rowsContaining(receipts, 'GOV-SILENT');
+    expect(silentRow).toHaveLength(1);
+    expect(silentRow[0]).toContain('not reported');
+    expect(silentRow[0]).not.toContain('>match<');
+    expect(silentRow[0]).toContain('class="warm"');
+
     // The summary bar counts the deviation, so an owner sees it without reading
     // rows — and says "applied a policy other than the one the server served"
     // rather than lumping it in with runs that simply have not answered yet.
     expect(html).toContain('applied a policy other than the one the server served');
+    expect(html).toContain('Attention required');
   });
 
   it('persists a critical preflight and renders it, criticals first', async () => {
@@ -582,11 +616,62 @@ describe('policy from the UI', () => {
 
   it('refuses to publish a rulebook with no rules in it', async () => {
     const res = await post('/app/teams/bare-team/policy', ownerJar, { scope: 'team' });
-    expect(res.status).toBe(302);
-    expect(decodeURIComponent(res.location)).toContain('would publish a rulebook with no rules');
+    // A refusal hands the editor back rather than sending the owner away.
+    expect(res.status).toBe(422);
+    expect(res.location).toBe('');
     // And the live policy is untouched.
     const html = (await page('/app/teams/bare-team/governance', ownerJar)).html;
     expect(html).toContain('push to main');
+  });
+
+  it('hands a refused publish back with everything that was typed, in the scope it was typed for', async () => {
+    // The usual refusal is one malformed line at the end of a long rulebook. It used
+    // to redirect to the governance page with a band, and the rulebook was gone.
+    const typed = {
+      scope: 'team',
+      guidance: 'Keep migrations backwards compatible.\nNever touch another agent\u2019s branch.',
+      deny: 'push to main\ncontent: Comic Sans in public/**',
+      requiredChecks: 'npm test',
+      runtimes: 'node=22.14.0',
+      maxScopeItems: '7',
+    };
+    const response = await fetch(`${server.url}/app/teams/bare-team/policy`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded', ...ownerJar.header() },
+      body: new URLSearchParams(typed),
+      redirect: 'manual',
+    });
+    expect(response.status).toBe(422);
+    const html = await response.text();
+    const band = /id="publish-refused">(.*?)<\/div>/s.exec(html)?.[1] ?? '';
+    expect(band).toContain('content:');
+    expect(band).toContain('Nothing was published, and what you typed is still below.');
+    // Every field comes back as typed, the bad line included, so it can be fixed in place.
+    const field = (name: string) => new RegExp(`name="${name}"[^>]*>([^<]*)</textarea>`).exec(html)?.[1] ?? '';
+    expect(field('guidance')).toContain('Keep migrations backwards compatible.');
+    expect(field('guidance')).toContain('Never touch another agent');
+    expect(field('deny')).toContain('content: Comic Sans in public/**');
+    expect(field('requiredChecks')).toContain('npm test');
+    expect(field('runtimes')).toContain('node=22.14.0');
+    expect(html).toMatch(/name="maxScopeItems"[^>]*value="7"/);
+    // It is a page answered by a POST, so it draws its own rail: the workspace's.
+    expect(html).toContain('class="rail-group">Workspace</span>');
+    // Nothing was written.
+    const live = (await page('/app/teams/bare-team/governance', ownerJar)).html;
+    expect(live).not.toContain('Keep migrations backwards compatible.');
+
+    // In a project, the editor comes back in that project.
+    const scoped = await fetch(`${server.url}/app/teams/governance-lab/policy`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded', ...ownerJar.header() },
+      body: new URLSearchParams({ scope: 'billing-api', deny: 'content: no quotes here' }),
+      redirect: 'manual',
+    });
+    expect(scoped.status).toBe(422);
+    const scopedHtml = await scoped.text();
+    expect(scopedHtml).toContain('class="rail-group">billing-api</span>');
+    expect(scopedHtml).toContain('project: billing-api');
+    expect(scopedHtml).toContain('content: no quotes here');
   });
 
   it('lets only an owner write policy, whichever door they use', async () => {
@@ -685,6 +770,70 @@ describe('baseline from the UI', () => {
     expect(body.status).toBe('critical');
   });
 
+  it('pins duplicate display names to durable project ids', async () => {
+    const [team] = await server.db.select().from(teams).where(eq(teams.slug, 'bare-team'));
+    const [owner] = await server.db.select().from(users).where(eq(users.username, 'gov-owner'));
+    const [repositoryProject] = await server.db
+      .insert(projects)
+      .values({
+        teamId: team!.id,
+        name: 'duplicate-api',
+        slug: 'duplicate-api',
+        repositoryIdentity: 'github.com/acme/duplicate-api',
+        createdBy: owner!.id,
+      })
+      .returning();
+    const [legacyProject] = await server.db
+      .insert(projects)
+      .values({
+        teamId: team!.id,
+        name: 'duplicate-api',
+        slug: 'duplicate-api-legacy',
+        repositoryIdentity: null,
+        createdBy: owner!.id,
+      })
+      .returning();
+    const [snapshot] = await server.db
+      .insert(snapshots)
+      .values({
+        teamId: team!.id,
+        userId: owner!.id,
+        repo: 'github.com/acme/duplicate-api',
+        projectId: repositoryProject!.id,
+        deviceLabel: 'known-good-duplicate',
+        data: baselineSnapshot,
+      })
+      .returning();
+
+    const before = (await page('/app/teams/bare-team/governance', ownerJar)).html;
+    const dialog = before.slice(before.indexOf('<dialog id="record-baseline"'));
+    expect(dialog).toContain(`value="${repositoryProject!.id}"`);
+    expect(dialog).toContain(`value="${legacyProject!.id}"`);
+    expect(dialog).toContain('duplicate-api — repository-bound');
+    expect(dialog).toContain('duplicate-api — duplicate-api-legacy');
+
+    const response = await post('/app/teams/bare-team/baseline', ownerJar, {
+      snapshot: snapshot!.id,
+      project: '',
+    });
+    expect(response.status).toBe(302);
+    // The band lands on the project the baseline was recorded for, by its slug:
+    // a repository-bound project and its legacy namesake are different pages.
+    expect(response.location).toContain(`/projects/${repositoryProject!.slug}/governance?`);
+    const active = await server.db
+      .select()
+      .from(environmentBaselines)
+      .where(eq(environmentBaselines.active, true));
+    expect(active.some((row) => row.projectId === repositoryProject!.id)).toBe(true);
+    expect(active.some((row) => row.projectId === legacyProject!.id)).toBe(false);
+
+    const scoped = (
+      await page(`/app/teams/bare-team/governance?project=${repositoryProject!.id}`, ownerJar)
+    ).html;
+    expect(scoped).toContain(`<option value="${repositoryProject!.id}" selected="">`);
+    expect(scoped).not.toContain(`<option value="${legacyProject!.id}" selected="">`);
+  });
+
   it('refuses a snapshot from another team, and a member trying to promote one', async () => {
     const html = (await page('/app/teams/bare-team/governance', ownerJar)).html;
     const dialog = html.slice(html.indexOf('<dialog id="record-baseline"'));
@@ -754,6 +903,85 @@ describe('project scope on the governance page', () => {
     expect(policyCard).toContain('Never edit a released invoice migration.');
   });
 
+  it('files every rule in effect under where it comes from', async () => {
+    // The owner, 2026-09-20: is governance an across-workspace thing or a project
+    // thing? Both: defined in the workspace, added to in a project. Inside a
+    // project the page must say which is which, because that decides where a
+    // person goes to change a rule.
+    const scoped = (await page('/app/teams/governance-lab/governance?project=billing-api', ownerJar)).html;
+    const card = scoped.slice(scoped.indexOf('id="in-effect"'), scoped.indexOf('id="policy-receipts"'));
+    expect(card).toContain('In effect in billing-api');
+    expect(card).toContain('2 from the workspace (v1)');
+    const group = (label: string, origin: 'workspace' | 'project') => {
+      const section = card.slice(card.indexOf(`<span class="steplabel">${label}</span>`));
+      const rows = section.slice(0, section.indexOf('<div class="step">', 10) > 0 ? section.indexOf('<div class="step">', 10) : undefined);
+      const at = rows.indexOf(`origin origin-${origin}`);
+      if (at < 0) return '';
+      const next = rows.indexOf('origin origin-', at + 10);
+      return rows.slice(at, next > 0 ? next : undefined);
+    };
+    expect(group('Guidance', 'workspace')).toContain('Ship behind a feature flag.');
+    expect(group('Guidance', 'workspace')).not.toContain('Never edit a released invoice migration.');
+    expect(group('Guidance', 'project')).toContain('Never edit a released invoice migration.');
+    expect(group('Denied', 'workspace')).toContain('push to main');
+    expect(group('Denied', 'project')).toContain('read secret values');
+    // A list the workspace says nothing about has one group, and it is the project's.
+    expect(group('Protected paths', 'workspace')).toBe('');
+    expect(group('Protected paths', 'project')).toContain('db/migrations/**');
+    // The origin is written in words, not carried by colour alone.
+    expect(card).toContain('from the workspace');
+    expect(card).toContain('this project only');
+    // An owner is offered both doors, each named for what it changes.
+    expect(card).toContain('href="/app/teams/governance-lab/policy?project=billing-api"');
+    expect(card).toContain('Add for this project only');
+    expect(card).toContain('Edit workspace rules');
+    const asMember = (await page('/app/teams/governance-lab/governance?project=billing-api', memberJar)).html;
+    expect(asMember).toContain('In effect in billing-api');
+    expect(asMember).not.toContain('Add for this project only');
+
+    // A project that adds nothing says so instead of showing an empty second group.
+    const web = (await page('/app/teams/governance-lab/governance?project=web-app', ownerJar)).html;
+    expect(web).toContain('In effect in web-app');
+    expect(web).toContain('this project adds nothing of its own yet');
+    expect(web).toContain('Ship behind a feature flag.');
+  });
+
+  it('says on the workspace page who each rulebook applies to, without repeating the workspace rules', async () => {
+    const { html } = await page('/app/teams/governance-lab/governance', ownerJar);
+    const policy = section(html, 'Effective policy', 'Policy receipts');
+    expect(policy).toContain('<th>Applies to</th>');
+    expect(policy).toContain('every project');
+    expect(policy).toContain('Workspace rules');
+    expect(policy).toContain('Applies to every project. 1 project adds rules of its own.');
+    const adds = policy.slice(policy.indexOf('billing-api adds'));
+    expect(adds).toContain('Applies to billing-api only, on top of the workspace rules above.');
+    expect(adds).toContain('Never edit a released invoice migration.');
+    expect(adds).not.toContain('Ship behind a feature flag.');
+    expect(adds).toContain('href="/app/teams/governance-lab/projects/billing-api/governance#effective-policy"');
+  });
+
+  it("sums up on the project's own page what is in effect there, with where each part comes from", async () => {
+    const { status, html } = await page('/app/teams/governance-lab/projects/billing-api', ownerJar);
+    expect(status).toBe(200);
+    const at = html.indexOf('Rules in effect here');
+    expect(at).toBeGreaterThan(0);
+    const card = html.slice(at, html.indexOf('Where each rule comes from', at) + 40);
+    expect(card).toContain('2 from the workspace');
+    // What this project adds leads the list, each line tagged in words.
+    const own = card.indexOf('Protected: db/migrations/**');
+    const inherited = card.indexOf('Denied: push to main');
+    expect(own).toBeGreaterThan(0);
+    expect(inherited).toBeGreaterThan(own);
+    expect(card.slice(own, own + 220)).toContain('this project');
+    expect(card.slice(inherited, inherited + 220)).toContain('workspace');
+    // Knowledge and Delivery answer the same question on the same card, and link in scope.
+    expect(card).toContain('href="/app/teams/governance-lab/projects/billing-api/knowledge"');
+    expect(card).toContain('no record reaches this project yet');
+    expect(card).toContain('href="/app/teams/governance-lab/projects/billing-api/delivery"');
+    expect(card).toContain('no flow published');
+    expect(card).toContain('href="/app/teams/governance-lab/projects/billing-api/governance#effective-policy"');
+  });
+
   it("opens the editor on the project's own additions, not the merge", async () => {
     const scoped = (await page('/app/teams/governance-lab/policy?project=billing-api', ownerJar))
       .html;
@@ -794,6 +1022,30 @@ describe('project scope on the governance page', () => {
     expect(body).not.toContain('GOV-CLEAN');
   });
 
+  it('filters the activity log and export by action, actor, agent, date and free text', async () => {
+    const action = (
+      await page('/app/teams/governance-lab/activity?action=policy_published', ownerJar)
+    ).html;
+    expect(action).toContain('policy_published');
+    expect(action).not.toContain('env_baseline_set');
+    expect(action).toContain('Apply filters');
+    expect(action).toContain('Search log');
+
+    const actor = (
+      await page('/app/teams/governance-lab/activity?actor=gov-member&q=GOV-DRIFT', ownerJar)
+    ).html;
+    expect(actor).toContain('GOV-DRIFT');
+    expect(actor).not.toContain('GOV-CLEAN');
+
+    const csv = await fetch(
+      `${server.url}/app/teams/governance-lab/activity.csv?action=policy_published`,
+      { headers: ownerJar.header() },
+    );
+    const body = await csv.text();
+    expect(body).toContain('policy_published');
+    expect(body).not.toContain('env_baseline_set');
+  });
+
   it("scopes the environment comparison to one project's snapshots", async () => {
     const html = (
       await page(
@@ -804,5 +1056,29 @@ describe('project scope on the governance page', () => {
     // Nobody pushed a billing-api snapshot (the baseline came in over the control
     // API), so the page must say the *project* has no snapshot, not the machine.
     expect(html).toContain('no billing-api snapshot');
+  });
+
+  /**
+   * Phase 3 taught Policy, Knowledge and Delivery to say whether a rule is the
+   * workspace's or the project's. A baseline never inherits at all, and this
+   * page said nothing, which reads as the same silence a page with an inherited
+   * rule would produce. It is the one scope question a reader here has:
+   * preflight can only report what a baseline claims.
+   */
+  it('says a baseline belongs to one project and never comes from the workspace', async () => {
+    const inProject = (
+      await page('/app/teams/governance-lab/compare?project=billing-api', ownerJar)
+    ).html;
+    expect(inProject).toContain('Baseline for billing-api');
+    expect(inProject).toContain('There is no workspace-wide one to fall back on');
+
+    // A project that has one names who recorded it; a project that has none is
+    // told what that costs, and sent to the page where a baseline is promoted.
+    expect(inProject).toContain('billing-api');
+    expect(inProject).toContain('/app/teams/governance-lab/projects/billing-api/governance');
+
+    const workspaceWide = (await page('/app/teams/governance-lab/compare', ownerJar)).html;
+    expect(workspaceWide).toContain('Baselines');
+    expect(workspaceWide).toContain('There is no workspace-wide one to fall back on');
   });
 });

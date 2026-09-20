@@ -19,12 +19,17 @@
  * - **Rate cap** — at most `NOTIFY_MAX_PER_HOUR` emails per person per rolling hour,
  *   counted from the queue's own `sent` rows. The MCP loop guard lets an agent post
  *   20 messages per session per hour; the mailbox must be quieter than that.
+ * - **Database ownership** — a short row lease lets many app processes sweep without
+ *   concurrently sending the same notification; an expired handoff lease is recoverable.
+ * - **Critical retry** — a directed handoff retries transient delivery failure with
+ *   bounded backoff, at most three total attempts. Routine activity remains one-shot.
  * - **Own actions** — the actor is removed from the recipient list at enqueue time.
  *
  * Sending is best-effort throughout: every entry point swallows its own failures,
  * because a notification is the least important thing happening in the request that
  * triggered it.
  */
+import { randomUUID } from 'node:crypto';
 import {
   and,
   asc,
@@ -34,9 +39,11 @@ import {
   gte,
   inArray,
   isNull,
+  lt,
   lte,
   ne,
   or,
+  sql,
 } from 'drizzle-orm';
 import type { Db } from '../db';
 import {
@@ -54,6 +61,7 @@ import { logLine } from './log';
 import { activityEmail, type MailMessage, sendMail } from './mailer';
 import { deliverWebhook } from './notify';
 import { redactSecrets } from './redact';
+import { notificationAllowed } from './securityHooks';
 
 // ------------------------------------------------------------------ preferences
 
@@ -149,6 +157,8 @@ interface QueueRequest {
   teamId: string | null;
   sessionId: string | null;
   sinceAt: Date;
+  /** Only directed handoffs retry after a transient delivery failure. */
+  critical?: boolean;
 }
 
 /** Never throws — callers are request handlers with real work to finish. */
@@ -165,10 +175,10 @@ async function enqueue(db: Db, env: Env, requests: QueueRequest[]): Promise<void
   const notBefore = new Date(Date.now() + Math.max(0, env.notifyDebounceSeconds) * 1000);
   await db
     .insert(notificationQueue)
-    .values(requests.map((r) => ({ ...r, notBefore })))
-    // The coalescing step. The unique index covers pending rows only, so a second
-    // event for a thread this person is already owed an email about is dropped —
-    // the pending row's `sinceAt` window already includes it.
+    .values(requests.map((r) => ({ ...r, critical: r.critical ?? false, notBefore })))
+    // The coalescing step. The unique index covers queued and currently claimed
+    // rows, so a second event for a thread this person is already owed an email
+    // about is dropped — the row's `sinceAt` window already includes it.
     .onConflictDoNothing();
 }
 
@@ -307,12 +317,97 @@ export async function notifyTeamJoined(
 const HOUR = 60 * 60 * 1000;
 /** Rows handled per sweep — a burst is spread over ticks instead of blocking one. */
 const BATCH = 100;
+/** Longer than the two sequential transport timeouts (10s mail + 5s webhook). */
+const DELIVERY_LEASE_MS = 60_000;
+const CRITICAL_MAX_ATTEMPTS = 3;
+const CRITICAL_RETRY_BASE_MS = 30_000;
 /** How many new messages one email looks at. Beyond this the count says "many". */
 const MESSAGE_WINDOW = 20;
 const EXCERPT = 280;
 const TITLE = 90;
 
 type QueueRow = typeof notificationQueue.$inferSelect;
+
+const leaseExpired = (now: Date) =>
+  or(isNull(notificationQueue.leaseUntil), lte(notificationQueue.leaseUntil, now));
+
+const hasAttemptsLeft = () =>
+  or(
+    and(eq(notificationQueue.critical, true), lt(notificationQueue.attempts, CRITICAL_MAX_ATTEMPTS)),
+    and(eq(notificationQueue.critical, false), lt(notificationQueue.attempts, 1)),
+  );
+
+/**
+ * Claim a bounded due batch in one transaction. `skip locked` lets another
+ * process take different rows while guaranteeing that it cannot send these.
+ * A crashed critical delivery becomes eligible after its lease; routine rows
+ * remain single-attempt and are terminalised instead of being sent twice.
+ */
+async function claimDueNotifications(
+  db: Db,
+  now: Date,
+  leaseOwner: string,
+): Promise<QueueRow[]> {
+  return db.transaction(async (transaction) => {
+    const tx = transaction as unknown as Db;
+
+    // A routine notification is deliberately single-attempt. Critical rows also
+    // stop after the third claimed attempt, including attempts whose worker died.
+    await tx
+      .update(notificationQueue)
+      .set({
+        status: 'failed',
+        reason: sql<string>`coalesce(${notificationQueue.reason}, 'delivery_lease_expired_after_final_attempt')`,
+        leaseOwner: null,
+        leaseUntil: null,
+      })
+      .where(
+        and(
+          eq(notificationQueue.status, 'sending'),
+          leaseExpired(now),
+          or(
+            and(eq(notificationQueue.critical, true), gte(notificationQueue.attempts, CRITICAL_MAX_ATTEMPTS)),
+            and(eq(notificationQueue.critical, false), gte(notificationQueue.attempts, 1)),
+          ),
+        ),
+      );
+
+    const candidates = await tx
+      .select({ id: notificationQueue.id })
+      .from(notificationQueue)
+      .where(
+        and(
+          lte(notificationQueue.notBefore, now),
+          hasAttemptsLeft(),
+          or(
+            eq(notificationQueue.status, 'pending'),
+            and(eq(notificationQueue.status, 'sending'), leaseExpired(now)),
+          ),
+        ),
+      )
+      .orderBy(asc(notificationQueue.notBefore), asc(notificationQueue.createdAt))
+      .limit(BATCH)
+      .for('update', { skipLocked: true });
+    if (candidates.length === 0) return [];
+
+    return tx
+      .update(notificationQueue)
+      .set({
+        status: 'sending',
+        attempts: sql<number>`${notificationQueue.attempts} + 1`,
+        leaseOwner,
+        leaseUntil: new Date(now.getTime() + DELIVERY_LEASE_MS),
+        reason: sql<string | null>`case
+          when ${notificationQueue.status} = 'sending'
+            then coalesce(${notificationQueue.reason}, 'delivery_lease_expired_retrying')
+          else ${notificationQueue.reason}
+        end`,
+      })
+      .where(inArray(notificationQueue.id, candidates.map((candidate) => candidate.id)))
+      .returning();
+  });
+}
+
 /**
  * One notification, rendered for both routes it can take. `chat` is the same
  * news in one line — a chat client shows no subject and no button, so the link
@@ -346,6 +441,7 @@ async function buildSessionEmail(db: Db, env: Env, row: QueueRow, kind: Notifica
     .limit(1);
   const hit = found[0];
   if (!hit) return { ok: false, reason: 'gone' };
+  if (!(await notificationAllowed(db,{userId:row.userId,teamId:hit.team.id,projectId:hit.session.projectId}))) return {ok:false,reason:'scope_unavailable'};
   if ((await stillMembers(db, hit.team.id, [row.userId])).length === 0) {
     return { ok: false, reason: 'not_member' };
   }
@@ -419,6 +515,7 @@ async function buildTeamJoinedEmail(db: Db, env: Env, row: QueueRow): Promise<Bu
   const found = await db.select().from(teams).where(eq(teams.id, row.teamId)).limit(1);
   const team = found[0];
   if (!team) return { ok: false, reason: 'gone' };
+  if (!(await notificationAllowed(db,{userId:row.userId,teamId:team.id,projectId:null}))) return {ok:false,reason:'scope_unavailable'};
   if ((await stillMembers(db, team.id, [row.userId])).length === 0) {
     return { ok: false, reason: 'not_member' };
   }
@@ -435,28 +532,19 @@ async function buildTeamJoinedEmail(db: Db, env: Env, row: QueueRow): Promise<Bu
   };
 }
 
-/** One instance at a time per database — the sweep is not re-entrant. */
-const sweeping = new Set<Db>();
-
 /**
  * Deliver every queued notification that is due. Returns how many were actually
  * emailed. Exported so tests (and a self-host script) can drive it directly;
- * lib/cleanup runs it on a timer.
+ * lib/cleanup runs it on a timer. Ownership lives in the database, so multiple
+ * app processes may sweep without delivering the same row concurrently.
  */
 export async function flushNotificationsOnce(
   db: Db,
   env: Env,
   now: Date = new Date(),
 ): Promise<number> {
-  if (sweeping.has(db)) return 0;
-  sweeping.add(db);
-  try {
-    const due = await db
-      .select()
-      .from(notificationQueue)
-      .where(and(eq(notificationQueue.status, 'pending'), lte(notificationQueue.notBefore, now)))
-      .orderBy(asc(notificationQueue.notBefore))
-      .limit(BATCH);
+    const leaseOwner = randomUUID();
+    const due = await claimDueNotifications(db, now, leaseOwner);
     if (due.length === 0) return 0;
 
     const userIds = [...new Set(due.map((r) => r.userId))];
@@ -484,14 +572,37 @@ export async function flushNotificationsOnce(
 
     let delivered = 0;
     for (const row of due) {
-      const settle = async (status: string, reason: string | null) => {
-        await db
+      const settle = async (
+        status: 'pending' | 'sent' | 'skipped' | 'failed',
+        reason: string | null,
+        retryAt?: Date,
+      ) => {
+        const settled = await db
           .update(notificationQueue)
-          .set({ status, reason, sentAt: status === 'sent' ? now : null })
-          .where(eq(notificationQueue.id, row.id));
-        if (status !== 'sent') {
+          .set({
+            status,
+            reason,
+            sentAt: status === 'sent' ? now : null,
+            notBefore: retryAt ?? row.notBefore,
+            leaseOwner: null,
+            leaseUntil: null,
+          })
+          .where(
+            and(
+              eq(notificationQueue.id, row.id),
+              eq(notificationQueue.status, 'sending'),
+              eq(notificationQueue.leaseOwner, leaseOwner),
+            ),
+          )
+          .returning({ id: notificationQueue.id });
+        if (settled.length === 0) {
+          logLine({ evt: 'notify', a: 'lease_lost', kind: row.kind });
+          return false;
+        }
+        if (status !== 'sent' && status !== 'pending') {
           logLine({ evt: 'notify', a: 'skip', kind: row.kind, why: reason });
         }
+        return true;
       };
       const user = people.get(row.userId);
       if (!user) {
@@ -534,11 +645,11 @@ export async function flushNotificationsOnce(
       // A person who reads chat and never opened their mail still hears about
       // the reply, and a broken webhook does not suppress the email.
       let arrived = false;
-      let failure = '';
+      const failures: string[] = [];
       if (user.email) {
         const result = await sendMail(env, { to: user.email, ...built.mail });
         if (result.ok) arrived = true;
-        else failure = result.error.slice(0, 100);
+        else failures.push(`mail: ${result.error.slice(0, 100)}`);
       }
       if (webhookUrl) {
         const posted = await deliverWebhook(
@@ -547,28 +658,49 @@ export async function flushNotificationsOnce(
           env.nodeEnv === 'production',
         );
         if (posted.ok) arrived = true;
-        else failure = failure || `webhook: ${posted.error}`;
+        else failures.push(`webhook: ${posted.error}`);
       }
       if (arrived) {
-        budget.set(row.userId, (budget.get(row.userId) ?? 0) + 1);
-        delivered += 1;
-        await settle('sent', null);
-        logLine({
-          evt: 'notify',
-          a: 'send',
-          kind: row.kind,
-          u: user.username,
-          via: [user.email ? 'mail' : null, webhookUrl ? 'chat' : null].filter(Boolean).join('+'),
-        });
+        if (await settle('sent', null)) {
+          budget.set(row.userId, (budget.get(row.userId) ?? 0) + 1);
+          delivered += 1;
+          logLine({
+            evt: 'notify',
+            a: 'send',
+            kind: row.kind,
+            u: user.username,
+            via: [user.email ? 'mail' : null, webhookUrl ? 'chat' : null].filter(Boolean).join('+'),
+          });
+        }
       } else {
-        // No retry: an hour-old "new reply" is noise, and sendMail already logged why.
-        await settle('failed', failure.slice(0, 200));
+        const failure = (failures.join('; ') || 'delivery_failed').slice(0, 160);
+        if (row.critical && row.attempts < CRITICAL_MAX_ATTEMPTS) {
+          const retryAt = new Date(
+            now.getTime() + CRITICAL_RETRY_BASE_MS * 2 ** Math.max(0, row.attempts - 1),
+          );
+          await settle(
+            'pending',
+            `attempt_${row.attempts}_failed: ${failure}`.slice(0, 200),
+            retryAt,
+          );
+          logLine({
+            evt: 'notify',
+            a: 'retry',
+            kind: row.kind,
+            attempt: row.attempts,
+            why: failure,
+          });
+        } else {
+          // Routine activity is intentionally single-attempt. A directed
+          // handoff reaches this branch only after its third failed attempt.
+          await settle(
+            'failed',
+            `${row.critical ? `attempt_${row.attempts}_failed: ` : ''}${failure}`.slice(0, 200),
+          );
+        }
       }
     }
     return delivered;
-  } finally {
-    sweeping.delete(db);
-  }
 }
 
 /**
@@ -590,19 +722,41 @@ export async function notifyHandoff(
   env: Env,
   opts: { sessionId: string; teamId: string; recipientId: string; actorId: string | null; at: Date },
 ): Promise<void> {
+  await safely('enqueue', () => queueHandoffNotification(db, env, opts));
+}
+
+/** Transactional callers need failures to roll back, not a swallowed error. */
+export async function queueHandoffNotification(
+  db: Db,
+  env: Env,
+  opts: { sessionId: string; teamId: string; recipientId: string; actorId: string | null; at: Date },
+): Promise<void> {
   if (opts.recipientId === opts.actorId) return;
-  await safely('enqueue', async () => {
-    const prefs = await notificationPrefsForMany(db, [opts.recipientId]);
-    if (!prefs.get(opts.recipientId)?.sessionReply) return;
-    await enqueue(db, env, [
-      {
-        userId: opts.recipientId,
-        kind: 'session_reply',
-        coalesceKey: `session:${opts.sessionId}`,
-        teamId: opts.teamId,
-        sessionId: opts.sessionId,
-        sinceAt: opts.at,
-      },
-    ]);
-  });
+  const prefs = await notificationPrefsForMany(db, [opts.recipientId]);
+  if (!prefs.get(opts.recipientId)?.sessionReply) return;
+  const coalesceKey = `session:${opts.sessionId}`;
+  await enqueue(db, env, [
+    {
+      userId: opts.recipientId,
+      kind: 'session_reply',
+      coalesceKey,
+      teamId: opts.teamId,
+      sessionId: opts.sessionId,
+      sinceAt: opts.at,
+      critical: true,
+    },
+  ]);
+  // If a routine reply was already waiting for this same recipient/thread, the
+  // insert coalesced into it. Promote that row so the directed handoff does not
+  // silently lose its retry contract.
+  await db
+    .update(notificationQueue)
+    .set({ critical: true })
+    .where(
+      and(
+        eq(notificationQueue.userId, opts.recipientId),
+        eq(notificationQueue.coalesceKey, coalesceKey),
+        or(eq(notificationQueue.status, 'pending'), eq(notificationQueue.status, 'sending')),
+      ),
+    );
 }

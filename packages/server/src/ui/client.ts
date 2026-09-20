@@ -1,5 +1,36 @@
 /** Small vanilla-JS layer served as /app.js: copy buttons, tabs, confirm dialog, toasts. */
 export const clientJs = `(function () {
+  var railToggle = document.querySelector('.rail-nav-toggle');
+  if (railToggle && window.matchMedia) {
+    var rail = railToggle.closest('.rail');
+    var narrowRail = window.matchMedia('(max-width: 900px)');
+    var railState = function () {
+      railToggle.setAttribute('aria-expanded', String(!narrowRail.matches || rail.classList.contains('nav-open')));
+    };
+    rail.classList.add('nav-ready');
+    railToggle.addEventListener('click', function () { rail.classList.toggle('nav-open'); railState(); });
+    narrowRail.addEventListener('change', railState);
+    railState();
+  }
+  var launchStatus = document.querySelector('[data-launch-status]');
+  if (launchStatus) {
+    var launchChecks = 0;
+    var checkLaunch = async function () {
+      if (document.hidden || ++launchChecks > 24) {
+        launchStatus.textContent = 'Automatic checks paused. Refresh status when your agents are ready.';
+        return;
+      }
+      try {
+        var response = await fetch(launchStatus.getAttribute('data-launch-status'), { credentials: 'same-origin', cache: 'no-store', signal: AbortSignal.timeout(4000) });
+        if (!response.ok) { launchStatus.textContent = 'Access or connection changed. Refresh or sign in again.'; return; }
+        var status = await response.json();
+        if (status.exchanged || (launchStatus.hasAttribute('data-launch-first') && String(status.first) !== launchStatus.getAttribute('data-launch-first'))) { window.location.assign(launchStatus.getAttribute('data-launch-refresh') || window.location.href); return; }
+        launchStatus.textContent = status.first ? 'Sender observed. Waiting for the second agent to reply.' : 'Waiting for the sender prompt to run.';
+      } catch (_) { launchStatus.textContent = 'Could not refresh. Check the server connection; your launch is saved.'; }
+      setTimeout(checkLaunch, 5000);
+    };
+    setTimeout(checkLaunch, 1000);
+  }
   function toast(msg) {
     var el = document.createElement('div');
     el.className = 'toast';
@@ -42,6 +73,27 @@ export const clientJs = `(function () {
     if (e.persisted) window.location.reload();
   });
 
+  // A result band is news once. The parameter that carried it leaves the address
+  // as soon as the page has drawn it, so a refresh, a bookmark or a pasted link
+  // does not announce again something that happened earlier: "Published v3" on a
+  // page reloaded an hour later reads as a second publish. Signed-in pages only;
+  // sign-in and consent pages keep their addresses exactly as they were given.
+  try {
+    var path = window.location.pathname;
+    if ((path.indexOf('/app') === 0 || path.indexOf('/admin') === 0) && window.history && history.replaceState) {
+      var once = ['ok', 'error', 'err', 'notice', 'assign_error', 'assigned', 'cancelled', 'handoff', 'checkout', 'change'];
+      var here = new URL(window.location.href);
+      var had = false;
+      once.forEach(function (key) {
+        if (here.searchParams.has(key)) { here.searchParams.delete(key); had = true; }
+      });
+      if (had) {
+        var rest = here.searchParams.toString();
+        history.replaceState(history.state, '', here.pathname + (rest ? '?' + rest : '') + here.hash);
+      }
+    }
+  } catch (_) {}
+
   // Scope filters: a GET form marked data-autosubmit navigates the moment its
   // select changes. The visible View button stays as the no-script path.
   document.addEventListener('change', function (e) {
@@ -49,7 +101,28 @@ export const clientJs = `(function () {
     if (f) f.submit();
   });
 
+  // Scope pickers are <details>, so they work with no script. With one, a click
+  // anywhere else closes them, and opening one closes the other: a menu left
+  // hanging over the page reads as a page that is stuck.
   document.addEventListener('click', function (e) {
+    var inside = e.target.closest && e.target.closest('.scope-pick');
+    document.querySelectorAll('.scope-pick[open]').forEach(function (menu) {
+      if (menu !== inside) menu.removeAttribute('open');
+    });
+  });
+  document.addEventListener('keydown', function (e) {
+    if (e.key !== 'Escape') return;
+    document.querySelectorAll('.scope-pick[open]').forEach(function (menu) {
+      menu.removeAttribute('open');
+    });
+  });
+
+  document.addEventListener('click', function (e) {
+    var detailsLink = e.target.closest('[data-open-details]');
+    if (detailsLink) {
+      var details = document.getElementById(detailsLink.getAttribute('data-open-details'));
+      if (details && details.tagName === 'DETAILS') details.open = true;
+    }
     var copy = e.target.closest('[data-copy]');
     if (copy) {
       e.preventDefault();
@@ -110,6 +183,47 @@ export const clientJs = `(function () {
       if (dd) dd.close();
     }
   });
+
+  // Direct links from Needs attention or a copied URL should reveal the
+  // collapsed section instead of scrolling to an opaque closed card.
+  if (window.location.hash) {
+    var fragment = document.getElementById(window.location.hash.slice(1));
+    if (fragment && fragment.tagName === 'DETAILS') fragment.open = true;
+  }
+
+  // Deep links from a project can arrive with the team and project already
+  // selected. Opening the form on load keeps that context instead of making the
+  // user click New session and re-enter where they came from.
+  //
+  // A dialog the server also rendered open needs no script at all, which is how
+  // the Assign work ticket picker draws a list without one. With script it
+  // should be a modal like every other dialog here, and showModal() refuses an
+  // element that already carries the open attribute, so close it first.
+  var autoDialog = document.querySelector('dialog[data-auto-open]');
+  if (autoDialog) {
+    if (autoDialog.open) autoDialog.close();
+    openModal(autoDialog);
+  }
+
+  // The session form can span several teams, but a project belongs to exactly
+  // one. Keep impossible cross-team choices out of the picker as the team
+  // changes; the POST handler independently enforces the same boundary.
+  var sessionTeam = document.querySelector('[data-session-team]');
+  var sessionProject = document.querySelector('[data-session-project]');
+  if (sessionTeam && sessionProject) {
+    var syncSessionProjects = function () {
+      var selected = sessionProject.options[sessionProject.selectedIndex];
+      var selectedTeam = selected && selected.getAttribute('data-team');
+      if (selectedTeam && selectedTeam !== sessionTeam.value) sessionProject.value = '';
+      sessionProject.querySelectorAll('option[data-team]').forEach(function (option) {
+        var belongs = option.getAttribute('data-team') === sessionTeam.value;
+        option.hidden = !belongs;
+        option.disabled = !belongs;
+      });
+    };
+    sessionTeam.addEventListener('change', syncSessionProjects);
+    syncSessionProjects();
+  }
 
   // Gentle auto-refresh for watch pages (sessions list): never while a dialog
   // is open or the user is typing.

@@ -1,6 +1,7 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, expect, it } from 'vitest';
 import {
   dueForCheck,
@@ -95,7 +96,7 @@ beforeAll(async () => {
   srv = await startServer(
     loadEnv({
       port: 0,
-      host: 'localhost',
+      host: '127.0.0.1',
       nodeEnv: 'test',
       devMode: true,
       databaseUrl: undefined,
@@ -146,6 +147,14 @@ it('carries a handoff with the two calls that pick it up', async () => {
       next_steps: ['Update the read model', 'Add a partial-refund test'],
       reason: 'usage_limit',
       via: 'laptop-codex',
+      checkpoint: {
+        request_id: randomUUID(),
+        kind: 'tested',
+        repository_identity: 'https://github.com/acme/payments.git',
+        commit_sha: '1'.repeat(40),
+        worktree_clean: true,
+        tests: [{ name: 'news fixture', state: 'passed' }],
+      },
     },
     alice,
   );
@@ -157,14 +166,15 @@ it('carries a handoff with the two calls that pick it up', async () => {
   const waiting = body.pendingHandoffs[0]!;
   expect(waiting.title).toContain('NEWS-1');
   expect(waiting.resume?.branch).toBe('feat/news');
-  expect(waiting.resume?.checkout).toContain('git checkout feat/news');
+  expect(waiting.resume?.checkout).toBeNull();
   expect(waiting.resume?.reclaim?.tool).toBe('start_run');
 
   const text = renderNews(body.pendingHandoffs, body.unreadSessions)!;
   expect(text).toContain('work is waiting');
   expect(text).toContain('feat/news');
   expect(text).toContain('Update the read model');
-  expect(text).toContain('git checkout feat/news');
+  expect(text).toContain('update_handoff');
+  expect(text).toContain('dirty worktree');
   expect(text).toContain('start_run');
   // The offer stops at offering. Deciding to move somebody off what they are
   // doing is not the agent's call.

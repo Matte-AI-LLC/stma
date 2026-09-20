@@ -1,3 +1,4 @@
+import { membershipUser } from '../lib/securityHooks';
 import { and, desc, eq, gte, inArray, sql } from 'drizzle-orm';
 import type { Db } from '../db';
 import {
@@ -358,7 +359,7 @@ export async function confirmSaving(
   const member = await db
     .select({ id: memberships.userId })
     .from(memberships)
-    .where(and(eq(memberships.teamId, teamId), eq(memberships.userId, userId)))
+    .where(and(eq(memberships.teamId, teamId), membershipUser(userId)))
     .limit(1);
   if (!member[0]) return { error: 'You are not a member of that team.' };
   const minutes =

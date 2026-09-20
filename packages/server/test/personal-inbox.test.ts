@@ -101,7 +101,7 @@ beforeAll(async () => {
   srv = await startServer(
     loadEnv({
       port: 0,
-      host: 'localhost',
+      host: '127.0.0.1',
       nodeEnv: 'test',
       devMode: true,
       databaseUrl: undefined,
@@ -201,7 +201,7 @@ it('hands over a runbook with no code in it', async () => {
   expect(brief.resume.checkout, 'nothing to check out').toBeNull();
   expect(brief.resume.reclaim, 'nothing to re-claim').toBeNull();
   expect(brief.body).toContain('No branch — this is a brief, not code.');
-  expect(thread.data.notice).toContain('steps it left');
+  expect(thread.data.notice).toContain('not execution authority');
 });
 
 it('offers the brief to the other machine and says which one wrote it', async () => {
@@ -233,8 +233,8 @@ it('offers the brief to the other machine and says which one wrote it', async ()
     const after = await call('inbox', {}, tok);
     expect(
       after.data.pendingHandoffs.map((h: any) => h.title),
-      `${who} no longer sees it queued`,
-    ).not.toContain(waiting.title);
+      `${who} still sees it queued until an explicit lifecycle action`,
+    ).toContain(waiting.title);
   }
 });
 

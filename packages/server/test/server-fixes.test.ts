@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { PGlite } from '@electric-sql/pglite';
-import { and, eq } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/pglite';
 import { afterAll, beforeAll, expect, it } from 'vitest';
 import * as schema from '../src/db/schema';
@@ -98,7 +98,7 @@ beforeAll(async () => {
   srv = await startServer(
     loadEnv({
       port: 0,
-      host: 'localhost',
+      host: '127.0.0.1',
       nodeEnv: 'test',
       devMode: true,
       databaseUrl: undefined,
@@ -112,7 +112,7 @@ afterAll(async () => {
   rmSync(dataDir, { recursive: true, force: true });
 });
 
-it('github hook verifies X-Hub-Signature-256 against the raw body when present', async () => {
+it('github hook requires X-Hub-Signature-256 and verifies it against the raw body', async () => {
   const t = await setupTeam('gina', 'Hook Sig Team');
   const payload = (msg: string) =>
     JSON.stringify({
@@ -141,11 +141,11 @@ it('github hook verifies X-Hub-Signature-256 against the raw body when present',
   const garbled = await post(forgedBody, { 'x-hub-signature-256': 'sha256=nothex' });
   expect(garbled.status).toBe(401);
 
-  // No signature header → URL secrecy remains the baseline.
+  // No signature header: the URL token alone is not enough to forge an event.
   const unsigned = await post(payload('unsigned-commit'));
-  expect(unsigned.status).toBe(200);
+  expect(unsigned.status).toBe(401);
 
-  // Only the verified and unsigned pushes reached the announcements channel.
+  // Only the verified push reached the announcements channel.
   const list = await callTool(t.pat, 'list_sessions');
   const sessions = JSON.parse(list.content[0]!.text).sessions as Array<{
     sessionId: string;
@@ -155,7 +155,7 @@ it('github hook verifies X-Hub-Signature-256 against the raw body when present',
   expect(channel).toBeTruthy();
   const thread = await callTool(t.pat, 'get_session', { session_id: channel!.sessionId });
   expect(thread.content[0]!.text).toContain('signed-commit');
-  expect(thread.content[0]!.text).toContain('unsigned-commit');
+  expect(thread.content[0]!.text).not.toContain('unsigned-commit');
   expect(thread.content[0]!.text).not.toContain('forged-commit');
 });
 
@@ -183,6 +183,57 @@ it('concurrent first announces create exactly one announcements channel', async 
   // Losers of the create race fell back to the winner's channel for their message.
   const thread = await callTool(t.pat, 'get_session', { session_id: channels[0]!.sessionId });
   for (let i = 0; i < 6; i++) expect(thread.content[0]!.text).toContain(`race-msg-${i}`);
+});
+
+it('consumes a single-use invite exactly once under concurrent terminal redemption', async () => {
+  const t = await setupTeam('invite-owner', 'Invite Race Team');
+  const created = await callTool(t.pat, 'create_invite', {
+    team: 'invite-race-team',
+    max_uses: 1,
+  });
+  const invite = JSON.parse(created.content[0]!.text) as { code: string };
+
+  const redeem = (email: string) =>
+    fetch(`${srv.url}/api/invites/redeem`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ code: invite.code, email, password: 'racepassword1' }),
+    });
+  const responses = await Promise.all([
+    redeem('invite-race-a@example.com'),
+    redeem('invite-race-b@example.com'),
+  ]);
+  expect(responses.map((res) => res.status).sort()).toEqual([200, 404]);
+
+  const team = (
+    await srv.db
+      .select({ id: schema.teams.id })
+      .from(schema.teams)
+      .where(eq(schema.teams.slug, 'invite-race-team'))
+      .limit(1)
+  )[0]!;
+  const members = await srv.db
+    .select({ id: schema.memberships.userId })
+    .from(schema.memberships)
+    .where(eq(schema.memberships.teamId, team.id));
+  expect(members).toHaveLength(2); // owner + exactly one redeemer
+  const storedInvite = (
+    await srv.db
+      .select({ uses: schema.invites.uses })
+      .from(schema.invites)
+      .where(eq(schema.invites.code, invite.code))
+      .limit(1)
+  )[0]!;
+  expect(storedInvite.uses).toBe(1);
+
+  const raceAccounts = await srv.db
+    .select({ email: schema.users.email })
+    .from(schema.users)
+    .where(
+      // One loser account must not be left behind after the invitation race.
+      sql`${schema.users.email} in ('invite-race-a@example.com', 'invite-race-b@example.com')`,
+    );
+  expect(raceAccounts).toHaveLength(1);
 });
 
 it('search_past_issues frames results with the untrusted-content notice', async () => {

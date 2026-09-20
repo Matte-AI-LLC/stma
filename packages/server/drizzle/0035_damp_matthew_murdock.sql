@@ -1,0 +1,3 @@
+ALTER TABLE "knowledge_contexts" ADD COLUMN "purpose" text DEFAULT 'retrieval' NOT NULL;--> statement-breakpoint
+CREATE UNIQUE INDEX "knowledge_contexts_run_start" ON "knowledge_contexts" USING btree ("run_id") WHERE purpose = 'run_start' and run_id is not null;--> statement-breakpoint
+ALTER TABLE "knowledge_contexts" ADD CONSTRAINT "knowledge_contexts_purpose" CHECK ("knowledge_contexts"."purpose" in ('retrieval', 'run_start', 'handoff_resume'));

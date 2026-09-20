@@ -17,9 +17,48 @@
  */
 
 /** The fleet half: runs, claims and the conflict radar. */
+import { AsyncLocalStorage } from 'node:async_hooks';
+import type { Db } from '../db';
 export type FleetAccess = 'full' | 'readonly';
 
+export type EntitlementResolver = (
+  db: Db,
+  team: { id: string; plan: string | null },
+  base: PlanLimits,
+) => Promise<PlanLimits>;
+const entitlementContext = new AsyncLocalStorage<{
+  resolver?: EntitlementResolver;
+  hosted?: boolean;
+  unmetered?: boolean;
+}>();
+export function withEntitlements<T>(
+  resolver: EntitlementResolver | undefined,
+  fn: () => T,
+  hosted?: boolean,
+  unmetered?: boolean,
+): T {
+  return entitlementContext.run({ resolver, hosted, unmetered }, fn);
+}
+/** Request-local composition; a failed hosted resolver fails closed, never falls back. */
+export async function effectiveLimits(
+  db: Db,
+  team: { id: string; plan: string | null },
+  hosted = isHosted(),
+): Promise<PlanLimits> {
+  const base = planLimits(team.plan, hosted);
+  // The beta skips the hosted resolver too. Its job is to narrow — evaluation
+  // expiry, licensed seats — and there is nothing to narrow toward while there
+  // is nothing to buy; letting it run would expire a workspace out of features
+  // it was never charged for.
+  if (isUnmetered()) return base;
+  const resolver = entitlementContext.getStore()?.resolver;
+  return hosted && resolver ? resolver(db, team, base) : base;
+}
+
 export interface PlanLimits {
+  /** Composition-specific expiry: read/export/finish/revoke remain available. */
+  readOnly?: boolean;
+  evaluationEndsAt?: string;
   maxMembers: number;
   maxProjects: number;
   /** Team-wide MCP tool calls per UTC day. */
@@ -62,7 +101,9 @@ export interface PlanLimits {
 
 export const PLANS = {
   free: {
-    maxMembers: 10,
+    // Cloud Free is one human evaluating the control plane. Collaboration is
+    // what Team sells; agents and machines are not seats.
+    maxMembers: 1,
     maxProjects: 10,
     maxToolCallsPerDay: 20_000,
     maxDevicesPerMember: 2,
@@ -97,7 +138,9 @@ export const PLANS = {
     savings: true,
   },
   team: {
-    maxMembers: 100,
+    // Self-serve Team ends at 50 humans. Larger organizations need the
+    // contractual, identity and support controls of Enterprise.
+    maxMembers: 50,
     maxProjects: 100,
     maxToolCallsPerDay: 500_000,
     maxDevicesPerMember: null,
@@ -173,7 +216,31 @@ export function setHosted(value: boolean): void {
 }
 
 export function isHosted(): boolean {
-  return hostedInstance;
+  return entitlementContext.getStore()?.hosted ?? hostedInstance;
+}
+
+/**
+ * The private beta: hosted, but nothing to buy, so nothing to meter.
+ *
+ * Deliberately separate from `hosted`. Turning hosted off would also take the
+ * audit, identity and billing composition with it, and those have to keep
+ * behaving the way they will when money is switched on. This lifts the ceilings
+ * and leaves everything else standing — and because it writes no plan onto any
+ * workspace, unsetting it restores the matrix with nothing to unwind.
+ */
+let unmeteredInstance = false;
+
+export function setUnmetered(value: boolean): void {
+  unmeteredInstance = value;
+}
+
+/**
+ * Per request first, like `isHosted`. Two instances can share a process — the
+ * suite runs a metered and an unmetered server side by side — and a module
+ * value alone would hand whichever booted last to both of them.
+ */
+export function isUnmetered(): boolean {
+  return entitlementContext.getStore()?.unmetered ?? unmeteredInstance;
 }
 
 /**
@@ -182,8 +249,8 @@ export function isHosted(): boolean {
  * Pass `hosted` explicitly at the gates, where reading it next to the check is
  * clearer than knowing the module answer; everything else takes the default.
  */
-export function planLimits(plan: string | null | undefined, hosted = hostedInstance): PlanLimits {
-  if (!hosted) return UNMETERED;
+export function planLimits(plan: string | null | undefined, hosted = isHosted()): PlanLimits {
+  if (!hosted || isUnmetered()) return UNMETERED;
   return PLANS[(plan as PlanId) ?? 'free'] ?? PLANS.free;
 }
 
@@ -192,10 +259,30 @@ export function planName(plan: string | null | undefined): string {
   return (PLAN_IDS as readonly string[]).includes(plan ?? '') ? plan! : 'free';
 }
 
+/**
+ * What a person is actually using right now, rather than only the persisted
+ * Stripe plan. Evaluations deliberately leave `teams.plan` as `free`, so any
+ * UI that renders that column directly lies while Team capabilities are active.
+ */
+export function effectivePlanLabel(
+  plan: string | null | undefined,
+  limits: Pick<PlanLimits, 'evaluationEndsAt' | 'readOnly'>,
+  now = new Date(),
+): string {
+  // Otherwise every workspace in the beta reads "free" beside a console with
+  // every feature switched on, which is the one label that is certainly wrong.
+  if (isUnmetered()) return 'Private beta';
+  if (!limits.evaluationEndsAt) return planName(plan);
+  const endsAt = new Date(limits.evaluationEndsAt);
+  if (limits.readOnly || !Number.isFinite(endsAt.getTime()) || endsAt <= now) {
+    return 'Team evaluation ended';
+  }
+  const days = Math.max(1, Math.ceil((endsAt.getTime() - now.getTime()) / 86_400_000));
+  return `Team evaluation · ${days} ${days === 1 ? 'day' : 'days'} left`;
+}
+
 /** The cheapest plan that carries a feature — what an upgrade message names. */
-export function cheapestWith(
-  predicate: (limits: PlanLimits) => boolean,
-): PlanId | null {
+export function cheapestWith(predicate: (limits: PlanLimits) => boolean): PlanId | null {
   return PLAN_IDS.find((id) => predicate(PLANS[id])) ?? null;
 }
 

@@ -1,44 +1,89 @@
 {
-  "team": "acme-payments",
+  "schemaVersion": 1,
   "project": "payments-api",
+  "requiredEnvVarName": "STMA_HUMAN_LAB",
+  "requiredCheck": "npm test",
   "runs": [
     {
-      "agent": "alice-claude",
-      "taskKey": "PAY-201",
-      "intent": "Add payment retry and attempt tracking",
-      "claims": [
+      "id": "device-a",
+      "agent": "device-a-agent",
+      "role": "implementer",
+      "device": "device-a",
+      "task": "PAY-201",
+      "branch": "human-lab/PAY-201-payment-attempts",
+      "intent": "Add idempotent payment-attempt tracking without changing capture semantics.",
+      "scope": [
         {
-          "resourceType": "path",
-          "resourceKey": "src/domain/payment.js",
+          "type": "path",
+          "key": "src/domain/payment.js",
           "access": "write"
         },
         {
-          "resourceType": "migration",
-          "resourceKey": "payments-db",
+          "type": "path",
+          "key": "migrations/**",
+          "access": "write"
+        },
+        {
+          "type": "migration",
+          "key": "payments-db",
+          "access": "write"
+        },
+        {
+          "type": "path",
+          "key": "test/payment-attempts.test.js",
           "access": "write"
         }
+      ],
+      "acceptance": [
+        "A repeated attempt id is rejected without mutating prior payment state.",
+        "Attempt outcome is one of approved, declined, or error.",
+        "migrations/002_payment_attempts.sql is backwards compatible.",
+        "Add behavioral tests in test/payment-attempts.test.js; new and unchanged baseline tests pass with npm test."
       ]
     },
     {
-      "agent": "bob-codex",
-      "taskKey": "PAY-202",
-      "intent": "Add refunds and captured amount accounting",
-      "claims": [
+      "id": "device-b",
+      "agent": "device-b-agent",
+      "role": "implementer",
+      "device": "device-b",
+      "task": "PAY-202",
+      "branch": "human-lab/PAY-202-refunds",
+      "intent": "Add bounded refunds for captured payments without changing authorization semantics.",
+      "scope": [
         {
-          "resourceType": "path",
-          "resourceKey": "src/domain/payment.js",
+          "type": "path",
+          "key": "src/domain/payment.js",
           "access": "write"
         },
         {
-          "resourceType": "migration",
-          "resourceKey": "payments-db",
+          "type": "path",
+          "key": "migrations/**",
+          "access": "write"
+        },
+        {
+          "type": "migration",
+          "key": "payments-db",
+          "access": "write"
+        },
+        {
+          "type": "path",
+          "key": "test/refunds.test.js",
           "access": "write"
         }
+      ],
+      "acceptance": [
+        "Refunds are allowed only after capture and cannot exceed capturedMinor.",
+        "The aggregate records refundedMinor and moves to partially_refunded or refunded.",
+        "The original proposal names migrations/002_refunds.sql; if PAY-201 has landed, the human must require a rebase and migrations/003_refunds.sql before the file is created.",
+        "Add behavioral tests in test/refunds.test.js; new tests and unchanged baseline/PAY-201 tests pass with npm test."
       ]
     }
   ],
   "expected": {
-    "minimumConflicts": 2,
-    "highestSeverity": "critical"
+    "minimumConflicts": 3,
+    "highestSeverity": "critical",
+    "approvalClaimType": "migration",
+    "firstWriter": "device-a",
+    "secondWriterMustStopBeforeEditing": true
   }
 }

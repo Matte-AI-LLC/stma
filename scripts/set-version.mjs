@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 /**
- * One version for all three layers.
+ * One version for every public artefact and the private hosted composition.
  *
- * The repository ships the same code three ways — source under ELv2, two npm
- * packages, and a container image that runs the hosted service — and before
+ * The repository ships one deterministic core as source under ELv2, two npm
+ * packages and a public container, then composes it with private EE for the
+ * hosted service. Before the version train
  * this each carried its own number: the image was on v0.10.1, the server
  * package on 0.7.2, the CLI on 0.2.2. Nothing was wrong with any of them
  * individually, which is exactly the problem: given a bug report naming "0.2.2"
@@ -17,7 +18,7 @@
  *
  *   node scripts/set-version.mjs 0.11.0     # or v0.11.0
  */
-import { execFileSync } from 'node:child_process';
+import { execSync } from 'node:child_process';
 import { readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -47,6 +48,13 @@ for (const rel of MANIFESTS) {
 
 // The lockfile records workspace versions too, and a lockfile that disagrees
 // with the manifests fails `npm ci` on every runner — the one command every
-// workflow starts with.
-execFileSync('npm', ['install', '--package-lock-only', '--silent'], { cwd: root, stdio: 'inherit' });
+// workflow starts with. One fixed command string rather than an argument
+// array: on Windows npm is npm.cmd, which Node will not spawn without a shell
+// (CVE-2024-27980), and Node 24 warns when a shell meets an args array.
+// Nothing in the string is user input.
+const lockCommand = 'npm install --package-lock-only --ignore-scripts --no-audit --no-fund --silent';
+execSync(lockCommand, { cwd: root, stdio: 'inherit' });
+if (MANIFESTS.includes('ee/package.json')) {
+  execSync(lockCommand, { cwd: path.join(root, 'ee'), stdio: 'inherit' });
+}
 console.log(`\npackage-lock.json updated. Next: commit, then \`git tag v${version} && git push --tags\`.`);

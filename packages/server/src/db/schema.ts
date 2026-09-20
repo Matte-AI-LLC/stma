@@ -2,6 +2,7 @@ import { sql } from 'drizzle-orm';
 import {
   bigint,
   boolean,
+  check,
   index,
   integer,
   jsonb,
@@ -11,6 +12,7 @@ import {
   timestamp,
   uniqueIndex,
   uuid,
+  type AnyPgColumn,
 } from 'drizzle-orm/pg-core';
 
 export const users = pgTable(
@@ -28,11 +30,27 @@ export const users = pgTable(
      * Nullable because dev/OAuth accounts predate it; unique among the rows that have one.
      */
     email: text('email'),
+    /**
+     * When this address was proved, by entering a code mailed to it.
+     *
+     * Null means nobody has ever shown they can read it. That is the difference
+     * between an account somebody can get back into and one where a typo at
+     * signup is a permanent lockout: with email codes on, both the second factor
+     * and the reset go to this address and nowhere else. Rows that predate the
+     * column are left null and are told once, rather than being asserted as
+     * proved by a migration that cannot know.
+     */
+    emailVerifiedAt: timestamp('email_verified_at', { withTimezone: true }),
     avatarUrl: text('avatar_url'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [uniqueIndex('users_email_unique').on(t.email).where(sql`email is not null`)],
 );
+
+/** Persisted security requirements must be present in the running composition. */
+export const appExtensionRequirements = pgTable('app_extension_requirements', {
+  name: text('name').primaryKey(),
+});
 
 /**
  * Single-use email confirmation codes: sign-in second factor and password-change
@@ -89,10 +107,20 @@ export const projects = pgTable(
       .references(() => teams.id, { onDelete: 'cascade' }),
     name: text('name').notNull(),
     slug: text('slug').notNull(),
+    /**
+     * Canonical origin (host/owner/repository), independent of the human-facing
+     * name. Null means legacy/unverified and is never guessed into a remote.
+     */
+    repositoryIdentity: text('repository_identity'),
     createdBy: uuid('created_by').references(() => users.id),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
-  (t) => [uniqueIndex('projects_team_slug').on(t.teamId, t.slug)],
+  (t) => [
+    uniqueIndex('projects_team_slug').on(t.teamId, t.slug),
+    uniqueIndex('projects_team_repository_identity')
+      .on(t.teamId, t.repositoryIdentity)
+      .where(sql`repository_identity is not null`),
+  ],
 );
 
 export const memberships = pgTable(
@@ -120,22 +148,59 @@ export const invites = pgTable('invites', {
   expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
   uses: integer('uses').notNull().default(0),
   maxUses: integer('max_uses'),
+  /**
+   * What its holder joins as. Defaulted, so every invite written before this
+   * column existed means what it meant when it was written: member.
+   */
+  role: text('role').notNull().default('member'),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
 
-export const tokens = pgTable('tokens', {
-  id: uuid('id').primaryKey().defaultRandom(),
-  userId: uuid('user_id')
-    .notNull()
-    .references(() => users.id, { onDelete: 'cascade' }),
-  name: text('name').notNull(),
-  tokenHash: text('token_hash').notNull().unique(),
-  /** First characters of the token, for display purposes only. */
-  prefix: text('prefix').notNull(),
-  lastUsedAt: timestamp('last_used_at', { withTimezone: true }),
-  revokedAt: timestamp('revoked_at', { withTimezone: true }),
-  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
-});
+export const tokens = pgTable(
+  'tokens',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    name: text('name').notNull(),
+    /**
+     * Authorization boundary carried by this credential.
+     *
+     * Existing tokens migrate as `personal`, preserving the historical contract
+     * that a PAT follows all of its owner's memberships. Tokens minted by the
+     * agent-enrollment flow are explicit: one team, one project, or (only when
+     * the user deliberately asks for it) the same personal/cross-team reach.
+     */
+    scope: text('scope').notNull().default('personal'),
+    teamId: uuid('team_id').references(() => teams.id, { onDelete: 'cascade' }),
+    projectId: uuid('project_id').references(() => projects.id, { onDelete: 'cascade' }),
+    tokenHash: text('token_hash').notNull().unique(),
+    /** First characters of the token, for display purposes only. */
+    prefix: text('prefix').notNull(),
+    lastUsedAt: timestamp('last_used_at', { withTimezone: true }),
+    /** New enrollments have no working authority until whoami confirms client loading. */
+    setupExpiresAt: timestamp('setup_expires_at', { withTimezone: true }),
+    activatedAt: timestamp('activated_at', { withTimezone: true }),
+    /**
+     * OAuth access tokens are deliberately short-lived and refreshed by the MCP
+     * client. Null preserves the historical until-revoked PAT contract.
+     */
+    expiresAt: timestamp('expires_at', { withTimezone: true }),
+    /** Exact MCP resource URI this OAuth token may reach; null for legacy PATs. */
+    audience: text('audience'),
+    revokedAt: timestamp('revoked_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    check(
+      'tokens_scope_target',
+      sql`(${t.scope} = 'personal' and ${t.teamId} is null and ${t.projectId} is null)
+          or (${t.scope} = 'team' and ${t.teamId} is not null and ${t.projectId} is null)
+          or (${t.scope} = 'project' and ${t.teamId} is not null and ${t.projectId} is not null)`,
+    ),
+  ],
+);
 
 /** A durable coding-agent installation owned by a human user. */
 export const agentInstallations = pgTable(
@@ -145,7 +210,14 @@ export const agentInstallations = pgTable(
     userId: uuid('user_id')
       .notNull()
       .references(() => users.id, { onDelete: 'cascade' }),
+    /**
+     * Enrollment-created installations are bound one-to-one to the credential
+     * that activated them. Legacy CLI/manual registrations stay null.
+     */
+    tokenId: uuid('token_id').references(() => tokens.id, { onDelete: 'set null' }),
     name: text('name').notNull(),
+    /** Human-chosen machine label. Null only on pre-enrollment/legacy installations. */
+    deviceLabel: text('device_label'),
     clientType: text('client_type').notNull().default('generic'),
     clientVersion: text('client_version'),
     /**
@@ -157,16 +229,143 @@ export const agentInstallations = pgTable(
     /** Locally generated one-way device identifier; never a hostname or username. */
     deviceFingerprint: text('device_fingerprint').notNull(),
     capabilities: jsonb('capabilities').notNull().default([]),
+    /**
+     * Set on a checkout-local adapter: the MCP installation it listens for and
+     * acts beside. `stma adapter activate` authorizes its own installation, so
+     * without this nothing says the hooks in a checkout and the agent working
+     * there are the same seat. Same owner only and never a chain — both held by
+     * `domain/companions.ts`, because a CHECK cannot see another row. It moves
+     * no authority: the adapter hears what is addressed to its companion and is
+     * named beside it; it cannot accept that work or touch the companion's runs.
+     */
+    companionOf: uuid('companion_of').references((): AnyPgColumn => agentInstallations.id, {
+      onDelete: 'set null',
+    }),
     lastSeenAt: timestamp('last_seen_at', { withTimezone: true }).notNull().defaultNow(),
     revokedAt: timestamp('revoked_at', { withTimezone: true }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [
+    uniqueIndex('agent_installations_token_unique').on(t.tokenId).where(sql`token_id is not null`),
     uniqueIndex('agent_installations_user_device_name').on(
       t.userId,
       t.deviceFingerprint,
       t.name,
     ),
+    index('agent_installations_companion').on(t.companionOf).where(sql`companion_of is not null`),
+    check('agent_installations_companion_not_self', sql`${t.companionOf} is null or ${t.companionOf} <> ${t.id}`),
+  ],
+);
+
+/**
+ * A short-lived, single-use grant handed to one new coding-agent installation.
+ *
+ * The copied prompt contains the enrollment code, never a long-lived PAT. On
+ * redemption the code is consumed atomically, a scoped PAT is minted and one
+ * durable installation is bound to it. The code itself is stored only as a
+ * hash, exactly like a PAT.
+ */
+export const agentEnrollments = pgTable(
+  'agent_enrollments',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    codeHash: text('code_hash').notNull().unique(),
+    codePrefix: text('code_prefix').notNull(),
+    name: text('name').notNull(),
+    deviceLabel: text('device_label').notNull(),
+    clientType: text('client_type').notNull().default('generic'),
+    role: text('role'),
+    scope: text('scope').notNull(),
+    teamId: uuid('team_id').references(() => teams.id, { onDelete: 'cascade' }),
+    projectId: uuid('project_id').references(() => projects.id, { onDelete: 'cascade' }),
+    installationId: uuid('installation_id').references(() => agentInstallations.id, {
+      onDelete: 'set null',
+    }),
+    /**
+     * The pairing the human chose on a local adapter's consent screen, carried to
+     * redemption. It is a choice, not yet a fact: redemption re-checks it and
+     * drops it rather than minting a link to an agent that was revoked meanwhile.
+     */
+    companionOf: uuid('companion_of').references(() => agentInstallations.id, {
+      onDelete: 'set null',
+    }),
+    expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+    redeemedAt: timestamp('redeemed_at', { withTimezone: true }),
+    revokedAt: timestamp('revoked_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    check(
+      'agent_enrollments_scope_target',
+      sql`(${t.scope} = 'personal' and ${t.teamId} is null and ${t.projectId} is null)
+          or (${t.scope} = 'team' and ${t.teamId} is not null and ${t.projectId} is null)
+          or (${t.scope} = 'project' and ${t.teamId} is not null and ${t.projectId} is not null)`,
+    ),
+    index('agent_enrollments_user_created').on(t.userId, t.createdAt),
+    index('agent_enrollments_expires').on(t.expiresAt),
+  ],
+);
+
+/** Public MCP OAuth clients registered automatically by Claude/Codex. */
+export const oauthClients = pgTable('oauth_clients', {
+  id: text('id').primaryKey(),
+  clientName: text('client_name').notNull(),
+  clientUri: text('client_uri'),
+  redirectUris: jsonb('redirect_uris').$type<string[]>().notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  lastUsedAt: timestamp('last_used_at', { withTimezone: true }),
+});
+
+/** Single-use, PKCE-bound authorization codes. Only the code hash is stored. */
+export const oauthAuthorizationCodes = pgTable(
+  'oauth_authorization_codes',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    codeHash: text('code_hash').notNull().unique(),
+    clientId: text('client_id')
+      .notNull()
+      .references(() => oauthClients.id, { onDelete: 'cascade' }),
+    enrollmentId: uuid('enrollment_id')
+      .notNull()
+      .references(() => agentEnrollments.id, { onDelete: 'cascade' }),
+    redirectUri: text('redirect_uri').notNull(),
+    resource: text('resource').notNull(),
+    scope: text('scope').notNull(),
+    codeChallenge: text('code_challenge').notNull(),
+    expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+    consumedAt: timestamp('consumed_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index('oauth_authorization_codes_expires').on(t.expiresAt)],
+);
+
+/**
+ * Rotating public-client refresh tokens. Each generation is retained so reuse
+ * of an already-spent token can revoke the whole credential family.
+ */
+export const oauthRefreshTokens = pgTable(
+  'oauth_refresh_tokens',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tokenHash: text('token_hash').notNull().unique(),
+    tokenId: uuid('token_id')
+      .notNull()
+      .references(() => tokens.id, { onDelete: 'cascade' }),
+    clientId: text('client_id')
+      .notNull()
+      .references(() => oauthClients.id, { onDelete: 'cascade' }),
+    resource: text('resource').notNull(),
+    scope: text('scope').notNull(),
+    usedAt: timestamp('used_at', { withTimezone: true }),
+    revokedAt: timestamp('revoked_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    index('oauth_refresh_tokens_token').on(t.tokenId),
+    index('oauth_refresh_tokens_client').on(t.clientId),
   ],
 );
 
@@ -177,6 +376,23 @@ export const webSessions = pgTable('web_sessions', {
     .references(() => users.id, { onDelete: 'cascade' }),
   expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  /**
+   * Enough to answer "is that one me?", and deliberately no more.
+   *
+   * The browser and platform as the client stated them, truncated, plus the
+   * address it last arrived from and when. A person looking at their own list
+   * needs to tell one row from another; "Chrome on Windows" alone cannot
+   * separate an intruder from the same person's other laptop, which is the
+   * whole question the list exists to answer.
+   *
+   * This is the session's own data, shown only to the person it belongs to, and
+   * it dies with the row — sessions are swept on expiry, so nothing here
+   * outlives the access it describes. Do not add a second reader without saying
+   * why on the page.
+   */
+  userAgent: text('user_agent'),
+  lastIp: text('last_ip'),
+  lastSeenAt: timestamp('last_seen_at', { withTimezone: true }),
 });
 
 export const snapshots = pgTable(
@@ -233,6 +449,14 @@ export const agentRuns = pgTable(
     branch: text('branch'),
     worktree: text('worktree'),
     baseSha: text('base_sha'),
+    headSha: text('head_sha'),
+    /**
+     * Optional logical start operation identity. Older clients leave both
+     * fields null; newer clients can retry a lost response without creating a
+     * second run. The hash refuses reuse for different arguments.
+     */
+    startRequestId: uuid('start_request_id'),
+    startRequestHash: text('start_request_hash'),
     status: text('status').notNull().default('starting'),
     policyHash: text('policy_hash'),
     environmentFingerprint: text('environment_fingerprint'),
@@ -285,6 +509,43 @@ export const agentRuns = pgTable(
   (t) => [
     index('agent_runs_team_status_heartbeat').on(t.teamId, t.status, t.lastHeartbeatAt),
     index('agent_runs_installation_started').on(t.installationId, t.startedAt),
+    uniqueIndex('agent_runs_installation_start_request')
+      .on(t.installationId, t.startRequestId)
+      .where(sql`start_request_id is not null`),
+  ],
+);
+
+/**
+ * Immutable client-reported repository observations for one run. A checkpoint
+ * is provenance, not provider verification or authority to mutate a checkout.
+ */
+export const runCheckpoints = pgTable(
+  'run_checkpoints',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    runId: uuid('run_id')
+      .notNull()
+      .references(() => agentRuns.id, { onDelete: 'cascade' }),
+    teamId: uuid('team_id')
+      .notNull()
+      .references(() => teams.id, { onDelete: 'cascade' }),
+    projectId: uuid('project_id').references(() => projects.id, { onDelete: 'set null' }),
+    installationId: uuid('installation_id')
+      .notNull()
+      .references(() => agentInstallations.id, { onDelete: 'cascade' }),
+    kind: text('kind').notNull(),
+    repositoryIdentity: text('repository_identity').notNull(),
+    commitSha: text('commit_sha').notNull(),
+    worktreeClean: boolean('worktree_clean').notNull(),
+    tests: jsonb('tests').$type<Array<{ name: string; state: string; detail?: string }>>().notNull(),
+    requestId: uuid('request_id').notNull(),
+    requestHash: text('request_hash').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex('run_checkpoints_run_request').on(t.runId, t.requestId),
+    index('run_checkpoints_run_created').on(t.runId, t.createdAt),
+    check('run_checkpoints_kind', sql`${t.kind} in ('start', 'delivery', 'tested')`),
   ],
 );
 
@@ -314,8 +575,18 @@ export const workClaims = pgTable(
     resourceType: text('resource_type').notNull(),
     resourceKey: text('resource_key').notNull(),
     access: text('access').notNull().default('write'),
+    /** Declared before work, or observed later from the dirty worktree. */
+    source: text('source').notNull().default('planned'),
     leaseExpiresAt: timestamp('lease_expires_at', { withTimezone: true }).notNull(),
+    /** When this run last declared it: restating scope rewrites the row, which is how moved ground is acknowledged. */
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    /**
+     * When this run first declared it and has held it since. Carried across
+     * restatements, so it says who was on the ground first: that run keeps the
+     * right of way, and a run that declares the same ground later waits for it.
+     * Null on rows older than the column, which therefore yield to nobody.
+     */
+    firstDeclaredAt: timestamp('first_declared_at', { withTimezone: true }),
   },
   (t) => [
     uniqueIndex('work_claims_run_resource').on(
@@ -323,6 +594,7 @@ export const workClaims = pgTable(
       t.resourceType,
       t.resourceKey,
       t.access,
+      t.source,
     ),
     index('work_claims_lease').on(t.leaseExpiresAt),
   ],
@@ -357,6 +629,196 @@ export const policyReceipts = pgTable('policy_receipts', {
   drift: boolean('drift').notNull().default(false),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
+
+/**
+ * Stable Knowledge Hub identity. Draft and published content lives only in the
+ * immutable version table; these pointers are the small mutable lifecycle head.
+ */
+export const knowledgeItems = pgTable(
+  'knowledge_items',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    teamId: uuid('team_id')
+      .notNull()
+      .references(() => teams.id, { onDelete: 'cascade' }),
+    stableKey: text('stable_key').notNull(),
+    ownerId: uuid('owner_id').references(() => users.id, { onDelete: 'set null' }),
+    state: text('state').notNull().default('active'),
+    currentVersionId: uuid('current_version_id').references(
+      (): AnyPgColumn => knowledgeVersions.id,
+      { onDelete: 'set null' },
+    ),
+    draftVersionId: uuid('draft_version_id').references(
+      (): AnyPgColumn => knowledgeVersions.id,
+      { onDelete: 'set null' },
+    ),
+    /** Incremented by every pointer/lifecycle CAS; content rows are never updated. */
+    generation: integer('generation').notNull().default(0),
+    deletedAt: timestamp('deleted_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex('knowledge_items_team_key').on(t.teamId, t.stableKey),
+    index('knowledge_items_team_state').on(t.teamId, t.state, t.updatedAt),
+    check('knowledge_items_state', sql`${t.state} in ('active', 'archived', 'withdrawn', 'deleted')`),
+  ],
+);
+
+/** Immutable Knowledge Hub content/source/audience revision. */
+export const knowledgeVersions = pgTable(
+  'knowledge_versions',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    itemId: uuid('item_id')
+      .notNull()
+      .references(() => knowledgeItems.id, { onDelete: 'cascade' }),
+    /** Duplicated for SQL-first tenant filtering; the domain verifies it against the item. */
+    teamId: uuid('team_id')
+      .notNull()
+      .references(() => teams.id, { onDelete: 'cascade' }),
+    /** Every draft/publish append advances revision; publication numbers only published copies. */
+    revision: integer('revision').notNull(),
+    publication: integer('publication'),
+    status: text('status').notNull(),
+    kind: text('kind').notNull(),
+    title: text('title').notNull(),
+    body: text('body').notNull(),
+    bodyHash: text('body_hash').notNull(),
+    authorId: uuid('author_id').references(() => users.id, { onDelete: 'set null' }),
+    publisherId: uuid('publisher_id').references(() => users.id, { onDelete: 'set null' }),
+    audienceType: text('audience_type').notNull(),
+    sourceType: text('source_type').notNull(),
+    sourceUri: text('source_uri'),
+    sourceRepository: text('source_repository'),
+    sourceCommit: text('source_commit'),
+    sourcePath: text('source_path'),
+    /** Source observation, source change and owner review are intentionally distinct facts. */
+    sourceCheckedAt: timestamp('source_checked_at', { withTimezone: true }),
+    sourceChangedAt: timestamp('source_changed_at', { withTimezone: true }),
+    reviewedAt: timestamp('reviewed_at', { withTimezone: true }),
+    /** Persistent diagnostic; content stays immutable while resolution metadata may advance. */
+    conflictsWithVersionId: uuid('conflicts_with_version_id').references(
+      (): AnyPgColumn => knowledgeVersions.id,
+      { onDelete: 'set null' },
+    ),
+    conflictReason: text('conflict_reason'),
+    conflictDetectedAt: timestamp('conflict_detected_at', { withTimezone: true }),
+    conflictResolvedAt: timestamp('conflict_resolved_at', { withTimezone: true }),
+    validUntil: timestamp('valid_until', { withTimezone: true }),
+    reviewAfter: timestamp('review_after', { withTimezone: true }),
+    supersedesVersionId: uuid('supersedes_version_id').references(
+      (): AnyPgColumn => knowledgeVersions.id,
+      { onDelete: 'set null' },
+    ),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    publishedAt: timestamp('published_at', { withTimezone: true }),
+  },
+  (t) => [
+    uniqueIndex('knowledge_versions_item_revision').on(t.itemId, t.revision),
+    uniqueIndex('knowledge_versions_item_publication')
+      .on(t.itemId, t.publication)
+      .where(sql`publication is not null`),
+    index('knowledge_versions_team_status').on(t.teamId, t.status, t.publishedAt),
+    check('knowledge_versions_status', sql`${t.status} in ('draft', 'published')`),
+    check(
+      'knowledge_versions_publication_shape',
+      sql`(${t.status} = 'draft' and ${t.publication} is null and ${t.publisherId} is null and ${t.publishedAt} is null)
+          or (${t.status} = 'published' and ${t.publication} is not null and ${t.publisherId} is not null and ${t.publishedAt} is not null)`,
+    ),
+    check(
+      'knowledge_versions_audience',
+      sql`${t.audienceType} in ('workspace_members', 'selected_projects')`,
+    ),
+    check('knowledge_versions_source', sql`${t.sourceType} in ('native', 'import')`),
+    check(
+      'knowledge_versions_conflict_shape',
+      sql`(${t.conflictsWithVersionId} is null and ${t.conflictReason} is null and ${t.conflictDetectedAt} is null)
+          or (${t.conflictsWithVersionId} is not null and ${t.conflictReason} is not null and ${t.conflictDetectedAt} is not null)`,
+    ),
+  ],
+);
+
+/** Project audiences are rows, never a JSON list checked after retrieval. */
+export const knowledgeAudienceProjects = pgTable(
+  'knowledge_audience_projects',
+  {
+    versionId: uuid('version_id')
+      .notNull()
+      .references(() => knowledgeVersions.id, { onDelete: 'cascade' }),
+    teamId: uuid('team_id')
+      .notNull()
+      .references(() => teams.id, { onDelete: 'cascade' }),
+    projectId: uuid('project_id')
+      .notNull()
+      .references(() => projects.id, { onDelete: 'cascade' }),
+  },
+  (t) => [
+    primaryKey({ columns: [t.versionId, t.projectId] }),
+    index('knowledge_audience_team_project').on(t.teamId, t.projectId, t.versionId),
+  ],
+);
+
+/** Immutable resolver output; KH-3 will attach these manifests to runs/handoffs. */
+export const knowledgeContexts = pgTable(
+  'knowledge_contexts',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    teamId: uuid('team_id')
+      .notNull()
+      .references(() => teams.id, { onDelete: 'cascade' }),
+    projectId: uuid('project_id').references(() => projects.id, { onDelete: 'set null' }),
+    requestedBy: uuid('requested_by').references(() => users.id, { onDelete: 'set null' }),
+    tokenId: uuid('token_id').references(() => tokens.id, { onDelete: 'set null' }),
+    runId: uuid('run_id').references(() => agentRuns.id, { onDelete: 'set null' }),
+    checkpointId: uuid('checkpoint_id').references(() => runCheckpoints.id, {
+      onDelete: 'set null',
+    }),
+    query: text('query'),
+    purpose: text('purpose').notNull().default('retrieval'),
+    resolverVersion: text('resolver_version').notNull(),
+    manifest: jsonb('manifest').$type<Record<string, unknown>>().notNull(),
+    /** Exact server-produced envelope for retry-safe context delivery. */
+    response: jsonb('response').$type<Record<string, unknown>>(),
+    byteSize: integer('byte_size').notNull(),
+    truncated: boolean('truncated').notNull().default(false),
+    omittedCount: integer('omitted_count').notNull().default(0),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    index('knowledge_contexts_team_created').on(t.teamId, t.createdAt),
+    uniqueIndex('knowledge_contexts_run_start')
+      .on(t.runId)
+      .where(sql`purpose = 'run_start' and run_id is not null`),
+    check(
+      'knowledge_contexts_purpose',
+      sql`${t.purpose} in ('retrieval', 'run_start', 'handoff_resume')`,
+    ),
+  ],
+);
+
+/**
+ * Delivery evidence, not compliance: server-served and client-reported moments
+ * are separate facts and a missing report is never promoted into success.
+ */
+export const knowledgeReceipts = pgTable(
+  'knowledge_receipts',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    contextId: uuid('context_id')
+      .notNull()
+      .references(() => knowledgeContexts.id, { onDelete: 'cascade' }),
+    tokenId: uuid('token_id').references(() => tokens.id, { onDelete: 'set null' }),
+    installationId: uuid('installation_id').references(() => agentInstallations.id, {
+      onDelete: 'set null',
+    }),
+    runId: uuid('run_id').references(() => agentRuns.id, { onDelete: 'set null' }),
+    servedAt: timestamp('served_at', { withTimezone: true }).notNull().defaultNow(),
+    reportedAt: timestamp('reported_at', { withTimezone: true }),
+    reportedManifestHash: text('reported_manifest_hash'),
+  },
+  (t) => [index('knowledge_receipts_context').on(t.contextId, t.servedAt)],
+);
 
 /** Project golden-environment snapshots used by run preflight. */
 export const environmentBaselines = pgTable(
@@ -466,6 +928,73 @@ export const messages = pgTable(
   (t) => [index('messages_session_created').on(t.sessionId, t.createdAt)],
 );
 
+/** Durable onboarding observations, separate from the bounded activity feed. */
+export const launchAttempts = pgTable('launch_attempts', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  userId: uuid('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  teamId: uuid('team_id').notNull().references(() => teams.id, { onDelete: 'cascade' }),
+  projectId: uuid('project_id').references(() => projects.id, { onDelete: 'cascade' }),
+  intent: text('intent').notNull().default('my_agents'),
+  sessionId: uuid('session_id').references(() => debugSessions.id, { onDelete: 'set null' }),
+  firstInstallationId: uuid('first_installation_id').references(() => agentInstallations.id, { onDelete: 'set null' }),
+  secondInstallationId: uuid('second_installation_id').references(() => agentInstallations.id, { onDelete: 'set null' }),
+  firstConnectedAt: timestamp('first_connected_at', { withTimezone: true }),
+  secondConnectedAt: timestamp('second_connected_at', { withTimezone: true }),
+  exchangeConfirmedAt: timestamp('exchange_confirmed_at', { withTimezone: true }),
+  firstRealResultAt: timestamp('first_real_result_at', { withTimezone: true }),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [index('launch_owner_scope').on(t.userId, t.teamId, t.projectId)]);
+
+/** An offer is not accepted merely because somebody asks a question in chat. */
+export const handoffs = pgTable('handoffs', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  sessionId: uuid('session_id').notNull().unique().references(() => debugSessions.id, { onDelete: 'cascade' }),
+  offeredBy: uuid('offered_by').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  targetUserId: uuid('target_user_id').references(() => users.id, { onDelete: 'set null' }),
+  /**
+   * Set when the brief was assigned to one named agent rather than offered to a
+   * person or to the team. Only that installation may accept, resume or complete
+   * it: a lead who said "Codex B, take this" has already decided who, and a
+   * second agent on the same account taking it instead is exactly the race the
+   * name was meant to prevent.
+   */
+  targetInstallationId: uuid('target_installation_id').references(() => agentInstallations.id, {
+    onDelete: 'set null',
+  }),
+  /** `handoff` (an agent stopping) or `assignment` (a lead starting somebody). */
+  kind: text('kind').notNull().default('handoff'),
+  acceptedBy: uuid('accepted_by').references(() => users.id, { onDelete: 'set null' }),
+  installationId: uuid('installation_id').references(() => agentInstallations.id, { onDelete: 'set null' }),
+  checkpointId: uuid('checkpoint_id').references(() => runCheckpoints.id, { onDelete: 'set null' }),
+  knowledgeContextId: uuid('knowledge_context_id').references(() => knowledgeContexts.id, {
+    onDelete: 'set null',
+  }),
+  /** Receiver-scoped context resolved once on resume, retained for exact replay. */
+  resumedKnowledgeContextId: uuid('resumed_knowledge_context_id').references(
+    () => knowledgeContexts.id,
+    { onDelete: 'set null' },
+  ),
+  state: text('state').notNull().default('offered'),
+  acceptedAt: timestamp('accepted_at', { withTimezone: true }),
+  resumedAt: timestamp('resumed_at', { withTimezone: true }),
+  completedAt: timestamp('completed_at', { withTimezone: true }),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  index('handoff_state').on(t.state, t.updatedAt),
+  check('handoffs_kind', sql`${t.kind} in ('handoff', 'assignment')`),
+]);
+
+/** Retry receipts are scoped to the issuing credential and retained with the session. */
+export const handoffRequests = pgTable('handoff_requests', {
+  tokenId: uuid('token_id').notNull().references(() => tokens.id, { onDelete: 'cascade' }),
+  requestKey: text('request_key').notNull(),
+  requestHash: text('request_hash').notNull(),
+  sessionId: uuid('session_id').notNull().references(() => debugSessions.id, { onDelete: 'cascade' }),
+  response: jsonb('response').$type<Record<string, unknown>>().notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [primaryKey({ columns: [t.tokenId, t.requestKey] })]);
+
 export const activity = pgTable(
   'activity',
   {
@@ -527,6 +1056,113 @@ export const errorEvents = pgTable(
 );
 
 /**
+ * One closed five-minute bucket of load, so `/admin/ops` can answer "was last
+ * Tuesday worse than today" and not only "what is this process doing now".
+ *
+ * Everything else about load lives in `lib/metrics` as a ring in one process's
+ * memory: it dies with the container, and a second replica would tell a
+ * different story. This is the record.
+ *
+ * **Five minutes**, chosen against the two neighbours. One minute is 43,200 rows
+ * a month to re-answer a question the live ring already answers for the last
+ * hour. One hour is 720 rows, but a five-minute outage disappears into a
+ * twelfth of a bar and "when did it spike" stops having an answer. Five minutes
+ * is 8,640 rows a month and keeps the shape of a spike.
+ *
+ * **The latency histogram is stored, not a percentile.** A p95 cannot be
+ * averaged, summed or rolled up into an hour — the only honest way to answer
+ * p95-over-a-day is to add the histograms and recompute, which is what
+ * `percentileFrom` does. Storing a mean and calling it p95 is the mistake this
+ * column exists to refuse.
+ *
+ * **One row per process per bucket.** `instance` is a boot id, so the writer is
+ * correct with the single replica this app is pinned to today and does not
+ * silently become wrong with two: a second replica adds its own row, and every
+ * reader groups by bucket and sums — counts add, histograms add element-wise,
+ * peaks take a max. Two restarts in one bucket also show as two rows, which is
+ * how the history records a restart without a second table.
+ */
+export const loadSamples = pgTable(
+  'load_samples',
+  {
+    /** Boot id of the reporting process — new on every start, so a restart is visible. */
+    instance: text('instance').notNull(),
+    /** Start of the bucket, UTC, always a multiple of LOAD_BUCKET_MS. */
+    bucketAt: timestamp('bucket_at', { withTimezone: true }).notNull(),
+    /** Minutes of the five this process observed; below five the bucket is partial. */
+    minutes: integer('minutes').notNull().default(0),
+    requests: integer('requests').notNull().default(0),
+    redirects: integer('redirects').notNull().default(0),
+    clientErrors: integer('client_errors').notNull().default(0),
+    serverErrors: integer('server_errors').notNull().default(0),
+    rateLimited: integer('rate_limited').notNull().default(0),
+    /** One count per LATENCY_BUCKETS index in lib/metrics; that array is the row's meaning. */
+    latency: jsonb('latency').$type<number[]>().notNull(),
+    /** Worst event-loop lag sampled in the bucket, ms. */
+    loopLagMaxMs: integer('loop_lag_max_ms').notNull().default(0),
+    /** Peak resident set size, in MB rather than bytes: integer holds 2.1 GB of bytes. */
+    rssMb: integer('rss_mb').notNull().default(0),
+  },
+  (t) => [
+    primaryKey({ columns: [t.instance, t.bucketAt] }),
+    index('load_samples_bucket').on(t.bucketAt.desc()),
+  ],
+);
+
+/**
+ * When a workspace's ceiling moved, and who moved it.
+ *
+ * The operator question this answers is a customer saying "this used to work".
+ * Until now a plan switch reached stdout and nothing else, and the Stripe
+ * webhook — the writer for every change nobody made by hand — reached the
+ * billing log and nothing else either.
+ *
+ * Every ceiling in this product today is a function of exactly two things:
+ * `teams.plan`, and the EE evaluation that overrides the whole limit set for 14
+ * days without touching that column. So there are two `field` values and two
+ * writers, and `lib/ceilings` owns both; a test refuses any other write to
+ * `teams.plan`. Membership add/role/removal are deliberately *not* here: they
+ * spend a ceiling rather than move one, they already reach the team activity
+ * feed, and routine membership churn would bury the handful of rows an operator
+ * opens this table to find.
+ *
+ * `previous`/`next` are text because the fields they describe are not one type —
+ * a plan id and an evaluation window are both best read as the words a person
+ * would say. `detail` is written only by this codebase and never from a request
+ * body, for the same reason `field` and `source` are closed sets: a log a caller
+ * can write sentences into is not a log.
+ */
+export const ceilingChanges = pgTable(
+  'ceiling_changes',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    at: timestamp('at', { withTimezone: true }).notNull().defaultNow(),
+    teamId: uuid('team_id')
+      .notNull()
+      .references(() => teams.id, { onDelete: 'cascade' }),
+    /** The workspace's slug when it happened — a workspace can be renamed afterwards. */
+    teamSlug: text('team_slug').notNull(),
+    /** 'plan' | 'evaluation'. Validated in lib/ceilings. */
+    field: text('field').notNull(),
+    previous: text('previous'),
+    next: text('next'),
+    /** 'operator' | 'billing' | 'owner'. Validated in lib/ceilings. */
+    source: text('source').notNull(),
+    /** Null when no human did it — a Stripe webhook has no actor. */
+    actorId: uuid('actor_id').references(() => users.id, { onDelete: 'set null' }),
+    /** Their username as it read then, so a deleted account still names the change. */
+    actorLabel: text('actor_label'),
+    /** The exact route or event that carried it. */
+    route: text('route').notNull(),
+    detail: text('detail'),
+  },
+  (t) => [
+    index('ceiling_changes_at').on(t.at.desc()),
+    index('ceiling_changes_team').on(t.teamId, t.at.desc()),
+  ],
+);
+
+/**
  * Per-user email notification switches. A user who never opened the preferences
  * page has no row at all — NOTIFICATION_DEFAULTS in lib/notifications answers for
  * them, so the events that matter arrive without anyone opting in first.
@@ -568,30 +1204,75 @@ export const teamIntegrations = pgTable(
     teamId: uuid('team_id')
       .notNull()
       .references(() => teams.id, { onDelete: 'cascade' }),
-    /** 'github', 'azure-devops' or 'jira' — one connection of each kind per team. */
+    /** 'github', 'azure-devops', 'jira' or 'clickup'. */
     provider: text('provider').notNull().default('github'),
     /**
      * The human-readable locator, whatever "where" means for the provider:
-     * github "owner/name", azure-devops "org/project/repo", jira the site host.
+     * github "owner/name", azure-devops "org/project/repo", jira host, clickup workspace id.
      */
     repo: text('repo').notNull(),
     token: text('token').notNull(),
     /** Post a comment on the issue when a run that names it finishes or hands off. */
     commentOnFinish: boolean('comment_on_finish').notNull().default(true),
-    /** Provider extras that are not the locator or the secret (jira: { email }). */
+    /** Provider extras not in locator/secret (jira email; clickup name + project/list bindings). */
     config: jsonb('config'),
     createdBy: uuid('created_by').references(() => users.id, { onDelete: 'set null' }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
-  (t) => [uniqueIndex('team_integrations_team_provider').on(t.teamId, t.provider)],
+  (t) => [uniqueIndex('team_integrations_team_provider_repo').on(t.teamId, t.provider, t.repo)],
 );
+
+/** A provider connection can bind multiple exact repositories to projects. */
+export const repositoryBindings = pgTable('repository_bindings', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  connectionId: uuid('connection_id').notNull().references(() => teamIntegrations.id, { onDelete: 'cascade' }),
+  teamId: uuid('team_id').notNull().references(() => teams.id, { onDelete: 'cascade' }),
+  projectId: uuid('project_id').references(() => projects.id, { onDelete: 'cascade' }),
+  provider: text('provider').notNull(),
+  repositoryId: text('repository_id').notNull(),
+  fullName: text('full_name').notNull(),
+  verifiedAt: timestamp('verified_at', { withTimezone: true }),
+}, (t) => [uniqueIndex('repository_binding_identity').on(t.teamId, t.provider, t.repositoryId)]);
+
+/** Exact provider facts are separate from legacy branch-linked run summaries. */
+export const providerObservations = pgTable('provider_observations', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  bindingId: uuid('binding_id').notNull().references(() => repositoryBindings.id, { onDelete: 'cascade' }),
+  /** Scope at observation time. Moving a binding must not move its old evidence. */
+  projectId: uuid('project_id').references(() => projects.id, { onDelete: 'set null' }),
+  deliveryId: text('delivery_id').notNull(),
+  subjectId: text('subject_id').notNull(),
+  commitSha: text('commit_sha').notNull(),
+  kind: text('kind').notNull(),
+  state: text('state').notNull(),
+  attempt: integer('attempt').notNull().default(1),
+  observedAt: timestamp('observed_at', { withTimezone: true }).notNull(),
+  receivedAt: timestamp('received_at', { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [uniqueIndex('provider_delivery_once').on(t.bindingId, t.deliveryId), index('provider_subject').on(t.bindingId, t.subjectId, t.commitSha)]);
+
+export const deliverySetups = pgTable('delivery_setups', {
+  id: text('id').primaryKey(),
+  teamId: uuid('team_id').notNull().references(() => teams.id, { onDelete: 'cascade' }),
+  projectId: uuid('project_id').references(() => projects.id, { onDelete: 'cascade' }),
+  manifest: jsonb('manifest').notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+});
+export const deliverySetupReceipts = pgTable('delivery_setup_receipts', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  setupId: text('setup_id').notNull().references(() => deliverySetups.id, { onDelete: 'cascade' }),
+  userId: uuid('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  tokenId: uuid('token_id').references(() => tokens.id, { onDelete: 'set null' }),
+  digest: text('digest').notNull().unique(),
+  receipt: jsonb('receipt').notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+});
 
 /**
  * A team's delivery flows: the "how work moves here" document, per team or per
- * project. One *active* flow per scope — the domain archives the previous one
- * on save rather than a partial unique index, because Postgres treats NULL
- * project ids as distinct and the team-wide scope is exactly that NULL.
+ * project. One *active* flow per scope is enforced in both the domain and the
+ * database. The expression index maps the team-wide NULL project to a sentinel
+ * UUID so concurrent writers cannot create two active defaults.
  *
  * The document column holds a `deliveryFlowSchema` value; the pipeline YAML and
  * the agent brief are rendered from it on read, never stored — stored copies of
@@ -618,7 +1299,15 @@ export const deliveryFlows = pgTable(
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
-  (t) => [index('delivery_flows_team').on(t.teamId, t.status)],
+  (t) => [
+    index('delivery_flows_team').on(t.teamId, t.status),
+    uniqueIndex('delivery_flows_active_scope')
+      .on(
+        t.teamId,
+        sql`coalesce(${t.projectId}, '00000000-0000-0000-0000-000000000000'::uuid)`,
+      )
+      .where(sql`${t.status} = 'active'`),
+  ],
 );
 
 /**
@@ -654,6 +1343,12 @@ export const notificationQueue = pgTable(
     notBefore: timestamp('not_before', { withTimezone: true }).notNull(),
     /** 'pending' | 'sent' | 'skipped' | 'failed'. Only 'sent' counts against the cap. */
     status: text('status').notNull().default('pending'),
+    /** Handoff rows retry; routine activity remains single-attempt. */
+    critical: boolean('critical').notNull().default(false),
+    attempts: integer('attempts').notNull().default(0),
+    /** Database lease shared by every process running the notification sweep. */
+    leaseOwner: text('lease_owner'),
+    leaseUntil: timestamp('lease_until', { withTimezone: true }),
     /** Why a row was skipped or failed: read, pref_off, no_email, rate_capped, … */
     reason: text('reason'),
     sentAt: timestamp('sent_at', { withTimezone: true }),
@@ -663,10 +1358,21 @@ export const notificationQueue = pgTable(
     /** At most one pending email per (user, thread) — coalescing enforced by the database. */
     uniqueIndex('notification_queue_pending')
       .on(t.userId, t.coalesceKey)
-      .where(sql`status = 'pending'`),
+      .where(sql`status in ('pending', 'sending')`),
     index('notification_queue_due').on(t.status, t.notBefore),
     index('notification_queue_user_sent').on(t.userId, t.sentAt),
   ],
+);
+
+/** Agent inbox cursors are per credential, never shared with the human browser. */
+export const agentReadState = pgTable(
+  'agent_read_state',
+  {
+    tokenId: uuid('token_id').notNull().references(() => tokens.id, { onDelete: 'cascade' }),
+    sessionId: uuid('session_id').notNull().references(() => debugSessions.id, { onDelete: 'cascade' }),
+    lastReadAt: timestamp('last_read_at', { withTimezone: true }).notNull(),
+  },
+  (t) => [primaryKey({ columns: [t.tokenId, t.sessionId] })],
 );
 
 export const readState = pgTable(

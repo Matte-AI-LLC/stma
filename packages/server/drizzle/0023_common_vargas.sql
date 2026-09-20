@@ -1,0 +1,1 @@
+ALTER TABLE "agent_installations" ADD COLUMN "device_label" text;
