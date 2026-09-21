@@ -26,7 +26,7 @@ import {
   invalidateAllSessions,
   sanitizeNext,
 } from '../auth/session';
-import { accessCodeRequired, matchAccessCode } from '../auth/accessCodes';
+import { accessCodeRequired, cohortOf, matchAccessCode } from '../auth/accessCodes';
 import {
   LOGIN_FAIL_WINDOW_MS,
   clearLoginFailures,
@@ -350,6 +350,13 @@ authRoutes.post('/auth/local/signup', async (c) => {
         username: await usernameFromEmail(db, email),
         email,
         passwordHash: await hashPassword(password),
+        // The cohort, on the row, in the same statement that creates the
+        // account. It used to reach one log line and nowhere else, and a log
+        // with thirty days of retention cannot answer which wave a workspace
+        // arrived in six weeks later. `cohortOf` stores the label or, for a
+        // code the operator named nothing, a marker that is not a label —
+        // never the code, which is the rule this whole file is built around.
+        signupCohort: cohortOf(verdict),
       })
       .returning();
     user = inserted[0]!;

@@ -8,6 +8,7 @@ import { metrics } from './lib/metrics';
 import type { AppExtension, AppLifecycleHooks } from './extensions';
 import { appExtensionRequirements } from './db/schema';
 import { withSecurityHooks } from './lib/securityHooks';
+import { attachChangeTransport } from './lib/stream';
 
 export interface StartedServer {
   port: number;
@@ -27,7 +28,7 @@ export interface ServerComposition {
 }
 
 export async function startServer(env: Env, composition: ServerComposition = {}): Promise<StartedServer> {
-  const { db, close: closeDb } = await connectDb(env);
+  const { db, close: closeDb, notifyBus } = await connectDb(env);
   try {
     await composition.prepareDb?.(db, env);
     const required = await db.select().from(appExtensionRequirements);
@@ -39,6 +40,10 @@ export async function startServer(env: Env, composition: ServerComposition = {})
     throw error;
   }
   const stopCleanup = withSecurityHooks(composition.lifecycle ?? {}, () => startCleanup(db, env));
+  // The live channel's other half. Best effort by construction: without it this
+  // replica simply keeps its events to itself, which is what every embedded
+  // instance does, and the page's 30s poll is the floor either way.
+  const stopTransport = await attachChangeTransport(notifyBus);
   const stopSampler = metrics.startSampler();
   const stopErrorCapture = installProcessErrorCapture(db);
   let stopServices: void | (() => void | Promise<void>) = undefined;
@@ -53,6 +58,7 @@ export async function startServer(env: Env, composition: ServerComposition = {})
     stopCleanup();
     stopSampler();
     stopErrorCapture();
+    await stopTransport();
     await stopServices?.();
     await closeDb();
     throw error;
@@ -75,6 +81,7 @@ export async function startServer(env: Env, composition: ServerComposition = {})
           stopCleanup();
           stopSampler();
           stopErrorCapture();
+          await stopTransport();
           await stopServices?.();
           await new Promise<void>((res, rej) => server.close((err) => (err ? rej(err) : res())));
           await closeDb();

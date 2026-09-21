@@ -2,6 +2,7 @@ import { and, eq } from 'drizzle-orm';
 import type { Db } from '../db';
 import { agentRuns, debugSessions, projects } from '../db/schema';
 import { projectForTeam } from '../domain/access';
+import { adapterListensFor } from '../domain/companions';
 import { authorizeSecurity } from './securityHooks';
 
 export const TOKEN_SCOPES = ['personal', 'team', 'project'] as const;
@@ -22,9 +23,10 @@ export interface AgentGrant {
   deviceLabel: string | null;
   /**
    * The agent this installation listens for, when it is a paired local adapter
-   * (`domain/companions.ts`). It decides what the hook is told and nothing
-   * else: no guard in this file reads it, so it cannot widen what a credential
-   * may touch.
+   * (`domain/companions.ts`). It decides what the hook is told, and no guard in
+   * this file reads it: the run edge below asks the question from the other
+   * end, starting at the installation that owns the run, so an adapter can
+   * never use its own pairing to reach the agent's runs.
    */
   companionInstallationId: string | null;
 }
@@ -59,6 +61,21 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const scopeError = (grant: AgentGrant, attempted: string) =>
   `This credential is ${grantLabel(grant)} scoped and cannot access ${attempted}. ` +
   'Nothing was written. Ask your human to create a separate connection with the required scope.';
+
+/**
+ * A run inside this credential's own scope that belongs to somebody else's
+ * installation. Its own sentence, because the agent most likely to be standing
+ * here was *told* to reuse this run by the prompt hook beside it, and "create a
+ * separate connection with the required scope" is the wrong way out of that:
+ * the way out is the pairing (`domain/companions.ts`), which the owner sets in
+ * the browser. It names no installation: a refusal is not the place to hand out
+ * a name, and the caller that may read one can already see it on the agent map.
+ */
+const unownedRunError = (grant: AgentGrant, runId: string) =>
+  `This credential cannot access run "${runId}": it belongs to another agent connection. ` +
+  'Nothing was written. If the local adapter in this checkout started that run, ask your human ' +
+  'to pair that adapter with this agent on Agent connections — a paired agent may update, finish ' +
+  'and hand off its adapter\'s run. Otherwise start_run and use the run id it returns.';
 
 async function matchesGrantedProject(db: Db, grant: AgentGrant, value: unknown): Promise<boolean> {
   if (grant.scope !== 'project' || typeof value !== 'string' || !grant.teamId) return true;
@@ -152,12 +169,18 @@ export async function guardMcpToolCall(
       .where(eq(agentRuns.id, runId))
       .limit(1);
     const row = rows[0];
-    if (
-      row &&
-      (!grantAllowsProject(grant, row.teamId, row.projectId) ||
-        (requiresOwnedRun && grant.installationId && row.installationId !== grant.installationId))
-    ) {
-      return scopeError(grant, `run "${runId}"`);
+    if (row) {
+      // Scope first and unconditionally: the pairing edge below never crosses a
+      // team or a project, because by then this has already held.
+      if (!grantAllowsProject(grant, row.teamId, row.projectId)) return scopeError(grant, `run "${runId}"`);
+      if (
+        requiresOwnedRun &&
+        grant.installationId &&
+        row.installationId !== grant.installationId &&
+        !(await adapterListensFor(db, row.installationId, grant.installationId))
+      ) {
+        return unownedRunError(grant, runId);
+      }
     }
   }
 
@@ -201,8 +224,14 @@ export async function guardRunGrantScope(
   if (!grantAllowsProject(grant, row.teamId, row.projectId)) {
     return scopeError(grant, `run "${runId}"`);
   }
-  if (grant.installationId && row.installationId !== grant.installationId) {
-    return scopeError(grant, `another agent's run "${runId}"`);
+  if (
+    grant.installationId &&
+    row.installationId !== grant.installationId &&
+    // The same edge as the MCP guard, from the same function: these two doors
+    // onto one question must not start answering it differently.
+    !(await adapterListensFor(db, row.installationId, grant.installationId))
+  ) {
+    return unownedRunError(grant, runId);
   }
   return null;
 }

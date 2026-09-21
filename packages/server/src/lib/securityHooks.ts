@@ -14,22 +14,52 @@ export interface SecurityPrincipal {
   method: string;
 }
 
+/**
+ * Every action core can hand a composition's audit hook, as data.
+ *
+ * It is a value rather than only a union because the signed export in
+ * `ee/src/audit.tsx` publishes a `coverage[]` list, and that list was
+ * hand-maintained beside this union: adding an action needed two edits in two
+ * trees, and when the three `integration_*` actions arrived in 2026-09-20's
+ * change only one of the two was made. Measured on this branch: the export
+ * claimed seven actions while ten were being written, so a customer reading
+ * `coverage` was told their integration credential changes were not audited
+ * when they were. `coverage` is derived from this array now, and
+ * `admin-history.test.ts` fails if a hand-written list appears again.
+ */
+export const CRITICAL_AUDIT_ACTIONS = [
+  'membership_joined',
+  'policy_published',
+  'knowledge_published',
+  'knowledge_archived',
+  'knowledge_withdrawn',
+  'knowledge_deleted',
+  // Handing STMA a tracker credential, withdrawing it, or changing what it
+  // may touch. The subject is `provider:locator` — never the credential, and
+  // never a task, list or message.
+  'integration_connected',
+  'integration_disconnected',
+  'integration_scope_changed',
+] as const;
+export type CriticalAuditAction = (typeof CRITICAL_AUDIT_ACTIONS)[number];
+
+/**
+ * Membership *removal* is deliberately not in that list.
+ *
+ * `criticalAudit` is a no-op without a composition — core alone writes nothing
+ * — while the reader for "who lost access to this workspace" is the operator at
+ * `/admin`, which is core. And `ee_audit_events` is chained per team, so one
+ * organization deprovisioning across five workspaces would be five chains with
+ * nothing tying them together. That record is `lib/memberships` instead, which
+ * is core, spans workspaces, and carries the `group_id` that makes one act one
+ * query. Adding the actions here as well would give two records to drift apart
+ * and put membership churn into an export whose stated coverage is deliberately
+ * narrow; if a customer asks for it, the array above is where it goes.
+ */
 export interface CriticalAuditEvent {
   teamId: string;
   actorId: string;
-  action:
-    | 'membership_joined'
-    | 'policy_published'
-    | 'knowledge_published'
-    | 'knowledge_archived'
-    | 'knowledge_withdrawn'
-    | 'knowledge_deleted'
-    // Handing STMA a tracker credential, withdrawing it, or changing what it
-    // may touch. The subject is `provider:locator` — never the credential, and
-    // never a task, list or message.
-    | 'integration_connected'
-    | 'integration_disconnected'
-    | 'integration_scope_changed';
+  action: CriticalAuditAction;
   subjectId: string;
 }
 export interface EnrollmentCredentialMetadata {

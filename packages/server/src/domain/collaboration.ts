@@ -305,9 +305,9 @@ export async function transitionHandoff(
           'Only an explicitly addressed recipient can decline. Leave an open offer available to other agents, or ask its sender to cancel it.',
       };
     }
-    /** The start checkpoint of the run doing this work: the one named, else this installation's only live run here. */
-    const receivingRunStart = async () => {
-      if (!grant?.installationId) return undefined;
+    /** This installation's live runs in the handoff's workspace and project. */
+    const liveRunsHere = async (named?: string): Promise<string[]> => {
+      if (!grant?.installationId) return [];
       const runs = await tx
         .select({ id: agentRuns.id })
         .from(agentRuns)
@@ -317,9 +317,15 @@ export async function transitionHandoff(
             eq(agentRuns.teamId, session.teamId),
             session.projectId ? eq(agentRuns.projectId, session.projectId) : isNull(agentRuns.projectId),
             inArray(agentRuns.status, ['starting', 'active', 'waiting', 'blocked']),
-            receiverRunId ? eq(agentRuns.id, receiverRunId) : undefined,
+            named ? eq(agentRuns.id, named) : undefined,
           ),
         );
+      return runs.map((run) => run.id);
+    };
+    /** The start checkpoint of the run doing this work: the one named, else this installation's only live run here. */
+    const receivingRunStart = async () => {
+      if (!grant?.installationId) return undefined;
+      const runs = (await liveRunsHere(receiverRunId)).map((id) => ({ id }));
       if (runs.length !== 1) return undefined;
       const [start] = await tx
         .select()
@@ -437,9 +443,21 @@ export async function transitionHandoff(
         .limit(1)
         .for('update');
       if (!receiverRun) {
+        // Which of this agent's runs is live here, because the usual reason to
+        // be standing at this refusal is a run id that was right a minute ago:
+        // a branch switch closes the hook's run and opens another, and the
+        // agent sends the id it was given first (agent lab, 2026-09-20). The
+        // ids named are this installation's own, in this workspace and project.
+        const live = await liveRunsHere();
         return {
           error:
-            'The receiving run is not an active run owned by this installation in the handoff workspace/project, or it does not match the recorded replay.',
+            `The receiving run is not an active run owned by this installation in the handoff workspace/project, or it does not match the recorded replay.${
+              live.length === 1
+                ? ` This agent has one live run here — ${live[0]} — which is the one your hooks own if they started it: resume with that run_id.`
+                : live.length > 1
+                  ? ` This agent has ${live.length} live runs here (${live.slice(0, 3).join(', ')}): resume with the run_id of the one doing this work.`
+                  : ' This agent has no live run here: start_run in this checkout first, then resume with its run_id.'
+            }`,
         };
       }
       [receiverStartCheckpoint] = await tx

@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { accountDeleted, membershipUser } from '../lib/securityHooks';
 import {
   ACTIVE_AGENT_RUN_STATUSES,
@@ -56,6 +57,11 @@ import {
 } from '../lib/devices';
 import { effectiveLimits, effectivePlanLabel } from '../lib/entitlements';
 import { logLine } from '../lib/log';
+import {
+  hasNoOwner,
+  recordMembershipChange,
+  recordMembershipChanges,
+} from '../lib/memberships';
 import {
   emailChangeCodeEmail,
   emailChangedNotice,
@@ -907,6 +913,22 @@ dashboardRoutes.post('/app/teams', async (c) => {
     .returning();
   const team = inserted[0]!;
   await db.insert(memberships).values({ teamId: team.id, userId: user.id, role: 'owner' });
+  // The first row of every workspace's access history, so the history explains
+  // itself: whoever is the owner and never joined is the person who created it.
+  await recordMembershipChange(db, {
+    teamId: team.id,
+    teamSlug: team.slug,
+    action: 'added',
+    subjectId: user.id,
+    subjectLabel: user.username,
+    previousRole: null,
+    nextRole: 'owner',
+    source: 'self',
+    route: 'POST /app/teams',
+    actorId: user.id,
+    actorLabel: user.username,
+    detail: 'created the workspace',
+  });
   await c.get('lifecycle').teamMemberCountChanged?.({ db, teamId: team.id });
   return c.redirect(`/app/teams/${team.slug}`);
 });
@@ -1949,6 +1971,24 @@ dashboardRoutes.post('/app/teams/:slug/leave', async (c) => {
   await db
     .delete(memberships)
     .where(and(eq(memberships.teamId, found.team.id), eq(memberships.userId, user.id)));
+  await recordMembershipChange(db, {
+    teamId: found.team.id,
+    teamSlug: found.team.slug,
+    action: 'removed',
+    subjectId: user.id,
+    subjectLabel: user.username,
+    previousRole: found.role,
+    nextRole: null,
+    source: 'self',
+    route: 'POST /app/teams/:slug/leave',
+    actorId: user.id,
+    actorLabel: user.username,
+    // Asked even though the route refuses a last owner two checks up: a member
+    // can still leave a workspace that the organization path already left with
+    // no owner, and the column must mean the same thing whichever route wrote
+    // the row.
+    leftOwnerless: await hasNoOwner(db, found.team.id),
+  });
   await c.get('lifecycle').teamMemberCountChanged?.({ db, teamId: found.team.id });
   await track(db, {
     teamId: found.team.id,
@@ -2000,6 +2040,19 @@ dashboardRoutes.post('/app/teams/:slug/members/:userId/role', async (c) => {
     .set({ role })
     .where(and(eq(memberships.teamId, found.team.id), eq(memberships.userId, targetId)));
   const self = targetId === user.id;
+  await recordMembershipChange(db, {
+    teamId: found.team.id,
+    teamSlug: found.team.slug,
+    action: 'role_changed',
+    subjectId: targetId,
+    subjectLabel: target.username,
+    previousRole: target.role,
+    nextRole: role,
+    source: self ? 'self' : 'owner',
+    route: 'POST /app/teams/:slug/members/:userId/role',
+    actorId: user.id,
+    actorLabel: user.username,
+  });
   await track(db, {
     teamId: found.team.id,
     userId: user.id,
@@ -2037,7 +2090,7 @@ dashboardRoutes.post('/app/teams/:slug/members/:userId/remove', async (c) => {
     );
   }
   const targetRows = await db
-    .select({ username: users.username })
+    .select({ username: users.username, role: memberships.role })
     .from(memberships)
     .innerJoin(users, eq(memberships.userId, users.id))
     .where(and(eq(memberships.teamId, found.team.id), eq(memberships.userId, targetId)))
@@ -2047,6 +2100,20 @@ dashboardRoutes.post('/app/teams/:slug/members/:userId/remove', async (c) => {
   await db
     .delete(memberships)
     .where(and(eq(memberships.teamId, found.team.id), eq(memberships.userId, targetId)));
+  await recordMembershipChange(db, {
+    teamId: found.team.id,
+    teamSlug: found.team.slug,
+    action: 'removed',
+    subjectId: targetId,
+    subjectLabel: target.username,
+    previousRole: target.role,
+    nextRole: null,
+    source: 'owner',
+    route: 'POST /app/teams/:slug/members/:userId/remove',
+    actorId: user.id,
+    actorLabel: user.username,
+    leftOwnerless: await hasNoOwner(db, found.team.id),
+  });
   await c.get('lifecycle').teamMemberCountChanged?.({ db, teamId: found.team.id });
   await track(db, {
     teamId: found.team.id,
@@ -2100,6 +2167,12 @@ dashboardRoutes.post('/app/teams/:slug/delete', async (c) => {
     // transiently collide with the unique team-wide active-flow scope.
     await tx.delete(deliveryFlows).where(eq(deliveryFlows.teamId, teamId));
     await tx.delete(projects).where(eq(projects.teamId, teamId));
+    // Every membership goes, and this is the one removal `lib/memberships`
+    // deliberately does not record: `membership_changes` cascades with `teams`,
+    // so a row written here would be deleted three statements later by this
+    // same transaction. Writing it anyway would put a lie in the code and a
+    // promise of completeness on the operator's page that nothing keeps. The
+    // workspace's absence is the answer to why nobody is in it.
     await tx.delete(memberships).where(eq(memberships.teamId, teamId));
     await tx.delete(teams).where(eq(teams.id, teamId));
   });
@@ -4336,8 +4409,8 @@ dashboardRoutes.post('/app/installations/:id/companion', async (c) => {
   return connectionReturn(
     c,
     result.companion
-      ? `${result.adapter.name} now listens for ${result.companion.name}: its prompt hook announces work assigned to ${result.companion.name}, and an edit its guard stops is filed under ${result.companion.name}. It still cannot accept work or touch that agent's runs.`
-      : `${result.adapter.name} is no longer paired. Its hooks keep guarding the checkout; the agent beside it hears about assigned work only when somebody asks it to read its inbox.`,
+      ? `${result.adapter.name} now listens for ${result.companion.name}: its prompt hook announces work assigned to ${result.companion.name}, an edit its guard stops is filed under ${result.companion.name}, and ${result.companion.name} may update, finish and hand off the runs these hooks start. It still cannot accept work itself or touch that agent's own runs.`
+      : `${result.adapter.name} is no longer paired. Its hooks keep guarding the checkout; the agent beside it hears about assigned work only when somebody asks it to read its inbox, and is refused from its next call on the runs these hooks start.`,
   );
 });
 
@@ -4630,8 +4703,9 @@ dashboardRoutes.post('/app/account/delete', async (c) => {
   const back = (msg: string) => c.redirect(`/app/account?error=${encodeURIComponent(msg)}`);
 
   const affectedTeams = await db
-    .select({ teamId: memberships.teamId })
+    .select({ teamId: memberships.teamId, teamSlug: teams.slug, role: memberships.role })
     .from(memberships)
+    .innerJoin(teams, eq(memberships.teamId, teams.id))
     .where(eq(memberships.userId, user.id));
   const ownedTeams = await db
     .select({ teamId: memberships.teamId, name: teams.name })
@@ -4700,6 +4774,33 @@ dashboardRoutes.post('/app/account/delete', async (c) => {
       .where(eq(users.id, user.id));
     await accountDeleted(tx as unknown as Db, user.id);
   });
+  // Every workspace above just lost a member, and until now that left no trace
+  // anywhere: no feed row (nobody in those workspaces did anything), no audit.
+  // The subject is deliberately **unnamed** — `users.username` was scrubbed
+  // three statements ago at this person's own request, and writing it into an
+  // operator record would undo that. `subject_id` still points at the scrubbed
+  // row, which answers the operator's actual question (this workspace lost one
+  // member, on this day, because the account was deleted) without naming them.
+  // Written after the transaction commits: see `lib/memberships`.
+  const deletionGroup = randomUUID();
+  await recordMembershipChanges(
+    db,
+    affectedTeams.map((affected) => ({
+      teamId: affected.teamId,
+      teamSlug: affected.teamSlug,
+      action: 'removed' as const,
+      subjectId: user.id,
+      subjectLabel: null,
+      previousRole: affected.role,
+      nextRole: null,
+      source: 'self' as const,
+      route: 'POST /app/account/delete',
+      actorId: user.id,
+      actorLabel: null,
+      groupId: deletionGroup,
+      detail: 'account deleted',
+    })),
+  );
   for (const affected of affectedTeams) {
     await c.get('lifecycle').teamMemberCountChanged?.({ db, teamId: affected.teamId });
   }

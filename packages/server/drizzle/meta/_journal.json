@@ -323,6 +323,27 @@
       "when": 1789935227793,
       "tag": "0045_operator_history",
       "breakpoints": true
+    },
+    {
+      "idx": 46,
+      "version": "7",
+      "when": 1789947741260,
+      "tag": "0046_membership_history",
+      "breakpoints": true
+    },
+    {
+      "idx": 48,
+      "version": "7",
+      "when": 1789949153459,
+      "tag": "0048_beta_cohort",
+      "breakpoints": true
+    },
+    {
+      "idx": 49,
+      "version": "7",
+      "when": 1790016359888,
+      "tag": "0049_plan_grants",
+      "breakpoints": true
     }
   ]
 }

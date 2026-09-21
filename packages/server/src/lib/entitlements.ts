@@ -19,6 +19,7 @@
 /** The fleet half: runs, claims and the conflict radar. */
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { Db } from '../db';
+import { activePlanGrant, grantLastDay } from './planGrants';
 export type FleetAccess = 'full' | 'readonly';
 
 export type EntitlementResolver = (
@@ -45,6 +46,26 @@ export async function effectiveLimits(
   team: { id: string; plan: string | null },
   hosted = isHosted(),
 ): Promise<PlanLimits> {
+  // An operator's grant is a decision about the plan, so it applies exactly
+  // where plans do: hosted and outside the beta. Self-host and the beta both
+  // answer UNMETERED whatever the plan says, which is also why neither pays for
+  // the read. Every gate in the product reaches the matrix through this
+  // function — `planLimits` has no other caller — so resolving the grant here is
+  // what makes it true at every one of them rather than at the ones somebody
+  // remembered.
+  if (hosted && !isUnmetered()) {
+    const grant = await activePlanGrant(db, team.id);
+    if (grant) {
+      // The resolver is skipped on purpose. Its job is to narrow toward what a
+      // workspace is charged for — an evaluation's clock, licensed seats — and
+      // nothing is charged for a grant. What the operator gave is not taken back
+      // in part by something downstream while it lasts.
+      return {
+        ...planLimits(grant.plan, hosted),
+        grant: { plan: grant.plan, endsAt: grant.endsAt?.toISOString() ?? null },
+      };
+    }
+  }
   const base = planLimits(team.plan, hosted);
   // The beta skips the hosted resolver too. Its job is to narrow — evaluation
   // expiry, licensed seats — and there is nothing to narrow toward while there
@@ -58,12 +79,21 @@ export async function effectiveLimits(
 export interface PlanLimits {
   /** Composition-specific expiry: read/export/finish/revoke remain available. */
   readOnly?: boolean;
+  /**
+   * Set when an operator's grant decides the plan (`lib/planGrants`). `endsAt`
+   * is the first instant it no longer applies, null for no end date.
+   */
+  grant?: { plan: string; endsAt: string | null };
   evaluationEndsAt?: string;
   maxMembers: number;
   maxProjects: number;
   /** Team-wide MCP tool calls per UTC day. */
   maxToolCallsPerDay: number;
-  /** Machines one person may keep snapshots for. `null` is unlimited. */
+  /**
+   * Devices one person may push snapshots from, counted over the last
+   * `DEVICE_WINDOW_DAYS` (`lib/devices`). Enforced at `push_snapshot`; agents
+   * connect from any number of machines either way. `null` is unlimited.
+   */
   maxDevicesPerMember: number | null;
   /** Handoffs a team may make per 30 days. `null` is unlimited. */
   maxHandoffsPerMonth: number | null;
@@ -76,6 +106,11 @@ export interface PlanLimits {
    * cannot bound a busy team. This is the one limit customers ask to buy: an
    * outcome history that is swept every 90 days is not a record anyone can plan
    * against.
+   *
+   * Read from `PLANS` alone, by `historyRetentionDays` in `lib/cleanup.ts`, and
+   * never from `planLimits`: an unmetered answer does not reach it. A self-host
+   * keeps `ACTIVITY_RETENTION_DAYS`, and the private beta keeps the plan's number
+   * (decided 2026-09-21), so `UNMETERED.retentionDays` describes no sweep at all.
    */
   retentionDays: number | null;
   /**
@@ -226,7 +261,9 @@ export function isHosted(): boolean {
  * audit, identity and billing composition with it, and those have to keep
  * behaving the way they will when money is switched on. This lifts the ceilings
  * and leaves everything else standing — and because it writes no plan onto any
- * workspace, unsetting it restores the matrix with nothing to unwind.
+ * workspace, unsetting it restores the matrix with nothing to unwind. The age
+ * limit on history is the one ceiling it leaves where it was, so that unsetting
+ * it deletes nothing either (`historyRetentionDays` in `lib/cleanup.ts`).
  */
 let unmeteredInstance = false;
 
@@ -266,12 +303,22 @@ export function planName(plan: string | null | undefined): string {
  */
 export function effectivePlanLabel(
   plan: string | null | undefined,
-  limits: Pick<PlanLimits, 'evaluationEndsAt' | 'readOnly'>,
+  limits: Pick<PlanLimits, 'evaluationEndsAt' | 'readOnly' | 'grant'>,
   now = new Date(),
 ): string {
   // Otherwise every workspace in the beta reads "free" beside a console with
   // every feature switched on, which is the one label that is certainly wrong.
   if (isUnmetered()) return 'Private beta';
+  // The column says free and the workspace has Team: the same lie the
+  // evaluation branch below exists to avoid, from the other override.
+  if (limits.grant) {
+    const name = planName(limits.grant.plan);
+    if (!limits.grant.endsAt) return `${name} · complimentary`;
+    const endsAt = new Date(limits.grant.endsAt);
+    return Number.isFinite(endsAt.getTime())
+      ? `${name} · complimentary through ${grantLastDay(endsAt)}`
+      : `${name} · complimentary`;
+  }
   if (!limits.evaluationEndsAt) return planName(plan);
   const endsAt = new Date(limits.evaluationEndsAt);
   if (limits.readOnly || !Number.isFinite(endsAt.getTime()) || endsAt <= now) {

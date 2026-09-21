@@ -363,10 +363,12 @@ async function consentPage(
               <span class="help" id="oauth-companion-help">
                 This connection is the STMA CLI's local adapter, a separate installation from your
                 agent's MCP connection. Paired, its prompt hook tells that agent about work assigned
-                to it by name, and an edit the file guard stops is filed under that agent's name,
-                "via its adapter". It must be one of your own agents that can reach the project
-                chosen above. Pairing moves no authority — the adapter cannot accept work or touch
-                the agent's runs — and you can change it later on Agent connections.
+                to it by name, an edit the file guard stops is filed under that agent's name,
+                "via its adapter", and that agent may update, finish and hand off the runs these
+                hooks start in this checkout. It must be one of your own agents that can reach the
+                project chosen above. That is all it moves, and it moves it one way: the adapter
+                cannot accept work or touch the agent's own runs. You can change it later on Agent
+                connections, which takes the run back on that agent's next call.
                 {companions.length === 0
                   ? ' None of your connected agents can be paired yet: connect the agent\'s MCP first, or pair later.'
                   : ''}

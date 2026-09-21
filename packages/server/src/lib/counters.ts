@@ -1,4 +1,4 @@
-import { eq, lt, sql } from 'drizzle-orm';
+import { eq, inArray, lt, sql } from 'drizzle-orm';
 import { rowsAffected, type Db } from '../db';
 import { rateCounters } from '../db/schema';
 
@@ -34,7 +34,7 @@ export async function hitCounter(
   const now = Date.now();
   const windowStart = Math.floor(now / windowMs) * windowMs;
   const resetAt = new Date(windowStart + windowMs);
-  const key = `${bucket}:${subject}:${windowStart}`;
+  const key = counterKey(bucket, subject, windowMs, now);
   const rows = await db
     .insert(rateCounters)
     .values({ key, count: by, expiresAt: resetAt })
@@ -47,6 +47,17 @@ export async function hitCounter(
   return { count, resetAt, exceeded: count > max };
 }
 
+/**
+ * The one spelling of a counter key.
+ *
+ * Every reader has to rebuild it to find a row, and a reader that builds it a
+ * second way silently reports zero for a counter that is being enforced — which
+ * is the worst shape a quota display can take, because nothing looks broken.
+ */
+export function counterKey(bucket: string, subject: string, windowMs: number, now = Date.now()): string {
+  return `${bucket}:${subject}:${Math.floor(now / windowMs) * windowMs}`;
+}
+
 /** Current value without spending a hit — for showing a quota, not enforcing it. */
 export async function readCounter(
   db: Db,
@@ -54,13 +65,35 @@ export async function readCounter(
   subject: string,
   windowMs: number,
 ): Promise<number> {
-  const windowStart = Math.floor(Date.now() / windowMs) * windowMs;
   const rows = await db
     .select({ count: rateCounters.count })
     .from(rateCounters)
-    .where(eq(rateCounters.key, `${bucket}:${subject}:${windowStart}`))
+    .where(eq(rateCounters.key, counterKey(bucket, subject, windowMs)))
     .limit(1);
   return rows[0]?.count ?? 0;
+}
+
+/**
+ * The same read for a list of subjects, in one statement.
+ *
+ * An operator page showing a quota for every workspace would otherwise pay a
+ * round trip per row. Subjects that have not been counted in this window are
+ * absent from the map rather than zero, so a caller can tell "nothing yet" from
+ * "not asked for" if it ever needs to; every caller today reads it as zero.
+ */
+export async function readCounters(
+  db: Db,
+  bucket: string,
+  subjects: readonly string[],
+  windowMs: number,
+): Promise<Map<string, number>> {
+  if (subjects.length === 0) return new Map();
+  const keys = new Map(subjects.map((s) => [counterKey(bucket, s, windowMs), s]));
+  const rows = await db
+    .select({ key: rateCounters.key, count: rateCounters.count })
+    .from(rateCounters)
+    .where(inArray(rateCounters.key, [...keys.keys()]));
+  return new Map(rows.flatMap((r) => (keys.has(r.key) ? [[keys.get(r.key)!, r.count] as const] : [])));
 }
 
 /**
@@ -76,8 +109,7 @@ export async function clearCounter(
   subject: string,
   windowMs: number,
 ): Promise<void> {
-  const windowStart = Math.floor(Date.now() / windowMs) * windowMs;
-  await db.delete(rateCounters).where(eq(rateCounters.key, `${bucket}:${subject}:${windowStart}`));
+  await db.delete(rateCounters).where(eq(rateCounters.key, counterKey(bucket, subject, windowMs)));
 }
 
 /** Windows that have closed carry no information. */

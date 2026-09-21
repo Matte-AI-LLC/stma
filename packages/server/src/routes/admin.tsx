@@ -18,8 +18,25 @@ import {
   tokens,
   users,
 } from '../db/schema';
+import { describeCohort } from '../auth/accessCodes';
+import {
+  BETA_LEDGER_MAX,
+  betaLedger,
+  ceilingSummary,
+  ceilingText,
+  cohortSummaries,
+  nearestTheLine,
+} from '../domain/betaCohorts';
 import { adminConfigured, isAdminUser } from '../lib/admin';
 import { ceilingHistory, setTeamPlan, type CeilingChangeRow } from '../lib/ceilings';
+import { DEVICE_WINDOW_DAYS } from '../lib/devices';
+import {
+  appendMembershipChange,
+  hasNoOwner,
+  membershipHistory,
+  recordMembershipChange,
+  type MembershipChangeRow,
+} from '../lib/memberships';
 import {
   LOAD_BUCKET_MS,
   LOAD_WINDOWS,
@@ -43,11 +60,28 @@ import { effectiveLimits, PLANS } from '../lib/entitlements';
 import { emailIsFree, isEmail, normalizeEmail } from '../lib/email';
 import { fmtDate, initials, timeAgo } from '../lib/format';
 import { logLine } from '../lib/log';
+import { historyRetentionDays } from '../lib/cleanup';
+import {
+  GRANTABLE_PLANS,
+  MAX_GRANT_NOTE,
+  activePlanGrants,
+  describeGrant,
+  endsAtFromLastDay,
+  grantLastDay,
+  isGrantActive,
+  isGrantablePlan,
+  normalizeGrantNote,
+  planGrantFor,
+  revokePlanGrant,
+  setPlanGrant,
+  type PlanGrant,
+} from '../lib/planGrants';
 import { mailHealth, mailTransport } from '../lib/mailer';
 import { metrics } from '../lib/metrics';
 import { criticalAudit, SecurityRefusal } from '../lib/securityHooks';
 import { track } from '../lib/track';
 import type { AppEnv } from '../types';
+import { CeilingDistance, MAX_CHART_ROWS, chartOverflow } from '../ui/CeilingDistance';
 import { AppLayout } from '../ui/Layout';
 
 export const adminRoutes = new Hono<AppEnv>();
@@ -83,7 +117,7 @@ const Banner = ({ kind, text }: { kind: 'error' | 'success'; text: string }) => 
 const AdminTabs = ({
   active,
 }: {
-  active: 'overview' | 'usage' | 'ops' | 'teams' | 'users' | 'crm';
+  active: 'overview' | 'usage' | 'beta' | 'ops' | 'teams' | 'users' | 'crm';
 }) => (
   <div class="tabs">
     <a class={`tab${active === 'overview' ? ' active' : ''}`} href="/admin">
@@ -91,6 +125,9 @@ const AdminTabs = ({
     </a>
     <a class={`tab${active === 'usage' ? ' active' : ''}`} href="/admin/usage">
       Usage
+    </a>
+    <a class={`tab${active === 'beta' ? ' active' : ''}`} href="/admin/beta">
+      Beta
     </a>
     <a class={`tab${active === 'ops' ? ' active' : ''}`} href="/admin/ops">
       Ops
@@ -147,6 +184,153 @@ const meteringNote = (env: { hosted: boolean; betaUnmetered: boolean }) =>
       : 'This instance is hosted and metered: the plan column decides what each workspace may do.';
 
 /**
+ * What a grant does here, in the regime this instance runs under. Separate from
+ * `meteringNote` because the beta case differs: plans decide nothing while it
+ * runs, but a grant already decides how long history is kept.
+ */
+const grantRegimeNote = (env: { hosted: boolean; betaUnmetered: boolean }) =>
+  !env.hosted
+    ? 'This instance is not hosted (STMA_HOSTED unset): every workspace is unmetered and keeps history by ACTIVITY_RETENTION_DAYS, so a grant decides nothing here.'
+    : env.betaUnmetered
+      ? "While BETA_UNMETERED=1 every workspace already has every feature, so the grant takes over the day the beta ends — but it already decides how long this workspace's history is kept."
+      : '';
+
+/**
+ * A plan given to this workspace, beside the one it has (`lib/planGrants`).
+ *
+ * Unlimited or through a last day, the operator's choice either way: the owner
+ * asked for both, and an operator's page is where the wide door belongs. The
+ * card says what happens at the end before anybody picks a date, because the
+ * one irreversible consequence of a grant is not the grant — it is the history
+ * sweep on the workspace's own plan once it is over.
+ */
+const PlanGrantCard = ({
+  workspace,
+  grant,
+  env,
+  managedBilling,
+}: {
+  workspace: { id: string; name: string; plan: string };
+  grant: PlanGrant | null;
+  env: { hosted: boolean; betaUnmetered: boolean; activityRetentionDays: number };
+  managedBilling: boolean;
+}) => {
+  const live = grant ? isGrantActive(grant) : false;
+  const today = new Date().toISOString().slice(0, 10);
+  const ownDays = env.hosted ? historyRetentionDays(env, workspace.plan) : null;
+  const regime = grantRegimeNote(env);
+  return (
+    <div class="card" id="plan-grant" data-card="plan-grant">
+      <div class="card-head">
+        <div>
+          <div class="card-title">Complimentary plan</div>
+          <div class="card-note">
+            Give this workspace a plan with no subscription behind it, with no end date or through
+            a last day you choose. While it lasts it decides every limit, whatever its own plan{' '}
+            <b>{workspace.plan}</b>
+            {managedBilling ? ' or a Stripe subscription' : ''} says, and its owner's Plan &amp;
+            billing page says it was given and offers nothing to buy. When a dated grant ends the
+            workspace is back on {workspace.plan} by itself — the clock decides, so nothing is
+            written then and nothing needs undoing.{regime ? ` ${regime}` : ''}
+          </div>
+        </div>
+      </div>
+      <div class="card-pad">
+        <div data-grant-state={!grant ? 'none' : live ? 'active' : 'ended'} style="margin-bottom:14px">
+          {!grant ? (
+            <span class="muted">None given.</span>
+          ) : (
+            <>
+              <span class={`pill ${live ? 'pill-active' : 'pill-member'}`}>{live ? 'active' : 'ended'}</span>{' '}
+              <b>{grant.plan}</b>{' '}
+              {grant.endsAt
+                ? live
+                  ? `through ${grantLastDay(grant.endsAt)}`
+                  : `ended after ${grantLastDay(grant.endsAt)}`
+                : 'with no end date'}
+              <div class="muted small">
+                given by {grant.grantedByLabel ?? 'an operator'} {timeAgo(grant.grantedAt) ?? ''}
+                {grant.note ? ` · ${grant.note}` : ''}
+              </div>
+            </>
+          )}
+        </div>
+        <form
+          method="post"
+          action={`/admin/teams/${workspace.id}/grant`}
+          style="display:grid;gap:12px;max-width:560px"
+        >
+          <label class="field" style="margin:0">
+            <span>Plan</span>
+            <select class="in" name="plan" required>
+              {GRANTABLE_PLANS.map((p) => (
+                <option value={p} selected={(live ? grant!.plan : 'team') === p}>
+                  {p}
+                </option>
+              ))}
+            </select>
+          </label>
+          <div class="field" style="margin:0">
+            <span>How long</span>
+            <label class="row" style="gap:8px;align-items:center">
+              <input type="radio" name="ends" value="never" checked={!(live && grant?.endsAt)} /> No
+              end date, until you revoke it
+            </label>
+            <label class="row" style="gap:8px;align-items:center;flex-wrap:wrap">
+              <input type="radio" name="ends" value="date" checked={Boolean(live && grant?.endsAt)} />{' '}
+              Through
+              <input
+                class="in"
+                type="date"
+                name="last_day"
+                min={today}
+                value={live && grant?.endsAt ? grantLastDay(grant.endsAt) : ''}
+                style="max-width:190px"
+                aria-label="Last day the plan applies"
+              />
+              <span class="muted small">the last day included, UTC</span>
+            </label>
+          </div>
+          <label class="field" style="margin:0">
+            <span>Note, for you only</span>
+            <input
+              class="in"
+              name="note"
+              maxlength={MAX_GRANT_NOTE}
+              value={grant?.note ?? ''}
+              placeholder="Who and why. Shown on this page only, never logged, never shown to them."
+            />
+          </label>
+          {ownDays !== null ? (
+            <div class="muted small" data-grant-retention>
+              When it ends or is revoked, its history rule is {workspace.plan}'s again: activity
+              and agent events older than {ownDays} days are deleted at the next sweep.
+            </div>
+          ) : null}
+          <div class="row" style="gap:8px">
+            <button class="btn btn-primary" type="submit">
+              {live ? 'Update the grant' : 'Give this plan'}
+            </button>
+          </div>
+        </form>
+        {grant ? (
+          <form
+            method="post"
+            action={`/admin/teams/${workspace.id}/grant/revoke`}
+            class="m0"
+            style="margin-top:12px"
+          >
+            <button class="btn btn-sm" type="submit">
+              {live ? 'Revoke now' : 'Clear the ended grant'}
+            </button>
+          </form>
+        ) : null}
+      </div>
+    </div>
+  );
+};
+
+/**
  * What moved, both times said in full.
  *
  * "free → team" is the whole row; the route and the source are what tell an
@@ -173,8 +357,8 @@ const CeilingHistoryCard = ({
     </div>
     {rows.length === 0 ? (
       <div class="card-pad muted small">
-        No ceiling change recorded. Plan switches and evaluations appear here from the moment they
-        happen; changes made before this record existed are not in it.
+        No ceiling change recorded. Plan switches, grants and evaluations appear here from the
+        moment they happen; changes made before this record existed are not in it.
       </div>
     ) : (
       <table class="tbl" data-table="ceiling-history">
@@ -220,6 +404,115 @@ const CeilingHistoryCard = ({
     )}
   </div>
 );
+
+/**
+ * Who gained or lost access, and who did it.
+ *
+ * The sibling of the card above, drawn separately for the reason the tables are
+ * separate: the questions are different and the volumes are different. What it
+ * must never imply is completeness — deleting a workspace removes every
+ * membership in it *and* this record with it, which is why the note says so on
+ * every rendering rather than leaving an operator to work it out from an
+ * absence.
+ */
+const MembershipHistoryCard = ({
+  rows,
+  title,
+  note,
+  withWorkspace,
+  withSubject = true,
+}: {
+  rows: MembershipChangeRow[];
+  title: string;
+  note: string;
+  withWorkspace: boolean;
+  withSubject?: boolean;
+}) => (
+  <div class="card scroll-x" data-card="membership-history">
+    <div class="card-head">
+      <div>
+        <div class="card-title">{title}</div>
+        <div class="card-note">{note}</div>
+      </div>
+    </div>
+    {rows.length === 0 ? (
+      <div class="card-pad muted small">
+        No membership change recorded. Joins, role changes and removals appear here from the
+        moment they happen; changes made before this record existed are not in it.
+      </div>
+    ) : (
+      <table class="tbl" data-table="membership-history">
+        <tr>
+          <th>When</th>
+          {withWorkspace ? <th>Workspace</th> : null}
+          {withSubject ? <th>Who</th> : null}
+          <th>What</th>
+          <th>By</th>
+          <th class="hide-sm">Route</th>
+        </tr>
+        {rows.map((r) => (
+          <tr>
+            <td class="muted" style="white-space:nowrap" title={r.at.toISOString()}>
+              {timeAgo(r.at)}
+            </td>
+            {withWorkspace ? (
+              <td>
+                <a href={`/admin/teams/${r.teamId}`}>{r.teamName ?? r.teamSlug}</a>
+                {r.teamName && r.teamName !== r.teamSlug ? (
+                  <div class="mono muted small">{r.teamSlug}</div>
+                ) : null}
+              </td>
+            ) : null}
+            {withSubject ? (
+              <td>
+                {/* The label as it read then. Unnamed is a decision, not a gap:
+                    an account deleting itself is scrubbed, and the row must not
+                    put the name back. */}
+                {r.subjectId ? (
+                  <a href={`/admin/users/${r.subjectId}`}>{r.subjectLabel ?? 'account deleted'}</a>
+                ) : (
+                  <span class="muted">{r.subjectLabel ?? 'account deleted'}</span>
+                )}
+                {r.subjectLabel && r.subjectUsername && r.subjectUsername !== r.subjectLabel ? (
+                  <div class="mono muted small">now {r.subjectUsername}</div>
+                ) : null}
+              </td>
+            ) : null}
+            <td class="mono">
+              {r.action === 'added'
+                ? `joined as ${r.nextRole ?? '—'}`
+                : r.action === 'removed'
+                  ? `removed (was ${r.previousRole ?? '—'})`
+                  : `${r.previousRole ?? '—'} → ${r.nextRole ?? '—'}`}
+              {r.leftOwnerless ? (
+                <div class="small" style="font-family:var(--sans);color:var(--red)">
+                  left the workspace with no owner
+                </div>
+              ) : null}
+              {r.detail ? (
+                <div class="muted small" style="font-family:var(--sans)">{r.detail}</div>
+              ) : null}
+            </td>
+            <td>
+              <span class={`pill ${r.source === 'identity' ? 'pill-active' : 'pill-member'}`}>
+                {r.source}
+              </span>
+              {r.actorLabel ? <div class="muted small">{r.actorLabel}</div> : null}
+            </td>
+            <td class="mono muted small hide-sm">{r.route}</td>
+          </tr>
+        ))}
+      </table>
+    )}
+  </div>
+);
+
+/**
+ * Said on every rendering of the card, because an operator reading a short list
+ * must not conclude the short list is all that happened.
+ */
+const MEMBERSHIP_LIMITS =
+  'Deleting a workspace removes every membership in it and this record with it, so a workspace that is gone leaves nothing here. The workspace activity feed is the readers-inside-the-workspace copy and is swept by age.';
 
 // ---------------------------------------------------------------- fleet
 
@@ -395,6 +688,7 @@ adminRoutes.get('/admin', async (c) => {
   }
   const fleet = [...fleetBy.values()].slice(0, FLEET_PEOPLE);
   const ceilings = await ceilingHistory(db, { limit: 15 });
+  const accessChanges = await membershipHistory(db, { limit: 15 });
   const clientTop = byClient[0]?.n ?? 0;
   const runnersTop = activeByUser.reduce((m, r) => Math.max(m, r.n), 0);
   const runners = [...activeByUser].sort((a, b) => b.n - a.n).slice(0, 8);
@@ -437,6 +731,15 @@ adminRoutes.get('/admin', async (c) => {
         note={`When a workspace's limits last moved, whoever moved them — an operator here, a workspace owner starting an evaluation, or a Stripe reconciliation nobody was watching. Newest ${ceilings.length}; a workspace's whole history is on its own page. ${meteringNote(c.get('env'))}`}
         withWorkspace
       />
+
+      <div style="margin-top:14px">
+        <MembershipHistoryCard
+          rows={accessChanges}
+          title="Recent access changes"
+          note={`Who joined, changed role or lost access to a workspace, and who did it — an owner, an operator here, an invite, or an organization's identity administrator. Newest ${accessChanges.length}; a workspace's whole history is on its own page and a person's is on theirs. ${MEMBERSHIP_LIMITS}`}
+          withWorkspace
+        />
+      </div>
 
       <div>
         <div class="card-title">Fleet</div>
@@ -797,6 +1100,320 @@ adminRoutes.get('/admin/usage', async (c) => {
                 <td class="mono">{nfmt(row.callsToday)}</td>
                 <td class="muted" style="white-space:nowrap">
                   {timeAgo(row.lastActiveAt)}
+                </td>
+              </tr>
+            ))}
+          </table>
+        )}
+      </div>
+    </AppLayout>,
+  );
+});
+
+// ---------------------------------------------------------------- beta reach
+
+/**
+ * Who did we give how much beta to, and what does the flip cost them.
+ *
+ * `BETA_UNMETERED=1` lifts every ceiling from the process environment and
+ * writes no plan onto any workspace, which is what makes it safe to switch off
+ * — `teams.plan` is `NOT NULL DEFAULT 'free'`, so unsetting it drops everybody
+ * onto the free row with nothing to unwind. There is deliberately no migration
+ * path and no grandfathering here. What there is, is the distance: this page
+ * exists so the day somebody unsets it is a decision rather than a surprise.
+ *
+ * Two things it says out loud rather than leaving to be discovered, because
+ * each one is a place where the obvious reading is wrong:
+ *
+ * - **The beta does not lift retention, by decision (2026-09-21).**
+ *   `historyRetentionDays` in `lib/cleanup.ts` reads the plan and ignores the
+ *   flag, so a beta workspace on `free` is swept at 90 days today. It is not in
+ *   the table because unsetting the flag does not change it — which is the
+ *   point: lifting it would have made the flip the day history is deleted.
+ * - **An evidence-pack read is not recorded**, so that switch answers
+ *   `unrecorded` rather than pretending silence means unused.
+ *
+ * Devices per member is counted the way `push_snapshot` counts it: distinct
+ * device labels per person over the last `DEVICE_WINDOW_DAYS`, so the busiest
+ * member's number is the one the gate would refuse on.
+ */
+const BetaKey = () => (
+  <div class="cd-key">
+    <span>
+      <b>M</b> members
+    </span>
+    <span>
+      <b>P</b> projects
+    </span>
+    <span>
+      <b>C</b> tool calls today
+    </span>
+    <span>
+      <b>H</b> handoffs per 30 days
+    </span>
+    <span>
+      <b>I</b> connected integrations
+    </span>
+    <span>
+      <b>D</b> devices per member, last {DEVICE_WINDOW_DAYS} days
+    </span>
+    <span>
+      <b>F</b> claiming ground
+    </span>
+    <span>
+      <b>G</b> governance
+    </span>
+    <span>
+      <b>E</b> evidence packs
+    </span>
+    <span>
+      <b>S</b> savings ledger
+    </span>
+  </div>
+);
+
+adminRoutes.get('/admin/beta', async (c) => {
+  const user = c.get('user')!;
+  const env = c.get('env');
+  const ledger = await betaLedger(c.get('db'));
+  const cohorts = cohortSummaries(ledger);
+  const fromCode = ledger.workspaces.filter((w) => w.cohort !== null);
+  const over = ledger.workspaces.filter((w) => w.over.length > 0);
+  const losing = ledger.workspaces.filter((w) => w.losing.length > 0);
+  const given = ledger.workspaces.filter((w) => w.grant !== null);
+  const namedCohorts = cohorts.filter((row) => row.cohort !== null);
+  const overflow = chartOverflow(ledger.workspaces.length);
+
+  return c.html(
+    <AppLayout user={user} active="admin" title="Admin — Beta reach">
+      <div class="page-head">
+        <div>
+          <h1 class="title">Beta reach</h1>
+          <p class="sub">
+            Which access-code cohort every workspace arrived through, what it has done since, and
+            how far it already is from the ceilings of the plan it lands on when{' '}
+            <code>BETA_UNMETERED</code> is unset — free, unless you gave it a plan from its
+            workspace page. {meteringNote(env)}
+          </p>
+        </div>
+      </div>
+      <AdminTabs active="beta" />
+
+      <div style={statGrid}>
+        <Stat
+          label="Through a code"
+          value={nfmt(fromCode.length)}
+          note={`of ${nfmt(ledger.workspaces.length)} workspace${ledger.workspaces.length === 1 ? '' : 's'}`}
+          metric="beta-from-code"
+        />
+        <Stat
+          label="Cohorts"
+          value={nfmt(namedCohorts.length)}
+          note={
+            env.signupAccessCodes.length > 0
+              ? `${env.signupAccessCodes.length} code${env.signupAccessCodes.length === 1 ? '' : 's'} configured now`
+              : 'SIGNUP_ACCESS_CODES is unset: the door is open'
+          }
+          metric="beta-cohorts"
+        />
+        <Stat
+          label="Already over a ceiling"
+          value={nfmt(over.length)}
+          note="would be refused on day one"
+          metric="beta-over"
+        />
+        <Stat
+          label="Would lose a feature"
+          value={nfmt(losing.length)}
+          note="using something its landing plan does not carry"
+          metric="beta-losing"
+        />
+        <Stat
+          label="Given a plan"
+          value={nfmt(given.length)}
+          note="land on what you gave them, not on free"
+          metric="beta-given"
+        />
+      </div>
+
+      <div class="card" style="margin-top:14px" data-card="beta-distance">
+        <div class="card-head">
+          <div>
+            <div class="card-title">Distance to the ceiling each one lands on</div>
+            <div class="card-note">
+              One rule is the ceiling of the plan each workspace lands on — free, or the plan you
+              gave it. Every mark is a workspace's use of one ceiling, placed by
+              how much of that ceiling it has spent — left of the rule is room, on it is one person
+              or one project away, right of it is already past. Closest to the rule first, at most{' '}
+              {MAX_CHART_ROWS} drawn. Anything at twice a ceiling or more pins to the right edge as
+              an arrow rather than stretching an axis nobody could read.
+            </div>
+          </div>
+        </div>
+        {ledger.workspaces.length === 0 ? (
+          <div class="card-pad muted small">
+            No workspaces yet. They appear here as soon as somebody creates one.
+          </div>
+        ) : (
+          <>
+            <div class="cd-scroll">
+              <CeilingDistance
+                workspaces={nearestTheLine(ledger.workspaces, MAX_CHART_ROWS)}
+                href={(w) => `/admin/teams/${w.teamId}`}
+                cohortLabel={describeCohort}
+              />
+            </div>
+            <BetaKey />
+            {overflow ? <div class="cd-over">{overflow}</div> : null}
+          </>
+        )}
+      </div>
+
+      <div class="card scroll-x" style="margin-top:14px" data-card="beta-cohorts">
+        <div class="card-head">
+          <div>
+            <div class="card-title">Cohorts</div>
+            <div class="card-note">
+              Folded from the same rows as the table below, so a count here and the workspaces under
+              it cannot disagree. The cohort is the label on the access code the workspace's creator
+              signed up with — never the code, which is never stored anywhere. Waves in the order
+              they were sent; accounts that arrived through no code at all are last.
+            </div>
+          </div>
+        </div>
+        {cohorts.length === 0 ? (
+          <div class="card-pad muted small">Nothing to group yet.</div>
+        ) : (
+          <table class="tbl" data-table="beta-cohorts">
+            <tr>
+              <th>Cohort</th>
+              <th>Workspaces</th>
+              <th>People</th>
+              <th>Events · {ledger.windowDays}d</th>
+              <th>Over a ceiling</th>
+              <th>Losing a feature</th>
+              <th class="hide-sm">First arrival</th>
+            </tr>
+            {cohorts.map((row) => (
+              <tr>
+                <td>
+                  <span class={`pill ${row.cohort === null ? 'pill-member' : 'pill-active'}`}>
+                    {describeCohort(row.cohort)}
+                  </span>
+                </td>
+                <td class="mono">{nfmt(row.workspaces)}</td>
+                <td class="mono">{nfmt(row.people)}</td>
+                <td class="mono">{nfmt(row.events)}</td>
+                <td class="mono">{nfmt(row.over)}</td>
+                <td class="mono">{nfmt(row.losing)}</td>
+                <td class="muted hide-sm" style="white-space:nowrap">
+                  {row.firstAt ? fmtDate(row.firstAt) : '—'}
+                </td>
+              </tr>
+            ))}
+          </table>
+        )}
+      </div>
+
+      <div class="card scroll-x" style="margin-top:14px" data-card="beta-workspaces">
+        <div class="card-head">
+          <div>
+            <div class="card-title">Every workspace</div>
+            <div class="card-note">
+              Newest first, at most {BETA_LEDGER_MAX}
+              {ledger.truncated ? ' — this instance has more, and the rest are not shown' : ''}.
+              Tool calls and handoffs are read from the counters the limiter itself writes, so this
+              and a capped workspace are looking at one number. Devices are counted the way{' '}
+              <code>push_snapshot</code> counts them: the busiest member's distinct device labels
+              over the last {DEVICE_WINDOW_DAYS} days. Retention is deliberately absent: the beta
+              does not lift it, so the sweep already keeps each workspace's own rule — free's 90
+              days, or what the plan you gave it keeps — and unsetting the flag deletes nothing. And nothing records an evidence-pack
+              read, so that switch cannot be answered from stored rows for any workspace: it is
+              the <code>?</code> above and never a verdict.
+            </div>
+          </div>
+        </div>
+        {ledger.workspaces.length === 0 ? (
+          <div class="card-pad muted small">No workspaces yet.</div>
+        ) : (
+          <table class="tbl" data-table="beta-workspaces">
+            <tr>
+              <th>Workspace</th>
+              <th>Cohort</th>
+              <th class="hide-sm">Arrived</th>
+              <th class="hide-sm">Last active</th>
+              <th>Events</th>
+              <th>Against the plan it lands on</th>
+              <th>Would stop working</th>
+            </tr>
+            {ledger.workspaces.map((w) => (
+              <tr>
+                <td>
+                  <div class="name">
+                    <a href={`/admin/teams/${w.teamId}`}>{w.name}</a>
+                  </div>
+                  <div class="mono muted small">{w.slug}</div>
+                </td>
+                <td>
+                  <span class={`pill ${w.cohort === null ? 'pill-member' : 'pill-active'}`}>
+                    {describeCohort(w.cohort)}
+                  </span>
+                  {w.createdBy ? <div class="muted small">by {w.createdBy}</div> : null}
+                </td>
+                <td class="muted hide-sm" style="white-space:nowrap">
+                  {fmtDate(w.createdAt)}
+                  {/* The workspace was made here; the code was redeemed when its
+                      creator signed up, which can be an earlier day entirely. */}
+                  {w.cohortAt && w.cohort !== null ? (
+                    <div class="small">code {fmtDate(w.cohortAt)}</div>
+                  ) : null}
+                </td>
+                <td class="muted hide-sm" style="white-space:nowrap">
+                  {timeAgo(w.lastActiveAt) ?? '—'}
+                </td>
+                <td class="mono">{nfmt(w.events)}</td>
+                <td>
+                  {/* The ones that are already past, named, then every one with
+                      its numbers — "what it has used since" is the question
+                      this column answers, and a reader should not have to hover
+                      the chart above to get it. */}
+                  <div class="small" data-lands-on={w.landsOn}>
+                    lands on <b>{w.landsOn}</b>
+                    {w.grant ? (
+                      <span class="muted">
+                        {' '}
+                        · given
+                        {w.grant.endsAt ? `, through ${grantLastDay(w.grant.endsAt)}` : ', no end date'}
+                      </span>
+                    ) : null}
+                  </div>
+                  {w.over.length === 0 ? (
+                    <div class="muted small">within every ceiling</div>
+                  ) : (
+                    w.over.map((use) => (
+                      <div class="mono small" style="color:var(--red-ink)">
+                        {use.label.toLowerCase()} {ceilingText(use)}
+                      </div>
+                    ))
+                  )}
+                  <div class="mono muted small">{ceilingSummary(w.ceilings)}</div>
+                </td>
+                <td>
+                  {/* Only what this workspace is actually using. Evidence packs
+                      are `unrecorded` for every row — nothing writes when one is
+                      read — so the pill would be the same noise on every line
+                      and the card note says it once instead. */}
+                  {w.losing.length === 0 ? (
+                    <span class="muted small">nothing recorded in use</span>
+                  ) : (
+                    w.losing.map((f) => (
+                      <div style="margin-bottom:2px">
+                        <span class="pill pill-open" title={f.evidence}>
+                          {f.label}
+                        </span>
+                      </div>
+                    ))
+                  )}
                 </td>
               </tr>
             ))}
@@ -1521,6 +2138,8 @@ adminRoutes.get('/admin/teams', async (c) => {
       .from(activity)
       .groupBy(activity.teamId),
   );
+  // Which of these an operator has given a plan to: one query, whatever the count.
+  const grants = await activePlanGrants(db, list.map((t) => t.id));
   const error = c.req.query('error');
   const notice = c.req.query('ok');
 
@@ -1597,6 +2216,13 @@ adminRoutes.get('/admin/teams', async (c) => {
                   <span class={`pill ${t.plan === 'free' ? 'pill-member' : 'pill-active'}`}>
                     {t.plan}
                   </span>
+                  {/* The column is the workspace's own plan; a grant rides beside it and
+                      decides while it lasts, so it is named here rather than hidden. */}
+                  {grants.get(t.id) ? (
+                    <div class="muted small" data-grant={t.slug}>
+                      given {describeGrant(grants.get(t.id)!)}
+                    </div>
+                  ) : null}
                 </td>
                 <td>{memberCounts.get(t.id) ?? 0}</td>
                 <td>{projectCounts.get(t.id) ?? 0}</td>
@@ -1670,6 +2296,83 @@ adminRoutes.post('/admin/teams/:id/plan', async (c) => {
   );
 });
 
+/**
+ * Give a workspace a plan, or change the one given: no end date or through a
+ * last day. `lib/planGrants` owns the write and its history row in one
+ * transaction; the note never reaches a log line.
+ */
+adminRoutes.post('/admin/teams/:id/grant', async (c) => {
+  const user = c.get('user')!;
+  const db = c.get('db');
+  const id = c.req.param('id');
+  if (!UUID_RE.test(id)) return c.notFound();
+  const body = await c.req.parseBody();
+  const back = (msg: string, ok = false) =>
+    c.redirect(`/admin/teams/${id}?${ok ? 'ok' : 'error'}=${encodeURIComponent(msg)}#plan-grant`);
+  const plan = typeof body.plan === 'string' ? body.plan.trim() : '';
+  if (!isGrantablePlan(plan)) {
+    return back(`Choose ${GRANTABLE_PLANS.join(', ')} to give; free is where every workspace already stands.`);
+  }
+  let endsAt: Date | null = null;
+  if (body.ends === 'date') {
+    const parsed = endsAtFromLastDay(typeof body.last_day === 'string' ? body.last_day.trim() : '');
+    if ('error' in parsed) return back(parsed.error);
+    endsAt = parsed.endsAt;
+  }
+  const result = await setPlanGrant(db, {
+    teamId: id,
+    plan,
+    endsAt,
+    note: normalizeGrantNote(body.note),
+    actorId: user.id,
+    actorLabel: user.username,
+    route: 'POST /admin/teams/:id/grant',
+  });
+  if (!result) return c.notFound();
+  if (!result.changed) return back(`${result.team.name} already has ${describeGrant(result.grant!)}.`, true);
+  logLine({
+    evt: 'admin',
+    a: 'plan_grant',
+    u: user.username,
+    team: result.team.slug,
+    plan,
+    through: endsAt ? grantLastDay(endsAt) : null,
+  });
+  return back(`${result.team.name} now has ${describeGrant(result.grant!)}.`, true);
+});
+
+/** Take a grant back, or clear one that has already ended. */
+adminRoutes.post('/admin/teams/:id/grant/revoke', async (c) => {
+  const user = c.get('user')!;
+  const db = c.get('db');
+  const id = c.req.param('id');
+  if (!UUID_RE.test(id)) return c.notFound();
+  const back = (msg: string, ok = false) =>
+    c.redirect(`/admin/teams/${id}?${ok ? 'ok' : 'error'}=${encodeURIComponent(msg)}#plan-grant`);
+  const result = await revokePlanGrant(db, {
+    teamId: id,
+    actorId: user.id,
+    actorLabel: user.username,
+    route: 'POST /admin/teams/:id/grant/revoke',
+  });
+  if (!result) return c.notFound();
+  if (!result.previous) return back(`${result.team.name} has no complimentary plan.`, true);
+  const wasLive = isGrantActive(result.previous);
+  logLine({
+    evt: 'admin',
+    a: wasLive ? 'plan_grant_revoked' : 'plan_grant_cleared',
+    u: user.username,
+    team: result.team.slug,
+    plan: result.previous.plan,
+  });
+  return back(
+    wasLive
+      ? `Revoked. ${result.team.name} is back on its own plan, ${result.team.plan}.`
+      : `Cleared the ended grant. ${result.team.name} was already on its own plan, ${result.team.plan}.`,
+    true,
+  );
+});
+
 adminRoutes.get('/admin/teams/:id', async (c) => {
   const user = c.get('user')!;
   const db = c.get('db');
@@ -1712,6 +2415,9 @@ adminRoutes.get('/admin/teams/:id', async (c) => {
     .where(eq(tokens.teamId, id))
     .orderBy(desc(tokens.createdAt));
   const ceilings = await ceilingHistory(db, { teamId: id, limit: 50 });
+  const accessChanges = await membershipHistory(db, { teamId: id, limit: 50 });
+  const grant = await planGrantFor(db, id);
+  const grantLive = grant ? isGrantActive(grant) : false;
   const projectConnections = new Map<string, number>();
   for (const connection of connectionRows) {
     if (!connection.projectId || connection.tokenRevokedAt || connection.installationRevokedAt) continue;
@@ -1742,17 +2448,43 @@ adminRoutes.get('/admin/teams/:id', async (c) => {
       <AdminTabs active="teams" />
 
       <div style={statGrid}>
-        <Stat label="Workspace plan" value={workspace.plan} note="Applies to this workspace, not directly to a user" />
+        <Stat
+          label="Workspace plan"
+          value={grantLive ? `${grant!.plan}, given` : workspace.plan}
+          note={
+            grantLive
+              ? `complimentary ${grant!.endsAt ? `through ${grantLastDay(grant!.endsAt)}` : 'with no end date'}; its own plan is ${workspace.plan}`
+              : 'Applies to this workspace, not directly to a user'
+          }
+        />
         <Stat label="Members" value={memberRows.length} note="Humans; agents are not seats" />
         <Stat label="Projects" value={projectRows.length} note="Children of this workspace" />
         <Stat label="Scoped connections" value={connectionRows.length} note="Team + project credentials" />
       </div>
 
       <div style="margin-top:14px">
+        <PlanGrantCard
+          workspace={{ id: workspace.id, name: workspace.name, plan: workspace.plan }}
+          grant={grant}
+          env={c.get('env')}
+          managedBilling={Boolean(c.get('capabilities').managedBilling)}
+        />
+      </div>
+
+      <div style="margin-top:14px">
         <CeilingHistoryCard
           rows={ceilings}
           title="Ceiling history"
-          note={`Every time this workspace's limits moved, newest first (up to 50). ${meteringNote(c.get('env'))} Membership add, role change and removal are not here — they spend a ceiling rather than move one, and they are in the workspace's own activity feed.`}
+          note={`Every time this workspace's limits moved, newest first (up to 50). ${meteringNote(c.get('env'))} Membership add, role change and removal are not here — they spend a ceiling rather than move one, and they are in Access history below.`}
+          withWorkspace={false}
+        />
+      </div>
+
+      <div style="margin-top:14px">
+        <MembershipHistoryCard
+          rows={accessChanges}
+          title="Access history"
+          note={`Every join, role change and removal in this workspace, newest first (up to 50). ${MEMBERSHIP_LIMITS}`}
           withWorkspace={false}
         />
       </div>
@@ -1964,6 +2696,7 @@ adminRoutes.get('/admin/users/:id', async (c) => {
     .innerJoin(teams, eq(memberships.teamId, teams.id))
     .where(eq(memberships.userId, id))
     .orderBy(teams.name);
+  const accessChanges = await membershipHistory(db, { subjectId: id, limit: 50 });
   const allWorkspaces = await db.select().from(teams).orderBy(teams.name);
   const currentIds = new Set(workspaceRows.map((row) => row.team.id));
   const available = allWorkspaces.filter((workspace) => !currentIds.has(workspace.id));
@@ -2034,6 +2767,19 @@ adminRoutes.get('/admin/users/:id', async (c) => {
           </table>
         )}
       </div>
+
+      {/* The list above is where they are now; this is how they got there and
+          what they have lost, which is the question asked after an identity
+          provider has already acted. */}
+      <div style="margin-top:14px">
+        <MembershipHistoryCard
+          rows={accessChanges}
+          title="Access history"
+          note={`Every workspace this person joined, changed role in or lost, newest first (up to 50). ${MEMBERSHIP_LIMITS}`}
+          withWorkspace
+          withSubject={false}
+        />
+      </div>
     </AppLayout>,
   );
 });
@@ -2089,6 +2835,22 @@ adminRoutes.post('/admin/users/:id/memberships', async (c) => {
           actorId: actor.id,
           action: 'membership_joined',
           subjectId: userId,
+        });
+        // On the transaction, because `criticalAudit` above already rolls the
+        // insert back if it refuses and a second failure mode here would be
+        // the one that leaves the two records disagreeing.
+        await appendMembershipChange(tx as unknown as Db, {
+          teamId,
+          teamSlug: lockedWorkspace.slug,
+          action: 'added',
+          subjectId: userId,
+          subjectLabel: account.username,
+          previousRole: null,
+          nextRole: role,
+          source: 'operator',
+          route: 'POST /admin/users/:id/memberships',
+          actorId: actor.id,
+          actorLabel: actor.username,
         });
       }
       return rows[0] ? { kind: 'inserted' } as const : { kind: 'existing' } as const;
@@ -2157,6 +2919,19 @@ adminRoutes.post('/admin/users/:id/memberships/:teamId/role', async (c) => {
     return c.redirect(userAdminBack(userId, 'A workspace needs at least one owner. Promote another member first.'));
   }
   const row = result.row;
+  await recordMembershipChange(db, {
+    teamId,
+    teamSlug: row.workspaceSlug,
+    action: 'role_changed',
+    subjectId: userId,
+    subjectLabel: row.username,
+    previousRole: row.currentRole,
+    nextRole: role,
+    source: 'operator',
+    route: 'POST /admin/users/:id/memberships/:teamId/role',
+    actorId: actor.id,
+    actorLabel: actor.username,
+  });
   await track(db, { teamId, userId: actor.id, action: role === 'owner' ? 'member_promoted' : 'member_demoted', detail: `${row.username} was changed to ${role} by operator ${actor.username}` });
   logLine({ evt: 'admin', a: 'membership_role', u: actor.username, target: row.username, team: row.workspaceSlug, role });
   return c.redirect(userAdminBack(userId, `${row.username} is now ${role} in ${row.workspaceName}.`, true));
@@ -2195,6 +2970,20 @@ adminRoutes.post('/admin/users/:id/memberships/:teamId/remove', async (c) => {
     return c.redirect(userAdminBack(userId, 'The last workspace owner cannot be removed. Promote another member first.'));
   }
   const row = result.row;
+  await recordMembershipChange(db, {
+    teamId,
+    teamSlug: row.workspaceSlug,
+    action: 'removed',
+    subjectId: userId,
+    subjectLabel: row.username,
+    previousRole: row.role,
+    nextRole: null,
+    source: 'operator',
+    route: 'POST /admin/users/:id/memberships/:teamId/remove',
+    actorId: actor.id,
+    actorLabel: actor.username,
+    leftOwnerless: await hasNoOwner(db, teamId),
+  });
   await c.get('lifecycle').teamMemberCountChanged?.({ db, teamId });
   await track(db, { teamId, userId: actor.id, action: 'member_removed', detail: `${row.username} was removed by operator ${actor.username}` });
   logLine({ evt: 'admin', a: 'membership_remove', u: actor.username, target: row.username, team: row.workspaceSlug });

@@ -524,17 +524,40 @@ savingsRoutes.post('/app/teams/:slug/savings/rate', async (c) => {
     return c.redirect(back(slug, 'Only an owner can set what an hour is worth.'), 302);
   }
   const raw = String((await c.req.parseBody()).rate ?? '').trim();
+  // Deliberately NOT a ceiling change and not an access change, so it is in
+  // neither operator record. `hourly_cost_cents` gates nothing, meters nothing
+  // and removes nobody: it is the number the ledger multiplies minutes by, and
+  // moving it moves every money figure on this page retroactively. That makes
+  // it the workspace's own business, which is what the activity feed is — and
+  // until now it wrote nothing there either, so an owner could watch the
+  // totals change with no line anywhere saying why.
+  const previous = found.team.hourlyCostCents;
+  const noteRate = (cents: number | null) => (cents === null ? 'not set' : money(cents));
   if (raw === '') {
     await db.update(teams).set({ hourlyCostCents: null }).where(eq(teams.id, found.team.id));
+    if (previous !== null) {
+      await track(db, {
+        teamId: found.team.id,
+        userId: user.id,
+        action: 'savings_rate_set',
+        detail: `${user.username} cleared the hourly cost (was ${noteRate(previous)})`,
+      });
+    }
     return c.redirect(back(slug, 'Rate cleared. The ledger reports minutes again.', true), 302);
   }
   const value = Number(raw);
   if (!Number.isFinite(value) || value < 0 || value > 10_000) {
     return c.redirect(back(slug, 'Enter an hourly cost between 0 and 10000, or leave it blank.'), 302);
   }
-  await db
-    .update(teams)
-    .set({ hourlyCostCents: Math.round(value * 100) })
-    .where(eq(teams.id, found.team.id));
-  return c.redirect(back(slug, `An hour is now worth ${money(Math.round(value * 100))}.`, true), 302);
+  const cents = Math.round(value * 100);
+  await db.update(teams).set({ hourlyCostCents: cents }).where(eq(teams.id, found.team.id));
+  if (previous !== cents) {
+    await track(db, {
+      teamId: found.team.id,
+      userId: user.id,
+      action: 'savings_rate_set',
+      detail: `${user.username} set the hourly cost to ${money(cents)} (was ${noteRate(previous)})`,
+    });
+  }
+  return c.redirect(back(slug, `An hour is now worth ${money(cents)}.`, true), 302);
 });

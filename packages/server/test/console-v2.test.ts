@@ -341,7 +341,28 @@ it('draws the rail of the scope the page is in: account, workspace or project', 
   // Without the filter it is a workspace page again.
   const everyProject = await page('/app/teams/v2-team/governance');
   expect(everyProject.html).toContain('class="rail-group">Workspace</span>');
-  expect(everyProject.html).toContain('class="rail-group later">Rules for every project</span>');
+  expect(everyProject.html).toContain('class="rail-group later">Rules set here</span>');
+  // The pair has to read as one sentence, because it is the inheritance rule the
+  // whole console is built on: set at the workspace, in effect in the project. It
+  // said "Rules for every project", which is what the console does NOT do —
+  // Governance takes project additions, Knowledge takes a project audience, and a
+  // project can replace the Delivery flow outright.
+  expect(everyProject.html).not.toContain('Rules for every project');
+  // A place and what is happening in it are two groups, not one list of nine.
+  expect(everyProject.html).toContain('class="rail-group later">What is happening</span>');
+  const railOf = (html: string) =>
+    /<div class="rail-nav" id="rail-destinations">(.*?)<\/div>/s.exec(html)?.[1] ?? '';
+  const wsRail = railOf(everyProject.html);
+  expect(wsRail.indexOf('Agent map')).toBeGreaterThan(wsRail.indexOf('What is happening'));
+  expect(wsRail.indexOf('Knowledge')).toBeGreaterThan(wsRail.indexOf('Rules set here'));
+
+  // A baseline is an observation of a machine, not a rule anybody published:
+  // activeBaselines joins projects on a NOT NULL column, so there is no
+  // workspace-wide baseline and nothing inherits. It sits with what is happening
+  // at both levels, and the two rails no longer disagree about it.
+  const projectRail = railOf(project.html);
+  expect(projectRail.indexOf('Environments')).toBeLessThan(projectRail.indexOf('Rules in effect here'));
+  expect(wsRail.indexOf('Environments')).toBeLessThan(wsRail.indexOf('Rules set here'));
 
   // The map has a scope as well. payments-api has two live runs; manual-api none.
   const workspaceMap = await page('/app/agents?team=v2-team');

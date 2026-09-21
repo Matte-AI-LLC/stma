@@ -316,6 +316,16 @@ export const Rail = ({ user, active }: { user: User; active?: RailKey }) => {
               label="Activity"
               active={active === 'activity'}
             />
+            {/* A baseline is an observation of a machine, not a rule somebody
+                published: `activeBaselines` joins `projects` on a NOT NULL
+                column, so there is no workspace-wide baseline and nothing
+                inherits. It belongs with what is happening, not with the three
+                documents a project can add to or replace. */}
+            <RailLink
+              href={sectionHref(ws, project.slug, 'environments')}
+              label="Environments"
+              active={active === 'environments'}
+            />
             <span class="rail-group later">Rules in effect here</span>
             <RailLink
               href={sectionHref(ws, project.slug, 'knowledge')}
@@ -332,14 +342,13 @@ export const Rail = ({ user, active }: { user: User; active?: RailKey }) => {
               label="Delivery"
               active={active === 'delivery'}
             />
-            <RailLink
-              href={sectionHref(ws, project.slug, 'environments')}
-              label="Environments"
-              active={active === 'environments'}
-            />
           </>
         ) : ws ? (
           <>
+            {/* Two groups, not one list of nine: a place and what is
+                happening in it. The project rail has the same split and reads
+                because it is shorter, which is a reason to name the split
+                rather than to rely on the length. */}
             <span class="rail-group">Workspace</span>
             <RailLink href={teamHref(ws, '')} label="Overview" active={active === 'team'} />
             <RailLink
@@ -349,6 +358,7 @@ export const Rail = ({ user, active }: { user: User; active?: RailKey }) => {
               badge={rail.projects}
             />
             <RailLink href={sectionHref(ws, null, 'agents')} label="People and agents" active={active === 'people'} />
+            <span class="rail-group later">What is happening</span>
             <RailLink
               href={`/app/agents${scopeQuery(ws)}`}
               label="Agent map"
@@ -373,7 +383,12 @@ export const Rail = ({ user, active }: { user: User; active?: RailKey }) => {
               label="Needs attention"
               active={active === 'attention'}
             />
-            <span class="rail-group later">Rules for every project</span>
+            {/* Set here, in effect there. All three are scoped: a project adds
+                to Governance, addresses Knowledge to itself, and can replace the
+                Delivery flow outright. "for every project" said the opposite of
+                what the console does, which is the one thing a rail label must
+                not do. */}
+            <span class="rail-group later">Rules set here</span>
             <RailLink href={sectionHref(ws, null, 'knowledge')} label="Knowledge" active={active === 'knowledge'} />
             <RailLink
               href={sectionHref(ws, null, 'governance')}

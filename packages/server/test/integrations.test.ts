@@ -8,12 +8,18 @@ import { afterAll, beforeAll, expect, it } from 'vitest';
 import { projects } from '../src/db/schema';
 import { loadEnv, type Env } from '../src/env';
 import { githubOutbox, parseIssueRef } from '../src/lib/github';
-import { clickupOutbox, isClickupCustomTaskId, parseClickupTaskRef } from '../src/lib/clickup';
+import {
+  clickupOutbox,
+  CLICKUP_SEARCH_SCAN,
+  isClickupCustomTaskId,
+  parseClickupTaskRef,
+} from '../src/lib/clickup';
 import {
   guessTracker,
   pickableTrackers,
   ticketExamples,
   TICKET_PICKER_LIMIT,
+  TICKET_SEARCH_MAX,
 } from '../src/domain/tickets';
 import { flushNotificationsOnce } from '../src/lib/notifications';
 import { startServer, type StartedServer } from '../src/server';
@@ -224,17 +230,21 @@ it('reads the tracker off the shape of a ticket reference', () => {
 });
 
 /**
- * Pasting a reference and browsing for one are not the same list.
+ * Pasting a reference and browsing or searching for one are not the same list.
  *
  * Every connected tracker can be pasted from; only GitHub and ClickUp can be
- * browsed. Atlassian moved issue search to `/rest/api/3/search/jql`, nothing
- * here has exercised that endpoint against a real site, and `getJiraIssue` is
- * the one Jira door this codebase has measured — against both of Jira's. A
- * guessed search call would fail on a lead's critical path rather than in a
- * test, so a Jira-connected project keeps the field and is told why the button
- * is missing.
+ * browsed or searched. Atlassian moved issue search to `/rest/api/3/search/jql`,
+ * nothing here has exercised that endpoint against a real site, and
+ * `getJiraIssue` is the one Jira door this codebase has measured — against both
+ * of Jira's. A guessed search call would fail on a lead's critical path rather
+ * than in a test, so a Jira-connected project keeps the field and is told why
+ * the button is missing.
+ *
+ * One list for both verbs, deliberately: they ask a tracker the same question,
+ * and two lists would let one be searchable but not browsable — a distinction
+ * nobody reading the dialog could explain.
  */
-it('offers browsing for the trackers whose list endpoint has been measured', () => {
+it('offers browsing and searching for the trackers whose endpoints have been measured', () => {
   expect(pickableTrackers(['jira', 'github', 'clickup'])).toEqual(['github', 'clickup']);
   expect(pickableTrackers(['jira'])).toEqual([]);
   expect(pickableTrackers(['clickup'])).toEqual(['clickup']);
@@ -244,6 +254,12 @@ it('offers browsing for the trackers whose list endpoint has been measured', () 
   expect(pickableTrackers(['clickup', 'github'])).toEqual(['github', 'clickup']);
   // A picker, not a mirror.
   expect(TICKET_PICKER_LIMIT).toBeLessThanOrEqual(20);
+  // A search box, not a query language, and not a paragraph either.
+  expect(TICKET_SEARCH_MAX).toBeLessThanOrEqual(120);
+  // What a ClickUp search can honestly claim to have looked at. It is stated on
+  // the page in words, so it is a number with a reader rather than a tuning
+  // knob: changing it changes a sentence somebody is relying on.
+  expect(CLICKUP_SEARCH_SCAN).toBe(300);
 });
 
 // ------------------------------------------------------------------- github

@@ -18,7 +18,7 @@ import {
 } from '../src/db/schema';
 import { trimAgentEvents } from '../src/domain/agents';
 import { loadEnv } from '../src/env';
-import { runCleanupOnce } from '../src/lib/cleanup';
+import { historyRetentionDays, historyRetentionNote, runCleanupOnce } from '../src/lib/cleanup';
 import { getAnnouncementsSession, trimAnnouncements } from '../src/lib/sessions';
 import { trimActivity } from '../src/lib/track';
 import { startServer, type StartedServer } from '../src/server';
@@ -218,6 +218,89 @@ describe('retention', () => {
     expect(actions, 'free tier is swept past 90').not.toContain('free-120');
     expect(actions, 'a paid team was promised the rows would still be there').toContain('paid-120');
     expect(actions, 'and that promise has no far edge either').toContain('paid-900');
+  });
+
+  // Decided 2026-09-21: the private beta lifts the ceilings that refuse work and
+  // leaves this one where it was. Lifting it too would make the day the flag is
+  // unset the day months of history are deleted — at boot, before anybody could
+  // buy a plan. Changing this test is taking that decision the other way, which
+  // also needs /admin/beta to count what the flip would delete.
+  it('keeps the plan\'s age limit on history through the private beta', async () => {
+    const owner = await devLogin('ret-beta');
+    const freeSlug = await createTeam(owner, 'Retention Beta Free');
+    const paidSlug = await createTeam(owner, 'Retention Beta Paid');
+    const [freeId, paidId] = [await teamId(freeSlug), await teamId(paidSlug)];
+    const uid = await userId('ret-beta');
+    await db.update(teams).set({ plan: 'team' }).where(eq(teams.id, paidId));
+    const freeRun = await seedRun(uid, freeId, 'fp-retention-beta');
+    await db.insert(activity).values([
+      { teamId: freeId, userId: uid, action: 'beta-free-120', createdAt: ago(120) },
+      { teamId: freeId, userId: uid, action: 'beta-free-30', createdAt: ago(30) },
+      { teamId: paidId, userId: uid, action: 'beta-paid-120', createdAt: ago(120) },
+    ]);
+    await db.insert(agentEvents).values([
+      { runId: freeRun, type: 'beta-event-120', createdAt: ago(120) },
+      { runId: freeRun, type: 'beta-event-30', createdAt: ago(30) },
+    ]);
+
+    await runCleanupOnce(
+      db,
+      loadEnv({
+        nodeEnv: 'test',
+        databaseUrl: undefined,
+        hosted: true,
+        betaUnmetered: true,
+        activityRetentionDays: 180,
+      }),
+    );
+
+    const actions = (
+      await db
+        .select({ action: activity.action })
+        .from(activity)
+        .where(inArray(activity.teamId, [freeId, paidId]))
+    ).map((r) => r.action);
+    expect(actions, 'the beta keeps free\'s 90 days').toContain('beta-free-30');
+    expect(actions, 'and sweeps past them exactly as it would without the flag').not.toContain('beta-free-120');
+    expect(actions, 'a workspace an operator moved to a paid plan keeps everything').toContain('beta-paid-120');
+    const events = (
+      await db.select({ type: agentEvents.type }).from(agentEvents).where(eq(agentEvents.runId, freeRun))
+    ).map((r) => r.type);
+    expect(events, 'the run trail follows the same rule').toContain('beta-event-30');
+    expect(events).not.toContain('beta-event-120');
+  });
+
+  it('gives the sweep and the pages one answer for how long history lasts', () => {
+    const base = { nodeEnv: 'test', databaseUrl: undefined, activityRetentionDays: 180 } as const;
+    const selfHost = loadEnv({ ...base, hosted: false });
+    const hosted = loadEnv({ ...base, hosted: true });
+    const beta = loadEnv({ ...base, hosted: true, betaUnmetered: true });
+    const noAgePurge = { hosted: false, activityRetentionDays: 0 };
+
+    // Self-host: the environment's number whatever the column says; 0 purges nothing by age.
+    expect(historyRetentionDays(selfHost, 'free')).toBe(180);
+    expect(historyRetentionDays(selfHost, 'team')).toBe(180);
+    expect(historyRetentionDays(noAgePurge, 'free')).toBeNull();
+    // Hosted: the plan, and the environment's number does not enter into it.
+    expect(historyRetentionDays(hosted, 'free')).toBe(90);
+    expect(historyRetentionDays(hosted, 'solo')).toBe(365);
+    expect(historyRetentionDays(hosted, 'team')).toBeNull();
+    expect(historyRetentionDays(hosted, 'enterprise')).toBeNull();
+    // An id nobody recognises is swept as free, so no page may promise it more.
+    expect(historyRetentionDays(hosted, 'pro')).toBe(90);
+    expect(historyRetentionDays(hosted, null)).toBe(90);
+    // The beta answers exactly as hosted does, plan by plan.
+    for (const plan of ['free', 'solo', 'team', 'enterprise', 'pro']) {
+      expect(historyRetentionDays(beta, plan), plan).toBe(historyRetentionDays(hosted, plan));
+    }
+
+    // What the Activity page and a person's trail print. The environment's 180
+    // used to be printed on the hosted service, where it governs neither table.
+    expect(historyRetentionNote(beta, 'free')).toBe('purged after 90 days');
+    expect(historyRetentionNote(hosted, 'team')).toBe('not purged by age');
+    expect(historyRetentionNote(selfHost, 'free')).toBe('purged after 180 days');
+    // Not "purged after 0 days", which is what an unset age purge used to read as.
+    expect(historyRetentionNote(noAgePurge, 'free')).toBe('not purged by age');
   });
 
   it('leaves the feed alone when the age purge is disabled, but still applies the cap', async () => {

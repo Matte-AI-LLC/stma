@@ -1,10 +1,12 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { eq } from 'drizzle-orm';
+import { and, eq } from 'drizzle-orm';
 import { afterAll, beforeAll, expect, it } from 'vitest';
-import { teams } from '../src/db/schema';
+import { projects, snapshots, teams } from '../src/db/schema';
 import { loadEnv } from '../src/env';
+import { DAY_MS } from '../src/lib/counters';
+import { DEVICE_WINDOW_DAYS, deviceAllowance, insertFromNewDevice } from '../src/lib/devices';
 import { effectivePlanLabel, PLANS, planLimits } from '../src/lib/entitlements';
 import { startServer, type StartedServer } from '../src/server';
 
@@ -157,6 +159,98 @@ it('gives the free plan three handoffs and then says the work is not lost', asyn
   // The point of the taster is the moment the work survives a limit. A refusal
   // that reads like the work was dropped teaches the opposite lesson.
   expect(fourth.text).toContain('the work is not lost');
+});
+
+/** The least a snapshot can be: these tests are about the device it came from. */
+const SNAPSHOT = { os: { platform: 'linux', arch: 'x64' } };
+
+const pushFrom = (srv: StartedServer, tok: string, team: string, device: string, repo?: string) =>
+  call(srv, 'push_snapshot', { team, device, snapshot: SNAPSHOT, ...(repo ? { repo } : {}) }, tok);
+
+it('keeps a free member to two devices, counted over the last thirty days', async () => {
+  expect((await pushFrom(hostedSrv, freeToken, 'thrifty', 'macbook')).isError).toBe(false);
+  expect((await pushFrom(hostedSrv, freeToken, 'thrifty', 'win-desktop')).isError).toBe(false);
+
+  // A third machine, pushing for a repository nobody has named yet. Refused
+  // before the project is resolved, because resolving creates one: a refused
+  // snapshot must not spend a project the person got nothing for.
+  const third = await pushFrom(hostedSrv, freeToken, 'thrifty', 'win-laptop', 'label-printer');
+  expect(third.isError).toBe(true);
+  expect(third.text).toContain('Device limit reached');
+  expect(third.text).toContain('2 devices per member');
+  // Both ways out depend on which devices count, so the refusal names them —
+  // and choosing between them is a person's call, the same as any plan limit.
+  expect(third.text).toContain('macbook');
+  expect(third.text).toContain('win-desktop');
+  expect(third.text).toContain('solo plan');
+  expect(third.text).toContain('your human');
+
+  const thrifty = (await hostedSrv.db.select().from(teams).where(eq(teams.slug, 'thrifty')))[0]!;
+  const stored = await hostedSrv.db
+    .select({ device: snapshots.deviceLabel })
+    .from(snapshots)
+    .where(eq(snapshots.teamId, thrifty.id));
+  expect(stored.map((s) => s.device)).not.toContain('win-laptop');
+  const made = await hostedSrv.db
+    .select()
+    .from(projects)
+    .where(and(eq(projects.teamId, thrifty.id), eq(projects.name, 'label-printer')));
+  expect(made).toHaveLength(0);
+
+  // A device already counted keeps pushing: it cannot change the count.
+  expect((await pushFrom(hostedSrv, freeToken, 'thrifty', 'macbook')).isError).toBe(false);
+
+  // And a device stops counting a window after its last snapshot, which is how
+  // a replaced laptop gives its slot back without anybody pressing anything.
+  await hostedSrv.db
+    .update(snapshots)
+    .set({ createdAt: new Date(Date.now() - (DEVICE_WINDOW_DAYS + 1) * DAY_MS) })
+    .where(and(eq(snapshots.teamId, thrifty.id), eq(snapshots.deviceLabel, 'win-desktop')));
+  const later = await pushFrom(hostedSrv, freeToken, 'thrifty', 'win-laptop');
+  expect(later.isError, later.text).toBe(false);
+});
+
+it('counts a new device again before storing it, so the last slot is not given twice', async () => {
+  // Two new machines that both ask before either writes are both told there is
+  // room. The interleaving is written out here rather than raced over HTTP,
+  // because two requests against one embedded database never overlapped in
+  // practice: a race test passed with the second count removed.
+  const racer = await tenant(hostedSrv, 'racer', 'Racer');
+  expect((await pushFrom(hostedSrv, racer, 'racer', 'first')).isError).toBe(false);
+  const team = (await hostedSrv.db.select().from(teams).where(eq(teams.slug, 'racer')))[0]!;
+  const [{ userId }] = await hostedSrv.db
+    .select({ userId: snapshots.userId })
+    .from(snapshots)
+    .where(eq(snapshots.teamId, team.id))
+    .limit(1);
+  const cap = PLANS.free.maxDevicesPerMember;
+  const row = (deviceLabel: string) => ({ teamId: team.id, userId, deviceLabel, data: SNAPSHOT });
+
+  expect(await deviceAllowance(hostedSrv.db, team, userId, 'second', cap)).toEqual({
+    ok: true,
+    counted: false,
+  });
+  expect(await deviceAllowance(hostedSrv.db, team, userId, 'third', cap)).toEqual({
+    ok: true,
+    counted: false,
+  });
+  expect(await insertFromNewDevice(hostedSrv.db, team, cap, row('second'))).toEqual({ ok: true });
+  const late = await insertFromNewDevice(hostedSrv.db, team, cap, row('third'));
+  expect('error' in late ? late.error : '').toContain('Device limit reached');
+  const devices = await hostedSrv.db
+    .select({ device: snapshots.deviceLabel })
+    .from(snapshots)
+    .where(eq(snapshots.teamId, team.id));
+  expect(new Set(devices.map((d) => d.device))).toEqual(new Set(['first', 'second']));
+});
+
+it('never counts devices for a paid team or a self-hosted instance', async () => {
+  for (const device of ['one', 'two', 'three', 'four']) {
+    const paid = await pushFrom(hostedSrv, paidToken, 'flush', device);
+    expect(paid.isError, `paid ${device}: ${paid.text}`).toBe(false);
+    const own = await pushFrom(ownSrv, ownToken, 'homelab', device);
+    expect(own.isError, `self-host ${device}: ${own.text}`).toBe(false);
+  }
 });
 
 it('lets a paid team do all of it', async () => {

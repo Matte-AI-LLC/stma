@@ -3,6 +3,7 @@ import { and, count, eq, gt, isNull, lt, or, sql } from 'drizzle-orm';
 import type { Db } from '../db';
 import { invites, memberships, teams, users } from '../db/schema';
 import { effectiveLimits } from '../lib/entitlements';
+import { appendMembershipChange } from '../lib/memberships';
 import { criticalAudit } from '../lib/securityHooks';
 
 type InviteClaimFailure =
@@ -94,14 +95,21 @@ export async function claimInviteMembership(
       // Terminal onboarding creates the user inside this transaction. A lost
       // max-use/member-limit race therefore cannot expose or leave an account
       // that never joined a team.
-      const userId = 'userId' in input
-        ? input.userId
+      const joining = 'userId' in input
+        ? (
+            await tx
+              .select({ id: users.id, username: users.username })
+              .from(users)
+              .where(eq(users.id, input.userId))
+              .limit(1)
+          )[0] ?? { id: input.userId, username: null }
         : (
             await tx
               .insert(users)
               .values(input.newUser)
-              .returning({ id: users.id })
-          )[0]!.id;
+              .returning({ id: users.id, username: users.username })
+          )[0]!;
+      const userId = joining.id;
 
       const inserted = await tx
         .insert(memberships)
@@ -130,6 +138,28 @@ export async function claimInviteMembership(
         .returning({ id: invites.id });
       if (!consumed[0]) throw new InviteClaimExpired();
       await criticalAudit(tx as unknown as Db, { teamId: row.team.id, actorId: userId, action: 'membership_joined', subjectId: row.invite.id });
+      // On the transaction, beside `criticalAudit`, because this whole claim is
+      // one atomic act and a row saying somebody joined a workspace they did
+      // not is worse than no row. The actor is the joiner: an invite is the one
+      // door where nobody on the other side pressed anything at this moment.
+      await appendMembershipChange(tx as unknown as Db, {
+        teamId: row.team.id,
+        teamSlug: row.team.slug,
+        action: 'added',
+        subjectId: userId,
+        subjectLabel: joining.username,
+        previousRole: null,
+        nextRole: row.invite.role,
+        source: 'invite',
+        route: 'invite redeemed',
+        actorId: userId,
+        actorLabel: joining.username,
+        // Never any part of the code: it is the credential, an invite with uses
+        // left is still live after this row is written, and half of one is a
+        // real reduction of the guessing space. Which invite it was is already
+        // the `criticalAudit` row's subject.
+        detail: 'joined by invitation',
+      });
 
       return {
         ok: true,

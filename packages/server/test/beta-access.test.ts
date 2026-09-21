@@ -1,8 +1,11 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { eq } from 'drizzle-orm';
 import { afterAll, beforeAll, expect, it } from 'vitest';
+import { teams, users } from '../src/db/schema';
 import { loadEnv } from '../src/env';
+import { MONTH_MS, hitCounter } from '../src/lib/counters';
 import { startServer, type StartedServer } from '../src/server';
 
 /**
@@ -22,6 +25,15 @@ let beta: StartedServer;
 let betaDir: string;
 
 const CODE = 'stma-beta-cohort-one';
+/**
+ * A configured code the operator gave no `:label` to.
+ *
+ * The corner the storage has to keep separate: it is not a cohort, and it is
+ * also not "arrived before the beta". Both would otherwise be null.
+ */
+const UNLABELLED = 'stma-beta-no-label';
+/** The operator reading the console — an address, so the file needs no dev login. */
+const ADMIN = 'ada@example.dev';
 
 const form = (url: string, body: Record<string, string>, headers: Record<string, string> = {}) =>
   fetch(url, {
@@ -53,8 +65,11 @@ beforeAll(async () => {
       hosted: true,
       betaUnmetered: true,
       publicMode: 'teaser',
-      signupAccessCodes: [{ code: CODE, label: 'cohort-one' }],
+      signupAccessCodes: [{ code: CODE, label: 'cohort-one' }, { code: UNLABELLED }],
       demoLogins: [{ email: 'shown@example.dev', password: 'hunter2' }],
+      // The beta ledger is an operator page, so the fixture needs an operator.
+      // An address rather than a username because this server has no dev login.
+      adminEmails: [ADMIN],
     }),
   );
 });
@@ -83,11 +98,46 @@ it('refuses signup without the access code and accepts it with', async () => {
 
   const right = await form(`${beta.url}/auth/local/signup`, {
     access_code: CODE,
-    email: 'ada@example.dev',
+    email: ADMIN,
     password: 'correct horse battery',
   });
   expect(right.status).toBe(302);
   expect(right.headers.get('location')).not.toContain('error');
+});
+
+/**
+ * The cohort has to outlive the log line.
+ *
+ * It used to reach one `logLine` at signup and nowhere else, and that log is
+ * swept at thirty days — so a beta that runs longer than a month could not say
+ * which wave a workspace came from. The column is the fix, and the three states
+ * it can hold are the whole point: a named cohort, a code the operator named
+ * nothing for, and no code at all. Two of those would collapse into null if the
+ * door only recorded a label.
+ */
+it('stores the cohort an account arrived through, and never the code', async () => {
+  const cohortOf = async (email: string) =>
+    (await beta.db.select().from(users).where(eq(users.email, email)).limit(1))[0]?.signupCohort;
+
+  expect(await cohortOf(ADMIN)).toBe('cohort-one');
+
+  const unlabelled = await form(`${beta.url}/auth/local/signup`, {
+    access_code: UNLABELLED,
+    email: 'bo@example.dev',
+    password: 'correct horse battery',
+  });
+  expect(unlabelled.status).toBe(302);
+  // Not null: this account came through the door. Not a label either, because
+  // the operator typed none and the console must not invent one.
+  expect(await cohortOf('bo@example.dev')).toBe('');
+
+  // The rule the whole access-code module is built around, asserted where it
+  // would now be easiest to break: a stored cohort must never be a stored code.
+  const stored = await beta.db.select({ cohort: users.signupCohort }).from(users);
+  for (const row of stored) {
+    expect(row.cohort).not.toBe(CODE);
+    expect(row.cohort).not.toBe(UNLABELLED);
+  }
 });
 
 it('checks the code before the address, so the door cannot confirm an account', async () => {
@@ -110,22 +160,59 @@ it('never prints example accounts on a hosted sign-in page', async () => {
   expect(page).not.toContain('Demo accounts');
 });
 
-it('gives a beta workspace every feature and no ceiling', async () => {
+/** A cookie jar and the sign-in that fills it — two tests need the same one. */
+async function signIn(email: string) {
   const jar = new Map<string, string>();
-  const store = (res: Response) => {
-    for (const line of res.headers.getSetCookie()) {
-      const [kv] = line.split(';');
-      const i = kv!.indexOf('=');
-      jar.set(kv!.slice(0, i), kv!.slice(i + 1));
-    }
-  };
-  const header = () => ({ cookie: [...jar].map(([k, v]) => `${k}=${v}`).join('; ') });
-  store(
-    await form(`${beta.url}/auth/local/login`, {
-      email: 'ada@example.dev',
-      password: 'correct horse battery',
+  const res = await form(`${beta.url}/auth/local/login`, {
+    email,
+    password: 'correct horse battery',
+  });
+  for (const line of res.headers.getSetCookie()) {
+    const [kv] = line.split(';');
+    const i = kv!.indexOf('=');
+    jar.set(kv!.slice(0, i), kv!.slice(i + 1));
+  }
+  return { header: () => ({ cookie: [...jar].map(([k, v]) => `${k}=${v}`).join('; ') }) };
+}
+
+/** A personal token for a signed-in account: what its agent would carry. */
+async function tokenFor(header: () => Record<string, string>) {
+  const res = await form(`${beta.url}/app/tokens`, { name: 'beta-machine' }, header());
+  const token = /stma_[0-9a-f]{40}/.exec(await res.text())?.[0] ?? '';
+  expect(token, 'a token from /app/tokens').toBeTruthy();
+  return token;
+}
+
+async function pushSnapshot(token: string, team: string, device: string) {
+  const res = await fetch(`${beta.url}/mcp`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      accept: 'application/json, text/event-stream',
+      authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'tools/call',
+      params: {
+        name: 'push_snapshot',
+        arguments: { team, device, snapshot: { os: { platform: 'linux', arch: 'x64' } } },
+      },
     }),
-  );
+  });
+  const json = (await res.json()) as {
+    result?: { content?: { text: string }[]; isError?: boolean };
+    error?: { message?: string };
+  };
+  return {
+    isError: json.result?.isError === true || json.error !== undefined,
+    text: json.result?.content?.[0]?.text ?? json.error?.message ?? '',
+  };
+}
+
+it('gives a beta workspace every feature and no ceiling that refuses work', async () => {
+  const { header } = await signIn(ADMIN);
   await form(`${beta.url}/app/teams`, { name: 'Northwind' }, header());
 
   // Governance is the plan gate a free hosted workspace would meet first.
@@ -140,6 +227,102 @@ it('gives a beta workspace every feature and no ceiling', async () => {
   ).text();
   expect(label).toContain('plan Private beta');
   expect(label).not.toContain('plan free');
+});
+
+/**
+ * The one ceiling the beta keeps (decided 2026-09-21), said where somebody reads
+ * their history. Both pages printed the environment's retention, 180 unless set,
+ * which the hosted service does not apply to these tables at all.
+ */
+it('tells a beta workspace how long its history lasts, in the number the sweep uses', async () => {
+  const { header } = await signIn(ADMIN);
+  for (const path of ['/app/teams/northwind/activity', '/app/teams/northwind/people/ada']) {
+    const res = await fetch(`${beta.url}${path}`, { headers: header() });
+    expect(res.status, path).toBe(200);
+    const html = await res.text();
+    expect(html, path).toContain('purged after 90 days');
+    expect(html, path).not.toContain('purged after 180 days');
+  }
+});
+
+/**
+ * The operator console's answer to "who did we give how much beta to".
+ *
+ * The distance, not the arrival: `/admin/usage` already draws signups. What
+ * this page owes is what unsetting `BETA_UNMETERED` costs each workspace, so
+ * the assertion that matters is a ceiling read from the limiter's own counter
+ * and reported as already past.
+ */
+it('answers, per workspace, the cohort and the distance to the plan it lands on', async () => {
+  const { header } = await signIn(ADMIN);
+  // The second wave, so the page has to render both a named cohort and the one
+  // the operator gave no name to. A workspace is what the ledger lists, so the
+  // unnamed account has to have made one.
+  const bo = await signIn('bo@example.dev');
+  await form(`${beta.url}/app/teams`, { name: 'Contoso' }, bo.header());
+
+  const northwind = (
+    await beta.db.select().from(teams).where(eq(teams.slug, 'northwind')).limit(1)
+  )[0]!;
+
+  // Four handoffs against a free ceiling of three, spent through the same
+  // function `handoffAllowance` spends them through. Writing the row directly
+  // would prove the page can read a table; this proves it reads the meter.
+  for (let i = 0; i < 4; i += 1) {
+    await hitCounter(beta.db, 'handoff-month', northwind.id, MONTH_MS, 3);
+  }
+
+  // Three machines of one member against a free ceiling of two, pushed through
+  // push_snapshot itself. The beta lifts the gate, so all three are stored —
+  // and the page counts them the way the gate will the day the flag is unset.
+  const token = await tokenFor(header);
+  for (const device of ['macbook', 'win-desktop', 'win-laptop']) {
+    const pushed = await pushSnapshot(token, 'northwind', device);
+    expect(pushed.isError, pushed.text).toBe(false);
+  }
+
+  const page = await fetch(`${beta.url}/admin/beta`, { headers: header() });
+  expect(page.status).toBe(200);
+  const html = await page.text();
+
+  // Which wave, and the wave that has no name — both spelled by describeCohort.
+  expect(html).toContain('cohort-one');
+  expect(html).toContain('Unnamed code');
+  // What it has used since, and which ceiling it is already past.
+  expect(html).toContain('handoffs 4 / 3');
+  // Every ceiling, not only the ones that broke: the summary line is what makes
+  // "what has this workspace used" answerable without hovering the chart. One
+  // member against a ceiling of one is every beta workspace's real position —
+  // an invite away from breaking — so it belongs on the page in words.
+  // Non-breaking inside a pair, so a narrow column wraps between ceilings and
+  // never inside one — `C 0 / 20,000` split across two lines reads as two
+  // numbers, which is how a summary line stops being read at all.
+  expect(html).toContain('H 4 / 3');
+  expect(html).toContain('M 1 / 1');
+  // Devices are enforced now, so they are a ceiling a workspace can be past.
+  expect(html).toContain('devices 3 / 2');
+  expect(html).toContain('D 3 / 2');
+  expect(html).toContain('devices per member, last 30 days');
+  expect(html).toContain('data-card="beta-distance"');
+  expect(html).toContain('data-table="beta-workspaces"');
+  expect(html).toContain('data-metric="beta-over"');
+  // Retention is deliberately not in the table, and the page says why rather
+  // than leaving an operator to notice the gap on the flip day.
+  // Retention is absent from the ledger because the beta does not lift it, and
+  // since operator grants it follows the plan in force: free's 90 days, or the gift's.
+  expect(html).toContain('the sweep already keeps each workspace');
+  expect(html).not.toContain('nothing in the server enforces it');
+  // The code itself never reaches an operator page either.
+  expect(html).not.toContain(CODE);
+  expect(html).not.toContain(UNLABELLED);
+});
+
+it('keeps the beta ledger undisclosed to everybody but an operator', async () => {
+  // bo@example.dev is a real beta account and not on the admin list: a plain
+  // 404, never a 403, so the area's existence is not disclosed.
+  const { header } = await signIn('bo@example.dev');
+  expect((await fetch(`${beta.url}/admin/beta`, { headers: header() })).status).toBe(404);
+  expect((await fetch(`${beta.url}/admin/beta`)).status).toBe(404);
 });
 
 it('does not sell anything while the beta runs', async () => {
@@ -165,6 +348,19 @@ it('leaves an unconfigured instance exactly as it was', async () => {
     });
     expect(created.status).toBe(302);
     expect(created.headers.get('location')).not.toContain('error');
+    // Null, not the empty marker: nobody was asked for a code here. An instance
+    // somebody runs themselves is not in anybody's cohort, and the operator
+    // page has to be able to tell that from a code with no name on it.
+    const row = (
+      await plain.db
+        .select({ cohort: users.signupCohort })
+        .from(users)
+        .where(eq(users.email, 'homelab@example.dev'))
+        .limit(1)
+    )[0];
+    expect(row?.cohort).toBeNull();
+    // And /admin does not exist at all without an operator list.
+    expect((await fetch(`${plain.url}/admin/beta`)).status).toBe(404);
   } finally {
     await plain.close();
     rmSync(dir, { recursive: true, force: true });

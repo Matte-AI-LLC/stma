@@ -5,6 +5,8 @@ import type { Db } from '../db';
 import { activity, memberships, projects, teams, tokens, users } from '../db/schema';
 import { loginRedirect } from '../auth/session';
 import { projectForTeam } from '../domain/access';
+import { historyRetentionNote } from '../lib/cleanup';
+import { grantedOrOwnPlan } from '../lib/planGrants';
 import { timeAgo } from '../lib/format';
 import { pageWindow, slicePage } from '../lib/pagination';
 import { projectInPath, scopedProjectParam, sectionHref } from '../lib/scope';
@@ -147,6 +149,8 @@ const activityPage = async (c: Context<AppEnv>) => {
   const found = await teamForMember(db, c.req.param('slug') ?? '', user.id);
   if (!found) return c.notFound();
   const { team } = found;
+  // The rule the sweep applies, which follows an operator's grant while it lasts.
+  const retentionPlan = await grantedOrOwnPlan(db, team);
 
   const win = pageWindow(c.req.query('page'), PAGE_SIZE);
   const filters = filtersFrom((name) => c.req.query(name));
@@ -241,7 +245,7 @@ const activityPage = async (c: Context<AppEnv>) => {
         />
       }
       keys={[{ k: 'E', label: 'export csv' }]}
-      keysNote={`events are immutable · purged after ${c.get('env').activityRetentionDays} days`}
+      keysNote={`events are immutable · ${historyRetentionNote(c.get('env'), retentionPlan)}`}
     >
       {/* Auto-refresh only on page 1: reloading page 4 under a reader would slide
           the window as new events arrive at the top. */}

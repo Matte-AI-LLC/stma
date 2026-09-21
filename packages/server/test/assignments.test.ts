@@ -750,7 +750,7 @@ it('offers a connected tracker’s open tickets, and only fetches when asked', a
   // Jira is connected here and is deliberately not offered; the page says so
   // rather than leaving a missing button to be wondered about.
   expect(plain).not.toContain('Browse Jira');
-  expect(plain).toContain('Picking is not available for Jira yet');
+  expect(plain).toContain('Jira cannot be browsed or searched here yet');
   // Nothing is listed until somebody clicks, and the dialog stays closed.
   expect(plain).not.toContain('class="tickets"');
   expect(plain).not.toContain('data-auto-open');
@@ -813,7 +813,7 @@ it('offers a connected tracker’s open tickets, and only fetches when asked', a
   const jiraPick = await read('?pick=jira');
   expect(jiraOutbox.all().length).toBe(jiraCalls);
   expect(jiraPick).not.toContain('class="tickets"');
-  expect(jiraPick).toContain('Picking is not available for Jira yet');
+  expect(jiraPick).toContain('Jira cannot be browsed or searched here yet');
 
   // ---- ClickUp, whose reference is the native id rather than the custom one.
   // Both id spaces are readable now (`isClickupCustomTaskId` picks the query),
@@ -857,6 +857,216 @@ it('offers a connected tracker’s open tickets, and only fetches when asked', a
   expect(back).toContain('value="parcel/desk#207"');
   // And the reason is inside the dialog, because the modal covers the band.
   expect(back).toContain('banner banner-error');
+  githubOutbox.clear();
+});
+
+// ------------------------------------------------------- typing, not scrolling
+
+/**
+ * Finding the ticket by typing a few words.
+ *
+ * Browsing closed the common case — the ticket the lead wants is one of the few
+ * that are open — and left the other one wide open: bounded to twenty rows, a
+ * workspace with two hundred open tickets shows exactly the twenty nobody is
+ * looking for. Search is the rest of it, and it is the same link-shaped
+ * selection as everything else here (`?pick=<tracker>&q=<words>`), reached by a
+ * GET form of its own inside the dialog. Its controls sit beside the list
+ * through the `form` attribute rather than inside that form, because assigning
+ * is a POST, forms do not nest, and a submit button borrowing the assignment
+ * form would carry a `maxlength=8000` brief through Node's 16 KiB header cap.
+ *
+ * **The two trackers reach different distances and the page says which.**
+ * GitHub has a search endpoint, so GitHub searches the whole repository.
+ * ClickUp's v2 API has no text parameter for tasks anywhere, so STMA reads a
+ * bounded window of the mapped List and matches it in its own process — a real
+ * limit, said in words rather than left for somebody whose ticket is the three
+ * hundred and first. Jira is neither: nothing here has ever called
+ * `/rest/api/3/search/jql` against a real site, so it is named on the page with
+ * the reason instead of being guessed at on a lead's critical path.
+ */
+it('searches a connected tracker, and says how far the search reached', async () => {
+  const projectUrl = `${srv.url}/app/teams/parcel-desk/projects/parcel-desk-api`;
+  const read = async (query = '') =>
+    (await fetch(`${projectUrl}${query}`, { headers: leadCookie })).text();
+  /** What the transport was last asked, decoded the way the provider reads it. */
+  const lastGithub = () => decodeURIComponent(githubOutbox.all().at(-1)?.path ?? '');
+
+  githubOutbox.clear();
+  githubOutbox.seedIssues([
+    {
+      number: 301,
+      title: 'Label printer queue jams under load',
+      url: 'https://github.com/parcel/desk/issues/301',
+      labels: ['bug'],
+      updatedAt: '2026-09-19T10:00:00.000Z',
+    },
+    {
+      number: 302,
+      title: 'Second label printer for the night shift',
+      url: 'https://github.com/parcel/desk/issues/302',
+      labels: [],
+      updatedAt: '2026-09-19T09:00:00.000Z',
+    },
+    {
+      number: 303,
+      title: 'Courier handover receipts are unreadable',
+      url: 'https://github.com/parcel/desk/issues/303',
+      labels: [],
+      updatedAt: '2026-09-19T08:00:00.000Z',
+    },
+  ]);
+
+  // The box is on the page before anything is typed, and drawing it asks no
+  // tracker anything: the page reads the connections and fetches on the search.
+  const quiet = githubOutbox.all().length;
+  const plain = await read();
+  expect(githubOutbox.all().length, 'the plain page asks GitHub nothing').toBe(quiet);
+  expect(plain).toContain('id="ticket-search"');
+  expect(plain).toContain('form="ticket-search"');
+  expect(plain).toContain('Search tickets');
+  // Two pickable trackers here, so the box has to say which one it asks.
+  expect(plain).toContain('aria-label="Tracker to search"');
+
+  // Typing is one request, and it is GitHub's own search rather than a page of
+  // the newest issues filtered afterwards: that is what reaches past the bound.
+  const hits = await read('?pick=github&q=label+printer');
+  expect(githubOutbox.all().length, 'a search is one request').toBe(quiet + 1);
+  expect(lastGithub()).toContain('/search/issues');
+  // The qualifiers are STMA's and cannot be typed over: this repository, issues
+  // (an agent handed a pull request tries to "implement" a review), open only.
+  expect(lastGithub()).toContain('q=repo:parcel/desk is:issue is:open label printer');
+  expect(hits).toContain('Label printer queue jams under load');
+  expect(hits).toContain('Second label printer for the night shift');
+  expect(hits).not.toContain('Courier handover receipts');
+  // What was searched, said where the list ends. GitHub looked at everything.
+  expect(hits).toContain('GitHub searched every open issue in parcel/desk');
+  // And the box keeps the words, so a refresh or the back button lands on the
+  // same list rather than on an empty search.
+  expect(hits).toContain('value="label printer"');
+
+  // A search box, not a query language. GitHub reads `:` as a qualifier
+  // separator and a leading `-` as NOT, so a lead typing either would get a 422
+  // or a silently different search; the punctuation is dropped here instead.
+  await read('?pick=github&q=printer%3A');
+  expect(lastGithub()).toContain('q=repo:parcel/desk is:issue is:open printer&');
+  await read('?pick=github&q=-queue%20printer');
+  expect(lastGithub()).toContain('q=repo:parcel/desk is:issue is:open queue printer&');
+
+  // Choosing a result is a link like every other selection here, and it carries
+  // the search: picking one used to be the moment you lost the list.
+  const chosen = await read('?pick=github&q=label+printer&ticket=parcel%2Fdesk%23302');
+  expect(chosen).toContain('value="parcel/desk#302"');
+  expect(chosen).toContain('aria-current="true"');
+  expect(chosen).toContain('q=label%20printer');
+
+  // And that reference is the one a paste produces, through the same reader:
+  // there is no second way to build an assignment from a picked ticket.
+  const created = await form(
+    `${srv.url}/app/teams/parcel-desk/projects/parcel-desk-api/assign`,
+    { agent: bobsCodexBInstallation, ticket: 'parcel/desk#302', task: '', brief: '', steps: '', branch: '' },
+    leadCookie,
+  );
+  const session = /assigned=([0-9a-f-]{36})/.exec(created.headers.get('location') ?? '')?.[1];
+  const thread = await (await fetch(`${srv.url}/app/sessions/${session}`, { headers: leadCookie })).text();
+  expect(thread).toContain('Second label printer for the night shift');
+  expect(thread).toContain('parcel/desk#302');
+
+  // Nothing matched is a different answer from nothing open, and a person acts
+  // differently on each: try other words, versus there is no work here.
+  const none = await read('?pick=github&q=forklift');
+  expect(none).toContain('matches');
+  expect(none).toContain('Try fewer words');
+  expect(none).not.toContain('class="tickets"');
+  expect(none).not.toContain('right now. Paste a reference above');
+
+  // A tracker that refuses is named where its rows would have been — an empty
+  // list with no explanation reads as "nothing matched".
+  githubOutbox.seedAuthFailure(true);
+  const broken = await read('?pick=github&q=label');
+  expect(broken).toContain('Could not search open issues in parcel/desk');
+  expect(broken).toContain('bad_token');
+  expect(broken).not.toContain('class="tickets"');
+  githubOutbox.seedAuthFailure(false);
+
+  // Jira cannot be searched even by an address naming it: nothing here has
+  // measured that endpoint, so no call is made and the page says why.
+  const jiraCalls = jiraOutbox.all().length;
+  const jiraSearch = await read('?pick=jira&q=label');
+  expect(jiraOutbox.all().length, 'no Jira call is invented').toBe(jiraCalls);
+  expect(jiraSearch).not.toContain('class="tickets"');
+  expect(jiraSearch).toContain('Jira cannot be browsed or searched here yet');
+
+  // ---- ClickUp, which has no task search at all, so STMA reads and matches.
+  // A hundred and fifty tasks: the one being looked for is past ClickUp's fixed
+  // hundred-row page, which is the whole reason this pages rather than reading
+  // the first page and calling it the list.
+  const tasks = Array.from({ length: 150 }, (_, i) => ({
+    id: `cu-bulk-${i}`,
+    customId: `PD-${500 + i}`,
+    name: i === 120 ? 'Reprint the courier manifest' : `Routine sweep ${i}`,
+    url: `https://app.clickup.com/t/cu-bulk-${i}`,
+    status: 'open',
+    updatedAt: '2026-09-19T10:00:00.000Z',
+  }));
+  clickupOutbox.clear();
+  clickupOutbox.seed({ tasks, taskListId: '2200' });
+
+  const cuBefore = clickupOutbox.all().length;
+  const cuHits = await read('?pick=clickup&q=courier+manifest');
+  const cuPaths = clickupOutbox.all().slice(cuBefore).map((call) => call.path);
+  // Two pages, then it stops: ClickUp said `last_page` on the second. A loop
+  // that always made three calls would spend a request nobody asked for.
+  expect(cuPaths.length, 'it pages, and stops where ClickUp says the list ends').toBe(2);
+  expect(cuPaths[0]).toContain('page=0');
+  expect(cuPaths[1]).toContain('page=1');
+  expect(cuHits).toContain('Reprint the courier manifest');
+  expect(cuHits).not.toContain('Routine sweep 0<');
+  // The reference is the native id, as a browse or a paste produces.
+  expect(cuHits).toContain('clickup%3Acu-bulk-120');
+  // ...and the key beside it is what the people in that workspace say out loud.
+  expect(cuHits).toContain('PD-620');
+  // The bound is ClickUp's limitation named, not a number left to be inferred.
+  expect(cuHits).toContain('API cannot search tasks');
+  expect(cuHits).toContain('300 most recently updated open tasks in Engineering');
+
+  // The key is searchable too: it is what somebody half-remembers.
+  const byKey = await read('?pick=clickup&q=PD-620');
+  expect(byKey).toContain('Reprint the courier manifest');
+
+  // Bounded at the rows drawn, however many match: a hundred and forty-nine do
+  // here, and the twentieth is the last one on the page.
+  const many = await read('?pick=clickup&q=routine');
+  expect(many).toContain('Routine sweep 19<');
+  expect(many).not.toContain('Routine sweep 20<');
+
+  // Browse is still the other question, and it clears the search rather than
+  // filtering what it shows.
+  const browse = await read('?pick=clickup');
+  expect(browse).toContain('most recently updated open tasks in Engineering');
+  expect(browse).not.toContain('API cannot search tasks');
+
+  clickupOutbox.seedFailure('authorization_failed');
+  const cuBroken = await read('?pick=clickup&q=courier');
+  expect(cuBroken).toContain('Could not search Engineering in ClickUp');
+  expect(cuBroken).toContain('authorization_failed');
+  expect(cuBroken).not.toContain('class="tickets"');
+  clickupOutbox.seedFailure(null);
+
+  // Put the fixture back the way the suite found it.
+  clickupOutbox.clear();
+  clickupOutbox.seed({
+    tasks: [
+      {
+        id: 'cu-parcel-7',
+        customId: 'PD-207',
+        name: 'Split the label printer queue',
+        url: 'https://app.clickup.com/t/cu-parcel-7',
+        status: 'in progress',
+        updatedAt: '2026-09-19T10:00:00.000Z',
+      },
+    ],
+    taskListId: '2200',
+  });
   githubOutbox.clear();
 });
 
@@ -1319,12 +1529,52 @@ it('files a stopped edit under the agent the lead knows, and keeps who reported 
   ).text();
   expect(activity).toContain('Codex B (via its adapter lead-codex-local)');
 
-  // Deliberately unchanged here: pairing moves no run authority. The hook tells
-  // the agent to reuse the adapter's run while the agent's own credential cannot
-  // update it — a contradiction that needs its own decision, not a side effect.
+  // The decision of 2026-09-21: the agent an adapter listens for may act on
+  // that adapter's run. The hook tells it to reuse this run_id, and until now
+  // the product refused the instruction the product had just given.
   const reused = await call('update_run', { run_id: adapterRun, status: 'active' }, codexB);
-  expect(reused.isError).toBe(true);
-  expect(reused.text).toContain(`cannot access run "${adapterRun}"`);
+  expect(reused.isError, reused.text).toBe(false);
+  const finishing = await call('update_run', { run_id: adapterRun, scope: [{ type: 'path', key: 'public/styles.css', access: 'write' }] }, codexB);
+  expect(finishing.isError, finishing.text).toBe(false);
+
+  // And nobody else. Another agent of the same owner, in the same workspace,
+  // that this adapter does not listen for is refused — and told the way out.
+  const sibling = await call('update_run', { run_id: adapterRun, status: 'active' }, codexA);
+  expect(sibling.isError).toBe(true);
+  expect(sibling.text).toContain(`cannot access run "${adapterRun}"`);
+  expect(sibling.text).toContain('ask your human to pair that adapter with this agent');
+  // Nor another person's agent in the same workspace: a pairing is one owner's.
+  const stranger = await call('finish_run', { run_id: adapterRun }, bobsCodexB);
+  expect(stranger.isError).toBe(true);
+  expect(stranger.text).toContain(`cannot access run "${adapterRun}"`);
+
+  // The tool that decides which run a call means reads the same pairing, or the
+  // guard would allow a run_id that handoff_work then calls "not one of yours".
+  const named = await call('handoff_work', { run_id: adapterRun, branch: 'lab/b2', summary: 'Not this time.', reason: 'other', team: 'parcel-desk', project: 'parcel-desk-web' }, codexB);
+  expect(named.isError).toBe(true);
+  expect(named.text).not.toContain('not one of your active runs');
+  // Refused for the reason it should be — no delivery checkpoint, and the run
+  // keeps its claims — not for whose run it is.
+  expect(named.text).toContain('A branch handoff requires an immutable delivery/tested checkpoint');
+
+  // An omitted run_id still stands only for a run this agent started itself:
+  // one Codex identity can be paired with an adapter in every checkout, so
+  // "your newest live run" would quietly mean another checkout's. It is told
+  // which run the hooks own rather than told to start one.
+  const guessed = await call('update_run', { status: 'active' }, codexB);
+  expect(guessed.isError).toBe(true);
+  expect(guessed.text).toContain(`hooks own a live run here — ${adapterRun}`);
+  expect(guessed.text).not.toContain('Call start_run first');
+
+  // One-way, which is the half worth proving: the adapter listens for Codex B
+  // and still cannot touch Codex B's own run. `companion_of` lives on the
+  // adapter and points at the agent, so there is no query that reads it back.
+  const own = await call('start_run', { request_id: randomUUID(), team: 'parcel-desk', project: 'parcel-desk-web', repository_identity: WEB_REPO, task: 'PD-13 Agent-owned' }, codexB);
+  expect(own.isError, own.text).toBe(false);
+  const reached = await api(`/api/agent/runs/${own.data.runId}/heartbeat`, { status: 'active' });
+  expect(reached.status).toBe(403);
+  expect((await reached.json()).error).toContain(`cannot access run "${own.data.runId}"`);
+  expect((await call('finish_run', { run_id: own.data.runId }, codexB)).isError).toBe(false);
 });
 
 it('pairs an already-installed adapter from Agent connections, under the same rules', async () => {
@@ -1346,6 +1596,14 @@ it('pairs an already-installed adapter from Agent connections, under the same ru
   const unpaired = await form(pairUrl(adapter.installationId), { companion: 'none' }, leadCookie);
   expect(location(unpaired)).toContain('is no longer paired');
   expect((await installation(adapter.installationId)).companionOf).toBeNull();
+  // The run edge is read per call against the current row, so unpairing takes
+  // it back at once — even from a run this agent was updating a moment ago.
+  const lost = await call('update_run', { run_id: adapterRun, status: 'active' }, codexB);
+  expect(lost.isError).toBe(true);
+  expect(lost.text).toContain(`cannot access run "${adapterRun}"`);
+  // And the run keeps every record it had: who reported it does not move.
+  expect((await srv.db.select().from(agentRuns).where(eq(agentRuns.id, adapterRun)))[0]!.installationId)
+    .toBe(adapter.installationId);
   // Still an adapter: unpairing does not put it back in the picker.
   const { data } = await call('list_teammates', { team: 'parcel-desk' }, codexA);
   expect(
@@ -1372,6 +1630,12 @@ it('pairs an already-installed adapter from Agent connections, under the same ru
     (await news(tok)).pendingHandoffs.filter((h) => h.kind === 'assignment').map((h) => h.title);
   expect(await assignments(strayAdapter.token)).toContain('Assignment: PD-15 Buttons');
   expect(await assignments(adapter.token)).toHaveLength(0);
+  // Codex B is paired again, with a different adapter — so it hears assignments
+  // here and still cannot touch the first adapter's run. The edge is that one
+  // pairing, never "an adapter of mine started it".
+  const elsewhere = await call('update_run', { run_id: adapterRun, status: 'active' }, codexB);
+  expect(elsewhere.isError).toBe(true);
+  expect(elsewhere.text).toContain(`cannot access run "${adapterRun}"`);
 
   // Same owner only, reachable only, adapters only — and never somebody else's adapter.
   const refused = async (id: string, companion: string, cookie = leadCookie) =>

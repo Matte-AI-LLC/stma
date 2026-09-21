@@ -15,6 +15,8 @@ import {
   workForPerson,
   type RosterEntry,
 } from '../domain/roster';
+import { historyRetentionNote } from '../lib/cleanup';
+import { grantedOrOwnPlan } from '../lib/planGrants';
 import { fmtDate, timeAgo } from '../lib/format';
 import { pageWindow, slicePage } from '../lib/pagination';
 import { ensureRail } from '../lib/rail';
@@ -470,6 +472,8 @@ rosterRoutes.get('/app/teams/:slug/people/:username', async (c) => {
     entries.map((entry) => entry.agent.installationId),
   );
   const win = pageWindow(c.req.query('page'), TRAIL_SHOWN);
+  // The rule the sweep applies, which follows an operator's grant while it lasts.
+  const retentionPlan = await grantedOrOwnPlan(db, team);
   const trail = slicePage(
     await readActivity(db, team.id, undefined, { ...noActivityFilters(), actor: person.username }, win),
     win,
@@ -764,7 +768,7 @@ rosterRoutes.get('/app/teams/:slug/people/:username', async (c) => {
           window={win}
           page={trail}
           noun="events"
-          note={`purged after ${c.get('env').activityRetentionDays} days`}
+          note={`· ${historyRetentionNote(c.get('env'), retentionPlan)}`}
         />
       </div>
     </AppLayout>,

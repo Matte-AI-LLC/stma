@@ -20,11 +20,10 @@ import {
   handoffs,
   launchAttempts,
   memberships,
-  rateCounters,
   snapshots,
   teams,
 } from '../db/schema';
-import { DAY_MS } from './counters';
+import { DAY_MS, readCounters } from './counters';
 
 /**
  * Are people actually using this, and where do they fall off?
@@ -195,17 +194,10 @@ export async function teamUsage(db: Db, limit = 20): Promise<TeamUsageRow[]> {
     .groupBy(memberships.teamId);
   const members = new Map(memberRows.map((m) => [m.teamId, m.n]));
 
-  const windowStart = Math.floor(Date.now() / DAY) * DAY;
-  const counterRows = await db
-    .select({ key: rateCounters.key, count: rateCounters.count })
-    .from(rateCounters)
-    .where(
-      inArray(
-        rateCounters.key,
-        ids.map((id) => `team-day:${id}:${windowStart}`),
-      ),
-    );
-  const calls = new Map(counterRows.map((r) => [r.key.split(':')[1]!, r.count]));
+  // The same key the limiter writes, built by the same function it builds it
+  // with — an operator and a capped team must never read different numbers, and
+  // a second spelling of the key would report a confident zero instead.
+  const calls = await readCounters(db, 'team-day', ids, DAY_MS);
 
   return agg.flatMap((row) => {
     const team = byId.get(row.teamId);

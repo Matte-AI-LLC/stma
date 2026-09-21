@@ -417,6 +417,17 @@ it('executes the shipped native runtime in two isolated checkouts, blocks a real
       child.once('error', reject); child.once('close', (code) => resolve({ stdout, stderr, code }));
       child.stdin.end(JSON.stringify(payload ?? {}));
     });
+    // A lead's assignment is already waiting when the first sentence is typed in
+    // a fresh checkout — the ordinary case, since dispatching work is what makes
+    // somebody go and type. That first prompt is also the one whose hook has to
+    // create the run, file its receipt and run its preflight first, and the news
+    // check used to be skipped whenever that work had already spent most of the
+    // hook's budget. Measured across both agent-lab rounds of 2026-09-20: not
+    // one of eight first prompts asked, so the assignment reached each agent on
+    // its next tool call instead, inside a tool result, where two of the four
+    // correctly refused to act on work that had not come from their human.
+    const waitingWork = await tool(clients[1]!, 'assign_work', { to_agent: clients[0]!.name, task: 'TOPO-8 Heard on the first prompt', brief: 'Nothing to do; this proves when the hook speaks.' });
+    expect(waitingWork.error, JSON.stringify(waitingWork.data)).toBe(false);
     for (let i = 0; i < 2; i++) {
       dirs.push(mkdtempSync(path.join(root, `checkout-${i}-`)));
       const git = (...args: string[]) => execFileSync('git', args, { cwd: dirs[i], stdio: 'pipe' });
@@ -430,6 +441,7 @@ it('executes the shipped native runtime in two isolated checkouts, blocks a real
       const started = await run(i, ['adapter', 'hook', '--event', 'start', '--profile', 'native'], { session_id: `session-${i}`, hook_event_name: 'UserPromptSubmit', prompt: 'SECRET-NOT-COLLECTED' });
       expect(started.code).toBe(0); expect(started.stdout).toContain('native tracking owns run');
       expect(started.stdout).not.toContain('SECRET-NOT-COLLECTED');
+      if (i === 0) expect(started.stdout, 'the first prompt of a session carries the work already waiting for it').toContain('TOPO-8 Heard on the first prompt');
       // The run the hook owns answers for itself. Before this, every hook-owned
       // run sat on the governance page as `?` — it reads as a run nobody is
       // checking — because only the agent could send update_run { policy_hash }
@@ -474,6 +486,23 @@ it('executes the shipped native runtime in two isolated checkouts, blocks a real
     const denied = await run(1, ['adapter', 'hook', '--event', 'guard', '--profile', 'native'], payload(1));
     expect(JSON.parse(denied.stdout).hookSpecificOutput).toMatchObject({ hookEventName: 'PreToolUse', permissionDecision: 'deny' });
     expect(denied.stdout).toContain('work_conflict');
+    // The same collision said to the agent rather than to its file tool. It used
+    // to be a count with no ground and no holder in it ("conflict radar found 2
+    // overlap(s)"), printed beside a second sentence telling the same run to
+    // carry on, and a real agent reported that the two contradicted each other
+    // and stopped (agent lab, 2026-09-20). Both halves now come from the same
+    // `conflictReport` the tool replies are built from.
+    writeFileSync(path.join(dirs[1]!, 'native.js'), '// being edited\n');
+    const collided = await run(1, ['adapter', 'hook', '--event', 'heartbeat', '--profile', 'native'], { session_id: 'session-1', hook_event_name: 'PostToolUse', tool_name: 'Edit', tool_input: { file_path: path.join(dirs[1]!, 'native.js') } });
+    expect(collided.code, collided.stderr).toBe(0);
+    // And the observed claim is the file, whole: `git status --porcelain` opens
+    // an unstaged edit with a space, which the CLI used to trim away before
+    // slicing the status columns off — the run claimed `ative.js` and collided
+    // with nobody at all.
+    expect(collided.stdout).toContain('The ground to leave alone is native.js');
+    expect(collided.stdout).toContain(clients[0]!.name);
+    expect(collided.stdout).not.toContain('conflict radar');
+    writeFileSync(path.join(dirs[1]!, 'native.js'), '// untouched\n');
     const offline = await run(0, ['adapter', 'hook', '--event', 'guard', '--profile', 'native'], payload(0), true);
     expect(JSON.parse(offline.stdout).hookSpecificOutput.permissionDecision).toBe('deny');
     // A rule a machine can check. The path is this run's own ground, so the
@@ -517,6 +546,13 @@ it('executes the shipped native runtime in two isolated checkouts, blocks a real
     expect(switched.stdout).toContain('switched from branch main to feature/handoff');
     const afterSwitch = JSON.parse(readFileSync(path.join(dirs[0]!, '.stma/profiles/native/state.json'), 'utf8')).currentRunId as string;
     expect(afterSwitch).not.toBe(beforeSwitch);
+    // And it says which run to use now. The new id is the one thing the agent
+    // cannot work without, and it used to be printed only after the replacement
+    // run's optional setup had also succeeded: in the agent lab (2026-09-20) the
+    // preflight behind a branch switch failed, the id was never printed, and the
+    // agent went on addressing the run its own hook had just closed until it was
+    // refused twice and started a third run of its own.
+    expect(switched.stdout, 'the switch notice names the run that replaced the closed one').toContain(afterSwitch);
     expect((await a.db.select().from(agentRuns).where(eq(agentRuns.id, beforeSwitch)))[0]!.status).toBe('completed');
     expect((await a.db.select().from(agentRuns).where(eq(agentRuns.id, afterSwitch)))[0]!.branch).toBe('feature/handoff');
     // Staying on the branch is quiet.

@@ -37,9 +37,10 @@ import {
   listTicketsFor,
   pickableTrackers,
   readNamedTicket,
+  searchTicketsFor,
   ticketExamples,
   ticketPlaceholder,
-  TICKET_PICKER_LIMIT,
+  TICKET_SEARCH_MAX,
   trackersFor,
   TRACKER_NAMES,
   type Tracker,
@@ -574,8 +575,25 @@ projectsRoutes.get('/app/teams/:slug/projects/:project', async (c) => {
    */
   const asked = c.req.query('pick');
   const picking = pickable.find((t) => t === asked) ?? null;
-  // The one fetch on this page, and only because somebody clicked for it.
-  const listed = picking ? await listTicketsFor(db, env, team.id, project.id, picking) : null;
+  /**
+   * The words typed into the search box, which is a form of its own inside the
+   * dialog: a GET form writes a query string and nothing else, so `q` joins
+   * `pick` and `ticket` in the address and every one of them survives a
+   * refresh. It cannot be a submit button on the assignment form — that would
+   * carry the `maxlength=8000` brief through Node's 16 KiB header cap — which
+   * is why the controls sit inside that form and belong to this one.
+   */
+  const searchText = (c.req.query('q') ?? '').slice(0, TICKET_SEARCH_MAX);
+  /** Which tracker the box searches when there is more than one to choose. */
+  const searchTracker = picking ?? pickable[0] ?? null;
+  // The one fetch on this page, and only because somebody asked for it: a
+  // click on Browse, or a search. Drawing the page reads the connections and
+  // nothing else.
+  const listed = picking
+    ? searchText.trim()
+      ? await searchTicketsFor(db, env, team.id, project.id, picking, searchText)
+      : await listTicketsFor(db, env, team.id, project.id, picking)
+    : null;
   /**
    * The reference in the Ticket field: what the picker just chose, or what a
    * refused assignment was carrying. Without the second, a lead who picked a
@@ -588,12 +606,18 @@ projectsRoutes.get('/app/teams/:slug/projects/:project', async (c) => {
   // `data-auto-open` alongside it upgrades this to a real modal where there is
   // script; showModal() refuses an already-open element, so client.ts closes it
   // first.
-  const assignOpen = asked !== undefined || Boolean(ticketField || assignError);
+  const assignOpen =
+    asked !== undefined || c.req.query('q') !== undefined || Boolean(ticketField || assignError);
+  /** The address this page and its picker forms are written to. */
+  const projectHref = `/app/teams/${team.slug}/projects/${encodeURIComponent(project.slug)}`;
   /** This page, plus the picker's own selection. */
-  const pickHref = (query: { pick?: Tracker | null; ticket?: string }) => {
+  const pickHref = (query: { pick?: Tracker | null; ticket?: string; q?: string }) => {
     const parts = [`pick=${query.pick ?? ''}`];
     if (query.ticket) parts.push(`ticket=${encodeURIComponent(query.ticket)}`);
-    return `/app/teams/${team.slug}/projects/${encodeURIComponent(project.slug)}?${parts.join('&')}#assign-work`;
+    // Carried through a choice, so picking a result does not throw away the
+    // search that found it and leave somebody typing it again.
+    if (query.q?.trim()) parts.push(`q=${encodeURIComponent(query.q)}`);
+    return `${projectHref}?${parts.join('&')}#assign-work`;
   };
 
   const policyDoc = 'error' in policy ? null : policy;
@@ -1104,6 +1128,22 @@ projectsRoutes.get('/app/teams/:slug/projects/:project', async (c) => {
             the lead reopened on a refusal and would otherwise read a filled-in
             form with nothing saying why it came back. */}
         {assignError ? <div class="banner banner-error">{assignError}</div> : null}
+        {/* The picker's own form, and it has to be a separate element: assigning
+            is a POST and HTML forms do not nest. Its controls still sit where
+            they belong — beside the list they filter — through the `form`
+            attribute, which associates a control with a form it is not inside.
+            Measured in a browser rather than assumed: submitting this carries
+            exactly `ticket`, `q` and `pick` and keeps the `#assign-work`
+            fragment, so the `maxlength=8000` brief stays out of the query
+            string (the reason a `formmethod="get"` button was rejected the
+            first time round) and `q` stays out of the assignment body. No
+            script: pressing Enter in the box submits this form, not the POST.
+            It sits outside the branch below so that branch stays one element. */}
+        {assignable.length && trackers.length && searchTracker ? (
+          <form id="ticket-search" method="get" action={`${projectHref}#assign-work`}>
+            <input type="hidden" name="ticket" value={ticketField} />
+          </form>
+        ) : null}
         {assignable.length === 0 ? (
           <>
             <p class="m0 sub">
@@ -1144,11 +1184,60 @@ projectsRoutes.get('/app/teams/:slug/projects/:project', async (c) => {
                     aria-describedby="assign-ticket-help"
                   />
                 </Field>
+                {searchTracker ? (
+                  <Field
+                    id="ticket-q"
+                    label="Search tickets"
+                    help={
+                      pickable.includes('clickup') && !pickable.includes('github')
+                        ? "A few words from the title or the key. ClickUp's API cannot search tasks, so STMA matches a window of the mapped List and says how far it read."
+                        : 'A few words from the title or the key. Punctuation is dropped — this is a search box, not a query language.'
+                    }
+                  >
+                    <div class="row" style="flex-wrap:wrap;gap:8px">
+                      <input
+                        class="in"
+                        id="ticket-q"
+                        name="q"
+                        form="ticket-search"
+                        value={searchText}
+                        maxlength={TICKET_SEARCH_MAX}
+                        placeholder="label printer"
+                        aria-describedby="ticket-q-help"
+                        style="flex:1;min-width:180px"
+                      />
+                      {/* With one tracker there is nothing to choose and a
+                          select would be a control with a single option; with
+                          two the box has to say which one it is asking. */}
+                      {pickable.length > 1 ? (
+                        <select
+                          class="in"
+                          name="pick"
+                          form="ticket-search"
+                          aria-label="Tracker to search"
+                          style="width:auto;flex:0 0 auto"
+                        >
+                          {pickable.map((tracker) => (
+                            <option value={tracker} selected={searchTracker === tracker}>
+                              {TRACKER_NAMES[tracker]}
+                            </option>
+                          ))}
+                        </select>
+                      ) : (
+                        <input type="hidden" name="pick" value={searchTracker} form="ticket-search" />
+                      )}
+                      <button class="btn btn-sm" type="submit" form="ticket-search">
+                        Search
+                      </button>
+                    </div>
+                  </Field>
+                ) : null}
                 <div class="row" style="flex-wrap:wrap;gap:8px">
                   {pickable.map((tracker) => (
                     // `aria-controls` only while the list is on the page: a
                     // control pointing at an id that is not there is worse than
-                    // no pointer at all.
+                    // no pointer at all. No `q`: Browse means "show me what is
+                    // open", which is the question a search is not asking.
                     <a
                       class="btn btn-sm"
                       href={pickHref({ pick: tracker, ticket: ticketField })}
@@ -1170,14 +1259,18 @@ projectsRoutes.get('/app/teams/:slug/projects/:project', async (c) => {
                       // Named, the way the paste path names a refusal: an empty
                       // list and no explanation reads as "nothing to do here".
                       <div class="banner banner-error">{listed.error}</div>
-                    ) : listed.value.length === 0 ? (
+                    ) : listed.value.options.length === 0 ? (
+                      // "Nothing matched" and "nothing is open" are different
+                      // answers and a person acts differently on each: one says
+                      // try other words, the other says there is no work here.
                       <p class="m0 sub">
-                        Nothing open in {TRACKER_NAMES[picking!]} right now. Paste a reference above
-                        if you know one.
+                        {searchText.trim()
+                          ? `Nothing open in ${TRACKER_NAMES[picking!]} matches “${searchText.trim()}”. Try fewer words, browse what is open, or paste a reference above.`
+                          : `Nothing open in ${TRACKER_NAMES[picking!]} right now. Paste a reference above if you know one.`}
                       </p>
                     ) : (
                       <div class="tickets">
-                        {listed.value.map((row) =>
+                        {listed.value.options.map((row) =>
                           row.ref === ticketField ? (
                             <div class="introw" aria-current="true">
                               <div class="who">
@@ -1190,7 +1283,10 @@ projectsRoutes.get('/app/teams/:slug/projects/:project', async (c) => {
                               <span class="pill pill-active">chosen</span>
                             </div>
                           ) : (
-                            <a class="introw" href={pickHref({ pick: picking, ticket: row.ref })}>
+                            <a
+                              class="introw"
+                              href={pickHref({ pick: picking, ticket: row.ref, q: searchText })}
+                            >
                               <div class="who">
                                 <div class="t">{row.summary}</div>
                                 <div class="s">
@@ -1207,13 +1303,18 @@ projectsRoutes.get('/app/teams/:slug/projects/:project', async (c) => {
                     {/* Outside the three cases above, so a refusing tracker and
                         an empty list have the way back that a full one has. */}
                     <div class="row" style="flex-wrap:wrap;gap:8px">
-                      {listed.ok && listed.value.length ? (
+                      {/* Written where the bound is decided, because browsing,
+                          a GitHub search and a ClickUp search reach three
+                          different distances and one sentence covering all
+                          three would be untrue about two of them. */}
+                      {listed.ok && listed.value.options.length ? (
                         <span class="card-note" style="margin:0">
-                          The {TICKET_PICKER_LIMIT} most recently updated open{' '}
-                          {picking === 'github' ? 'issues' : 'tasks'}. Older ones are still
-                          reachable by pasting the reference.
+                          {listed.value.bound}
                         </span>
                       ) : null}
+                      {/* Drops `q` as well as the list: this closes the picker,
+                          and a search box still full beside no results reads as
+                          a search that found nothing. */}
                       <a
                         class="btn btn-sm"
                         style="margin-left:auto"

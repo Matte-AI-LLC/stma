@@ -431,6 +431,17 @@ helpRoutes.get('/help', (c) => {
                   current builds, so seeing it means the checkout runs older hooks —{' '}
                   <code>stma adapter repair --pin-runtime --apply</code>.
                 </Wall>
+                <Wall seen={<code>cannot access run "…": it belongs to another agent connection</code>}>
+                  The hook starts the run under the local adapter's own installation and tells the
+                  agent beside it to reuse that <code>run_id</code>. That works when the two are{' '}
+                  <b>paired</b>, and this is what it looks like when they are not. Pair them on{' '}
+                  <a href="/app/tokens">Agent connections</a> — the adapter's row asks{' '}
+                  <b>Listens for</b> — and the agent may update, finish and hand off that run from
+                  its next call. If the run really is somebody else's, the agent should call{' '}
+                  <code>start_run</code> and use the id it returns instead. A checkout connected
+                  with <code>stma connect</code> never sees this: one installation serves the agent
+                  and its hooks, so there is nothing to pair.
+                </Wall>
                 <Wall
                   seen={
                     <>
@@ -474,12 +485,17 @@ helpRoutes.get('/help', (c) => {
                   </>
                 }
               >
-                The embedded database's PostgreSQL major moved between releases, and a major
-                version never opens an older data directory in place. Either run the release that
-                last opened that directory, or move it aside and start with an empty one.{' '}
-                <b>Nothing moves your data for you</b>, and there is no export/import path yet —
-                that is an open decision, not a missing feature. Newer builds refuse with the
-                sentence above instead of the bare PGlite error.
+                The embedded database's PostgreSQL major moved between releases (PGlite 0.3 carries
+                17, 0.5 carries 18), and a major version never opens an older data directory in
+                place. The refusal names the command that takes it across:{' '}
+                <code>stma-server --upgrade-data "&lt;that directory&gt;"</code>, or the same binary
+                through npx. It reads the old database with the engine that wrote it, rebuilds the
+                new one from the migrations this build ships, and moves the rows in PostgreSQL's
+                own COPY format. The PostgreSQL 17 copy is <b>kept</b> beside the new one and
+                nothing ever deletes it, so a bad outcome is one rename away from being undone.{' '}
+                <b>Boot still moves nothing on its own</b>: this is a command you type, once. It
+                fetches the older engine the first time, so the machine needs the registry for a
+                minute — or point <code>STMA_UPGRADE_ENGINE</code> at a copy you already have.
               </Wall>
               <Wall seen="Two machines each ran the server and cannot see each other.">
                 <code>npx @matteai/stma serve</code> on each machine is two private instances, not

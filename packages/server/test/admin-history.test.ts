@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { asc, count, desc, eq } from 'drizzle-orm';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { Db } from '../src/db';
-import { ceilingChanges, loadSamples, teams } from '../src/db/schema';
+import { ceilingChanges, loadSamples, membershipChanges, teams, users } from '../src/db/schema';
 import { loadEnv } from '../src/env';
 import {
   CEILING_FIELDS,
@@ -15,6 +15,12 @@ import {
   trimCeilingChanges,
 } from '../src/lib/ceilings';
 import { runCleanupOnce } from '../src/lib/cleanup';
+import {
+  MEMBERSHIP_ACTIONS,
+  MEMBERSHIP_SOURCES,
+  membershipHistory,
+  trimMembershipChanges,
+} from '../src/lib/memberships';
 import {
   INSTANCE_ID,
   LOAD_BUCKET_MS,
@@ -475,20 +481,21 @@ describe('ceiling history', () => {
  * `ee/` is scanned when present and simply absent from the public tree, which
  * is why this test walks the directory instead of importing anything from it.
  */
+const here = path.dirname(fileURLToPath(import.meta.url));
+/** `ee/` is scanned when present and simply absent from the public tree. */
+const roots = [
+  path.join(here, '..', 'src'),
+  path.join(here, '..', '..', '..', 'ee', 'src'),
+].filter((dir) => existsSync(dir));
+
+const sources = (dir: string): string[] =>
+  readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) return sources(full);
+    return /\.tsx?$/.test(entry.name) ? [full] : [];
+  });
+
 describe('nothing but lib/ceilings writes teams.plan', () => {
-  const here = path.dirname(fileURLToPath(import.meta.url));
-  const roots = [
-    path.join(here, '..', 'src'),
-    path.join(here, '..', '..', '..', 'ee', 'src'),
-  ].filter((dir) => existsSync(dir));
-
-  const sources = (dir: string): string[] =>
-    readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
-      const full = path.join(dir, entry.name);
-      if (entry.isDirectory()) return sources(full);
-      return /\.tsx?$/.test(entry.name) ? [full] : [];
-    });
-
   it('finds the plan column written in exactly one file', () => {
     expect(roots.length).toBeGreaterThan(0);
     // Both spellings a writer could use: the query builder, and raw SQL through
@@ -511,7 +518,387 @@ describe('nothing but lib/ceilings writes teams.plan', () => {
   it('keeps the closed sets closed', () => {
     // A `field` or `source` a caller could choose would let it write sentences
     // into the operator log, which is the thing a log must not be.
-    expect([...CEILING_FIELDS]).toEqual(['plan', 'evaluation']);
+    expect([...CEILING_FIELDS]).toEqual(['plan', 'evaluation', 'grant']);
     expect([...CEILING_SOURCES]).toEqual(['operator', 'billing', 'owner']);
+  });
+
+  /**
+   * The audit export's `coverage[]` used to be typed out by hand beside
+   * `CriticalAuditEvent`'s union, and it had already drifted: the three
+   * `integration_*` actions were added to the union on 2026-09-20 and not to
+   * the list, so a signed export told customers three months of their own
+   * credential changes were not audited. Derived now, and this refuses a
+   * literal list coming back.
+   */
+  it('derives the signed export coverage from core instead of listing it again', () => {
+    const audit = roots
+      .flatMap(sources)
+      .find((file) => file.endsWith(path.join('src', 'audit.tsx')));
+    if (!audit) return; // Public tree: `ee/` is not here at all.
+    const source = readFileSync(audit, 'utf8');
+    expect(source).toMatch(/coverage:\s*AUDIT_COVERAGE/);
+    expect(source).toContain('CRITICAL_AUDIT_ACTIONS');
+    // A hand-written array of action names in a coverage position is the exact
+    // shape that drifted; the EE-only list is allowed and is named.
+    expect(source).not.toMatch(/coverage:\s*\[\s*'/);
+  });
+});
+
+// --------------------------------------------------------- membership changes
+
+/**
+ * Who gained or lost access to a workspace.
+ *
+ * Same discipline as the ceiling history above, so the tests that matter most
+ * are the sweep and the bound rather than the happy read — plus the two things
+ * only this record can say: that an act spanning several workspaces is one act,
+ * and that a removal which left a workspace with no owner is marked.
+ */
+describe('membership history', () => {
+  let ada: ReturnType<typeof jar>;
+  let teamId: string;
+  let teamSlug: string;
+
+  const historyFor = (opts: Parameters<typeof membershipHistory>[1]) =>
+    membershipHistory(db, { limit: 200, ...opts });
+
+  it('records the first owner, an invite join and a role change', async () => {
+    ada = await devLogin('ada');
+    expect(
+      (await fetch(`${srv.url}/app/teams`, form({ name: 'Access Lab', tag: 'access-lab' }, ada.header()))).status,
+    ).toBe(302);
+    const found = (await db.select().from(teams).where(eq(teams.slug, 'access-lab')))[0]!;
+    teamId = found.id;
+    teamSlug = found.slug;
+
+    // Creating a workspace left no trace of any kind before this: no feed row,
+    // no audit. It is the row that explains why the owner never joined.
+    const created = await historyFor({ teamId });
+    expect(created).toHaveLength(1);
+    expect(created[0]).toMatchObject({
+      action: 'added',
+      nextRole: 'owner',
+      previousRole: null,
+      source: 'self',
+      route: 'POST /app/teams',
+      subjectLabel: 'ada',
+      actorLabel: 'ada',
+      teamSlug: 'access-lab',
+      leftOwnerless: false,
+    });
+
+    // Cloud Free is one human, and this server is hosted and metered, so a
+    // second member needs a plan that allows one.
+    expect(
+      (await fetch(`${srv.url}/admin/teams/${teamId}/plan`, form({ plan: 'team' }, ada.header())))
+        .status,
+    ).toBe(302);
+
+    expect(
+      (
+        await fetch(`${srv.url}/app/teams/${teamSlug}/invites`, {
+          method: 'POST',
+          headers: ada.header(),
+          redirect: 'manual',
+        })
+      ).status,
+    ).toBe(302);
+    const people = await (
+      await fetch(`${srv.url}/app/teams/${teamSlug}?tab=people`, { headers: ada.header() })
+    ).text();
+    const code = /\/join\/([A-Za-z0-9_-]+)/.exec(people)?.[1] ?? '';
+    expect(code).toBeTruthy();
+
+    const bob = await devLogin('bob');
+    expect((await fetch(`${srv.url}/join/${code}`, form({}, bob.header()))).status).toBe(302);
+    const joined = (await historyFor({ teamId }))[0]!;
+    expect(joined).toMatchObject({
+      action: 'added',
+      nextRole: 'member',
+      source: 'invite',
+      route: 'invite redeemed',
+      subjectLabel: 'bob',
+    });
+
+    const bobId = (await db.select().from(users).where(eq(users.username, 'bob')))[0]!.id;
+    expect(
+      (
+        await fetch(
+          `${srv.url}/app/teams/${teamSlug}/members/${bobId}/role`,
+          form({ role: 'owner' }, ada.header()),
+        )
+      ).status,
+    ).toBe(302);
+    const promoted = (await historyFor({ teamId }))[0]!;
+    expect(promoted).toMatchObject({
+      action: 'role_changed',
+      previousRole: 'member',
+      nextRole: 'owner',
+      source: 'owner',
+      actorLabel: 'ada',
+      subjectLabel: 'bob',
+    });
+  });
+
+  it('marks a removal and says the workspace still has an owner', async () => {
+    const bobId = (await db.select().from(users).where(eq(users.username, 'bob')))[0]!.id;
+    expect(
+      (
+        await fetch(
+          `${srv.url}/app/teams/${teamSlug}/members/${bobId}/remove`,
+          form({}, ada.header()),
+        )
+      ).status,
+    ).toBe(302);
+    const removed = (await historyFor({ teamId }))[0]!;
+    expect(removed).toMatchObject({
+      action: 'removed',
+      previousRole: 'owner',
+      nextRole: null,
+      source: 'owner',
+      route: 'POST /app/teams/:slug/members/:userId/remove',
+      // `previous_role` is what restoring it needs, which is the reason the
+      // column is there rather than a bare "removed".
+      leftOwnerless: false,
+    });
+    // The console refuses to remove a last owner, so this flag can only ever be
+    // written true by the organization path — which is the point of having it.
+    expect((await historyFor({ teamId })).some((r) => r.leftOwnerless)).toBe(false);
+  });
+
+  it('records the operator console on both its writes, and shows them on both pages', async () => {
+    const bobId = (await db.select().from(users).where(eq(users.username, 'bob')))[0]!.id;
+    expect(
+      (
+        await fetch(
+          `${srv.url}/admin/users/${bobId}/memberships`,
+          form({ team_id: teamId, role: 'member' }, ada.header()),
+        )
+      ).status,
+    ).toBe(302);
+    expect((await historyFor({ teamId }))[0]).toMatchObject({
+      action: 'added',
+      source: 'operator',
+      route: 'POST /admin/users/:id/memberships',
+      actorLabel: 'ada',
+      subjectLabel: 'bob',
+    });
+
+    expect(
+      (
+        await fetch(
+          `${srv.url}/admin/users/${bobId}/memberships/${teamId}/role`,
+          form({ role: 'owner' }, ada.header()),
+        )
+      ).status,
+    ).toBe(302);
+    expect((await historyFor({ teamId }))[0]).toMatchObject({
+      action: 'role_changed',
+      previousRole: 'member',
+      nextRole: 'owner',
+      source: 'operator',
+    });
+
+    expect(
+      (
+        await fetch(
+          `${srv.url}/admin/users/${bobId}/memberships/${teamId}/remove`,
+          form({}, ada.header()),
+        )
+      ).status,
+    ).toBe(302);
+    expect((await historyFor({ teamId }))[0]).toMatchObject({
+      action: 'removed',
+      source: 'operator',
+      route: 'POST /admin/users/:id/memberships/:teamId/remove',
+    });
+
+    const workspace = await (
+      await fetch(`${srv.url}/admin/teams/${teamId}`, { headers: ada.header() })
+    ).text();
+    expect(workspace).toContain('data-table="membership-history"');
+    expect(workspace).toContain('Access history');
+    expect(workspace).toContain('member → owner');
+    // The page must not imply a completeness it does not have.
+    expect(workspace).toContain('Deleting a workspace removes every membership in it');
+
+    const person = await (
+      await fetch(`${srv.url}/admin/users/${bobId}`, { headers: ada.header() })
+    ).text();
+    expect(person).toContain('data-table="membership-history"');
+    expect(person).toContain('Access Lab');
+
+    const overview = await (await fetch(`${srv.url}/admin`, { headers: ada.header() })).text();
+    expect(overview).toContain('Recent access changes');
+  });
+
+  it('is a plain 404 for everyone but an operator', async () => {
+    const mallory = await devLogin('mallory');
+    const bobId = (await db.select().from(users).where(eq(users.username, 'bob')))[0]!.id;
+    for (const p of [`/admin/teams/${teamId}`, `/admin/users/${bobId}`]) {
+      expect((await fetch(srv.url + p, { headers: mallory.header() })).status).toBe(404);
+      expect((await fetch(srv.url + p)).status).toBe(404);
+    }
+  });
+
+  it('records a deleted account without naming it, and ties the workspaces together', async () => {
+    // Two workspaces, so the one act writes two rows under one group id — the
+    // shape the organization deprovisioning path needs and the only way to ask
+    // "what did that one thing do" without guessing from timestamps.
+    const cara = await devLogin('cara');
+    for (const tag of ['leaving-one', 'leaving-two']) {
+      expect(
+        (await fetch(`${srv.url}/app/teams`, form({ name: tag, tag }, cara.header()))).status,
+      ).toBe(302);
+    }
+    const caraId = (await db.select().from(users).where(eq(users.username, 'cara')))[0]!.id;
+    // Sole owner of both, so deletion is refused until somebody else owns them.
+    await devLogin('dave');
+    const daveId = (await db.select().from(users).where(eq(users.username, 'dave')))[0]!.id;
+    for (const tag of ['leaving-one', 'leaving-two']) {
+      const workspace = (await db.select().from(teams).where(eq(teams.slug, tag)))[0]!;
+      expect(
+        (
+          await fetch(
+            `${srv.url}/admin/teams/${workspace.id}/plan`,
+            form({ plan: 'team' }, ada.header()),
+          )
+        ).status,
+      ).toBe(302);
+      expect(
+        (
+          await fetch(
+            `${srv.url}/admin/users/${daveId}/memberships`,
+            form({ team_id: workspace.id, role: 'owner' }, ada.header()),
+          )
+        ).status,
+      ).toBe(302);
+    }
+
+    const gone = await fetch(`${srv.url}/app/account/delete`, form({}, cara.header()));
+    expect(gone.status).toBe(302);
+
+    const rows = await historyFor({ subjectId: caraId });
+    const deletions = rows.filter((r) => r.detail === 'account deleted');
+    expect(deletions).toHaveLength(2);
+    expect(new Set(deletions.map((r) => r.groupId)).size).toBe(1);
+    expect(deletions[0]!.groupId).toBeTruthy();
+    for (const row of deletions) {
+      expect(row.action).toBe('removed');
+      expect(row.previousRole).toBe('owner');
+      // The scrub the person asked for is not undone by the operator's record:
+      // the row names when and why, and the id still resolves, but the label
+      // they deleted is deliberately not written back into it.
+      expect(row.subjectLabel).toBeNull();
+      expect(row.actorLabel).toBeNull();
+      expect(row.subjectUsername).toBe(`deleted-${caraId}`);
+    }
+    expect((await historyFor({ groupId: deletions[0]!.groupId! }))).toHaveLength(2);
+  });
+
+  it('writes nothing for a workspace it could not outlive, and goes with the one it describes', async () => {
+    const solo = await devLogin('erin');
+    expect(
+      (await fetch(`${srv.url}/app/teams`, form({ name: 'Doomed', tag: 'doomed' }, solo.header())))
+        .status,
+    ).toBe(302);
+    const doomed = (await db.select().from(teams).where(eq(teams.slug, 'doomed')))[0]!;
+    expect(await historyFor({ teamId: doomed.id })).toHaveLength(1);
+
+    expect(
+      (await fetch(`${srv.url}/app/teams/doomed/delete`, form({}, solo.header()))).status,
+    ).toBe(302);
+    // The wipe of every membership in it is deliberately unrecorded: a row
+    // written there would be deleted by the same transaction, and the create
+    // row above goes with it. The absence is the answer.
+    expect(await historyFor({ teamId: doomed.id })).toHaveLength(0);
+  });
+
+  it('is capped, and deliberately never swept by age', async () => {
+    const old = new Date(Date.now() - 900 * DAY);
+    await db.insert(membershipChanges).values({
+      teamId,
+      teamSlug,
+      action: 'removed',
+      subjectId: null,
+      previousRole: 'member',
+      source: 'operator',
+      route: 'test',
+      at: old,
+    });
+    await runCleanupOnce(
+      db,
+      loadEnv({ nodeEnv: 'test', databaseUrl: undefined, activityRetentionDays: 1 }),
+    );
+    // Two and a half years old and the retention sweep leaves it: "why can this
+    // person not get in any more" is asked long after the fact.
+    const survived = await db
+      .select({ at: membershipChanges.at })
+      .from(membershipChanges)
+      .where(eq(membershipChanges.teamId, teamId));
+    expect(survived.some((r) => Math.abs(r.at.getTime() - old.getTime()) < 1000)).toBe(true);
+
+    for (let i = 0; i < 6; i++) {
+      await db.insert(membershipChanges).values({
+        teamId,
+        teamSlug,
+        action: 'added',
+        nextRole: 'member',
+        source: 'operator',
+        route: 'test',
+        at: new Date(Date.now() + i * 1000),
+      });
+    }
+    expect(await trimMembershipChanges(db, 1000)).toBe(0);
+    const total = (await db.select({ n: count() }).from(membershipChanges))[0]!.n;
+    expect(await trimMembershipChanges(db, 2)).toBe(total - 2);
+    expect((await db.select({ n: count() }).from(membershipChanges))[0]!.n).toBe(2);
+  });
+
+  it('keeps the closed sets closed', () => {
+    // Same rule as the ceiling log: a caller that could choose these could
+    // write a sentence into the operator's page.
+    expect([...MEMBERSHIP_ACTIONS]).toEqual(['added', 'role_changed', 'removed']);
+    expect([...MEMBERSHIP_SOURCES]).toEqual([
+      'self',
+      'owner',
+      'operator',
+      'invite',
+      'identity',
+    ]);
+  });
+
+  /**
+   * `teams.plan` could be given a single writer; `memberships` cannot.
+   *
+   * Twelve writes with genuinely different shapes — one row, a role, a bulk
+   * delete across a workspace, a bulk delete across an organization — would
+   * have to be flattened through one function that could serve none of them
+   * well, and the refactor would be far riskier than what it bought. So the
+   * mechanism here is the pin instead: every file that writes the table is
+   * named, with what it does and whether it records. A new writer fails this
+   * test and has to say which of the two it is.
+   */
+  it('pins every file that writes memberships, and what it owes', () => {
+    const writers = new Map<string, string>([
+      ['invites.ts', 'invite redemption — records on the transaction'],
+      ['dashboard.tsx', 'create, leave, role, remove, team delete, account delete — records all but the team delete, which it could not outlive'],
+      ['admin.tsx', 'operator add, role, remove — records all three'],
+      ['routes.tsx', 'EE assignWorkspace — records when the core role moves'],
+      ['store.ts', 'EE deactivateMember — records one row per workspace, one group'],
+    ]);
+    const statements = [
+      /\.(insert|update|delete)\(\s*memberships\s*\)/,
+      /(insert\s+into|update|delete\s+from)\s+memberships\b/i,
+    ];
+    const found = roots
+      .flatMap(sources)
+      .filter((file) => {
+        const source = readFileSync(file, 'utf8');
+        return statements.some((re) => re.test(source));
+      })
+      .map((file) => path.basename(file))
+      .sort();
+    expect(found).toEqual([...writers.keys()].sort());
   });
 });

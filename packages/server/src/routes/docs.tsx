@@ -137,7 +137,7 @@ docsRoutes.get('/docs', (c) => {
               deployment; do not expose a development server or send credentials over public HTTP.
             </p>
             <FirstExchange baseUrl={base} expanded />
-            <div class="card card-pad"><h3>Connected is the start, not the result</h3><p>For real work, ask the sender to call <code>handoff_work</code>. The receiving enrolled agent calls <code>update_handoff</code> with <code>accept</code>, then resumes only from the checkpoint's exact repository and commit in a clean worktree, and finally uses <code>complete</code>. A mismatch stays visible. A question or chat reply does not accept or complete the job. Local file access and external changes still need your authorization.</p><p>A handoff can name its receiver: <code>handoff_work</code> with <code>to_agent</code> addresses one agent, as <code>list_teammates</code> shows it; only that agent can accept it and its prompt hook announces it. Without it the work is offered to a person or the team.</p><p>To start an agent rather than stop one, a lead calls <code>assign_work</code> or uses <b>Assign work</b> on the project page: the task is addressed to one agent by name, only that agent can accept it, and its own <code>start_run</code> records the ground it takes.</p><p>Source-only credentials stay on the source machine. For a branch handoff, STMA refuses peer-authored next steps that tell the receiver to provision, copy or use a credential; the allowed pattern is to ask the source machine for a non-secret result. Branchless operator runbooks can still describe future credential administration.</p><p>Use <b>Needs attention</b> for bounded review items, and <b>Manage workspace</b> for Governance, Delivery, Repositories and receipts. These screens do not imply that STMA observed every action your agents took.</p><p>Delivery downloads bind scope, content, mode and optional policy in a schema-v2 manifest. Submit compact JSON with <code>record_delivery_receipt</code>. A run checkpoint or Knowledge receipt remains a client report. Provider evidence must match the newest delivery/test checkpoint's repository and commit; even then, one successful workflow is not all required checks or human approval.</p></div>
+            <div class="card card-pad"><h3>Connected is the start, not the result</h3><p>For real work, ask the sender to call <code>handoff_work</code>. The receiving enrolled agent calls <code>update_handoff</code> with <code>accept</code>, then resumes only from the checkpoint's exact repository and commit in a clean worktree, and finally uses <code>complete</code>. A mismatch stays visible. A question or chat reply does not accept or complete the job. Local file access and external changes still need your authorization.</p><p>A handoff can name its receiver: <code>handoff_work</code> with <code>to_agent</code> addresses one agent, as <code>list_teammates</code> shows it; only that agent can accept it and its prompt hook announces it. Without it the work is offered to a person or the team.</p><p>To start an agent rather than stop one, a lead calls <code>assign_work</code> or uses <b>Assign work</b> on the project page: the task is addressed to one agent by name, only that agent can accept it, and its own <code>start_run</code> records the ground it takes.</p><p><b>Any member of a workspace may dispatch work, and may see every person and agent in it.</b> That is deliberate: a lead is a role people hold, not one STMA enforces, and requiring ownership to hand work out would put a human back in the middle of the thing this removes. It is worth knowing before you invite somebody, because it is not where the neighbouring boundaries sit — publishing policy, editing the delivery flow, recording a baseline and creating a project are all owner-only.</p><p>Source-only credentials stay on the source machine. For a branch handoff, STMA refuses peer-authored next steps that tell the receiver to provision, copy or use a credential; the allowed pattern is to ask the source machine for a non-secret result. Branchless operator runbooks can still describe future credential administration.</p><p>Use <b>Needs attention</b> for bounded review items, and <b>Manage workspace</b> for Governance, Delivery, Repositories and receipts. These screens do not imply that STMA observed every action your agents took.</p><p>Delivery downloads bind scope, content, mode and optional policy in a schema-v2 manifest. Submit compact JSON with <code>record_delivery_receipt</code>. A run checkpoint or Knowledge receipt remains a client report. Provider evidence must match the newest delivery/test checkpoint's repository and commit; even then, one successful workflow is not all required checks or human approval.</p></div>
             <p class="small muted">
               The other computer does not need another account; it does need its own browser approval
               and installation. Already using project-only connections? Keep both agents on that same
@@ -399,9 +399,13 @@ docsRoutes.get('/docs', (c) => {
                   in this checkout, or nobody. An adapter you activated earlier is paired on{' '}
                   <a href="/app/tokens">Agent connections</a>, on its own row, without activating
                   it again. Paired, its prompt hook announces work assigned to that agent by name,
-                  and an edit its guard stops is filed under that agent's name, "via its adapter".
-                  It must be one of your own agents and able to reach the same project. Pairing
-                  moves no authority: the adapter cannot accept the work it announces.
+                  an edit its guard stops is filed under that agent's name, "via its adapter", and
+                  that agent may update, finish and hand off the runs these hooks start here — the
+                  hook tells it to reuse the <code>run_id</code>, and unpaired it is told to and
+                  then refused. It must be one of your own agents and able to reach the same
+                  project. That is the only authority a pairing moves, and it moves it one way: the
+                  adapter still cannot accept the work it announces or touch the agent's own runs,
+                  and unpairing takes the run back on the agent's next call.
                 </div>
               </div>
               <p class="m0 small muted">
@@ -545,7 +549,9 @@ docsRoutes.get('/docs', (c) => {
                     Store tool versions, lockfile hashes, env var names, git state. Name the
                     machine with <code>device</code>. Enrolled connections default to their
                     human-chosen installation machine; legacy tokens fall back to the token name.
-                    Each machine keeps its own slot and history.
+                    Each machine keeps its own slot and history. On hosted Cloud Free one person
+                    pushes from at most two devices in any 30 days; a third is refused, and the
+                    reply names the two that count.
                   </td>
                 </tr>
                 <tr>
@@ -1012,10 +1018,19 @@ docsRoutes.get('/docs', (c) => {
                   One it cannot read is said out loud rather than dispatched quietly. You do not
                   have to go and look the key up: <b>Browse GitHub</b> and <b>Browse ClickUp</b>{' '}
                   beside the field list that tracker's twenty most recently updated open tickets,
-                  and picking one fills the field. The list is read only when you ask for it, so it
-                  never slows the page down, and a tracker that refuses says so where the list
-                  would have been. Browsing Jira is not available yet — paste the key; STMA reads
-                  it the same way. If that checkout's local adapter is paired with the agent (Agent
+                  and picking one fills the field. When the one you want is not among those
+                  twenty, type a few words into <b>Search tickets</b> instead. Both are read only
+                  when you ask for them, so neither slows the page down, and a tracker that
+                  refuses says so where the rows would have been. The line under the results says
+                  what was actually looked at, and it differs by tracker on purpose: GitHub
+                  searches every open issue in the connected repository, while ClickUp's API
+                  cannot search tasks at all, so STMA reads the three hundred most recently
+                  updated open tasks of the mapped List and matches them itself — an older one is
+                  still reachable by pasting its link. Jira can be neither browsed nor searched
+                  yet: Atlassian moved issue search to an endpoint STMA has never measured against
+                  a real site, and a guess that fails while you are assigning work is worse than
+                  no button. Paste the key; STMA reads it the same way. If that checkout's local
+                  adapter is paired with the agent (Agent
                   connections → Listens for), its prompt hook announces the task by itself the next
                   time anyone types to it. Otherwise say one sentence on that machine — "read your
                   STMA inbox and do what is assigned to you" — instead of retyping the task.
@@ -1241,7 +1256,10 @@ docsRoutes.get('/docs', (c) => {
                     read, red where two live runs want to write the same thing. In a collision
                     the run that declared the ground first keeps the right of way: it is told to
                     carry on and its edits stay allowed, while the run that came later is told to
-                    wait and is the one the file guard refuses. Click a run to see
+                    wait and is the one the file guard refuses. Two runs usually reach for the same
+                    files in a different order, so each is first on some of the ground: the reply an
+                    agent reads then says both halves as two sentences, each naming its own files,
+                    the one it must leave alone and the one it keeps. Click a run to see
                     only its ground, or a piece of ground to see everyone holding it. The critical
                     count in the status strip filters the map to just those runs. The map has a
                     scope like every other page: opened from a workspace it shows that workspace,
@@ -1422,6 +1440,8 @@ docsRoutes.get('/docs', (c) => {
                 worktree, MCP call and CI run is never a seat. Cloud Free is permanent; Solo is
                 one human; Team supports 2–50, includes five and reconciles only people above five.
                 A one-human workspace can buy Team first and invite the second human afterwards.
+                Cloud Free takes environment snapshots from two devices per person, counted over
+                the last 30 days; connecting agents is never limited by machine.
               </p>
               <div class="card card-pad">
                 <p class="m0 small">

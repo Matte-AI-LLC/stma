@@ -50,7 +50,7 @@ import { VERSION, clientHeaders } from './version.js';
 import { environmentNotice } from './notices.js';
 import { savedConnection, type ConnectionReference } from './connectionCredentials.js';
 import { checkoutAddedText, fileToolAddedText, fileToolClaims, nativeHookContext, retainedHookPayload, hookSessionIdentity } from './fileGuard.js';
-import { matchContentRules, parseContentRules } from '@bridge/shared';
+import { conflictReport, matchContentRules, parseContentRules, type RightOfWayConflict } from '@bridge/shared';
 import { checkNativeRuntime, prepareNativeRuntime } from './nativeInstall.js';
 import { appendCodexEntry, checkCodexEntry, codexConfigPath, readCodexConfig, removeCodexEntry, writeCodexConfig } from './codexConfig.js';
 import { authorizeLocalAdapter, isTerminalCredential, localOAuthConnection, revokeLocalAdapterCredential, revokeTerminalCredential, saveTerminalCredential } from './oauthLocal.js';
@@ -248,12 +248,30 @@ function gitCheckpoint(
   };
 }
 
+/**
+ * The files this checkout has changed, as the run's observed ground.
+ *
+ * Read without the trimming the helper above does, because
+ * `git status --porcelain` is `XY<space>PATH` and X is a **space** for the most
+ * ordinary state there is: edited, not staged. Trimming the whole output and
+ * then slicing three characters off each line ate the first character of the
+ * first path — `native.js` was claimed as `ative.js` — so a run's observed
+ * scope named a file that does not exist, overlapped nobody, and the collision
+ * the hook exists to find was silently missed. Every later line kept its
+ * leading space and parsed correctly, which is why it survived: one dirty file
+ * is the common case and it was always the broken one. Found while testing the
+ * collision wording against the shipped runtime, 2026-09-20.
+ */
 function dirtyFiles(): string[] {
-  const output = shell('git', ['status', '--porcelain']);
-  if (!output) return [];
+  let output: string;
+  try {
+    output = execFileSync('git', ['status', '--porcelain'], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+  } catch {
+    return [];
+  }
   return output
     .split(/\r?\n/)
-    .map((line) => line.slice(3).trim().split(' -> ').at(-1)!)
+    .map((line) => /^.. (.*)$/.exec(line)?.[1]?.trim().split(' -> ').at(-1) ?? '')
     .filter(Boolean);
 }
 
@@ -1293,10 +1311,24 @@ async function startNativeRun(
       ...(started.headSha ? { adapterRunCommits: { ...(latest.adapterRunCommits ?? {}), [sessionKey]: started.headSha } } : {}),
     }));
   }
-  const environment = await completeNativeSetup(profile, runId, event.id, result.policy);
+  // The run exists the moment the server answered, and its id is the one thing
+  // the agent cannot work without. Everything after it — the policy receipt,
+  // the environment preflight — is advisory, and it used to be able to take the
+  // id with it. Measured in the agent lab (2026-09-20): a branch switch closed
+  // one run and started another, the preflight behind it failed, the notice
+  // naming the new run was never printed, and the agent went on addressing the
+  // run its own hook had just closed. It was refused by update_handoff and
+  // update_run, then started a third run of its own, which is the state in
+  // which a resume can no longer tell which run is doing the work.
+  let environment: string | undefined;
+  try {
+    environment = await completeNativeSetup(profile, runId, event.id, result.policy);
+  } catch {
+    // Silence, like the receipt's own catch: a run whose optional setup failed
+    // is still a run, and the hook still has to say which one.
+  }
 
   const knowledge = result.knowledgeContext as Record<string, unknown> | undefined;
-  const conflicts = Array.isArray(result.conflicts) ? result.conflicts : [];
   const readiness = result.readiness as Record<string, any> | undefined;
   const notices: string[] = [`STMA native tracking owns run ${runId} for this client session. Reuse this run_id for planned scope and handoffs; do not start a second MCP run. File-tool guards do not cover arbitrary shell/MCP writes. Readiness and policy prose are not execution permission.`];
   if (environment) notices.push(environment);
@@ -1307,13 +1339,7 @@ async function startNativeRun(
     );
     if (typeof knowledge.reportHint === 'string') notices.push(knowledge.reportHint);
   }
-  if (conflicts.length) {
-    const critical = conflicts.filter((item: any) => item.severity === 'critical').length;
-    notices.push(
-      `STMA conflict radar found ${conflicts.length} overlapping work claim(s)` +
-        `${critical ? `, including ${critical} critical` : ''}. Check the Live Agent Map before editing.`,
-    );
-  }
+  notices.push(...collisionNotices(result.conflicts));
   const approvals = Array.isArray(readiness?.needsApproval)
     ? readiness.needsApproval.length
     : readiness?.needsApproval
@@ -1436,6 +1462,41 @@ function forgetAdapterRun(profileId: string, sessionKey: string, runId: string):
 }
 
 /**
+ * What a collision reported by the server should say in this agent's context.
+ *
+ * The same `conflictReport` the tool replies are built from, so the hook and
+ * `update_run` cannot tell one agent two different stories about one heartbeat.
+ * Until 2026-09-20 they did: the hook counted the overlaps it was not first on
+ * ("conflict radar found 2 overlap(s)") and separately told the run to carry on
+ * with the ground it was first on, neither sentence naming a file, while the
+ * tool answered "narrow what you touch, or coordinate". A real agent read both,
+ * wrote in its report that they contradicted each other and stopped.
+ *
+ * Agent names, usernames and paths are typed by people and this text becomes
+ * another agent's context, so every fragment that came off the wire passes a
+ * shape check first — the rule the write guard's `conflictAgents` already
+ * follows — and anything unrecognised is named generically instead of dropped.
+ */
+function collisionNotices(conflicts: unknown): string[] {
+  const rows = (Array.isArray(conflicts) ? conflicts : []).filter(
+    (item): item is RightOfWayConflict =>
+      Boolean(item) && typeof (item as RightOfWayConflict)?.current?.resourceKey === 'string',
+  );
+  if (rows.length === 0) return [];
+  const report = conflictReport(rows, {
+    safe: (text, kind) =>
+      kind === 'holder'
+        ? /^[\w ,.()@-]{1,160}$/.test(text)
+          ? text
+          : 'another agent'
+        : /^[\w./\\@+-]{1,160}$/.test(text)
+          ? text
+          : 'a path it claimed',
+  });
+  return [report.blocked, report.holding].filter((line): line is string => Boolean(line)).map((line) => `STMA — ${line}`);
+}
+
+/**
  * A hook-owned run is one branch. When the checkout moves to another branch —
  * a handoff received on a different branch is the ordinary case — the old run
  * is closed and a new one starts on the branch the work is now on, so its
@@ -1507,16 +1568,7 @@ async function processHookEvent(
         headers: { 'x-stma-event-id': event.id },
         body: JSON.stringify(buildNativeHeartbeatRequest(event.payload, observed, event.id)),
       }, HOOK_REQUEST_TIMEOUT_MS);
-      const notices: string[] = [];
-      const conflicts = Array.isArray(result?.conflicts) ? result.conflicts : [];
-      // Ground this run declared first: the other run was told to wait, and saying
-      // "conflict" here made the holder stop with its work done (agent lab, 2026-09-20).
-      const waiting = conflicts.filter((item: any) => item?.rightOfWay === 'yours');
-      if (conflicts.length > waiting.length) notices.push(`STMA conflict radar found ${conflicts.length - waiting.length} overlap(s).`);
-      if (waiting.length) {
-        const names = [...new Set(waiting.map((item: any) => item?.existing?.agentName).filter((name: unknown) => typeof name === 'string' && /^[\w .()@-]{1,120}$/.test(name)))].slice(0, 3).join(', ');
-        notices.push(`STMA — ${names || 'another run'} declared ground this run already holds. This run was first and keeps the right of way; the other was told to wait. Carry on, and complete or release it when the work is done.`);
-      }
+      const notices: string[] = [...collisionNotices(result?.conflicts)];
       const stale = Array.isArray(result?.stale) ? result.stale.length : result?.stale ? 1 : 0;
       if (stale) notices.push(`STMA warning: ${stale} stale-ground overlap(s) detected.`);
       if (result?.quota && result.quota.state !== 'ok' && result.quota.advice) {
@@ -1735,6 +1787,19 @@ async function adapterHook(flags: Flags): Promise<void> {
   const deadline = Date.now() + (value === 'finish' ? 2_200 : 8_000);
   const notices: string[] = [];
   const delivered: Array<{ file: string; id: string }> = [];
+  // Asked before the queued lifecycle work and awaited after it. A prompt is
+  // the one moment an announcement can land, and this used to be skipped when
+  // the queue had already spent most of the hook's budget — which is every
+  // first prompt of every session, because that is the one that has to create
+  // the run, file its receipt and run the preflight first. Measured across both
+  // agent-lab rounds of 2026-09-20: not one of the eight first prompts asked,
+  // the lead's assignment reached each agent on its next tool call instead, and
+  // two of four agents correctly refused to act on work that had arrived inside
+  // a tool result. The request is the same bounded GET as before; it now
+  // overlaps work already in flight rather than queueing behind it.
+  const waiting = value === 'finish'
+    ? undefined
+    : newsNotice(profile, hookSessionKey(profile.config, payload), value === 'start');
   try {
     const pending = readQueuedHookEvents(cwd, profile.id);
     for (const stored of pending.events) {
@@ -1766,13 +1831,9 @@ async function adapterHook(flags: Flags): Promise<void> {
         break;
       }
     }
-    const waiting =
-      value === 'finish' || Date.now() + NEWS_TIMEOUT_MS >= deadline
-        ? undefined
-        : await newsNotice(profile, hookSessionKey(profile.config, payload), value === 'start');
     hookOutput(
       profile.config.target,
-      [...notices, waiting].filter(Boolean).join('\n\n') || undefined,
+      [...notices, await waiting].filter(Boolean).join('\n\n') || undefined,
       String(payload.hook_event_name ?? (value === 'heartbeat' ? 'PostToolUse' : value === 'finish' ? 'Stop' : 'UserPromptSubmit')),
     );
     // Delete only after stdout has received every server-generated notice. A

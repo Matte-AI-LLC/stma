@@ -1,6 +1,6 @@
 {
   "name": "@matteai/stma-server",
-  "version": "0.15.0",
+  "version": "0.16.0",
   "type": "module",
   "scripts": {
     "build:connector": "tsup --config tsup.connector.config.ts",
@@ -28,6 +28,7 @@
     "@bridge/shared": "*",
     "@types/node": "^22.20.2",
     "drizzle-kit": "^0.31.1",
+    "pglite-pg17": "npm:@electric-sql/pglite@0.3.16",
     "smol-toml": "1.8.0",
     "tsup": "^8.3.5",
     "tsx": "^4.23.13",

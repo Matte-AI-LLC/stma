@@ -1,7 +1,13 @@
 import type { Env } from '../env';
 import type { Db } from '../db';
-import { getClickupTask, listClickupTasks, parseClickupTaskRef } from '../lib/clickup';
-import { getIssue, listOpenIssues, parseIssueRef } from '../lib/github';
+import {
+  CLICKUP_SEARCH_SCAN,
+  getClickupTask,
+  listClickupTasks,
+  parseClickupTaskRef,
+  searchClickupTasks,
+} from '../lib/clickup';
+import { getIssue, listOpenIssues, parseIssueRef, searchIssues } from '../lib/github';
 import { getJiraIssue } from '../lib/jira';
 import { clickupForTeam, githubForTeam, jiraForTeam } from './integrations';
 
@@ -126,8 +132,19 @@ export function ticketPlaceholder(connected: readonly Tracker[]): string {
 export const TICKET_PICKER_LIMIT = 20;
 
 /**
- * The trackers a lead can *browse* here, which is not every tracker they can
- * paste a reference from.
+ * How much text the search box takes.
+ *
+ * Long enough for a title somebody half remembers, short enough that what
+ * reaches a tracker is words rather than a paragraph. The form marks it, the
+ * route slices it, and each transport reduces it again to what its own provider
+ * can be asked — three bounds, because the browser's is a courtesy and the
+ * other two are the actual limit.
+ */
+export const TICKET_SEARCH_MAX = 80;
+
+/**
+ * The trackers a lead can *browse and search* here, which is not every tracker
+ * they can paste a reference from.
  *
  * **Jira is deliberately absent.** Atlassian moved issue search to
  * `/rest/api/3/search/jql`, nothing in this codebase has exercised that
@@ -137,19 +154,25 @@ export const TICKET_PICKER_LIMIT = 20;
  * lead's critical path and fail there, which is strictly worse than a paste
  * field that works; so a Jira-connected project keeps the field and the page
  * says why the button is missing rather than leaving somebody to wonder.
+ *
+ * One list for both verbs on purpose. They ask the same question of a tracker —
+ * *can this codebase read your work items?* — and two lists would eventually
+ * let a tracker be searchable but not browsable, which is a distinction nobody
+ * reading the dialog could explain.
  */
 export const PICKABLE_TRACKERS: readonly Tracker[] = ['github', 'clickup'];
 
 /**
  * Said on the page, so a missing button is an answer rather than a gap.
  *
- * Short on purpose: it sits beside the Browse buttons, and the reason above is
- * for whoever comes to add the button, not for the lead who wants their ticket.
+ * It names the reason because this is the one place a lead can act on it: with
+ * only "not available" they would keep looking for the control. The paste field
+ * is the way through and ends the sentence, since that is what they do next.
  */
 export const JIRA_PICK_NOTE =
-  'Picking is not available for Jira yet — paste the key; STMA reads it the same way.';
+  'Jira cannot be browsed or searched here yet: Atlassian moved issue search to an endpoint STMA has never measured against a real site, and a guess that fails while you are assigning work is worse than no button. Paste the key — STMA reads it the same way.';
 
-/** What this project can be browsed from, in the trackers it actually has. */
+/** What this project can be browsed or searched from, in the trackers it has. */
 export function pickableTrackers(connected: readonly Tracker[]): Tracker[] {
   return PICKABLE_TRACKERS.filter((tracker) => connected.includes(tracker));
 }
@@ -169,7 +192,53 @@ export interface TicketOption {
   updatedAt: Date | null;
 }
 
-type TicketListResult = { ok: true; value: TicketOption[] } | { ok: false; error: string };
+export interface TicketList {
+  options: TicketOption[];
+  /**
+   * What was actually looked at, in words, for the line under the list.
+   *
+   * It lives here rather than on the page because this is where the bound is
+   * decided, and because the three cases are not the same shape: browsing reads
+   * the newest N of a tracker, a GitHub search is GitHub searching the whole
+   * repository, and a ClickUp search is STMA matching a window of it. A page
+   * that flattened those into one sentence would be claiming something untrue
+   * about two of them.
+   */
+  bound: string;
+}
+
+type TicketListResult = { ok: true; value: TicketList } | { ok: false; error: string };
+
+/** `owner/repo#42`, the same key `readNamedTicket` builds: a number on its own
+ *  says nothing on a ledger line read next to another project's work. */
+const githubOption = (repo: string, issue: { number: number; title: string; labels: string[]; updatedAt: string }): TicketOption => ({
+  ref: `${repo}#${issue.number}`,
+  key: `${repo}#${issue.number}`,
+  summary: issue.title,
+  // GitHub's REST issue carries `state`, which this reader does not map, and
+  // every row here is open by construction; labels are what a person actually
+  // sorts by. Same choice `readNamedTicket` makes.
+  status: issue.labels.length ? issue.labels.join(', ') : 'issue',
+  updatedAt: issue.updatedAt ? new Date(issue.updatedAt) : null,
+});
+
+/**
+ * The native id, not the workspace's custom one — and a decision rather than a
+ * limitation. `getClickupTask` reads either id space (`isClickupCustomTaskId`
+ * picks the query), so `clickup:PD-207` would resolve here too; what makes the
+ * native id the one to *store* is that ClickUp guarantees it, while a custom
+ * id's prefix is a per-space setting an admin can change or switch off. A task
+ * key is written once and read back at merge time, so the durable half must be
+ * the stable half. The custom id is what the row is labelled with, because that
+ * is what the people in that workspace say out loud.
+ */
+const clickupOption = (task: { id: string; customId: string | null; name: string; status: string; updatedAt: string | null }): TicketOption => ({
+  ref: `clickup:${task.id}`,
+  key: task.customId ?? task.id,
+  summary: task.name,
+  status: task.status,
+  updatedAt: task.updatedAt ? new Date(task.updatedAt) : null,
+});
 
 /**
  * One tracker's open tickets, most recently updated first.
@@ -206,19 +275,10 @@ export async function listTicketsFor(
     }
     return {
       ok: true,
-      value: issues.value.map((issue) => ({
-        // `owner/repo#42` rather than `#42`, the same key `readNamedTicket`
-        // builds: a number on its own says nothing on a ledger line read next
-        // to another project's work.
-        ref: `${github.repo}#${issue.number}`,
-        key: `${github.repo}#${issue.number}`,
-        summary: issue.title,
-        // GitHub's REST issue carries `state`, which this reader does not map,
-        // and every row here is open by construction; labels are what a person
-        // actually sorts by. Same choice `readNamedTicket` makes.
-        status: issue.labels.length ? issue.labels.join(', ') : 'issue',
-        updatedAt: issue.updatedAt ? new Date(issue.updatedAt) : null,
-      })),
+      value: {
+        options: issues.value.map((issue) => githubOption(github.repo, issue)),
+        bound: `The ${TICKET_PICKER_LIMIT} most recently updated open issues in ${github.repo}. Search above, or paste a reference, to reach an older one.`,
+      },
     };
   }
 
@@ -235,22 +295,84 @@ export async function listTicketsFor(
   }
   return {
     ok: true,
-    value: tasks.value.map((task) => ({
-      // The native id, not the workspace's custom one — and now a decision
-      // rather than a limitation. `getClickupTask` reads either id space
-      // (`isClickupCustomTaskId` picks the query), so `clickup:PD-207` would
-      // resolve here too; what makes the native id the one to *store* is that
-      // ClickUp guarantees it, while a custom id's prefix is a per-space
-      // setting an admin can change or switch off. A task key is written once
-      // and read back at merge time, so the durable half must be the stable
-      // half. The custom id is what the row below is labelled with, because
-      // that is what the people in that workspace say out loud.
-      ref: `clickup:${task.id}`,
-      key: task.customId ?? task.id,
-      summary: task.name,
-      status: task.status,
-      updatedAt: task.updatedAt ? new Date(task.updatedAt) : null,
-    })),
+    value: {
+      options: tasks.value.map(clickupOption),
+      bound: `The ${TICKET_PICKER_LIMIT} most recently updated open tasks in ${clickup.listName}. Search above, or paste a task link, to reach an older one.`,
+    },
+  };
+}
+
+/**
+ * One tracker's open tickets matching a few typed words.
+ *
+ * The other half of the picker, and the one the twenty-row bound made
+ * necessary: browsing answers "show me what is open", which is the wrong
+ * question in a workspace with two hundred open tickets, where the twenty
+ * newest are exactly the twenty nobody wants.
+ *
+ * **The two trackers reach different distances and the bound says which.**
+ * GitHub has a search endpoint, so GitHub searches its whole repository and
+ * STMA bounds only the rows drawn. ClickUp's v2 API has no text parameter for
+ * tasks at all, so STMA reads a window of the mapped List and matches it here —
+ * a real limit, named on the page rather than left to be discovered by somebody
+ * whose ticket is the three hundred and first.
+ *
+ * Same discipline as `listTicketsFor`: read only when somebody asked, and a
+ * tracker that refuses is named where its rows would have been.
+ */
+export async function searchTicketsFor(
+  db: Db,
+  env: Env,
+  teamId: string,
+  projectId: string | null,
+  tracker: Tracker,
+  text: string,
+): Promise<TicketListResult> {
+  if (tracker === 'jira') return { ok: false, error: JIRA_PICK_NOTE };
+  const typed = text.trim().slice(0, TICKET_SEARCH_MAX);
+  // Nothing typed is not "everything": the caller draws the browse list for
+  // that, and answering it here would put a second path onto the same rows.
+  if (!typed) return listTicketsFor(db, env, teamId, projectId, tracker);
+
+  const found = await trackerConnections(db, teamId, projectId);
+  if (tracker === 'github') {
+    const github = found.github;
+    if (!github) {
+      return { ok: false, error: 'No GitHub connection reaches this project any more.' };
+    }
+    const issues = await searchIssues(env, github, typed, TICKET_PICKER_LIMIT);
+    if (!issues.ok) {
+      return {
+        ok: false,
+        error: `Could not search open issues in ${github.repo} (${issues.error}). Check that the connected token can still see that repository, or paste the reference instead.`,
+      };
+    }
+    return {
+      ok: true,
+      value: {
+        options: issues.value.map((issue) => githubOption(github.repo, issue)),
+        bound: `GitHub searched every open issue in ${github.repo}; the ${TICKET_PICKER_LIMIT} most recently updated matches are shown.`,
+      },
+    };
+  }
+
+  const clickup = found.clickup;
+  if (!clickup) {
+    return { ok: false, error: 'No ClickUp List is mapped to this project any more.' };
+  }
+  const tasks = await searchClickupTasks(env, clickup, typed, TICKET_PICKER_LIMIT);
+  if (!tasks.ok) {
+    return {
+      ok: false,
+      error: `Could not search ${clickup.listName} in ClickUp (${tasks.error}). Check that the connection can still see that list, or paste the task link instead.`,
+    };
+  }
+  return {
+    ok: true,
+    value: {
+      options: tasks.value.map(clickupOption),
+      bound: `ClickUp's API cannot search tasks, so STMA matched the ${CLICKUP_SEARCH_SCAN} most recently updated open tasks in ${clickup.listName}. An older one is reachable by pasting its link.`,
+    },
   };
 }
 

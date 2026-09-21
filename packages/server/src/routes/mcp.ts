@@ -49,8 +49,10 @@ import { projectForTeam } from '../domain/access';
 import type { Env } from '../env';
 import {
   describeDevices,
+  deviceAllowance,
   devicesByMember,
   devicesForUser,
+  insertFromNewDevice,
   lastSnapshotOf,
   normalizeDeviceLabel,
   resolveDeviceLabel,
@@ -64,7 +66,11 @@ import {
   snapshotsShareProject,
 } from '../lib/projects';
 import { DAY_MS, hitCounter } from '../lib/counters';
-import { ACCOUNT_CALLS_PER_MINUTE, ACCOUNT_DAILY_CALL_CAP } from '../lib/entitlements';
+import {
+  ACCOUNT_CALLS_PER_MINUTE,
+  ACCOUNT_DAILY_CALL_CAP,
+  effectiveLimits,
+} from '../lib/entitlements';
 import { redactSecrets } from '../lib/redact';
 import {
   UNTRUSTED_NOTICE,
@@ -424,6 +430,14 @@ export function buildMcpServer(
         grant.deviceLabel,
         token?.name,
       );
+      // The plan's device ceiling, asked before the project is resolved:
+      // resolving can create one, and a refused snapshot leaves nothing behind.
+      const deviceCap = (await effectiveLimits(db, resolved.team, env.hosted)).maxDevicesPerMember;
+      const allowance =
+        deviceCap === null
+          ? null
+          : await deviceAllowance(db, resolved.team, user.id, deviceLabel, deviceCap);
+      if (allowance && 'error' in allowance) return err(allowance.error);
       let projectId: string | null = null;
       if (repo) {
         const pr = await resolveProjectForWrite(db, resolved.team, repo, user.id, {
@@ -432,7 +446,7 @@ export function buildMcpServer(
         if ('error' in pr) return err(pr.error);
         projectId = pr.project.id;
       }
-      await db.insert(snapshots).values({
+      const row = {
         teamId: resolved.team.id,
         userId: user.id,
         repo: repo ?? null,
@@ -441,7 +455,15 @@ export function buildMcpServer(
         deviceLabel,
         deviceId,
         data: snapshot,
-      });
+      };
+      if (deviceCap !== null && allowance && !allowance.counted) {
+        // A device already counted cannot change the count; only a new one is
+        // counted again, under the workspace lock.
+        const stored = await insertFromNewDevice(db, resolved.team, deviceCap, row);
+        if ('error' in stored) return err(stored.error);
+      } else {
+        await db.insert(snapshots).values(row);
+      }
       if (deviceId) {
         await db
           .update(agentInstallations)

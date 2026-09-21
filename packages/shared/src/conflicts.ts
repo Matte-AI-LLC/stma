@@ -68,6 +68,104 @@ export function describeHolder(claim: ConflictClaim, now: Date = new Date()): st
   return parts.join(', ');
 }
 
+/** A conflict as its two sides see it: my claim, their claim, and who was first. */
+export interface RightOfWayConflict {
+  severity?: ConflictSeverity;
+  /** `yours`: the other run declared it after you. `theirs`: you are the one who waits. */
+  rightOfWay?: 'yours' | 'theirs';
+  current: { resourceKey: string };
+  existing: ConflictClaim;
+}
+
+/** The two things a collision can say to one run, each about its own ground. */
+export interface ConflictReport {
+  /** Ground another run declared first. This run waits for that ground. */
+  blocked?: string;
+  /** Ground this run declared first. The other run was told to wait for it. */
+  holding?: string;
+  /** A holder parked on a person will not free its ground by itself. */
+  needsAPerson: boolean;
+}
+
+export interface ConflictWords {
+  now?: Date;
+  /**
+   * Agent names, usernames and resource keys are typed by people, and these
+   * sentences land in another agent's context. The hook replaces any fragment
+   * whose shape it does not recognise; the server, whose reply the same agent
+   * reads, has always passed them through.
+   */
+  safe?: (text: string, kind: 'holder' | 'resource') => string;
+}
+
+const NAMED_RESOURCES = 3;
+const NAMED_HOLDERS = 3;
+
+function nameList(items: string[], limit: number): string {
+  const unique = [...new Set(items)].filter(Boolean);
+  const named = unique.slice(0, limit);
+  const rest = unique.length - named.length;
+  const head =
+    named.length > 1 ? `${named.slice(0, -1).join(', ')} and ${named.at(-1)}` : (named[0] ?? '');
+  return rest > 0 ? `${head} and ${rest} more` : head;
+}
+
+/**
+ * A collision, said once.
+ *
+ * Right of way splits every collision in two, and the halves call for opposite
+ * things: ground somebody else declared first is ground to leave alone, ground
+ * this run declared first is ground to carry on with. Both halves arrive at
+ * once as soon as two runs claim the same three files in a different order —
+ * and the two summaries used to be written separately and to name no ground at
+ * all. Measured in the agent lab (2026-09-20): the tool reply said "narrow what
+ * you touch, or coordinate", the prompt hook said "this run was first, carry
+ * on", and the agent wrote down that the two contradicted each other, took the
+ * cautious one and stopped over one file out of three.
+ *
+ * So both sentences are built here from the same rows, and each one names the
+ * ground it is about. Same reason as `describeHolder`, one level up.
+ */
+export function conflictReport(
+  conflicts: RightOfWayConflict[],
+  { now = new Date(), safe = (text) => text }: ConflictWords = {},
+): ConflictReport {
+  const blocked = conflicts.filter((conflict) => conflict.rightOfWay !== 'yours');
+  const holding = conflicts.filter((conflict) => conflict.rightOfWay === 'yours');
+  const needsAPerson = blocked.some((conflict) => holderNeedsAPerson(conflict.existing.runState));
+  const ground = (side: RightOfWayConflict[]) =>
+    nameList(
+      side.map((conflict) => safe(conflict.current.resourceKey, 'resource')),
+      NAMED_RESOURCES,
+    );
+  const report: ConflictReport = { needsAPerson };
+
+  if (blocked.length > 0) {
+    const holders = nameList(
+      blocked.map((conflict) => safe(describeHolder(conflict.existing, now), 'holder')),
+      NAMED_HOLDERS,
+    );
+    report.blocked = [
+      blocked[0]?.severity === 'critical'
+        ? 'STOP and tell your human before writing. Another live run holds the same migration or contract; claims are advisory, so nothing prevents you both from writing it. Coordinate through open_session or announce.'
+        : 'Another live run overlaps your scope. Narrow what you touch, or coordinate through open_session before writing.',
+      `The ground to leave alone is ${ground(blocked)}, held by ${holders}, which declared it first.`,
+      needsAPerson
+        ? 'The run holding it has stopped to ask a person, so it will not free the ground by itself — waiting will not help; say so to your human and coordinate.'
+        : '',
+    ]
+      .filter(Boolean)
+      .join(' ');
+  }
+
+  if (holding.length > 0) {
+    report.holding = blocked.length
+      ? `You were first on ${ground(holding)}, so that ground stays yours and the run that declared it after you was told to wait: carry on there, and complete, finish or release when your work there is done.`
+      : `Another run declared ground you already hold (${ground(holding)}). You were first, so you keep the right of way and that run was told to wait for you: carry on, and complete, finish or release when your work is done, which is what frees the ground for it. Do not stop on its account.`;
+  }
+  return report;
+}
+
 const SPECIAL_PATH_RE =
   /(^|\/)(?:[^/]*lock(?:\.[^/]*)?|package-lock\.json|pnpm-lock\.yaml|yarn\.lock|.*migration.*|schema\.(?:sql|prisma)|(?:terraform|k8s|kubernetes)(?:\/|$))/i;
 

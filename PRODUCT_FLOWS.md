@@ -112,7 +112,8 @@ Authorization is the intersection of credential scope and the human's current me
 - Explicit conflicting arguments are refused before tool dispatch. Omitted team/project arguments
   are filled from the credential so least privilege does not add repeated prompt friction.
 - A bound installation cannot be renamed by a tool argument and cannot update, finish or hand off
-  another installation's run.
+  another installation's run. The one exception is the explicit adapter pairing below: an agent may
+  act on the runs of a local adapter its owner paired with it, and on no others.
 
 User-level configuration and server authority are different boundaries. User-level means the MCP
 entry persists for that OS user and is available to the client across repositories. It never changes
@@ -137,6 +138,15 @@ local data only when the client deliberately includes it in a tool call.
 | Change plan | team → Plan | exact billable team | Checkout/Portal/current plan |
 | Remove access | People, Agent connections, Agent map, Account | exact membership/token/install | revoked or deleted state |
 | Get unstuck | `/help`, linked from every signed-out footer, the four password pages and the account menu | none — deliberately, the page is public | the wall named in the product's own words, with its next action |
+
+**Every write that adds, re-roles or removes a workspace membership leaves an operator-readable
+row** naming the workspace, the person, the roles on both sides, the door it came through and who
+acted — separate from the team activity feed, which is the same events written for the workspace's
+own members and swept by that workspace's retention. Two removals are deliberately shaped: an
+account deleting itself is recorded without naming the subject, because the username is scrubbed at
+that person's request and the row answers "this workspace lost a member and why" without undoing
+it; and deleting a workspace removes every membership in it and leaves no row at all, because the
+record lives inside that workspace and the console says so rather than implying completeness.
 
 A team-scoped URL is authoritative. The rail must not silently switch it to the newest membership.
 A project's sections are addressed under the project —
@@ -493,6 +503,15 @@ The Agent map groups installations under their human owner. Snapshots use the hu
 label, not an inferred hostname. Messages written on one installation remain unread to another
 installation and to the browser; “same account” does not mean “already seen.”
 
+That label is also what hosted Cloud Free's device ceiling counts: the distinct labels one person
+pushed snapshots under in the last 30 days, at most two. A `push_snapshot` from a third is refused
+before anything is stored or a project is created, and the reply names the two that count. A device
+that already counts is never refused by the ceiling. A device stops counting 30 days after its last snapshot, so a
+replaced machine frees its slot on its own; nothing needs to be deleted. Connections are never limited
+by machine, and self-hosted instances, paid plans, an active Team evaluation and the private beta
+count nothing. A count that would add a device is taken again under the workspace lock, so two new
+machines cannot both take the last slot.
+
 Parallel work uses separate runs. Deliberate parallel attempts require an explicit shared
 `attempt_group`, the same owner and distinct worktrees. Same task alone does not suppress overlap;
 two agents in the same worktree still collide. Lease expiry means coverage is lost, not proof of safety.
@@ -576,7 +595,15 @@ the tool reply, in the write guard's refusal, in the hook's explanation and in t
 inspector. A run that stopped to ask a person holds its claims for the longer human-response
 window and will not free them by itself, so it is named as such and the advice stops saying wait:
 the way through is the other person, not another attempt. Without this an agent could only guess
-how long to wait, and it guessed from its own lease. Governance receipts attest what was served/read; silence is “not
+how long to wait, and it guessed from its own lease. **Both halves can be true of one heartbeat**,
+because two runs reaching for the same files in a different order leave each of them first on
+some of the ground, and then one collision has to say two opposite things. It says them as two
+sentences that each name their own files, and both the tool reply and the local hook build them
+from the same function: before that they were written separately and named no ground at all, so
+one agent was told "narrow what you touch, or coordinate" by the tool and "you were first, carry
+on" by its hook in the same minute. The ground the hook reports as a run's own is what the
+checkout has actually changed, whole: a path read out of `git status` keeps every character of
+its name, or the run holds ground nobody else can collide with. Governance receipts attest what was served/read; silence is “not
 reported,” never a match. A run whose checkout has the local hooks installed files its own receipt
 at run start, recomputing the hash from the policy document it received rather than repeating the
 number the server sent; it writes nothing into the repository, because saying which rules a run is
@@ -721,7 +748,12 @@ completion/handoff should close its own run without closing another installation
   refused with the call that is missing (`complete` before `resume` names `resume`). Repository
   verification is one report of three fields: where a checkpoint needs it an incomplete report is
   refused and the missing field named; where there is nothing to verify, as in an assignment, it
-  is answered with a `verificationNote` instead of a refusal. Acceptance is serialized to one installation;
+  is answered with a `verificationNote` instead of a refusal. A `run_id` that names a run which is
+  no longer live is refused with the agent's own live run in that project named, and `update_run`
+  answers the same way rather than only offering `start_run`: the usual reason to be holding a
+  dead run id is that the hooks replaced the run a minute ago on a branch switch, and "start a new
+  one" turns that into two live runs in one project, which is the one state in which a resume can
+  no longer tell which run is doing the work. Acceptance is serialized to one installation;
   replay is idempotent. A reply or session resolution does not close a tracked handoff.
   Released ground stays on the record as `released`: it holds nobody up and no heartbeat renews
   it, the agent map draws it faded, the evidence pack still lists it, and an agent that began
@@ -771,12 +803,39 @@ completion/handoff should close its own run without closing another installation
   in the same place: the form is read by the same handler, which fetches the ticket again and
   builds the same task and brief. A tracker that refuses is named where the list would have been,
   never answered with an empty list. A refused assignment carries the reference back into the
-  field. **Browsing is GitHub and ClickUp only**: Jira keeps the paste field and the dialog says
-  picking is not available for it yet, because Atlassian moved issue search to a newer endpoint
-  that STMA has not measured against a real site and a guessed call would fail on the lead's
-  critical path rather than in a test.
+  field.
+- **And the lead can type a few words instead of scrolling a list.** Beside the field a search
+  box asks the same tracker for tickets matching what was typed; with more than one browsable
+  tracker connected it also names which one it is asking. It is the same link-shaped selection
+  (`?pick=<tracker>&q=<words>`) reached by a GET form of its own inside the dialog, so a search
+  survives a refresh, the back button undoes it, choosing a result keeps it, and no script is
+  involved. Drawing the page still fetches nothing: a search is read on the search.
+  **The line under the results says what was actually looked at**, because the two trackers do
+  not reach the same distance. GitHub has a search endpoint, so GitHub searches every open
+  issue in the connected repository and STMA bounds only the twenty rows it draws. ClickUp's
+  API has no text parameter for tasks at any endpoint, so STMA reads the three hundred most
+  recently updated open tasks of the mapped List and matches them in its own process; a task
+  older than that window is reachable by pasting its link, and the page says so rather than
+  leaving it to be discovered. What a person typed is words, never a query: punctuation a
+  provider would read as syntax is dropped before the call, so a typed `:` or leading `-`
+  cannot become a qualifier, a negation or a refused request. Nothing matched and nothing is
+  open are different answers and are said differently. A tracker that refuses a search is
+  named where its rows would have been, exactly as when browsing.
+  **Browsing and searching are GitHub and ClickUp only**: Jira keeps the paste field and the
+  dialog says it can be neither browsed nor searched here yet, because Atlassian moved issue
+  search to a newer endpoint that STMA has not measured against a real site and a guessed call
+  would fail on the lead's critical path rather than in a test.
 - `assign_work` (and **Assign work** on the project page) is the other direction: a member names
-  one connected agent as `list_teammates` lists it and dispatches a task to it. The record is a
+  one connected agent as `list_teammates` lists it and dispatches a task to it. **Any member may
+  dispatch, and any member may read the whole People and agents roster.** Neither path reads a
+  role: the browser one resolves with `teamForUser` and the MCP one through `resolveTeam`, both
+  membership-only, and `agentRoster` takes no viewer at all. That is deliberate and it is the
+  product's position rather than an oversight, because a lead who is not an owner has to be able
+  to hand work out; restricting it would put the human back in the middle of the flow this exists
+  to remove. It is worth reading twice before adding somebody to a workspace, since policy,
+  delivery, baseline and project creation sitting beside it are owner-only, so the boundary is
+  not where the neighbouring writes would suggest. A role between owner and member is open work,
+  not a promise. The record is a
   handoff of kind `assignment` addressed to that installation, not only to its owner. Only the
   named installation may accept, resume or complete it; its owner may decline; the sender may
   cancel. Other agents' inboxes list it as assigned to somebody else, and `/api/agent/news` — the
@@ -814,10 +873,22 @@ completion/handoff should close its own run without closing another installation
   thread); adapters, paired or not, are excluded from `list_teammates` and the Assign work picker,
   which mark the agent `adapterPaired`; Governance and the run timeline show the agent's name
   with "via its adapter" and keep the reporting adapter's name visible. The pairing shown is the
-  current one, resolved on read like every other name. Authority does not move: the adapter
-  cannot accept, resume or complete the assignment it announces, and neither installation may
-  update or finish the other's run. Revoking the agent leaves a dead pairing the connections page
-  flags; revoking the adapter ends it.
+  current one, resolved on read like every other name. **One authority moves, in one direction:**
+  the named agent may `update_run`, `finish_run`, `handoff_work` and `check_environment` on runs
+  owned by an adapter that listens for it, because the hooks start the run under the adapter's
+  installation and tell that agent to reuse its `run_id`. It is read per call from the stored
+  pairing, so unpairing or re-pointing an adapter refuses the agent from its next call, with no
+  grandfathering, and never moves the run's recorded installation. A *named* `run_id` may therefore
+  be a paired adapter's; an *omitted* one still resolves only to a run the credential started
+  itself, because one agent identity may be paired with an adapter in every checkout on a machine.
+  With no run of its own the agent is told which run its hooks own, never to start another.
+  Nothing else moves: the adapter cannot accept, resume or complete the assignment it announces,
+  cannot act on the agent's own runs (the column lives on the adapter and points at the agent, so
+  the edge has no reverse), and reaches no team or project the credential's own scope does not
+  already allow — scope is checked first. Another agent of the same owner, another adapter of the
+  same owner and another person's agent are all refused, and the refusal names pairing as the way
+  out. Revoking the agent leaves a
+  dead pairing the connections page flags; revoking the adapter ends it.
 - The delivery/test checkpoint travels as an immutable reference for code handoffs. Resume succeeds only
   when the receiver reports the same canonical repository and exact commit from a clean worktree;
   mismatch or local changes keep the handoff out of progress. Branchless intent handoffs have no
@@ -950,6 +1021,15 @@ is composed through the private operator layer; core code must not import it.
 4. Membership changes synchronize billed human quantity. Agents/devices never affect quantity.
 5. Portal handles supported billing-account operations. Enterprise remains contract-scoped; copy
    must not promise an unimplemented identity/audit/residency feature.
+6. An operator may **give** a workspace Solo, Team or Enterprise, with no end date or through a last
+   day. This is entitlement state, not billing state, so it lives in the core beside the workspace's
+   own plan and never writes it. While it lasts it decides every limit, whatever the workspace's own
+   plan or a subscription says; the Plan page marks it current, labels it complimentary with its
+   last day, and offers no checkout or plan change, while keeping the portal for a subscription
+   that predates it. It ends by the clock: nothing is written then, the workspace is on its own plan
+   again — including how long its history is kept — and checkout returns. An evaluation cannot be
+   started while one runs. Every give, change and revoke is in the operator's ceiling history; the
+   operator's note is shown to the operator only.
 
 Failure must leave the current entitlement intact and say that no charge was made when Checkout did
 not start. Billing state never belongs in the public package or public database migrations.
@@ -1005,11 +1085,20 @@ Enterprise plan. Engineering can use a test tenant; a paying customer is not a p
 7. Deactivation removes access only in that organization, revokes credentials, unused enrollment
    codes and SSO proofs, and releases STMA run leases. It does not kill a local OS process.
    Reactivation does not revive tokens or workspace memberships; explicit reassignment is needed.
+   It removes the membership in **every** attached workspace, and unlike the console and the
+   operator area it does **not** refuse when that takes a workspace's last owner: deprovisioning a
+   leaver must succeed, and an organization owner can reassign an ownerless workspace while a
+   terminated person holding a live credential cannot be undone by anybody. Each removal is
+   recorded per workspace under one group, carrying the role it removed — which is what
+   reassignment needs — and marked when it left no owner behind.
 8. Service identities use explicit project grants and their own one-time prompts, no browser
    login and no human seat. Policy/role changes require fresh enrollment instead of upgrading
    already issued credentials. The final active organization owner cannot be removed.
 
-Organization audit exports cover identity/admin events only. Optional signatures and a hash chain
+Organization audit exports cover identity/admin events only. The export's stated coverage is
+derived from the actions the server actually writes rather than listed separately, so it can
+neither over- nor under-claim; membership changes are deliberately outside it and belong to the
+operator's own record. Optional signatures and a hash chain
 do not establish complete action coverage, legal hold or protection from a compromised operator.
 Provider-tenant acceptance and deployed recovery/deprovision testing remain release gates. SAML,
 SCIM Groups, data-residency promises and HA/SLA are not supplied by this foundation.
@@ -1052,6 +1141,7 @@ SCIM Groups, data-residency promises and HA/SLA are not supplied by this foundat
 | generated setup prompt and URL correctness | `packages/server/test/findings-2026-08-25.test.ts` |
 | account/team removal and destructive invariants | `packages/server/test/account-hygiene.test.ts` |
 | personal multi-machine snapshots | `packages/server/test/personal-fleet.test.ts` |
+| Cloud Free device ceiling: third label refused before a project exists, counted label accepted, 30-day window, second count before storing, paid and self-host uncounted, beta ledger counts it | `packages/server/test/plans.test.ts`, `packages/server/test/beta-access.test.ts` |
 | real two-device stop/approve/handoff behavior | `examples/payments-api`, human-run acceptance required |
 | MCP run/claims/policy lifecycle | `packages/server/test/mcp-fleet.test.ts` |
 | idempotent run/checkpoint lifecycle and terminal races | `packages/server/test/run-reliability.test.ts` |

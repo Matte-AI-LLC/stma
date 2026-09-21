@@ -11,8 +11,8 @@ import { ceilingChanges, teams } from '../db/schema';
  * made by hand — reached the billing log and nothing else either. Neither is
  * queryable, and the container's stdout does not survive a revision.
  *
- * **Every ceiling in this product is a function of two things**, which is why
- * this module has exactly two writers. `teams.plan` chooses a row of the matrix
+ * **Every ceiling in this product is a function of two things** — three since
+ * operator grants (below) — which is why this module has exactly that many writers. `teams.plan` chooses a row of the matrix
  * in `lib/entitlements`, and that row is where `maxMembers`, `maxProjects`,
  * `maxDevicesPerMember`, handoffs, integrations, retention and the three
  * feature switches all come from. The EE evaluation is the one override: it
@@ -32,8 +32,16 @@ import { ceilingChanges, teams } from '../db/schema';
  * this table will never explain.
  */
 
-/** Closed set. A caller must not be able to write a sentence into the operator log. */
-export const CEILING_FIELDS = ['plan', 'evaluation'] as const;
+/**
+ * Closed set. A caller must not be able to write a sentence into the operator log.
+ *
+ * `grant` joined on 2026-09-21: an operator's complimentary plan
+ * (`lib/planGrants`) rides beside `teams.plan` the way the evaluation does, so
+ * it is a third input to every ceiling and its own writer here — see the note
+ * above on why a history is only worth having if nothing moves a ceiling
+ * around it.
+ */
+export const CEILING_FIELDS = ['plan', 'evaluation', 'grant'] as const;
 export type CeilingField = (typeof CEILING_FIELDS)[number];
 
 /** Who moved it: an operator at /admin, a Stripe reconciliation, a workspace owner. */

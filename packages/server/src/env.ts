@@ -39,6 +39,11 @@ export interface Env {
    * operator surfaces all behave as they will when billing turns on — and only
    * the ceilings lift. Turning it off restores the matrix with no data to unwind,
    * which is why the beta does not simply write a plan onto every team.
+   *
+   * One ceiling stays, by decision (2026-09-21): the age limit on history.
+   * Activity and the agent run trail keep their plan's retention, because
+   * lifting it would turn the day this is unset into the day months of history
+   * are deleted. `historyRetentionDays` in `lib/cleanup.ts` holds the rule.
    */
   betaUnmetered: boolean;
   /**
@@ -191,8 +196,15 @@ function parseDemoLogins(raw: string | undefined): Env['demoLogins'] {
 /**
  * `SIGNUP_ACCESS_CODES` — `code` or `code:label`, comma separated.
  *
- * The label is for the log line, so an operator can tell which cohort a beta
- * account came from without the code itself ever being written down next to it.
+ * The label names the cohort, so an operator can tell which wave a beta account
+ * came from without the code itself ever being written down next to it. It is
+ * stored on the account that redeems it (`users.signup_cohort`) and read by
+ * `/admin/beta`.
+ *
+ * `CODE:` with nothing after it yields **no label at all**, never an empty one —
+ * `auth/accessCodes.ts` uses the empty string to mean "came through the door,
+ * and the operator named no wave", and that only works while configuration
+ * cannot produce it.
  */
 function parseAccessCodes(raw: string | undefined): Env['signupAccessCodes'] {
   return (raw ?? '')
@@ -223,6 +235,16 @@ function parseAccessCodes(raw: string | undefined): Env['signupAccessCodes'] {
  * Anything that sets NODE_ENV itself — the Dockerfile, compose, the demo
  * scripts, the tests — is untouched.
  */
+/**
+ * Where the embedded database lives when nobody said.
+ *
+ * Named rather than written twice because `--upgrade-data` has to answer the
+ * same question without loading the rest of the configuration: somebody reading
+ * the data-directory refusal has a path and a shell, and a production boot that
+ * demands DATABASE_URL before it will look at a flag is another dead end.
+ */
+export const DEFAULT_PGLITE_DIR = '.data/pglite';
+
 export function bootNodeEnv(
   env: NodeJS.ProcessEnv = process.env,
   argv: readonly string[] = process.argv,
@@ -268,7 +290,7 @@ export function loadEnv(overrides: Partial<Env> = {}): Env {
     host: e.HOST ?? (nodeEnv === 'production' ? '0.0.0.0' : 'localhost'),
     baseUrl: (configuredBaseUrl || `http://localhost:${port}`).replace(/\/+$/, ''),
     databaseUrl: e.DATABASE_URL || undefined,
-    pgliteDir: e.PGLITE_DIR ?? '.data/pglite',
+    pgliteDir: e.PGLITE_DIR ?? DEFAULT_PGLITE_DIR,
     migrationsDir: e.MIGRATIONS_DIR || undefined,
     github,
     clickup,
@@ -376,7 +398,7 @@ export function loadEnv(overrides: Partial<Env> = {}): Env {
   }
   if (env.betaUnmetered && env.nodeEnv !== 'test') {
     console.warn(
-      '[stma] BETA_UNMETERED=1: every workspace has every feature and no ceiling. Plan limits resume the moment this is unset.',
+      '[stma] BETA_UNMETERED=1: every workspace has every feature and no plan ceiling except the age limit on history, which stays the plan\'s. Plan limits resume the moment this is unset.',
     );
   }
   if (env.hosted && (e.DEMO_LOGINS ?? '') !== '') {

@@ -145,7 +145,7 @@ controlRoutes.post('/api/agent/runs/start', async (c) => {
     grant.projectId,
   );
   if ('error' in result) return c.json({ error: result.error }, 400);
-  logLine({ evt: 'agent_run', a: 'started', installation: grant.installationId, run: result.run.id, project: result.run.projectId, team: parsed.data.team, replayed: result.replayed, source: 'rest', conflicts: result.conflicts.length, conflictRuns: result.conflicts.map((item) => item.existing.runId) });
+  logLine({ evt: 'agent_run', a: 'started', installation: grant.installationId, run: result.run.id, project: result.run.projectId, team: parsed.data.team, replayed: result.replayed, source: 'rest', conflicts: result.conflicts.length, conflictRuns: [...new Set(result.conflicts.map((item) => item.existing.runId))] });
   const readiness = await runStartReadiness(c.get('db'), c.get('mcpUser').id, {
     run: result.run,
     team: parsed.data.team,
@@ -246,7 +246,7 @@ controlRoutes.post('/api/agent/runs/:id/heartbeat', async (c) => {
   );
   if (!result) return c.json({ error: 'unknown_or_inactive_run' }, 404);
   if ('error' in result) return c.json({ error: result.error }, 409);
-  logLine({ evt: 'agent_run', a: 'updated', installation: c.get('mcpGrant').installationId, run: c.req.param('id'), source: 'rest', conflicts: result.conflicts.length, conflictRuns: result.conflicts.map((item) => item.existing.runId) });
+  logLine({ evt: 'agent_run', a: 'updated', installation: c.get('mcpGrant').installationId, run: c.req.param('id'), source: 'rest', conflicts: result.conflicts.length, conflictRuns: [...new Set(result.conflicts.map((item) => item.existing.runId))] });
   const { scope, ...payload } = result;
   // Only the escalation reaches the feed: a lead wants to know an agent is about
   // to run out, not that it is still at 40%.

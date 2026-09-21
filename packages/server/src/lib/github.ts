@@ -145,6 +145,33 @@ async function request<T>(
     calls.push({ method, path, body, at: new Date() });
     if (calls.length > CALL_CAP) calls.splice(0, calls.length - CALL_CAP);
     if (authFails) return { ok: false, error: 'bad_token' };
+    // Before the list branch below, because `/search/issues?…` contains
+    // `/issues?` too and would otherwise be answered as an unfiltered list —
+    // which would pass a caller that never sent the text at all.
+    if (method === 'GET' && path.startsWith('/search/issues')) {
+      const params = new URLSearchParams(path.slice(path.indexOf('?') + 1));
+      const query = params.get('q') ?? '';
+      // GitHub's own qualifier syntax: `repo:`/`is:` steer the search and the
+      // rest is the text. Only the text is matched here; the qualifiers are
+      // asserted by the caller's test, because getting them wrong is a 422
+      // from the real API rather than a wrong list.
+      const terms = query.split(/\s+/).filter((term) => term && !term.includes(':'));
+      const perPage = Number(params.get('per_page') ?? '30');
+      const items = seeded
+        .filter((issue) =>
+          terms.every((term) => issue.title.toLowerCase().includes(term.toLowerCase())),
+        )
+        .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt))
+        .slice(0, perPage)
+        .map(toRaw);
+      // The search endpoint's envelope, not a bare array: a caller reading
+      // `res.value` as a list would find nothing, which is the shape bug this
+      // branch exists to catch.
+      return {
+        ok: true,
+        value: { total_count: items.length, incomplete_results: false, items } as unknown as T,
+      };
+    }
     // Answers in GitHub's wire shape, not ours, so the mapping below is under
     // test too — a fake that returns the already-parsed type would have hidden
     // exactly the field-name bug it exists to catch.
@@ -241,6 +268,68 @@ export async function listOpenIssues(
   // Bounded here as well as in the query, the way `listClickupTasks` is: the
   // caller draws a picker and tells somebody it is the newest N, and a promise
   // that rests on a remote honouring `per_page` is not one this side can keep.
+  return { ok: true, value: rows.filter((r) => !r.pull_request).slice(0, capped).map(toIssue) };
+}
+
+/** A search box, not a query language. */
+const SEARCH_TERMS = 8;
+
+/**
+ * The words STMA will let reach GitHub's search, and nothing else.
+ *
+ * GitHub's search syntax is a query language: `:` separates a qualifier from
+ * its value, a leading `-` negates, `"` opens a phrase that must be closed, and
+ * an unparseable query is a 422 rather than an empty list. A lead typing
+ * `printer:` or pasting `PD-207` into a search box is not writing a query, so
+ * the punctuation is dropped instead of being passed through and blamed on
+ * them. The qualifiers that matter are STMA's own and are written in
+ * `searchIssues` below, where they cannot be overridden by anything typed.
+ *
+ * Words rather than a `"phrase"`: GitHub ANDs bare terms, which is what "a few
+ * words" means to the person typing them.
+ */
+const searchTerms = (text: string): string =>
+  text
+    .replace(/[^\p{L}\p{N}\s_.-]+/gu, ' ')
+    // A hyphen inside a word is ordinary (`label-printer`); one that starts a
+    // word is GitHub's NOT, and nobody typing in a search box meant that.
+    .split(/\s+/)
+    .map((word) => word.replace(/^[-.]+/, ''))
+    .filter(Boolean)
+    .slice(0, SEARCH_TERMS)
+    .join(' ');
+
+/**
+ * Open issues matching free text, searched by GitHub rather than here.
+ *
+ * `listOpenIssues` reads one page of the newest open issues, which answers
+ * "show me what is open" and is the wrong answer to "find the label printer
+ * ticket": in a repository with two hundred open issues the twenty newest are
+ * exactly the twenty nobody is looking for. GitHub's own search endpoint is the
+ * only thing on this side of the wire that can see the other hundred and
+ * eighty, so the bound here is on rows *returned*, not on rows looked at.
+ *
+ * Empty text is an empty list rather than every open issue: a search that
+ * silently becomes a browse tells somebody their words matched everything.
+ */
+export async function searchIssues(
+  env: Env,
+  config: GithubConfig,
+  text: string,
+  limit = ISSUE_PAGE_SIZE,
+): Promise<GithubResult<GithubIssue[]>> {
+  const terms = searchTerms(text);
+  if (!terms) return { ok: true, value: [] };
+  const capped = Math.min(limit, ISSUE_PAGE_SIZE);
+  // `is:issue` because the issues endpoint hands back pull requests and an
+  // agent offered a PR as work to pick up tries to "implement" a review; the
+  // `pull_request` filter below is the same rule kept twice, since a qualifier
+  // is a request and the field is the answer.
+  const q = `repo:${config.repo} is:issue is:open ${terms}`;
+  const path = `/search/issues?q=${encodeURIComponent(q)}&sort=updated&order=desc&per_page=${capped}`;
+  const res = await request<{ items?: RawIssue[] }>(env, config, 'GET', path);
+  if (!res.ok) return res;
+  const rows = Array.isArray(res.value?.items) ? res.value.items : [];
   return { ok: true, value: rows.filter((r) => !r.pull_request).slice(0, capped).map(toIssue) };
 }
 

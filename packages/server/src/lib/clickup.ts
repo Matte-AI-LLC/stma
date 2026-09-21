@@ -13,6 +13,26 @@ const API_ROOT = 'https://api.clickup.com/api/v2';
 const AUTHORIZE_ROOT = 'https://app.clickup.com/api';
 const MAX_LISTS = 100;
 const MAX_TASKS = 20;
+/**
+ * ClickUp's page size for a List's tasks. Not a choice — the endpoint takes a
+ * `page` index and hands back a hundred rows at a time, with `last_page` on the
+ * final one.
+ */
+const CLICKUP_PAGE = 100;
+/**
+ * How far back a search reads, and therefore the only honest thing the page can
+ * claim about it.
+ *
+ * **ClickUp's v2 API has no text parameter for tasks at any endpoint** —
+ * neither `/list/{id}/task` nor the workspace's filtered `/team/{id}/task`
+ * takes one — so a search here is STMA reading pages and matching them in its
+ * own process. Three pages: it covers the workspace this was asked for (a few
+ * hundred open tasks) while staying three bounded calls on a lead's click, and
+ * a list longer than that is still reachable by pasting the task's link. A page
+ * that says `last_page` ends the loop, so most workspaces pay for one call.
+ */
+export const CLICKUP_SEARCH_PAGES = 3;
+export const CLICKUP_SEARCH_SCAN = CLICKUP_SEARCH_PAGES * CLICKUP_PAGE;
 
 export interface ClickupWorkspace {
   id: string;
@@ -179,7 +199,20 @@ async function request<T>(
       return { ok: true, value: { folders: [{ id: 'folder-1', name: 'Product', lists: seededLists }] } as T };
     }
     if (/\/list\?/.test(path)) return { ok: true, value: { lists: [] } as T };
-    if (/\/task\?/.test(path)) return { ok: true, value: { tasks: seededTasks.map(toRaw) } as T };
+    if (/\/task\?/.test(path)) {
+      // Paged the way ClickUp pages, because the search below depends on it: a
+      // fake that answered every page with the whole fixture would report
+      // duplicates as matches and would never exercise the stop condition.
+      const page = Number(/[?&]page=(\d+)/.exec(path)?.[1] ?? '0');
+      const rows = seededTasks.slice(page * CLICKUP_PAGE, (page + 1) * CLICKUP_PAGE);
+      return {
+        ok: true,
+        value: {
+          tasks: rows.map(toRaw),
+          last_page: (page + 1) * CLICKUP_PAGE >= seededTasks.length,
+        } as T,
+      };
+    }
     const task = /^\/task\/([^/?]+)(?:\?|$)/.exec(path)?.[1];
     if (task && method === 'GET') {
       // The two id spaces are kept apart here exactly as ClickUp keeps them
@@ -311,10 +344,53 @@ const mapTask = (raw: any): ClickupTask => ({
   updatedAt: raw.date_updated ? new Date(Number(raw.date_updated)).toISOString() : raw.updatedAt ?? null,
 });
 
+const tasksPath = (listId: string, page: number) =>
+  `/list/${listId}/task?archived=false&include_closed=false&page=${page}&order_by=updated&reverse=true`;
+
 export async function listClickupTasks(env: Env, config: ClickupConfig, limit = MAX_TASKS): Promise<ClickupResult<ClickupTask[]>> {
-  const result = await request<{ tasks?: unknown[] }>(env, config.token, 'GET', `/list/${config.listId}/task?archived=false&include_closed=false&page=0&order_by=updated&reverse=true`);
+  const result = await request<{ tasks?: unknown[] }>(env, config.token, 'GET', tasksPath(config.listId, 0));
   if (!result.ok) return result;
   return { ok: true, value: (result.value.tasks ?? []).slice(0, Math.min(limit, MAX_TASKS)).map(mapTask) };
+}
+
+/**
+ * Tasks whose name or key contains every word given, matched here.
+ *
+ * Every other reader in this file asks ClickUp a question and maps the answer.
+ * This one cannot: see `CLICKUP_SEARCH_SCAN` — there is no text parameter to
+ * send. So the match is a plain case-insensitive substring over the fields a
+ * person would recognise, which is also the honest thing to be: nobody should
+ * read this as ClickUp's own relevance ranking. Order is ClickUp's, newest
+ * activity first, so the first twenty matches are the twenty freshest.
+ *
+ * `toLowerCase`, never `toLocaleLowerCase`: this codebase runs on a Turkish
+ * locale desktop, where a locale-aware fold turns `I` into `ı` and a search for
+ * `INVOICE` stops matching `invoice`.
+ */
+export async function searchClickupTasks(
+  env: Env,
+  config: ClickupConfig,
+  text: string,
+  limit = MAX_TASKS,
+): Promise<ClickupResult<ClickupTask[]>> {
+  const words = text.trim().toLowerCase().split(/\s+/).filter(Boolean).slice(0, 8);
+  if (!words.length) return { ok: true, value: [] };
+  const want = Math.min(limit, MAX_TASKS);
+  const found: ClickupTask[] = [];
+  for (let page = 0; page < CLICKUP_SEARCH_PAGES; page += 1) {
+    const result = await request<{ tasks?: unknown[]; last_page?: boolean }>(env, config.token, 'GET', tasksPath(config.listId, page));
+    // A refusal on page two is still a refusal: a partial list presented as the
+    // answer would read as "nothing else matched".
+    if (!result.ok) return result;
+    const rows = (result.value.tasks ?? []).map(mapTask);
+    for (const task of rows) {
+      const haystack = `${task.name} ${task.customId ?? ''} ${task.id}`.toLowerCase();
+      if (words.every((word) => haystack.includes(word))) found.push(task);
+      if (found.length >= want) return { ok: true, value: found };
+    }
+    if (result.value.last_page === true || rows.length < CLICKUP_PAGE) break;
+  }
+  return { ok: true, value: found };
 }
 
 /**

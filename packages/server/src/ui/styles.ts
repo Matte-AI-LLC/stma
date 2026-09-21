@@ -747,6 +747,44 @@ td.val.hot { color: #8a5a12; font-weight: 500; }
 .sg-col { font: 500 10px var(--sans); letter-spacing: .1em; fill: var(--mut); }
 .sg-over { padding: 0 16px 10px; font: 400 12px var(--sans); color: var(--mut); }
 
+/* ---------- beta ceiling distance (ui/CeilingDistance) ---------- */
+.cd-scroll { overflow-x: auto; padding: 4px 10px 6px; }
+.cd { display: block; width: 100%; min-width: 740px; max-width: 900px; height: auto; }
+.cd a { cursor: pointer; text-decoration: none; }
+.cd a:hover .cd-name { fill: var(--green-strong); }
+.cd-axis { stroke: var(--line); stroke-width: 1; }
+.cd-track { stroke: var(--line-2); stroke-width: 1; }
+.cd-sep { stroke: var(--line-3); stroke-width: 1; }
+.cd-lane { font: 500 8px var(--mono); fill: var(--mut-2); }
+.cd-lane.onit { fill: var(--amber-ink); }
+.cd-lane.over { fill: var(--red-ink); }
+.cd-ceiling { stroke: var(--ink); stroke-width: 1.4; stroke-dasharray: 3 3; }
+.cd-ceiling-t { font: 500 9.5px var(--sans); letter-spacing: .1em; fill: var(--ink); }
+.cd-tick { font: 400 9.5px var(--sans); fill: var(--mut-2); }
+.cd-col { font: 500 10px var(--sans); letter-spacing: .1em; fill: var(--mut); }
+.cd-name { font: 500 12px var(--sans); fill: var(--ink); }
+.cd-cohort { font: 400 9.5px var(--mono); fill: var(--mut); }
+.cd-dot { fill: #fff; stroke: var(--mut-2); stroke-width: 1.6; }
+.cd-dot.onit { stroke: var(--amber-ink); fill: var(--amber-bg); }
+.cd-dot.over { fill: var(--red); stroke: var(--red); }
+.cd-pin { fill: var(--red); stroke: var(--red); stroke-width: 1.6; stroke-linejoin: round; }
+.cd-pulse { fill: none; stroke: var(--red); stroke-width: 1.2; animation: cd-pulse 2s ease-out infinite; }
+@keyframes cd-pulse { 0% { opacity: .5; r: 4px; } 100% { opacity: 0; r: 8px; } }
+/* Only the marks already past a ceiling move, and only until somebody says they
+   would rather nothing did. The ring stays either way. */
+@media (prefers-reduced-motion: reduce) { .cd-pulse { animation: none; opacity: .35; } }
+.cd-feat { fill: #fff; stroke: var(--ctl-border); stroke-width: 1.2; }
+.cd-feat.in_use { fill: var(--red); stroke: var(--red); }
+.cd-feat.kept { fill: var(--green-bg); stroke: var(--green-line); }
+.cd-feat.unrecorded { stroke-dasharray: 2 2; }
+.cd-feat-t { font: 600 8.5px var(--mono); fill: var(--mut-2); }
+.cd-feat-t.in_use { fill: #fff; }
+.cd-feat-t.kept { fill: var(--green-ink); }
+.cd-key { display: flex; flex-wrap: wrap; gap: 6px 14px; padding: 0 16px 10px; font: 400 11px var(--sans); color: var(--txt-3); }
+.cd-key span { display: inline-flex; align-items: center; gap: 5px; }
+.cd-key b { font: 600 10px var(--mono); color: var(--ink); }
+.cd-over { padding: 0 16px 10px; font: 400 12px var(--sans); color: var(--mut); }
+
 /* The critical count in the status strip doubles as its own filter. */
 .stripfilter { display: inline-flex; align-items: center; gap: 6px; height: 22px; padding: 0 8px; border-radius: 99px; border: 1px solid var(--red-bg-line); background: var(--red-bg); color: var(--red-ink); font: 500 11px/1 var(--sans); text-decoration: none; }
 .stripfilter .d { width: 6px; height: 6px; border-radius: 99px; background: var(--red); flex: none; }

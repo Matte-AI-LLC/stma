@@ -18,10 +18,24 @@ import { grantLabel, type TokenScope } from '../lib/grants';
  * governance page rather than the agent the lead had given the task to.
  *
  * The link is one nullable column, set by the owner and shown wherever it
- * matters. It means "this adapter listens for, and acts beside, that agent" —
- * and nothing more. It moves no authority: the adapter still cannot accept the
- * assignment it hears about, and neither side can touch the other's runs. Who
- * may update a run is a separate decision and deliberately not made here.
+ * matters. It means "this adapter listens for, and acts beside, that agent".
+ *
+ * It moves authority in exactly one direction, and that was a decision rather
+ * than a drift (2026-09-21): the agent an adapter names may update, finish and
+ * hand off the runs that adapter owns — `adapterListensFor` below, read by
+ * `lib/grants.ts`. The hook starts the run under the adapter's installation and
+ * tells the agent beside it to reuse that `run_id`, and until this the agent's
+ * own credential was refused, so the product refused the instruction the product
+ * had just given. The consent that opens it was already there: the owner picked
+ * this pairing by hand, on the adapter's consent screen or on Agent connections,
+ * and `resolveCompanion` checked it there and again at redemption.
+ *
+ * Nothing else moves, and the shape is what keeps it that way. The column lives
+ * on the adapter and points at the agent, so the edge is one-way by
+ * construction: an adapter still cannot touch the agent's own runs. It still
+ * cannot accept the assignment it hears about — `transitionHandoff` lets only
+ * the named installation accept — and it reaches no other project, because a
+ * credential's own team/project scope is checked first and is unchanged.
  *
  * Many adapters may name one agent — Codex keeps one MCP identity per machine
  * and an adapter per checkout — but an adapter names at most one, and only an
@@ -331,6 +345,62 @@ export async function connectionPairings(db: Db, userId: string): Promise<Map<st
     });
   }
   return pairings;
+}
+
+/**
+ * The `agent_installations` row in hand is a live local adapter whose stored
+ * companion is this installation. The one definition of the run edge, written
+ * once and read by both the guards in `lib/grants.ts` and the tools in
+ * `mcp/fleet.ts` that decide which run a call means — a guard that allows what
+ * the tool then refuses is worse than either.
+ *
+ * It is not a second definition of who may be *paired*: `resolveCompanion` is
+ * still the only one of those, and it ran when the owner chose and again at
+ * redemption. This reads the stored answer back under the rules it was written
+ * under, the way `liveCompanion` does, so a row hand-edited into the column or
+ * a pairing whose adapter was revoked widens nothing. It says nothing about the
+ * owner, because it cannot: every caller already pins one, either by the user
+ * id it is querying under or by the join below.
+ */
+export const adapterListeningFor = (agentInstallationId: string) =>
+  and(
+    isAdapterSql,
+    eq(agentInstallations.companionOf, agentInstallationId),
+    isNull(agentInstallations.revokedAt),
+  );
+
+/**
+ * Is the installation that owns this run an adapter that listens for this
+ * credential? The one authorization question a pairing answers (2026-09-21).
+ *
+ * Asked per call, against the current row, which is the whole answer to what
+ * happens when a pairing moves under a live run: unpair or re-point it and the
+ * agent is refused from its very next call, with no grandfathering. It keeps
+ * nothing either, because the run was never its own — `agent_runs.installation_id`
+ * does not move, so every record still names the adapter that reported it.
+ */
+export async function adapterListensFor(
+  db: Db,
+  runInstallationId: string,
+  credentialInstallationId: string,
+): Promise<boolean> {
+  const [row] = await db
+    .select({ id: agentInstallations.id })
+    .from(agentInstallations)
+    .innerJoin(companionInstallations, eq(companionInstallations.id, agentInstallations.companionOf))
+    .where(
+      and(
+        eq(agentInstallations.id, runInstallationId),
+        eq(companionInstallations.id, credentialInstallationId),
+        // One person's on both sides. The guards hold no user id of their own,
+        // so this asks the two rows rather than trusting the column.
+        eq(agentInstallations.userId, companionInstallations.userId),
+        isNull(companionInstallations.revokedAt),
+        adapterListeningFor(credentialInstallationId),
+      ),
+    )
+    .limit(1);
+  return Boolean(row);
 }
 
 /** The live agent this installation listens for — what the news endpoint asks on behalf of. */

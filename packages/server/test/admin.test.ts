@@ -112,7 +112,7 @@ it('returns 404 for the whole /admin area when ADMIN_USERNAMES is unset', async 
 it('returns 404 for anonymous visitors and signed-in non-admins', async () => {
   expect((await fetch(`${srv.url}/admin`)).status).toBe(404);
   mallory = await devLogin(srv, 'mallory');
-  for (const p of ['/admin', '/admin/teams', '/admin/users', '/admin/crm']) {
+  for (const p of ['/admin', '/admin/teams', '/admin/users', '/admin/crm', '/admin/beta']) {
     expect((await fetch(srv.url + p, { headers: mallory.header() })).status).toBe(404);
   }
   const appHtml = await (await fetch(`${srv.url}/app`, { headers: mallory.header() })).text();

@@ -41,6 +41,27 @@ export const users = pgTable(
      * proved by a migration that cannot know.
      */
     emailVerifiedAt: timestamp('email_verified_at', { withTimezone: true }),
+    /**
+     * Which access-code cohort this account came through — never the code.
+     *
+     * The beta's door (`auth/accessCodes.ts`) matched a label and then wrote it
+     * to one stdout line and nowhere else, so the only record of which wave
+     * somebody arrived in expired with Log Analytics at thirty days. A beta that
+     * runs longer than a month could not answer its own first question.
+     *
+     * Three states, and the difference between the first two matters:
+     * `null` means no code was asked for at all (self-host, dev, or an account
+     * older than the door), the empty string means a code matched that the
+     * operator named no cohort for, and anything else is the label they typed.
+     * The parser turns `CODE:` into no label rather than an empty one, so the
+     * empty string is a value configuration cannot produce and the two silences
+     * can never be confused. `cohortOf` writes it and `describeCohort` reads it.
+     *
+     * Written once, at signup, by the only door that checks a code — so
+     * `created_at` is also when the cohort was redeemed, and there is no second
+     * timestamp to keep honest.
+     */
+    signupCohort: text('signup_cohort'),
     avatarUrl: text('avatar_url'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
@@ -1132,6 +1153,43 @@ export const loadSamples = pgTable(
  * body, for the same reason `field` and `source` are closed sets: a log a caller
  * can write sentences into is not a log.
  */
+/**
+ * A plan an operator gave a workspace, beside the plan it has.
+ *
+ * It rides beside `teams.plan` the way the EE evaluation does rather than
+ * writing the column, and that is the whole design: `setTeamPlan` stays the one
+ * writer of `teams.plan`, what Stripe or an operator set there is untouched
+ * while the grant lasts, and when a dated grant ends the workspace is simply
+ * back on its own plan with nothing to unwind and nothing to sweep —
+ * `lib/planGrants` compares `ends_at` with the clock on every read.
+ *
+ * One row per workspace: giving again replaces it, and the history of every
+ * give, change and revoke is in `ceiling_changes` under the field `grant`.
+ * `ends_at` null means no end date. It is the first instant the grant no longer
+ * applies, so a grant "through 31 December" ends at 1 January 00:00 UTC.
+ */
+export const planGrants = pgTable(
+  'plan_grants',
+  {
+    teamId: uuid('team_id')
+      .primaryKey()
+      .references(() => teams.id, { onDelete: 'cascade' }),
+    plan: text('plan').notNull(),
+    endsAt: timestamp('ends_at', { withTimezone: true }),
+    /** The operator's own words about why, shown only on /admin and never logged. */
+    note: text('note'),
+    grantedBy: uuid('granted_by').references(() => users.id, { onDelete: 'set null' }),
+    /** Their username as it read then, so a deleted account still names the grant. */
+    grantedByLabel: text('granted_by_label'),
+    grantedAt: timestamp('granted_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    // Free is the floor every workspace already stands on; granting it would be
+    // a row that changes nothing and reads like it did something.
+    check('plan_grants_plan', sql`${t.plan} in ('solo', 'team', 'enterprise')`),
+  ],
+);
+
 export const ceilingChanges = pgTable(
   'ceiling_changes',
   {
@@ -1142,7 +1200,7 @@ export const ceilingChanges = pgTable(
       .references(() => teams.id, { onDelete: 'cascade' }),
     /** The workspace's slug when it happened — a workspace can be renamed afterwards. */
     teamSlug: text('team_slug').notNull(),
-    /** 'plan' | 'evaluation'. Validated in lib/ceilings. */
+    /** 'plan' | 'evaluation' | 'grant'. Validated in lib/ceilings. */
     field: text('field').notNull(),
     previous: text('previous'),
     next: text('next'),
@@ -1159,6 +1217,87 @@ export const ceilingChanges = pgTable(
   (t) => [
     index('ceiling_changes_at').on(t.at.desc()),
     index('ceiling_changes_team').on(t.teamId, t.at.desc()),
+  ],
+);
+
+/**
+ * Who gained or lost access to a workspace, and who did it.
+ *
+ * The other half of `ceiling_changes`, and deliberately a second table rather
+ * than a `field` value on the first. A ceiling change is (workspace, field,
+ * previous, next) and a membership change is (workspace, *person*, previous
+ * role, next role): merging them would leave half the columns null in half the
+ * rows, and both of the questions an operator actually asks — "what happened to
+ * this person" and "what did this workspace lose" — would have to filter on
+ * `field` before they could begin. They also differ in volume by an order of
+ * magnitude, which is the reason the ceiling table names for keeping membership
+ * churn out of it.
+ *
+ * It is **not** the team activity feed, which already carries member_joined /
+ * member_removed / member_promoted for the workspace's own members to read.
+ * Different readers, different retention: the feed is swept by age (by plan, on
+ * the hosted service), is capped per team, and a team owner deleting their
+ * workspace deletes it. This is the operator's, has no age sweep, and can be
+ * read across every workspace at once. Both are written where both apply; where
+ * only one applies — an account deleting itself writes no feed row in anybody's
+ * workspace, an organization deprovisioning writes across several — the gap was
+ * the thing worth closing.
+ *
+ * It **cascades with the workspace**, exactly like `ceiling_changes` and for the
+ * same reason: the record explains access *to a workspace*, and once the
+ * workspace is gone its absence is the answer. The consequence is stated rather
+ * than hidden — deleting a team wipes every membership in it and this table
+ * cannot record that, because the rows would be deleted by the same
+ * transaction, so `lib/memberships` does not write them and says why.
+ */
+export const membershipChanges = pgTable(
+  'membership_changes',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    at: timestamp('at', { withTimezone: true }).notNull().defaultNow(),
+    teamId: uuid('team_id')
+      .notNull()
+      .references(() => teams.id, { onDelete: 'cascade' }),
+    /** The workspace's slug when it happened — a workspace can be renamed afterwards. */
+    teamSlug: text('team_slug').notNull(),
+    /** 'added' | 'role_changed' | 'removed'. Validated in lib/memberships. */
+    action: text('action').notNull(),
+    /** Whose access moved. Null once the account row itself is gone. */
+    subjectId: uuid('subject_id').references(() => users.id, { onDelete: 'set null' }),
+    /**
+     * Their username as it read then — deliberately null on the one path where
+     * the subject asked to be erased. See `lib/memberships`.
+     */
+    subjectLabel: text('subject_label'),
+    /** The role before and after: null on the side where there was no membership. */
+    previousRole: text('previous_role'),
+    nextRole: text('next_role'),
+    /** 'owner' | 'operator' | 'invite' | 'identity' | 'self'. Validated in lib/memberships. */
+    source: text('source').notNull(),
+    /** Null when no human did it — SCIM deprovisioning has no actor. */
+    actorId: uuid('actor_id').references(() => users.id, { onDelete: 'set null' }),
+    actorLabel: text('actor_label'),
+    /** The exact route or event that carried it. */
+    route: text('route').notNull(),
+    /**
+     * True when this removal left the workspace with no owner at all. The core
+     * console and `/admin` both refuse that; the organization deprovisioning
+     * path deliberately does not, so this column is where it shows up.
+     */
+    leftOwnerless: boolean('left_ownerless').notNull().default(false),
+    /**
+     * One act that touched several workspaces shares one id, so "what did that
+     * one deprovisioning do" is a single query rather than a guess from
+     * timestamps.
+     */
+    groupId: uuid('group_id'),
+    detail: text('detail'),
+  },
+  (t) => [
+    index('membership_changes_at').on(t.at.desc()),
+    index('membership_changes_team').on(t.teamId, t.at.desc()),
+    index('membership_changes_subject').on(t.subjectId, t.at.desc()),
+    index('membership_changes_group').on(t.groupId),
   ],
 );
 

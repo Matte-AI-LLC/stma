@@ -9,6 +9,7 @@ import { migrate as migratePg } from 'drizzle-orm/postgres-js/migrator';
 import postgres from 'postgres';
 import type { Env } from '../env';
 import { defaultMigrationsDir } from '../paths';
+import { PACKAGE_NAME as SERVER_PACKAGE, VERSION } from '../version';
 import * as schema from './schema';
 
 export * as schema from './schema';
@@ -31,7 +32,38 @@ export function rowsAffected(result: unknown): number {
   return r?.rowCount ?? r?.affectedRows ?? r?.count ?? 0;
 }
 
-export async function connectDb(env: Env): Promise<{ db: Db; close: () => Promise<void> }> {
+/**
+ * The database's own notification bus, when the connected driver has one that
+ * crosses processes.
+ *
+ * `lib/stream` is the only caller: it carries the news that something changed
+ * between replicas, never the change itself. Deliberately two methods and a
+ * string — naming the capability here rather than handing `lib/stream` a
+ * postgres-js client is what keeps everything outside this file from running a
+ * query on the listener's connection.
+ */
+export interface NotifyBus {
+  /** Fire and forget. Rejects rather than throwing into a caller's flow. */
+  notify(channel: string, payload: string): Promise<void>;
+  /** Resolves once the backend is listening; the returned disposer stops it. */
+  listen(channel: string, onPayload: (payload: string) => void): Promise<() => Promise<void>>;
+}
+
+export interface Connection {
+  db: Db;
+  close: () => Promise<void>;
+  /**
+   * Present only on the PostgreSQL path. PGlite has `listen`/`notify` too — it
+   * is PostgreSQL — but its backend is a wasm build inside *this* Node process,
+   * so a notification there can only ever reach the process that sent it. An
+   * embedded instance is one process by definition, which is why the seam is
+   * absent rather than wired to something that would add a database round trip
+   * to hand an event back to its own sender.
+   */
+  notifyBus?: NotifyBus;
+}
+
+export async function connectDb(env: Env): Promise<Connection> {
   const migrationsFolder = env.migrationsDir
     ? path.resolve(process.cwd(), env.migrationsDir)
     : defaultMigrationsDir;
@@ -62,7 +94,22 @@ export async function connectDb(env: Env): Promise<{ db: Db; close: () => Promis
     } finally {
       await migrationClient.end();
     }
-    return { db, close: () => client.end() };
+    // `sql.listen` opens its OWN connection — max 1, no idle timeout, no
+    // lifetime recycling — separate from this pool, and re-issues every LISTEN
+    // when that connection closes. It is the same shape the migration client
+    // above is built by hand for, and for the same reason: a session-scoped
+    // thing must never ride a connection the pool can take back. `client.end()`
+    // ends it too, so there is still one close path.
+    const notifyBus: NotifyBus = {
+      notify: async (channel, payload) => {
+        await client.notify(channel, payload);
+      },
+      listen: async (channel, onPayload) => {
+        const subscription = await client.listen(channel, onPayload);
+        return () => subscription.unlisten();
+      },
+    };
+    return { db, close: () => client.end(), notifyBus };
   }
 
   mkdirSync(env.pgliteDir, { recursive: true }); // PGlite's own mkdir is not recursive
@@ -90,17 +137,57 @@ export function dataDirectoryMajor(dir: string): string | undefined {
 }
 
 /**
- * What major this build's embedded engine writes, learned by asking it.
+ * The part of a PGlite build this file and the upgrade path need.
+ *
+ * Structural rather than the real type, because the upgrade loads a *second,
+ * older* engine at runtime: two different copies of the package, which cannot
+ * share a declaration. This is what both of them answer to.
+ */
+export interface EmbeddedEngine {
+  new (dataDir: string): EmbeddedClient;
+}
+
+export interface EmbeddedClient {
+  query(
+    query: string,
+    params?: unknown[],
+    options?: { blob?: Blob },
+  ): Promise<{ rows: Record<string, unknown>[]; blob?: Blob }>;
+  exec(query: string): Promise<unknown>;
+  close(): Promise<void>;
+}
+
+/**
+ * What major an engine writes, learned by asking it.
  *
  * There is no constant to read: PGlite carries its PostgreSQL inside a wasm
  * build and publishes no major of its own. One throwaway directory is the
- * honest way to find out, and it is created only on a path where the instance
- * has already failed to start.
+ * honest way to find out — and it is the only way to check an engine that was
+ * loaded from a path rather than imported, where the name it was installed
+ * under is not evidence of the version that arrived.
  */
-export async function embeddedMajor(): Promise<string | undefined> {
+const majors = new WeakMap<EmbeddedEngine, Promise<string | undefined>>();
+
+export function majorWrittenBy(engine: EmbeddedEngine): Promise<string | undefined> {
+  // Remembered per engine, not per call: an initdb costs seconds, and a wasm
+  // build cannot change its mind about which PostgreSQL it carries. The upgrade
+  // asks several times over and the refusal path can be reached more than once.
+  const known = majors.get(engine);
+  if (known) return known;
+  const asking = askMajor(engine).then((major) => {
+    // An engine that failed to start has not answered, and a non-answer is not
+    // worth keeping: the next caller should ask again.
+    if (major === undefined) majors.delete(engine);
+    return major;
+  });
+  majors.set(engine, asking);
+  return asking;
+}
+
+async function askMajor(engine: EmbeddedEngine): Promise<string | undefined> {
   const probe = mkdtempSync(path.join(tmpdir(), 'stma-pg-major-'));
   try {
-    const client = new PGlite(probe);
+    const client = new engine(probe);
     await client.query('select 1');
     await client.close();
     return dataDirectoryMajor(probe);
@@ -109,6 +196,17 @@ export async function embeddedMajor(): Promise<string | undefined> {
   } finally {
     rmSync(probe, { recursive: true, force: true });
   }
+}
+
+/**
+ * What major this build's embedded engine writes. Created only on a path where
+ * the instance has already failed to start, or when somebody asked for the
+ * upgrade.
+ */
+export async function embeddedMajor(): Promise<string | undefined> {
+  // The one cast: PGlite is the engine EmbeddedEngine was written from, and
+  // duck typing across two package copies is the whole point of the interface.
+  return majorWrittenBy(PGlite as unknown as EmbeddedEngine);
 }
 
 /**
@@ -122,12 +220,12 @@ export async function embeddedMajor(): Promise<string | undefined> {
  * minor/patch rule merged exactly that. `@matteai/stma-server@0.14.2` shipped
  * it, so anybody who ran `stma serve` on an earlier release and then upgraded
  * met an opaque failure with no way out of it. Dependabot is told to leave this
- * package alone now. Whether to stay on 18 and write an export and import path
- * or go back to 17 is the owner's call and is open; either way the message
- * names the cause on the first read rather than the third.
+ * package alone now, and the way out is `--upgrade-data` (`db/upgrade.ts`),
+ * which this message names.
  *
  * Deliberately not automatic. Moving somebody's only copy of their data is not
- * a thing to do on their behalf while they watch a server fail to start.
+ * a thing to do on their behalf while they watch a server fail to start — so
+ * boot still refuses, and the upgrade is a command a person types.
  */
 export async function dataDirectoryRefusal(
   dir: string,
@@ -140,12 +238,30 @@ export async function dataDirectoryRefusal(
   if (!wrote) return cause instanceof Error ? cause : new Error(detail);
   const expected = await embeddedMajor();
   if (expected && expected !== wrote) {
-    return new Error(
-      `The database in ${dir} was written by PostgreSQL ${wrote}, and this build's embedded engine is PostgreSQL ${expected}. ` +
-        'A major version never opens an older data directory in place, so this is a data migration rather than a restart. ' +
-        'Run the release that last opened this directory, or move it aside to start with an empty one — nothing here will move it for you. ' +
-        `Underlying error: ${detail}`,
+    return named(
+      `The database in ${dir} was written by PostgreSQL ${wrote}, and this build's embedded engine is PostgreSQL ${expected}.\n` +
+        'A major version never opens an older data directory in place, so this is a data migration rather than a restart.\n' +
+        '\nUpgrade it once, keeping the old copy beside it:\n\n' +
+        `  npx ${SERVER_PACKAGE}@${VERSION} --upgrade-data "${dir}"\n\n` +
+        `(in a container or a checkout, the same binary: stma-server --upgrade-data "${dir}")\n` +
+        '\nOr run the release that last opened this directory, or move it aside to start with an ' +
+        'empty one — nothing here will move it for you.\n' +
+        `\nUnderlying error: ${detail}`,
     );
   }
-  return new Error(`The database in ${dir} (PostgreSQL ${wrote}) could not be opened: ${detail}`);
+  return named(`The database in ${dir} (PostgreSQL ${wrote}) could not be opened: ${detail}`);
+}
+
+/**
+ * The sentence is the answer, so the bin prints it on its own instead of
+ * wrapping it in a stack trace — which is how the opaque failure read in the
+ * first place. `name` rather than a subclass: nothing catches this by type, and
+ * a subclass would invite something to start.
+ */
+export const DATA_DIRECTORY_ERROR = 'DataDirectoryError';
+
+function named(text: string): Error {
+  const error = new Error(text);
+  error.name = DATA_DIRECTORY_ERROR;
+  return error;
 }

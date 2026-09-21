@@ -15,13 +15,23 @@ import { fileURLToPath } from 'node:url';
  * that refuses to boot because it could not read its own manifest would be a
  * far worse trade than one that reports `unknown`.
  */
-function readVersion(): string {
+function readManifest(): { name?: string; version?: string } {
   try {
     const manifest = fileURLToPath(new URL('../package.json', import.meta.url));
-    return (JSON.parse(readFileSync(manifest, 'utf8')) as { version?: string }).version ?? 'unknown';
+    return JSON.parse(readFileSync(manifest, 'utf8')) as { name?: string; version?: string };
   } catch {
-    return 'unknown';
+    return {};
   }
 }
 
-export const VERSION = readVersion();
+const manifest = readManifest();
+
+export const VERSION = manifest.version ?? 'unknown';
+
+/**
+ * What this build is called on the registry, for the one place that has to
+ * print a command somebody will type: the data-directory refusal, which names
+ * `npx <package>@<version> --upgrade-data`. Read from the manifest rather than
+ * written out, so the two halves of that command cannot drift apart.
+ */
+export const PACKAGE_NAME = manifest.name ?? '@matteai/stma-server';

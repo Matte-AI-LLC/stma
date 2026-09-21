@@ -18,7 +18,7 @@ paste a new prompt into the second agent; it connects and replies. Do not copy t
 config between computers. The saved page confirms the exchange; no third prompt.
 
 No self-invitation, repository setup, governance or paid Team subscription is needed for the
-message check. Cloud Free supports two devices. Keep both agents on **one server URL**: running
+message check, and Cloud Free covers it. Keep both agents on **one server URL**: running
 `stma serve` on each computer creates two unrelated instances. To self-host across machines,
 run one server at a secured HTTPS address they can both reach and set `BASE_URL` to that address.
 `localhost` only works on the computer hosting the server; keep development servers private.

@@ -19,11 +19,13 @@ import {
   teams,
   webSessions,
 } from '../db/schema';
-import { PLANS, PLAN_IDS } from './entitlements';
+import { PLANS, PLAN_IDS, planName, type PlanId } from './entitlements';
+import { grantedOrOwnPlanSql } from './planGrants';
 import type { Env } from '../env';
 import { markStaleAgentRuns, trimAgentEvents } from '../domain/agents';
 import { trimEnvironmentChecks } from '../domain/environments';
 import { trimCeilingChanges } from './ceilings';
+import { trimMembershipChanges } from './memberships';
 import { trimErrorEvents } from './errors';
 import { startLoadHistory, trimLoadSamples } from './loadHistory';
 import { sweepCounters } from './counters';
@@ -32,7 +34,16 @@ import { flushNotificationsOnce } from './notifications';
 import { trimAnnouncements } from './sessions';
 import { trimActivity } from './track';
 
-/** Team ids on one of these plans — the subquery a scoped purge deletes through. */
+/**
+ * Team ids on one of these plans — the subquery a scoped purge deletes through.
+ *
+ * "On" means the plan in force: an operator's grant while it lasts, otherwise
+ * the workspace's own (`grantedOrOwnPlanSql`). A workspace given Team keeps
+ * Team's history instead of being swept at free's 90 days, and the day a dated
+ * grant ends it is swept like any workspace on its own plan — which is exactly
+ * what happens when a paid plan ends, and why the operator's grant card says
+ * so before anybody picks a date.
+ */
 const teamsIn = (db: Db, plans: readonly string[]) =>
   db
     .select({ id: teams.id })
@@ -42,9 +53,48 @@ const teamsIn = (db: Db, plans: readonly string[]) =>
       // to be swept like `free` here too — otherwise a typo in the column buys a
       // team unlimited history.
       plans.includes('free')
-        ? (or(inArray(teams.plan, [...plans]), notInArray(teams.plan, [...PLAN_IDS])) as SQL)
-        : inArray(teams.plan, [...plans]),
+        ? (or(
+            inArray(grantedOrOwnPlanSql, [...plans]),
+            notInArray(grantedOrOwnPlanSql, [...PLAN_IDS]),
+          ) as SQL)
+        : inArray(grantedOrOwnPlanSql, [...plans]),
     );
+
+/**
+ * How many days of activity and agent-event history one workspace keeps, or
+ * `null` when age never removes it (the row caps still do).
+ *
+ * The one answer the sweep below and the pages that print it both read. The
+ * Activity page used to print `ACTIVITY_RETENTION_DAYS` instead, and on the
+ * hosted service that number governs neither table, so every workspace there
+ * was told 180 days while a free one kept 90 and a Team one kept everything.
+ *
+ * **It deliberately ignores `BETA_UNMETERED` (decided 2026-09-21).** The beta
+ * lifts the ceilings that refuse work. Lifting this one too would make the day
+ * the flag is unset the day months of history are deleted: at boot, because
+ * the sweep runs the moment the server starts, and before anybody could buy
+ * their way out, because nothing is for sale while the beta runs. Kept here,
+ * the flip deletes nothing. The EE Team evaluation made the same choice for the
+ * same kind of temporary access, so there is one rule rather than two.
+ */
+export function historyRetentionDays(
+  env: Pick<Env, 'hosted' | 'activityRetentionDays'>,
+  plan: string | null | undefined,
+): number | null {
+  if (!env.hosted) return env.activityRetentionDays > 0 ? env.activityRetentionDays : null;
+  // `planName` sends an id nobody recognises to free, which is how `teamsIn`
+  // sweeps it — a typo in the column must not print a longer promise either.
+  return PLANS[planName(plan) as PlanId].retentionDays;
+}
+
+/** The same answer in words, for a page telling somebody how long their history lasts. */
+export function historyRetentionNote(
+  env: Pick<Env, 'hosted' | 'activityRetentionDays'>,
+  plan: string | null | undefined,
+): string {
+  const days = historyRetentionDays(env, plan);
+  return days === null ? 'not purged by age' : `purged after ${days} days`;
+}
 
 /**
  * How long history is kept, and for whom.
@@ -53,15 +103,16 @@ const teamsIn = (db: Db, plans: readonly string[]) =>
  * scoped to the plans that carry it; plans promising unlimited history simply
  * do not appear, so nothing deletes their rows by age. Self-host: a single
  * unscoped entry from the environment, which is the behaviour that existed
- * before plans reached this file at all.
+ * before plans reached this file at all. Both read `historyRetentionDays`.
  */
 function retentionGroups(env: Env): Array<[number, readonly string[] | null]> {
   if (!env.hosted) {
-    return env.activityRetentionDays > 0 ? [[env.activityRetentionDays, null]] : [];
+    const days = historyRetentionDays(env, null);
+    return days === null ? [] : [[days, null]];
   }
   const byDays = new Map<number, string[]>();
   for (const id of PLAN_IDS) {
-    const days = PLANS[id].retentionDays;
+    const days = historyRetentionDays(env, id);
     if (days === null) continue;
     byDays.set(days, [...(byDays.get(days) ?? []), id]);
   }
@@ -161,6 +212,10 @@ export async function runCleanupOnce(db: Db, env: Env): Promise<void> {
   // Ceiling changes have no age sweep on purpose (see lib/ceilings): the row
   // somebody opens this table for is the old one. The cap is the whole bound.
   counts.ceilingChangesCapped = await trimCeilingChanges(db);
+  // Access changes follow exactly the same rule, and for the same reason —
+  // "why can this person not get in any more" is asked long after the fact.
+  // The cap is higher because membership churn genuinely is.
+  counts.membershipChangesCapped = await trimMembershipChanges(db);
   // Preflight verdicts describe a machine at a moment, so they age out with the
   // snapshots they compare against — and, like the error log, a burst between
   // sweeps is caught by a row cap (per team, so a busy team evicts only itself).

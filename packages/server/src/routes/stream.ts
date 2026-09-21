@@ -8,6 +8,10 @@ import { membershipUser } from '../lib/securityHooks';
  * server-rendered path it always used, so nothing here duplicates a query, a
  * permission check, or a rendering rule — the one thing a live channel must not
  * become is a second, subtly different copy of the app.
+ *
+ * Which replica the browser reached does not change what it hears. This
+ * subscribes to the one channel in this process, and on the PostgreSQL path
+ * `lib/stream` is also delivering into it what the other replicas published.
  */
 import { eq } from 'drizzle-orm';
 import { Hono } from 'hono';

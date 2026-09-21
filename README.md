@@ -49,7 +49,8 @@ place to exchange messages and compare environments, without carrying context be
    Listens for** — its prompt hook announces the assignment by itself and nobody says anything.)
 
 No repository setup, CLI, project creation, governance or paid Team subscription is needed for
-this message check. Cloud Free includes two devices; the paid Solo plan is optional. “Personal”
+this message check. Cloud Free covers it (connecting agents is never limited by machine) and the
+paid Solo plan is optional. “Personal”
 credential access means **every workspace this account can reach while the credential is active**,
 not “I work alone”; one workspace's **Entire workspace** access is enough and includes its current
 and future projects. Existing project-only agents should stay on the same project.
@@ -207,9 +208,17 @@ a deployment until that build is released and its environment-specific gates pas
   `#42` or `owner/repo#42`, `PROJ-42`, or a ClickUp task link, reads the ticket and fills whatever
   you left empty — the ticket's own key becomes the task, and its summary and link go into the
   brief. For GitHub and ClickUp you can also **Browse** the twenty most recently updated open
-  tickets and pick one instead of looking the key up; the list is read only when you ask for it, so
-  it never slows the page down, and a tracker that refuses says so instead of showing nothing.
-  Browsing Jira is not available yet — paste the key; STMA reads it the same way.
+  tickets and pick one instead of looking the key up, or **Search** them by a few words when
+  the ticket you want is not among the newest twenty. Both are read only when you ask for
+  them, so neither slows the page down, and a tracker that refuses says so instead of showing
+  nothing. The line under the results says what was actually looked at, because the two
+  trackers reach different distances: GitHub searches the whole repository through its own
+  search endpoint, while ClickUp has no task search in its API at all, so STMA reads the three
+  hundred most recently updated open tasks of the mapped List and matches them itself. Jira
+  can be neither browsed nor searched yet, and the dialog says why — Atlassian moved issue
+  search to an endpoint STMA has never measured against a real site, and a guess that fails
+  while you are assigning work is worse than no button. Paste the key; STMA reads it the same
+  way.
 - **Agent handoff** (`handoff_work`, optionally `to_agent` so one named agent, not a person, is
   the only one that can take it and its prompt hook announces it): an agent about to hit its usage limit pushes its branch and
   attaches an immutable delivery/tested checkpoint in the same call (or records it on the run first).
@@ -596,13 +605,57 @@ EMBEDDED_DB=1 PGLITE_DIR=~/.stma/data BASE_URL=http://localhost:3000 stma-server
 The server bin assumes production unless started with `--dev`, so the passwordless dev
 login form is off and the first account you create needs a real password.
 
+### Upgrading across a PostgreSQL major
+
+The embedded database is PGlite, which carries its PostgreSQL inside its own **minor**
+version: 0.3 bundles PostgreSQL 17, 0.5 bundles 18. A PostgreSQL major never opens an older
+data directory in place, so a release that moves it is a data migration wearing the clothes
+of a dependency bump — which is exactly how it happened here, on 2026-09-14. Every data
+directory written by `@matteai/stma-server` **before 0.14.2** is PostgreSQL 17; 0.14.2 and
+later write 18.
+
+The server refuses such a directory at boot, names both majors and prints the command:
+
+```bash
+stma-server --upgrade-data "$HOME/.stma/data"
+# or, with nothing installed:
+npx @matteai/stma-server@latest --upgrade-data "$HOME/.stma/data"
+```
+
+It reads the old database with the engine that wrote it, rebuilds the schema from the
+migrations this build ships — replayed to exactly the level the old directory recorded, so
+the ordinary boot migrator carries on from there — and moves every row in PostgreSQL's own
+COPY format. Row counts are compared table by table before anything is swapped.
+
+**Rolling back is a rename.** On success the PostgreSQL 17 database is kept beside the new
+one as `<dir>.backup-pg17-<timestamp>`, and nothing in STMA ever deletes it. If the upgrade
+turns out badly, stop the server, remove the new directory and rename the backup back:
+
+```bash
+mv ~/.stma/data ~/.stma/data.pg18-discarded
+mv ~/.stma/data.backup-pg17-* ~/.stma/data
+# then run the release you were on before, which is the one that can open it
+```
+
+On failure nothing is swapped at all: the work happens in a sibling directory, every check
+that can refuse has refused before the first rename, and the original is left exactly as the
+old engine left it. The message says which directory holds what.
+
+The older engine is **fetched once** rather than shipped, because it is 25 MB of WebAssembly a
+fresh install will never open. A machine with no registry access can point
+`STMA_UPGRADE_ENGINE` at the module entry of a `@electric-sql/pglite@0.3.16` it already has.
+The command is idempotent: run against a directory this build already wrote, it says there is
+nothing to do and touches nothing.
+
 ### Hosted pricing
 
 **The hosted service is in a private beta and nothing is for sale yet.** An access code creates
-one account; every workspace has every feature and no ceiling, there is no card and no trial
-clock, and the plan pages say so rather than offering a checkout. The table below is the pricing
-the beta is testing toward — read it as the plan, not as today's bill. Nothing switches off
-underneath an existing workspace without a conversation first.
+one account; every workspace has every feature and none of the plan limits on members, projects,
+integrations, snapshot devices, calls or handoffs, there is no card and no trial clock, and the plan pages say so
+rather than offering a checkout. History is the one exception, on purpose: the activity feed and
+the agent run trail keep Cloud Free's 90 days, so the end of the beta deletes nothing. The table
+below is the pricing the beta is testing toward — read it as the plan, not as today's bill.
+Nothing switches off underneath an existing workspace without a conversation first.
 
 An instance you run yourself is unaffected either way. `SIGNUP_ACCESS_CODES` and `BETA_UNMETERED`
 are ordinary switches shipped in this source: the first makes signup invite-only without closing
@@ -614,10 +667,15 @@ inviting its second human; current member count is not a checkout prerequisite.
 
 | Plan | Price | Human limit | Hosted service |
 | --- | --- | --- | --- |
-| Cloud Free | $0 | 1 | 2 devices, 90-day history, 3 handoffs/30 days, read-only fleet |
+| Cloud Free | $0 | 1 | snapshots from 2 devices per 30 days, 90-day history, 3 handoffs/30 days, read-only fleet |
 | Solo | $9/month or $90/year | exactly 1 | unlimited agents/devices/handoffs, governance, 1-year history |
 | Team | $49/month or $490/year includes 5; then $12/month or $120/year per human | 2–50 | full collaboration, evidence, integrations and history |
 | Enterprise | from $15K/year, annual contract | contract | operator-provisioned identity and limited audit capabilities; exact support and rollout agreed separately |
+
+Cloud Free's device ceiling counts the device labels one person pushed environment snapshots under
+in the last 30 days. A third is refused before anything is stored, the reply names the two that
+count, and a device stops counting 30 days after its last snapshot. Connecting agents is never
+limited by machine.
 
 The deterministic collaboration core remains available to self-hosters without metering.
 Billing and managed-service operation belong to the hosted operator layer. Its organization
@@ -694,6 +752,16 @@ provider facts, never a fabricated approval. See [Product flows](PRODUCT_FLOWS.m
   workspace owner starting an evaluation, or a Stripe reconciliation nobody was watching — with
   what it moved from, what to, by which route and, when a person did it, who. It is on the
   workspace's own page and as a recent list on `/admin`.
+  **Beta reach** (`/admin/beta`) answers the other half: which access-code cohort every workspace
+  arrived through, when, what it has used since, and how far it already is from the ceilings it
+  falls to when `BETA_UNMETERED` is unset — so unsetting it is a decision rather than a surprise.
+  The cohort is the label on the code its creator signed up with, stored on the account at signup
+  (`users.signup_cohort`); the code itself is never stored, logged or shown anywhere. Tool calls
+  and handoffs are read from the counters the limiter enforces, and devices over the same 30-day
+  window the snapshot gate counts, so an operator and a capped workspace see one number. A chart
+  puts every workspace's six countable ceilings on one axis
+  against a single rule, and a strip beside it marks the features a workspace is using that the
+  free plan does not carry — losing a capability reads differently from being over a limit.
 - **GitHub OAuth** (optional): set `GITHUB_CLIENT_ID`/`GITHUB_CLIENT_SECRET` to add a
   "Continue with GitHub" button.
 
@@ -849,8 +917,12 @@ that agent's own briefs back), `list_teammates` and the **Assign work** picker m
 `adapterPaired`, and an edit the file guard stops is filed on Governance under the agent's name,
 "via its adapter". An adapter
 itself is never offered as somebody to assign work to, paired or not — it cannot call a tool, so
-it could never accept. Pairing moves no authority: the adapter cannot accept the assignment it
-announces, and neither installation can update the other's run.
+it could never accept. Pairing also lets that agent **update, finish and hand off the runs these
+hooks start**: the hook opens the run under the adapter's installation and tells the agent beside
+it to reuse that `run_id`, which only works because you paired them. It goes one way — the adapter
+cannot accept the assignment it announces and cannot touch the agent's own runs — it reaches no
+project the agent's connection does not already reach, and unpairing takes the run back on that
+agent's next call.
 
 For legacy/static-token deployments, review a dry run and then install one native project adapter.
 When developing this monorepo, `--command "npm run cli --"` gives the hook a resolvable command;
@@ -1018,9 +1090,9 @@ A self-hoster's first four are not on a hosted user's list:
 
 - **`PGlite failed to initialize properly`, or a refusal naming two PostgreSQL majors.** The
   embedded database's PostgreSQL major moved between releases (PGlite 0.3 carries 17, 0.5 carries
-  18) and a major never opens an older data directory in place. Run the release that last opened
-  that directory, or move it aside and start empty. **Nothing moves your data for you**, and
-  there is no export/import path yet — a deliberate gap, not an oversight.
+  18) and a major never opens an older data directory in place. The refusal names the way across:
+  `stma-server --upgrade-data "<that directory>"`. It keeps the old copy beside the new one. See
+  [Upgrading across a PostgreSQL major](#upgrading-across-a-postgresql-major).
 - **Two machines each running `npx @matteai/stma serve` cannot see each other.** That is two
   private instances. Run one server, give it an address both machines can reach, and set
   `BASE_URL` to it before connecting any client; `localhost` only works on the machine hosting it.
@@ -1028,6 +1100,27 @@ A self-hoster's first four are not on a hosted user's list:
   the recovery path is then an operator at `/admin/users`. Decide that before you invite anybody.
 - **A documented tool answers 404.** Usually a version gap. `stma version --server` prints both
   sides and `GET /health` names the build.
+
+## Running more than one instance
+
+On `DATABASE_URL` the app is horizontally scalable: every piece of state that has to agree
+between instances is in Postgres. Rate limits, the MCP loop guard, the per-account and per-team
+allowances and sign-in throttling count in the `rate_counters` table, and the live channel behind
+the console's watch pages (`/app/stream`) is carried by `LISTEN`/`NOTIFY` on the channel
+`stma_change`. Nothing to configure and no extra service: if `DATABASE_URL` is set, it is on.
+
+Three things are worth knowing before you turn the number up.
+
+- **The live channel is best effort, and that is deliberate.** Its payload is a team id and one
+  word — never the change itself — so a browser that hears it simply re-fetches the page it was
+  already on. A notification lost to a reconnect costs that page latency and never correctness,
+  because the 30-second poll stays underneath it as the floor.
+- **Per-IP rate limits are per instance, on purpose.** A shared counter row per anonymous request
+  would turn the limiter into an amplifier, so the in-memory `Map` stays. With N instances those
+  ceilings are up to N times as generous; everything keyed to an account is exact at any count.
+- **`EMBEDDED_DB=1` is one instance, full stop.** The embedded engine is a PostgreSQL compiled
+  into the Node process that uses it, so a second process cannot share the database — and would
+  not hear its notifications either.
 
 ## Configuration
 
@@ -1038,7 +1131,8 @@ A self-hoster's first four are not on a hosted user's list:
 | `PGLITE_DIR` | no | Embedded database directory (default `.data/pglite`) |
 | `BASE_URL` | prod | Public origin, used for OAuth redirects, invite links and snippets |
 | `DATABASE_URL` | prod* | Postgres connection string. Unset → embedded PGlite (dev, or prod with `EMBEDDED_DB=1`) |
-| `EMBEDDED_DB` | no | `1` allows production on the embedded database — single instance, persist `packages/server/.data` |
+| `EMBEDDED_DB` | no | `1` allows production on the embedded database — **one instance only**, persist `packages/server/.data`. On `DATABASE_URL` you may run several: rate limits, the loop guard and the live `/app/stream` channel are all shared through Postgres (the last over `LISTEN`/`NOTIFY`). See [Running more than one instance](#running-more-than-one-instance) |
+| `STMA_UPGRADE_ENGINE` | no | Only read by `--upgrade-data`: the module entry (`dist/index.js`) of a PGlite copy that can open the *older* data directory. Set it to run the upgrade with no registry access; unset, the pinned engine is fetched once into a temp directory. Never read on a normal boot |
 | `RESEND_API_KEY` | no | Resend API key for account emails (sign-in codes, password reset). Without it codes are only logged and email 2FA defaults off |
 | `MAIL_FROM` | no | Sender address (default `STMA <noreply@stma.ai>`). **Its domain must be verified with your mail provider**, or every message is refused and nothing says so on a page: sign-in codes and password resets simply stop arriving. A configured key proves an account, never a verified domain, so the server prints this address at boot and `/admin/ops` carries a Mail card with the provider's own refusal |
 | `ADMIN_USERNAMES` / `ADMIN_EMAILS` | no | Comma-separated operator lists. Unset → `/admin` (incl. `/admin/usage`) is a plain 404 |
@@ -1046,6 +1140,8 @@ A self-hoster's first four are not on a hosted user's list:
 | `ADMIN_EMAILS` | no | Comma-separated operator addresses for `/admin`; works alongside `ADMIN_USERNAMES` |
 | `AUTH_LOCAL` | no | Local username+password accounts (default on; `0` disables) |
 | `SIGNUPS_OPEN` | no | `0` closes new local account registration |
+| `SIGNUP_ACCESS_CODES` | no | Codes signup asks for, comma separated, each `CODE` or `CODE:cohort-label`. Set, signup is invite-only without being closed; unset, signup behaves exactly as it always has and a self-hosted instance never sees a code field. A cohort code, not a one-use invite — an invite adds a human to an existing workspace, this is the door before that. Codes are compared as sha256 digests in constant time with no early exit, and checked **before** the address is looked at so the form cannot confirm who already has an account. The **label** is stored on the account that redeemed it (`users.signup_cohort`) and is what `/admin/beta` groups by; **the code itself is never stored, logged or rendered**. A code with no label is recorded as having come through the door without naming a wave |
+| `BETA_UNMETERED` | no | `1` lifts every ceiling but one on a hosted instance that is not charging yet. Deliberately separate from `STMA_HOSTED`: audit, identity composition and every operator surface keep behaving the way they will when billing turns on, and only the limits lift. It writes no plan onto any workspace, so unsetting it restores the matrix with nothing to unwind — `teams.plan` is `NOT NULL DEFAULT 'free'`, which is exactly where everybody lands. The one it leaves alone is the age limit on history: activity and the agent run trail keep the plan's retention throughout, so unsetting it deletes nothing either. `/admin/beta` is where you check what that costs each workspace before you do it |
 | `SITE_MODE` | no | `teaser` makes the **signed-out** site pre-launch: the landing page says the platform is an invite-only private beta and points at the MCP docs, and the guide and `/help` drop the sections about a console a visitor cannot reach — on `/help` that is connecting an agent and running one, since a stranger has neither. Their sign-in, self-hosting and known-limits halves are always there, which is the point of a troubleshooting page. Signed-in members get the full app, the full guide and the full help page — it is a statement about who the marketing is for, not a reduced build |
 | `DEMO_LOGINS` | no | Credentials printed on the sign-in page of a throwaway environment: `email:password[:label]`, comma separated, up to 8. Only ever shows the literal you set — the page reads nothing from the database, so this can never expose a real account. **Never set it on a production app** |
 | `STMA_HOSTED` | no | `1` makes plan limits apply. **Unset means this is your instance and nothing is metered** — the fleet, governance, evidence, retention and every cap are open. Only the hosted service sets it |
@@ -1060,7 +1156,7 @@ A self-hoster's first four are not on a hosted user's list:
 | `AUTH_DEV_MODE` | no | `1` forces the dev login form. Auto-enabled outside production when OAuth is not configured |
 | `NOTIFY_DEBOUNCE_SECONDS` | no | Wait this long before emailing about a thread so a burst of replies becomes one message (default `120`) |
 | `NOTIFY_MAX_PER_HOUR` | no | Hard cap on notification emails per person per hour (default `6`) |
-| `ACTIVITY_RETENTION_DAYS` | no | Purge activity events, the agent run trail (`agent_events`) and announcements older than this (default `180`; `0` disables the age purge — a 20,000-row cap per team and 500 per run/channel still apply). **Ignored for the first two when `STMA_HOSTED=1`**: there the plan decides, because retention is one of the things a plan sells |
+| `ACTIVITY_RETENTION_DAYS` | no | Purge activity events, the agent run trail (`agent_events`) and announcements older than this (default `180`; `0` disables the age purge — a 20,000-row cap per team and 500 per run/channel still apply). **Ignored for the first two when `STMA_HOSTED=1`**: there the plan decides, because retention is one of the things a plan sells, and `BETA_UNMETERED` does not change that. The Activity page prints whichever number applies |
 | `ERROR_RETENTION_DAYS` | no | Purge operator error-log entries older than this (default `30`; `0` disables the age purge — a 2000-row cap still applies) |
 | `LOAD_RETENTION_DAYS` | no | How far back `/admin/ops` can look at load: five-minute rollups of request count, status mix, latency histogram, rate limiting, peak memory and peak event-loop lag, written every minute from the in-process counters (default `30`; `0` disables the age purge — a 20,000-row cap still applies). An instance fact, not a plan attribute: `STMA_HOSTED` does not change it |
 | `ADMIN_USERNAMES` | no | Comma-separated usernames allowed into the operator-only `/admin` panel (instance stats, team plan switching, partner CRM). Unset = the area does not exist |

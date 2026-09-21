@@ -5,18 +5,18 @@ import {
   QUOTA_CRITICAL_PCT,
   QUOTA_SOURCES,
   QUOTA_WARNING_PCT,
+  conflictReport,
   describeHolder,
-  holderNeedsAPerson,
   snapshotSchema,
   type AgentRole,
-  type AgentRunStatus,
   type ClaimConflict,
+  type RightOfWayConflict,
   type RunCheckpointInput,
   type WorkClaim,
 } from '@bridge/shared';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { randomUUID } from 'node:crypto';
-import { and, desc, eq, inArray } from 'drizzle-orm';
+import { and, desc, eq, inArray, or } from 'drizzle-orm';
 import { z } from 'zod/v3';
 import type { Db } from '../db';
 import {
@@ -84,7 +84,7 @@ import {
   writeAssignment,
   type AssignmentDraft,
 } from '../domain/assignments';
-import { agentsHeardIn } from '../domain/companions';
+import { adapterListeningFor, agentsHeardIn } from '../domain/companions';
 import { fingerprintJson } from '../lib/canonical';
 import { logLine } from '../lib/log';
 import { receiveSetupReceipt, setupReceiptSchema } from '../domain/setupReceipts';
@@ -179,28 +179,20 @@ const describeConflicts = (conflicts: ClaimConflict[]) =>
     rightOfWay: (c as { rightOfWay?: 'yours' | 'theirs' }).rightOfWay ?? 'theirs',
   }));
 
-const conflictAdvice = (conflicts: Array<{ severity: string; rightOfWay?: 'yours' | 'theirs'; existing?: { runState?: AgentRunStatus } }>) => {
-  // Only what somebody else held first is a reason to stop. Told of "a conflict"
-  // about ground it already held, a real agent stopped with its work done and
-  // unreported while the run that came later was waiting for it (agent lab, 2026-09-20).
-  const waitFor = conflicts.filter((c) => c.rightOfWay !== 'yours');
-  if (conflicts.length > 0 && waitFor.length === 0) {
-    return 'Another run declared ground you already hold. You were first, so you keep the right of way and that run was told to wait for you: carry on, and complete, finish or release when your work is done, which is what frees the ground for it. Do not stop on its account.';
-  }
-  const advice = adviceFor(waitFor.length, waitFor[0]?.severity);
-  // A holder that stopped to ask a person is not going to finish on its own, so
-  // "wait for it" is the wrong instruction: the way through is the other human.
-  return advice && waitFor.some((c) => holderNeedsAPerson(c.existing?.runState))
-    ? `${advice} The run holding it has stopped to ask a person, so it will not free the ground by itself — waiting will not help; say so to your human and coordinate.`
-    : advice;
+/**
+ * Only what somebody else held first is a reason to stop; ground this run holds
+ * is ground to carry on with. Both can be true of one heartbeat, so both
+ * sentences come from `conflictReport` — the same function the prompt hook
+ * reads — and each names the ground it is about. Before that they were written
+ * in two places and named none: a real agent was told "narrow what you touch"
+ * by the tool and "you were first, carry on" by its hook in the same minute,
+ * said in its report that the two contradicted each other, and stopped
+ * (agent lab, 2026-09-20).
+ */
+const conflictAdvice = (conflicts: RightOfWayConflict[]) => {
+  const report = conflictReport(conflicts);
+  return [report.blocked, report.holding].filter(Boolean).join(' ') || undefined;
 };
-
-const adviceFor = (n: number, severity?: string) =>
-  n === 0
-    ? undefined
-    : severity === 'critical'
-      ? 'STOP and tell your human before writing. Another live run holds the same migration or contract; claims are advisory, so nothing prevents you both from writing it. Coordinate through open_session or announce.'
-      : 'Another live run overlaps your scope. Narrow what you touch, or coordinate through open_session before writing.';
 
 /**
  * Peer-authored handoff steps are useful, but they are also the most likely
@@ -259,8 +251,18 @@ async function installationFor(
   });
 }
 
-/** Runs the caller owns that are still live, newest heartbeat first. */
-async function ownRuns(db: Db, userId: string, grant: AgentGrant) {
+/**
+ * Live runs this credential may address, newest heartbeat first: its own, plus
+ * those of local adapters that listen for it (2026-09-21).
+ *
+ * The second half is the same edge `lib/grants.ts` opens, applied where a tool
+ * decides which run a call means. Without it the guard would let a paired agent
+ * name its hook's run and `handoff_work` would then answer "that run_id is not
+ * one of your active runs" — one question with two answers, which is how the
+ * hook came to tell an agent to reuse a run the server refused in the first
+ * place.
+ */
+async function actionableRuns(db: Db, userId: string, grant: AgentGrant) {
   return db
     .select({ run: agentRuns, installation: agentInstallations })
     .from(agentRuns)
@@ -269,7 +271,10 @@ async function ownRuns(db: Db, userId: string, grant: AgentGrant) {
       and(
         eq(agentInstallations.userId, userId),
         grant.installationId
-          ? eq(agentRuns.installationId, grant.installationId)
+          ? or(
+              eq(agentRuns.installationId, grant.installationId),
+              adapterListeningFor(grant.installationId),
+            )
           : undefined,
         grant.scope !== 'personal' && grant.teamId
           ? eq(agentRuns.teamId, grant.teamId)
@@ -307,6 +312,60 @@ async function servedPolicyHash(db: Db, userId: string, runId: string): Promise<
 
 const noRunError =
   'No run_id given and you have no active run. Call start_run first — it returns the run_id every other fleet tool needs.';
+
+/** This credential's own live runs: which one an omitted `run_id` may stand for. */
+const ownedBy = (grant: AgentGrant) => (row: { run: { installationId: string } }) =>
+  !grant.installationId || row.run.installationId === grant.installationId;
+
+/**
+ * An omitted `run_id` stands only for a run this credential started itself,
+ * never for a paired adapter's, even though it may act on one. One Codex
+ * identity can be paired with an adapter in every checkout on the machine, so
+ * "your newest live run" would silently mean another checkout's — and
+ * `handoff_work` releasing the wrong checkout's claims cannot be taken back.
+ * Naming the run is the agent saying which work it means.
+ *
+ * When there is nothing of its own it must still not be told to start one: that
+ * is how the second agent-lab round ended with two live runs of one installation
+ * in one project. So the hook's run is named instead.
+ */
+function noRunHint(runs: { run: { id: string; installationId: string } }[], grant: AgentGrant): string {
+  const hooks = runs.filter((row) => !ownedBy(grant)(row));
+  if (hooks.length === 0) return noRunError;
+  if (hooks.length === 1) {
+    return `No run_id given. Your checkout's hooks own a live run here — ${hooks[0]!.run.id} — and this agent is paired with the adapter that started it: send that run_id. Start a new run only for new work.`;
+  }
+  return `No run_id given. Adapters paired with this agent own ${hooks.length} live runs (${hooks
+    .slice(0, 3)
+    .map((row) => row.run.id)
+    .join(', ')}): send the run_id your hooks named in this checkout. Start a new run only for new work.`;
+}
+
+/**
+ * A run id that is not live any more, answered with the thing the caller needs
+ * next: which of its own runs to use instead.
+ *
+ * "Start a new one with start_run" was the whole answer, and an agent whose
+ * hook had just replaced its run on a branch switch did exactly that (agent
+ * lab, 2026-09-20). It then had two live runs in one project — the state in
+ * which `update_handoff resume` can no longer fall back to "the installation's
+ * one live run here" — and the handoff it was in the middle of could not be
+ * resumed at all. The runs named here are the ones this credential may address,
+ * under the same grant scope `actionableRuns` already enforces — which since
+ * 2026-09-21 includes the run a paired adapter's hooks own, the usual answer in
+ * exactly this situation.
+ */
+async function staleRunError(db: Db, userId: string, grant: AgentGrant, runId: string): Promise<string> {
+  const live = (await actionableRuns(db, userId, grant)).filter((row) => row.run.id !== runId);
+  if (live.length === 0) return 'Unknown or already finished run. Start a new one with start_run.';
+  if (live.length === 1) {
+    return `Run ${runId} is finished or unknown. This agent has one live run here — ${live[0]!.run.id} — which is the one your hooks own if they started it: send that run_id. Start a new run only for new work.`;
+  }
+  return `Run ${runId} is finished or unknown. This agent has ${live.length} live runs here (${live
+    .slice(0, 3)
+    .map((row) => row.run.id)
+    .join(', ')}): send the run_id of the one doing this work. Start a new run only for new work.`;
+}
 
 export function registerFleetTools(
   server: McpServer,
@@ -745,8 +804,9 @@ export function registerFleetTools(
       },
     },
     async ({ run_id, status, scope, scope_source, policy_hash, usage, checkpoint }) => {
-      const runId = run_id ?? (await ownRuns(db, user.id, grant))[0]?.run.id;
-      if (!runId) return err(noRunError);
+      const addressable = run_id ? [] : await actionableRuns(db, user.id, grant);
+      const runId = run_id ?? addressable.find(ownedBy(grant))?.run.id;
+      if (!runId) return err(noRunHint(addressable, grant));
       // Confirming the policy is the one thing an MCP-only agent could not do,
       // which meant every one of its runs read as drift forever.
       let policyReceipt: { drift: boolean; expectedHash: string } | undefined;
@@ -781,7 +841,7 @@ export function registerFleetTools(
         scope_source,
         toCheckpoint(checkpoint),
       );
-      if (!result) return err('Unknown or already finished run. Start a new one with start_run.');
+      if (!result) return err(await staleRunError(db, user.id, grant, runId));
       if ('error' in result) return err(result.error);
       // Cost is bookkeeping, not an escalation: recorded with its source, shown
       // as what it is, and only measured figures ever reach a total.
@@ -897,8 +957,9 @@ export function registerFleetTools(
       },
     },
     async ({ run_id, status, note, checkpoint }) => {
-      const runId = run_id ?? (await ownRuns(db, user.id, grant))[0]?.run.id;
-      if (!runId) return err(noRunError);
+      const addressable = run_id ? [] : await actionableRuns(db, user.id, grant);
+      const runId = run_id ?? addressable.find(ownedBy(grant))?.run.id;
+      if (!runId) return err(noRunHint(addressable, grant));
       const result = await finishAgentRun(
         db,
         runId,
@@ -1318,8 +1379,9 @@ export function registerFleetTools(
       },
     },
     async ({ run_id }) => {
-      const runId = run_id ?? (await ownRuns(db, user.id, grant))[0]?.run.id;
-      if (!runId) return err(noRunError);
+      const addressable = run_id ? [] : await actionableRuns(db, user.id, grant);
+      const runId = run_id ?? addressable.find(ownedBy(grant))?.run.id;
+      if (!runId) return err(noRunHint(addressable, grant));
       const pack = await evidenceForRun(db, runId, user.id);
       if (failed(pack)) return err(pack.error);
       // Membership check: the pack names a person, their machine and what they
@@ -1777,8 +1839,10 @@ export function registerFleetTools(
         request_id ?? (run_id ? `run:${run_id}` : undefined),
         fingerprintJson({ branch: branch ?? null, summary, next_steps: next_steps ?? [], reason: reason ?? 'other', to: to ?? null, run_id: run_id ?? null, checkpoint: checkpoint ?? null, team: team ?? null, project: project ?? null, via: via ?? null }),
         async (db) => {
-      const mine = await ownRuns(db, user.id, grant);
-      const run = run_id ? mine.find((r) => r.run.id === run_id) : mine[0];
+      const mine = await actionableRuns(db, user.id, grant);
+      // Named: any run this credential may address, which since 2026-09-21
+      // includes a paired adapter's. Omitted: only its own — see `noRunHint`.
+      const run = run_id ? mine.find((r) => r.run.id === run_id) : mine.find(ownedBy(grant));
       if (run_id && !run) {
         return { error: 'That run_id is not one of your active runs. Omit it to hand off your newest run, or list yours with list_active_agents.' };
       }
