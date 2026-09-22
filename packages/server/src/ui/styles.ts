@@ -1,3 +1,5 @@
+import { siteCss } from './siteStyles';
+
 /**
  * Design system from the Claude Design project "Agent Bridge.dc.html":
  * Geist / Geist Mono, light theme, green accent #00915A, dark app nav & command blocks.
@@ -23,8 +25,10 @@ export const css = /* css */ `
 .flow-scope,.flow-device { display:inline-block; border:1px solid var(--line); padding:4px 7px; font:11px var(--mono); overflow-wrap:anywhere; }
 .flow-scope { border-radius:99px; }
 .flow-identity { display:flex; flex-wrap:wrap; align-items:center; gap:7px; font-size:12px; }
-.flow-empty { padding:28px 0; color:var(--txt-2); }
-.flow-empty h3 { margin-top:0; color:var(--ink); font-size:15px; }
+.flow-empty { margin: 4px 0; padding: 32px 20px; display:flex; flex-direction:column; align-items:center; text-align:center; gap:10px; color:var(--txt-2); border:1px dashed var(--line-frame); border-radius:10px; background:#fcfcfa; }
+.flow-empty::before { content:''; width:34px; height:34px; border-radius:9px; border:1px dashed #cfcfc8; background:#fff linear-gradient(var(--line-frame),var(--line-frame)) center/14px 2px no-repeat; }
+.flow-empty h3 { margin:0; color:var(--ink); font-size:15px; }
+.flow-empty p { margin:0; max-width:58ch; font-size:13px; line-height:1.6; }
 .flow-columns { display:grid; grid-template-columns:minmax(200px,.85fr) minmax(0,1.6fr); }
 .flow-columns > :first-child { border-right:1px solid var(--line); }
 .flow-facts { margin:0; display:grid; grid-template-columns:90px minmax(0,1fr); gap:10px; font-size:12px; }
@@ -146,7 +150,10 @@ a.appnav-link:hover { color: #fff; text-decoration: none; }
 .btn-signout:hover { color: #fff; }
 
 /* ---------- page scaffolding ---------- */
-.page { padding: 32px 0 72px; display: flex; flex-direction: column; gap: 22px; }
+/* padding-block, not the shorthand: this class sits on the same element as
+   .container on every signed-out page, and a shorthand here zeroed that class's
+   24px gutter — the guide and /help ran edge to edge on a phone. */
+.page { padding-block: 32px 72px; display: flex; flex-direction: column; gap: 22px; }
 .page-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
 h1.title, h2.title { margin: 0; font: 600 26px/1.2 var(--sans); letter-spacing: -.02em; }
 .sub { margin: 4px 0 0; font: 400 14px/1.5 var(--sans); color: var(--txt-3); }
@@ -282,11 +289,6 @@ table.tbl { width: 100%; border-collapse: collapse; }
 .origin-project { color: var(--green-strong); }
 .origin-note { color: var(--mut); font-weight: 400; }
 @media (max-width: 640px) { .origin { flex-basis: 100%; } }
-.pill-beta {
-  display: inline-flex; align-items: center; gap: 8px; height: 26px; padding: 0 10px;
-  border-radius: 99px; background: var(--green-bg); border: 1px solid var(--green-line);
-  font: 500 12px/1 var(--mono); letter-spacing: .06em; text-transform: uppercase; color: var(--green-strong);
-}
 .dot { width: 6px; height: 6px; border-radius: 99px; background: var(--green); flex: none; }
 .dot.gray { background: #c2c7cb; }
 .dot.red { background: var(--red); }
@@ -444,52 +446,65 @@ dialog.confirm p { margin: 0 0 16px; color: var(--txt-2); }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 10px; }
 
 /* ---------- landing ---------- */
-.site-head { height: 64px; border-bottom: 1px solid var(--line-3); background: #fbfbf9; }
-.site-head-inner { height: 64px; display: flex; align-items: center; justify-content: space-between; }
-.site-nav { display: flex; align-items: center; gap: 24px; }
-.site-nav a.plain { font: 400 14px/1 var(--sans); color: var(--txt-2); }
-.hero { padding: 80px 0 64px; display: grid; grid-template-columns: 1.05fr 1fr; gap: 48px; align-items: center; }
-.hero-copy { display: flex; flex-direction: column; align-items: flex-start; gap: 24px; }
-.hero h1 { margin: 0; font: 600 54px/1.05 var(--sans); letter-spacing: -.035em; max-width: 15ch; }
-.hero .lede { margin: 0; font: 400 18px/1.55 var(--sans); color: var(--txt-2); max-width: 46ch; }
-.hero-note { display: flex; align-items: center; gap: 9px; font: 400 14px/1.3 var(--sans); color: var(--txt-3); }
-.showcase {
-  background: var(--dark); border-radius: 12px; padding: 26px;
-  display: flex; flex-direction: column; gap: 16px;
-  box-shadow: 0 18px 40px -18px rgba(20,23,26,.5);
+/* The signed-out header stays put while the page moves under it: the one frame a
+   visitor keeps, and the way into the docs from anywhere on a long page. */
+.site-head {
+  position: sticky; top: 0; z-index: 30; height: 64px;
+  border-bottom: 1px solid rgba(20,23,26,.07);
+  background: rgba(251,251,249,.82);
+  -webkit-backdrop-filter: saturate(180%) blur(14px); backdrop-filter: saturate(180%) blur(14px);
 }
-.showcase-head { display: flex; align-items: center; justify-content: space-between; }
-.showcase .overline { color: var(--dark-mut-2); }
-.diffpill { display: inline-flex; align-items: center; height: 22px; padding: 0 8px; border-radius: 99px; background: rgba(180,83,9,.18); color: #f0b862; font: 500 11px/1 var(--mono); }
-.difftbl { display: flex; flex-direction: column; gap: 1px; background: #23272b; border-radius: 8px; overflow: hidden; }
-.diffrow { display: grid; grid-template-columns: 1.1fr 1fr 1fr; gap: 12px; padding: 12px 14px; background: #16191c; font: 400 13px/1.3 var(--mono); color: var(--dark-txt-2); }
-.diffrow.head { padding: 11px 14px; background: #1b1f22; font: 500 11px/1 var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--dark-mut-2); }
-.diffrow.warn { background: #1e1a12; color: #f3d9a8; }
-.diffrow .k { color: #8f959a; }
-.diffrow.warn .k { color: #b99a63; }
-.diffrow .bad { color: #e08f7a; }
-.showcase-foot { font: 400 12px/1.5 var(--mono); color: #6f767c; }
-.how { padding: 56px 0 64px; border-top: 1px solid var(--line-3); background: #fff; }
-.how-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 28px; margin-top: 32px; }
-.how-col { display: flex; flex-direction: column; gap: 12px; padding-top: 18px; border-top: 2px solid var(--ink); }
-.how-num { font: 500 13px/1 var(--mono); color: var(--green-strong); }
-.how-col h3 { margin: 0; font: 600 22px/1.2 var(--sans); letter-spacing: -.015em; }
-.how-col p { margin: 0; font: 400 15px/1.6 var(--sans); color: var(--txt-2); }
-.features { padding: 56px 0 64px; border-top: 1px solid var(--line-3); background: #fbfbf9; }
-.features-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 20px; }
-.feature { background: #fff; border: 1px solid var(--line); border-radius: 10px; padding: 22px; display: flex; flex-direction: column; gap: 9px; }
-.feature h4 { margin: 0; font: 600 16px/1.3 var(--sans); }
-.feature p { margin: 0; font: 400 14px/1.55 var(--sans); color: var(--txt-3); }
-.site-foot { padding: 28px 0; border-top: 1px solid var(--line-3); background: #fff; }
+.site-head-inner { height: 64px; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.site-nav { display: flex; align-items: center; gap: 22px; }
+.site-nav a.plain { font: 400 14px/1 var(--sans); color: var(--txt-2); }
+.site-nav a.plain:hover { color: var(--ink); text-decoration: none; }
+.site-nav a.plain.on { color: var(--ink); font-weight: 500; }
+@media (max-width: 860px) { .site-nav .wide-only { display: none; } .site-nav { gap: 14px; } }
+@media (max-width: 420px) { .site-nav .narrow-hide { display: none; } }
+.site-foot { padding: 56px 0 28px; border-top: 1px solid var(--line-3); background: #fff; }
 .site-foot-inner { display: flex; align-items: center; justify-content: space-between; gap: 16px; font: 400 13px/1 var(--mono); color: var(--mut); }
+.foot-grid { display: grid; grid-template-columns: minmax(0, 1.6fr) repeat(3, minmax(0, 1fr)); gap: 32px; }
+.foot-brand { display: flex; flex-direction: column; gap: 14px; }
+.foot-brand p { margin: 0; max-width: 40ch; font: 400 13px/1.6 var(--sans); color: var(--txt-3); }
+.foot-col { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.foot-col h5 { margin: 0 0 4px; font: 500 11px/1 var(--mono); letter-spacing: .1em; text-transform: uppercase; color: var(--mut); }
+.foot-col a { font: 400 13px/1.3 var(--sans); color: var(--txt-2); }
+.foot-col a:hover { color: var(--ink); text-decoration: none; }
+.foot-addr { margin-top: -6px; font: 400 11px/1.3 var(--mono); color: var(--mut); overflow-wrap: anywhere; }
+.foot-base {
+  margin-top: 40px; padding-top: 18px; border-top: 1px solid var(--line-2);
+  display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap;
+  font: 400 12px/1 var(--mono); color: var(--mut);
+}
+@media (max-width: 860px) { .foot-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .foot-brand { grid-column: 1 / -1; } }
+@media (max-width: 480px) { .foot-grid { grid-template-columns: 1fr; } }
 
 /* ---------- auth ---------- */
-.auth-wrap { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 40px 20px; }
+/* The same ground as the landing page, quieter: arriving at a sign-in card from
+   the site should not feel like leaving it. */
+.auth-wrap {
+  min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 40px 20px;
+  position: relative; isolation: isolate; overflow: hidden;
+}
+.auth-wrap::before {
+  content: ''; position: absolute; inset: 0; z-index: -2; pointer-events: none;
+  background-image: radial-gradient(rgba(20,23,26,.08) 1px, transparent 1.3px);
+  background-size: 22px 22px;
+  -webkit-mask-image: radial-gradient(ellipse 60% 55% at 50% 40%, #000 20%, transparent 75%);
+  mask-image: radial-gradient(ellipse 60% 55% at 50% 40%, #000 20%, transparent 75%);
+}
+.auth-wrap::after {
+  content: ''; position: absolute; z-index: -1; pointer-events: none;
+  left: 50%; top: -220px; width: 900px; height: 560px; transform: translateX(-50%);
+  background: radial-gradient(closest-side, rgba(0,195,122,.13), transparent 100%);
+}
+a.auth-home { display: inline-flex; color: inherit; }
+a.auth-home:hover { text-decoration: none; opacity: .8; }
 .auth-card {
   width: 100%; max-width: 460px;
   background: #fff; border: 1px solid var(--line-frame); border-radius: 12px;
   padding: 48px 44px; display: flex; flex-direction: column; align-items: center; gap: 22px;
-  box-shadow: 0 1px 2px rgba(0,0,0,.05);
+  box-shadow: 0 34px 70px -38px rgba(20,23,26,.32), 0 1px 2px rgba(20,23,26,.05);
 }
 .auth-card h1 { margin: 0; font: 600 26px/1.2 var(--sans); letter-spacing: -.02em; text-align: center; }
 .auth-card .lede { margin: 8px 0 0; font: 400 15px/1.5 var(--sans); color: var(--txt-3); text-align: center; }
@@ -522,6 +537,11 @@ dialog.confirm p { margin: 0 0 16px; color: var(--txt-2); }
 .doc-list { margin: 8px 0 0; padding-left: 20px; }
 .doc-list li { margin: 6px 0; }
 .doc-list li b { font-weight: 600; }
+/* Legal pages: a contents list in two columns (one on a phone), anchors that land below the
+   sticky 64px site header rather than under it, and tables of prose that read from the top. */
+.legal-toc { margin: 0; padding: 14px 18px 14px 38px; columns: 2 220px; column-gap: 32px; background: #fff; border: 1px solid var(--line); border-radius: 10px; font: 400 14px/1.7 var(--sans); }
+.legal .doc-section { scroll-margin-top: 84px; }
+.legal .tbl td { vertical-align: top; }
 .doc-section { display: flex; flex-direction: column; gap: 14px; scroll-margin-top: 24px; }
 .doc-section h2 { margin: 18px 0 0; font: 600 22px/1.2 var(--sans); letter-spacing: -.02em; }
 .say {
@@ -546,6 +566,44 @@ dialog.confirm p { margin: 0 0 16px; color: var(--txt-2); }
 .copybtn.onlight:hover { color: var(--ink); border-color: #b9b9b3; }
 .hero-card { border: 1px solid var(--green-line); background: #f3faf6; border-radius: 10px; padding: 20px; display: flex; flex-direction: column; gap: 12px; }
 .hero-card p { margin: 0; font: 400 15px/1.6 var(--sans); color: var(--ink-2); max-width: 66ch; }
+/* /docs: the six jobs, first thing on the page. Each card links to where the guide covers it. */
+.pillars { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 10px; }
+.pillar { background: #fff; border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; display: flex; flex-direction: column; gap: 8px; }
+.pillar-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.pillar-head b { font: 600 15px/1.2 var(--sans); color: var(--ink); }
+.pillar-tag { font: 400 12px/1.2 var(--sans); color: var(--txt-3); }
+.doc-col .pillar p { margin: 0; font: 400 13px/1.55 var(--sans); color: var(--ink-2); }
+.pillar-links { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: auto; font: 400 12px/1.6 var(--sans); }
+.pillar-links code { font-size: 12px; }
+/* /help: an index of the sections, then one entry per message: the words on screen in
+   the product's own spelling, what they mean, what to do. The side table of contents is
+   the same list, so below the width where it stops being beside the text it gives way
+   to the index rather than repeating it. */
+.helpidx { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 8px; }
+.helpidx a { display: flex; flex-direction: column; gap: 4px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: #fff; color: var(--ink); }
+.helpidx a:hover { text-decoration: none; border-color: var(--green-line); background: #f3faf6; }
+.helpidx b { font: 600 13px/1.3 var(--sans); }
+.helpidx span { font: 400 12px/1.4 var(--sans); color: var(--txt-3); }
+.helpidx .count { font: 500 11px/1 var(--mono); color: var(--mut); }
+.walls { display: flex; flex-direction: column; gap: 10px; }
+.wall { background: #fff; border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; display: flex; flex-direction: column; gap: 10px; }
+.wall-top { display: flex; align-items: flex-start; gap: 12px; }
+.wall-said { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 6px; }
+.doc-col .wall-msg { margin: 0; max-width: none; padding: 8px 12px; border-radius: 7px; background: #f7f7f5; border: 1px solid var(--line-3); font: 400 13px/1.55 var(--mono); color: var(--ink); white-space: pre-wrap; word-break: break-word; }
+.doc-col .wall-symptom { margin: 0; font: 500 14px/1.45 var(--sans); color: var(--ink); }
+.wall-by { margin-top: -2px; font: 400 11.5px/1.4 var(--sans); color: var(--mut); }
+.wall-where { flex: none; max-width: 16ch; text-align: right; font: 500 10px/1.5 var(--mono); letter-spacing: .06em; text-transform: uppercase; color: var(--mut); padding-top: 5px; overflow-wrap: anywhere; }
+.wall-part { display: grid; grid-template-columns: 104px minmax(0, 1fr); gap: 12px; font: 400 13.5px/1.55 var(--sans); color: var(--ink-2); }
+.wall-part > .wall-lbl { font: 500 10.5px/2.1 var(--mono); letter-spacing: .05em; text-transform: uppercase; color: var(--green-strong); }
+.wall-part > div > p, .wall-part > div > ol { margin: 0; }
+.wall-part > div > * + * { margin-top: 6px; }
+.wall-part ol { padding-left: 18px; }
+@media (max-width: 960px) { .sidetoc.helptoc { display: none; } }
+@media (max-width: 640px) {
+  .wall-top { flex-direction: column-reverse; gap: 4px; }
+  .wall-where { max-width: none; text-align: left; padding-top: 0; }
+  .wall-part { grid-template-columns: 1fr; gap: 0; }
+}
 
 /* ---------- sessions ---------- */
 .tabs a.tab:hover { text-decoration: none; color: var(--ink); }
@@ -1027,8 +1085,9 @@ a.chip:hover { border-color: var(--green); color: var(--green-strong); text-deco
 .chip b { color: var(--ink); font-weight: 500; }
 .scopeform { display: inline-flex; align-items: center; gap: 6px; }
 .scopeform select {
-  height: 24px; max-width: 260px; padding: 0 6px; border: 1px solid var(--line-frame);
-  border-radius: 4px; font: 400 11px/1 var(--mono); color: var(--ink); background: #fff;
+  height: 24px; max-width: 260px; padding: 0 24px 0 6px; border: 1px solid var(--line-frame);
+  border-radius: 4px; font: 400 11px/1 var(--mono); color: var(--ink); background-color: #fff;
+  background-position: right 8px center;
 }
 .scopeform .btn { height: 24px; padding: 0 9px; }
 .tokhelp { font-size: 12px; color: var(--txt-2); }
@@ -1179,15 +1238,10 @@ a.holds:hover { border-color: var(--ctl-border); background: #fff; }
 }
 
 @media (max-width: 960px) {
-  .hero { grid-template-columns: 1fr; padding-top: 48px; }
-  .hero h1 { font-size: 40px; }
-  .how-grid { grid-template-columns: 1fr; }
-  .features-grid { grid-template-columns: repeat(2, 1fr); }
   .grid2 { grid-template-columns: 1fr; }
   .pricing-grid { grid-template-columns: 1fr; }
 }
 @media (max-width: 640px) {
-  .features-grid { grid-template-columns: 1fr; }
   .appnav-user { display: none; }
   .scopeform select { max-width: 200px; }
   .activity-filters { grid-template-columns: 1fr; }
@@ -1296,4 +1350,125 @@ a.holds:hover { border-color: var(--ctl-border); background: #fff; }
   .rail .rail-nav { order:2; }
   .inspector { width:100%; min-width:0; }
 }
-`;
+
+/* ---------- controls nobody gave a class (2026-09-22) ----------
+   A console built page by page grew controls outside the design system: a select
+   in the platform's own chrome beside a green button, a file input still reading
+   "Choose file" in the browser's language, a disclosure triangle from 1998 on half
+   the folded sections. Everything below is a default at zero specificity (:where),
+   so any rule a page already wrote still wins; it only catches what nobody styled. */
+:where(input, select, textarea, button) { font-family: inherit; }
+input[type="checkbox"], input[type="radio"] { accent-color: var(--green); }
+:where(.frame, dialog) :where(select:not([class])) {
+  height: 34px; max-width: 100%; padding: 0 30px 0 10px;
+  border: 1px solid var(--ctl-border); border-radius: 7px; background-color: #fff;
+  font: 400 13px/1.2 var(--sans); color: var(--ink);
+}
+:where(.frame, dialog) :where(input:not([class]):not([type="hidden"], [type="checkbox"], [type="radio"], [type="file"], [type="submit"], [type="button"], [type="range"], [type="color"])) {
+  height: 36px; max-width: 100%; padding: 0 11px;
+  border: 1px solid var(--ctl-border); border-radius: 7px; background: #fff;
+  font: 400 13px/1.2 var(--sans); color: var(--ink);
+}
+:where(.frame, dialog) :where(textarea:not([class])) {
+  max-width: 100%; padding: 10px 12px; border: 1px solid var(--ctl-border); border-radius: 8px;
+  background: #fff; font: 400 13px/1.5 var(--sans); color: var(--ink); resize: vertical;
+}
+:where(.frame, dialog) :where(select:not([class]), input:not([class]), textarea:not([class])):focus {
+  outline: none; border-color: var(--ink); box-shadow: 0 0 0 3px rgba(0,145,90,.14);
+}
+/* One chevron for every select, classed or not, instead of each platform's own. */
+select.in, .activity-filters select, .scopeform select,
+:where(.frame, dialog) :where(select:not([class])) {
+  -webkit-appearance: none; appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%238a8f94' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat; background-position: right 11px center; background-size: 10px 6px;
+}
+select.in, .activity-filters select { padding-right: 30px; }
+select:disabled { opacity: .6; cursor: not-allowed; }
+/* The file picker's button speaks the design system; its label stays the browser's. */
+input[type="file"] { max-width: 100%; font: 400 13px/1.3 var(--sans); color: var(--txt-2); }
+input[type="file"]::file-selector-button {
+  height: 30px; margin-right: 10px; padding: 0 12px; cursor: pointer;
+  border: 1px solid var(--ctl-border); border-radius: 6px; background: #fff;
+  font: 500 12.5px/1 var(--sans); color: var(--ink);
+}
+input[type="file"]::file-selector-button:hover { background: #f7f7f5; }
+input.in[type="file"] { height: auto; padding: 5px; }
+/* Folded sections: a drawn chevron, not the platform triangle. The three folds that
+   draw their own marker (cards, answers, the scope pickers) are left alone. */
+details:not(.fold-card, .scope-pick, .answerfold) > summary:not(.scope-at, .rail-group) { list-style: none; cursor: pointer; }
+details:not(.fold-card, .scope-pick, .answerfold) > summary:not(.scope-at, .rail-group)::-webkit-details-marker { display: none; }
+details:not(.fold-card, .scope-pick, .answerfold) > summary:not(.scope-at, .rail-group)::before {
+  content: ''; display: inline-block; width: 6px; height: 6px; margin: 0 10px 2px 2px; vertical-align: middle;
+  border-right: 1.5px solid currentColor; border-bottom: 1.5px solid currentColor;
+  transform: rotate(-45deg); opacity: .55; transition: transform .15s ease;
+}
+details[open]:not(.fold-card, .scope-pick, .answerfold) > summary:not(.scope-at, .rail-group)::before { transform: rotate(45deg); margin-bottom: 4px; }
+details:not(.fold-card, .scope-pick, .answerfold) > summary:not(.scope-at, .rail-group):hover::before { opacity: 1; }
+@media (prefers-reduced-motion: reduce) { details > summary::before { transition: none; } }
+/* A column a tab left with nothing in it still took a gap: the band of blank above
+   the Integrations tab was an empty .col plus the 24px after it. */
+.col:empty { display: none; }
+
+/* Two flow columns beside an inspector left the first one about 230px on a laptop,
+   and every sentence in it wrapped after three words. Beside an inspector they
+   stack until the screen can give both a readable measure. */
+@media (max-width: 1500px) {
+  .cbody:has(> .inspector) .flow-columns { grid-template-columns: 1fr; }
+  .cbody:has(> .inspector) .flow-columns > :first-child { border-right: 0; border-bottom: 1px solid var(--line); }
+}
+
+/* A run row names its task and owner first; the ground it holds is the detail, and a
+   long list of claims used to take the width and squeeze the task to one word a line. */
+.introw-claims { flex: 0 1 45%; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.introw .who .t, .introw .who .s { overflow-wrap: anywhere; }
+
+/* ---------- integrations (team page, Integrations tab) ---------- */
+.integ-head { display: flex; align-items: center; gap: 12px; }
+.integ-mark {
+  width: 36px; height: 36px; flex: none; border-radius: 9px; display: inline-flex; align-items: center; justify-content: center;
+  background: var(--dark); color: #fff; font: 600 12px/1 var(--mono); letter-spacing: .02em;
+  box-shadow: inset 0 0 0 1px rgba(255,255,255,.06);
+}
+.integ-title { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; min-width: 0; }
+/* A field whose label wraps it: the visible name a placeholder never was. */
+.ifield { display: flex; flex-direction: column; gap: 6px; max-width: var(--field-max); }
+.ifield > span { font: 500 12.5px/1.2 var(--sans); color: var(--ink); }
+
+/* ---------- the first-result card (ui/FirstExchange) ---------- */
+.xchg { display: flex; flex-direction: column; overflow: hidden; }
+.xchg-head { padding: 20px 22px 4px; display: flex; flex-direction: column; gap: 6px; }
+.xchg-head .overline { color: var(--green-strong); }
+.xchg-head h3 { margin: 0; font: 600 18px/1.3 var(--sans); letter-spacing: -.01em; }
+.xchg-head p { margin: 0; font: 400 13.5px/1.6 var(--sans); color: var(--txt-2); }
+.xchg-steps {
+  margin: 14px 22px 0; padding: 0; list-style: none; counter-reset: xchg;
+  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px;
+}
+.xchg-steps li {
+  counter-increment: xchg; position: relative; display: flex; flex-direction: column; gap: 4px;
+  padding: 12px 14px 13px; border: 1px solid var(--line); border-radius: 9px; background: #fafaf8;
+}
+.xchg-steps li::before {
+  content: counter(xchg); width: 22px; height: 22px; margin-bottom: 4px; border-radius: 99px;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: var(--green-bg); border: 1px solid var(--green-line); color: var(--green-strong); font: 600 11px/1 var(--mono);
+}
+.xchg-steps b { font: 600 13px/1.3 var(--sans); color: var(--ink); }
+.xchg-steps span { font: 400 12px/1.5 var(--sans); color: var(--txt-3); }
+.xchg-foot {
+  margin-top: 16px; padding: 16px 22px 18px; border-top: 1px solid var(--line); background: #fcfcfa;
+  display: flex; flex-direction: column; gap: 10px;
+}
+.xchg-form { display: flex; align-items: flex-end; gap: 10px; flex-wrap: wrap; margin: 0; }
+.xchg-form .field { min-width: 220px; }
+.xchg-foot .card-note { margin: 0; }
+@media (max-width: 720px) { .xchg-steps { grid-template-columns: 1fr; } }
+
+/* A bare <pre> is a block of text somebody will copy: set it like one. */
+:where(.frame, dialog) :where(pre:not([class])) {
+  margin: 0; padding: 12px 14px; max-height: 420px; overflow: auto;
+  border: 1px solid var(--line); border-radius: 8px; background: #f7f7f5;
+  font: 400 12px/1.6 var(--mono); color: var(--ink-2); white-space: pre-wrap; overflow-wrap: anywhere;
+}
+` + siteCss;

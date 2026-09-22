@@ -22,7 +22,9 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { eq } from 'drizzle-orm';
 import { afterAll, beforeAll, expect, it } from 'vitest';
+import { users } from '../src/db/schema';
 import { loadEnv } from '../src/env';
 import { mailHealth, mailOutbox } from '../src/lib/mailer';
 import { startServer, type StartedServer } from '../src/server';
@@ -118,6 +120,10 @@ afterAll(async () => {
 it('M1: a refused send stops the sign-in instead of pretending', async () => {
   await post('/auth/local/signup', { email: 'opsadmin@example.com', password: 'opsadminpw12' }, ip('1'));
   await post('/auth/local/signup', { email: 'm1@example.com', password: 'm1password12' }, ip('1'));
+  // A signup can no longer take a listed operator name (audit 2026-09-21, F1),
+  // so it arrived as `opsadmin-2`. The operator here is an account that held
+  // the name before it was listed, which is the one an operator lists.
+  await srv.db.update(users).set({ username: 'opsadmin' }).where(eq(users.email, 'opsadmin@example.com'));
 
   // The admin gets in while the provider is still answering.
   const admin = jar();

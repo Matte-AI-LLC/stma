@@ -134,6 +134,8 @@ import { track } from '../lib/track';
 import type { AppEnv, User } from '../types';
 import { Field, Lead, PageHead, teamTrail, Vr } from '../ui/Console';
 import { AppLayout, Head, Logo } from '../ui/Layout';
+import { Landing } from '../ui/Landing';
+import { siteInfo } from '../ui/Site';
 import { ProjectCreateBar } from '../ui/ProjectCreate';
 
 export const dashboardRoutes = new Hono<AppEnv>();
@@ -304,325 +306,12 @@ const DeviceNames = ({ devices }: { devices: DeviceSummary[] }) =>
   ) : null;
 
 
-/**
- * The pre-launch landing page.
- *
- * Two claims, and they have to sit together without contradicting each other:
- * the hosted platform is an invite-only private beta, and the thing that makes
- * it work — the MCP server and the CLI — is on npm today and needs no invite.
- * A "coming soon" page with nothing to do is a page nobody returns to; this one
- * ends with a command that works.
- */
-/**
- * What a stranger sees while the beta runs.
- *
- * It stopped being "coming soon" the moment codes went out: somebody holding
- * one needs a door, and somebody without one needs to know that is the only
- * thing missing. So the page says what the beta is, offers the code path and
- * the sign-in path, and keeps pointing at the self-host command — that half is
- * public and needs no invitation at all.
- */
-/**
- * The signed-out footer, in one place because it was in two and they drifted.
- *
- * Support renders only when the instance has an address (`SUPPORT_EMAIL`, or
- * the hosted default): a page must not offer a door that is not there, the same
- * rule the access-code call to action follows.
- */
-const SiteFoot = ({ support }: { support: string }) => (
-  <footer class="site-foot">
-    <div class="container site-foot-inner">
-      <span>© 2026 STMA · Speak to my Agent — private beta</span>
-      <span>
-        <a class="plain" href="/docs" style="color:var(--mut)">
-          Docs
-        </a>{' '}
-        ·{' '}
-        {/* Before Terms, because somebody reading a footer in trouble is looking
-            for this one. It is public for the same reason /terms is: a person who
-            cannot sign in cannot read a page behind the login. */}
-        <a class="plain" href="/help" style="color:var(--mut)">
-          Help
-        </a>{' '}
-        ·{' '}
-        <a class="plain" href="/terms" style="color:var(--mut)">
-          Terms
-        </a>{' '}
-        ·{' '}
-        <a class="plain" href="/privacy" style="color:var(--mut)">
-          Privacy
-        </a>
-        {support ? (
-          <>
-            {' '}
-            ·{' '}
-            <a class="plain" href={`mailto:${support}`} style="color:var(--mut)">
-              Support
-            </a>
-          </>
-        ) : null}
-      </span>
-    </div>
-  </footer>
-);
-
-const TeaserLanding = ({ codeDoor, support }: { codeDoor: boolean; support: string }) => (
-  <html lang="en">
-    <Head />
-    <body>
-      <header class="site-head">
-        <div class="container site-head-inner">
-          <a class="brand" href="/">
-            <Logo />
-            Speak to my Agent
-          </a>
-          <nav class="site-nav">
-            <a class="plain" href="/docs">
-              MCP docs
-            </a>
-            <a class="btn btn-sm" href="/login">
-              Sign in
-            </a>
-          </nav>
-        </div>
-      </header>
-
-      <section class="container hero" style="grid-template-columns:1fr;max-width:820px">
-        <div class="hero-copy">
-          <span class="pill-beta">Private beta · access code required</span>
-          <h1>Your coding agents, talking to each other.</h1>
-          <p class="lede">
-            STMA — Speak to my Agent — is the control plane between a team's AI coding agents:
-            it maps every run to its human, project and task, warns two agents before they touch
-            the same ground, distributes the team's rules, and lets agents hand work over instead
-            of dropping it.
-          </p>
-          <p class="lede" style="margin-top:-6px">
-            The hosted service is open to a small group while we learn what it does to a real
-            team's week. {codeDoor ? 'An access code creates one account' : 'Accounts are created by invitation'} —
-            every feature is on, nothing to pay, no card. We are not selling plans yet.
-          </p>
-          <p class="lede" style="margin-top:-6px">
-            The MCP server and the CLI are source-available and on npm today. You do not need an
-            invite to run your own — one command, an embedded database, no setup:
-          </p>
-          <div class="cmd" style="max-width:640px">
-            <code>npx @matteai/stma serve</code>
-            <button class="copybtn" type="button" data-copy="npx @matteai/stma serve">
-              COPY
-            </button>
-          </div>
-          <div class="row" style="margin-top:18px">
-            {codeDoor ? (
-              <a class="btn btn-primary btn-lg" href="/signup">
-                I have an access code
-              </a>
-            ) : (
-              <a class="btn btn-primary btn-lg" href="/docs">
-                Read the MCP docs
-              </a>
-            )}
-            <a class="btn btn-lg" href="/login">
-              Sign in
-            </a>
-            {codeDoor ? (
-              <a class="btn btn-lg" href="/docs">
-                Read the MCP docs
-              </a>
-            ) : null}
-          </div>
-          <div class="hero-note">
-            <span class="dot" />
-            The snapshot collector sends variable names, not values. Never paste secrets into messages.
-          </div>
-        </div>
-      </section>
-
-      <SiteFoot support={support} />
-    </body>
-  </html>
-);
-
 // ---------------------------------------------------------------- landing
 
 dashboardRoutes.get('/', (c) => {
-  const user = c.get('user');
-  const env = c.get('env');
-  if (user) return c.redirect('/app');
-  // Pre-launch: the public face is the documentation and an honest sentence
-  // about where the platform is, not a product page for something a visitor
-  // cannot sign up for. The packages are real and public, so the page sends
-  // them there rather than to a waiting list.
-  if (env.publicMode === 'teaser') {
-    return c.html(
-      <TeaserLanding
-        codeDoor={env.localAuth && env.signupsOpen && accessCodeRequired(env)}
-        support={env.supportEmail}
-      />,
-    );
-  }
-  return c.html(
-    <html lang="en">
-      <Head />
-      <body>
-        <header class="site-head">
-          <div class="container site-head-inner">
-            <a class="brand" href="/">
-              <Logo />
-              Speak to my Agent
-            </a>
-            <nav class="site-nav">
-              <a class="plain" href="#how">
-                How it works
-              </a>
-              <a class="plain" href="#security">
-                Security
-              </a>
-              <a class="plain" href="/docs">
-                Docs
-              </a>
-              {c.get('capabilities').managedBilling ? (
-                <a class="plain" href="/pricing">
-                  Pricing
-                </a>
-              ) : null}
-              <a class="btn btn-sm" href="/login">
-                Sign in
-              </a>
-            </nav>
-          </div>
-        </header>
-
-        <section class="container hero">
-          <div class="hero-copy">
-            <span class="pill-beta">Private beta</span>
-            <h1>Let your agents compare notes.</h1>
-            <p class="lede">
-              STMA — Speak to my Agent — gives the AI coding agents on your team a shared meeting
-              point. They exchange structured environment snapshots, diff the two machines, and
-              debug together — so "works on my machine" stops being a conversation between humans
-              copy-pasting logs.
-            </p>
-            <div class="row">
-              <a class="btn btn-primary btn-lg" href={env.signupsOpen ? '/login' : '/docs'}>
-                {env.signupsOpen ? 'Get started' : 'Read the guide'}
-              </a>
-              <a class="btn btn-lg" href={env.signupsOpen ? '#how' : '/login'}>
-                {env.signupsOpen ? 'How it works' : 'Sign in'}
-              </a>
-            </div>
-            {env.signupsOpen ? null : (
-              // With registration closed, "Get started" led to a sign-in form with
-              // no account, no link and no explanation. Say what the door is.
-              <p class="m0 small muted" style="max-width:52ch">
-                Private beta — accounts are invite-only. If someone on your team already uses
-                STMA, their agent can create an invite for you in one call.
-              </p>
-            )}
-            <div class="hero-note">
-              <span class="dot" />
-              The snapshot collector sends variable names, not values. Never paste secrets into messages.
-            </div>
-          </div>
-
-          <div class="showcase">
-            <div class="showcase-head">
-              <span class="overline">Environment diff</span>
-              <span class="diffpill">3 differences</span>
-            </div>
-            <div class="difftbl">
-              <div class="diffrow head">
-                <span>Key</span>
-                <span>ada@mbp</span>
-                <span>jonas@thinkpad</span>
-              </div>
-              <div class="diffrow">
-                <span class="k">node</span>
-                <span>20.11.1</span>
-                <span>20.11.1</span>
-              </div>
-              <div class="diffrow warn">
-                <span class="k">pnpm</span>
-                <span>9.1.0</span>
-                <span>8.15.4</span>
-              </div>
-              <div class="diffrow warn">
-                <span class="k">pnpm-lock.yaml</span>
-                <span>sha 4f1c…</span>
-                <span>sha 90ab…</span>
-              </div>
-              <div class="diffrow warn">
-                <span class="k">DATABASE_URL</span>
-                <span>set</span>
-                <span class="bad">missing</span>
-              </div>
-              <div class="diffrow">
-                <span class="k">git HEAD</span>
-                <span>a91f0c2</span>
-                <span>a91f0c2</span>
-              </div>
-            </div>
-            <div class="showcase-foot">Reported by claude-code · 12 minutes ago</div>
-          </div>
-        </section>
-
-        <section class="how" id="how">
-          <div class="container">
-            <span class="overline">How it works</span>
-            <div class="how-grid">
-              <div class="how-col">
-                <span class="how-num">01</span>
-                <h3>Connect the agent</h3>
-                <p>
-                  Add one remote MCP address in Codex, Claude Code or another OAuth-capable client.
-                  Approve the exact agent, machine and project/workspace in STMA's browser page.
-                </p>
-              </div>
-              <div class="how-col">
-                <span class="how-num">02</span>
-                <h3>Share a snapshot</h3>
-                <p>
-                  Tool versions, lockfile hashes, env var names, git state — structured, and pushed
-                  by the agent itself.
-                </p>
-              </div>
-              <div class="how-col">
-                <span class="how-num">03</span>
-                <h3>Debug together</h3>
-                <p>
-                  Agents open a topic session and message asynchronously. Nobody has to be online at
-                  the same time.
-                </p>
-              </div>
-            </div>
-          </div>
-        </section>
-
-        <section class="features" id="security">
-          <div class="container features-grid">
-            <div class="feature">
-              <h4>Structured snapshots</h4>
-              <p>Machine-readable, versioned, and diffable — not a screenshot of a terminal.</p>
-            </div>
-            <div class="feature">
-              <h4>Names, never values</h4>
-              <p>The snapshot collector reports variable names and presence, not values. Never submit secret values in messages or attachments.</p>
-            </div>
-            <div class="feature">
-              <h4>Async sessions</h4>
-              <p>Typed messages — question, hypothesis, request, resolution — with log attachments.</p>
-            </div>
-            <div class="feature">
-              <h4>Searchable archive</h4>
-              <p>Every resolved issue keeps its root cause and fix, ready for the next agent that asks.</p>
-            </div>
-          </div>
-        </section>
-
-        <SiteFoot support={env.supportEmail} />
-      </body>
-    </html>,
-  );
+  if (c.get('user')) return c.redirect('/app');
+  // One page in both site modes; only the doors differ (ui/Landing.tsx).
+  return c.html(<Landing site={siteInfo(c)} baseUrl={c.get('env').baseUrl} />);
 });
 
 // ---------------------------------------------------------------- teams
@@ -1466,8 +1155,19 @@ dashboardRoutes.get('/app/teams/:slug', async (c) => {
 
           {role === 'owner' ? (
             <div class="card card-pad" style="display:flex;flex-direction:column;gap:12px">
+              <div class="integ-head">
+                <span class="integ-mark" aria-hidden="true">
+                  <svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M4 7a4 4 0 0 1 8 0v3l1.5 2h-11L4 10z" />
+                    <path d="M6.5 13.5a1.6 1.6 0 0 0 3 0" />
+                  </svg>
+                </span>
+                <div class="integ-title">
+                  <div class="card-title">Team notifications and hooks</div>
+                  {team.webhookUrl ? <span class="pill pill-active">Webhook set</span> : <span class="pill pill-muted">No webhook</span>}
+                </div>
+              </div>
               <div>
-                <div class="card-title">Notifications</div>
                 <div class="card-note">
                   Optional Slack or Discord incoming-webhook URL. New and resolved sessions ping it
                   — message bodies are never sent.
@@ -1521,8 +1221,14 @@ dashboardRoutes.get('/app/teams/:slug', async (c) => {
 
           {role === 'owner' ? (
             <div class="card card-pad" style="display:flex;flex-direction:column;gap:12px">
+              <div class="integ-head">
+                <span class="integ-mark" aria-hidden="true">GH</span>
+                <div class="integ-title">
+                  <div class="card-title">GitHub issues</div>
+                  {github ? <span class="pill pill-active">Connected</span> : <span class="pill pill-muted">Not connected</span>}
+                </div>
+              </div>
               <div>
-                <div class="card-title">GitHub issues</div>
                 <div class="card-note">
                   <a href={`/app/teams/${team.slug}/repositories`}>Manage all repository connections and exact project bindings</a>. Agents list what is open
                   (<code>list_issues</code>), start a run on a number
@@ -1548,24 +1254,30 @@ dashboardRoutes.get('/app/teams/:slug', async (c) => {
                 action={`/app/teams/${team.slug}/integrations/github`}
                 style="display:flex;flex-direction:column;gap:10px"
               >
-                <input
-                  class="in"
-                  type="text"
-                  name="repo"
-                  aria-label="GitHub repository, as owner/name"
-                  value={github?.repo ?? ''}
-                  placeholder="owner/name"
-                />
-                <input
-                  class="in"
-                  type="password"
-                  name="token"
-                  autocomplete="off"
-                  aria-label="GitHub access token with issues read and write"
-                  placeholder={
-                    github ? 'Stored — type a new token only to replace it' : 'github_pat_… or ghp_…'
-                  }
-                />
+                <label class="ifield">
+                  <span>Repository</span>
+                  <input
+                    class="in"
+                    type="text"
+                    name="repo"
+                    aria-label="GitHub repository, as owner/name"
+                    value={github?.repo ?? ''}
+                    placeholder="owner/name"
+                  />
+                </label>
+                <label class="ifield">
+                  <span>Access token</span>
+                  <input
+                    class="in"
+                    type="password"
+                    name="token"
+                    autocomplete="off"
+                    aria-label="GitHub access token with issues read and write"
+                    placeholder={
+                      github ? 'Stored — type a new token only to replace it' : 'github_pat_… or ghp_…'
+                    }
+                  />
+                </label>
                 <label class="checkrow">
                   <input
                     type="checkbox"
@@ -1602,8 +1314,14 @@ dashboardRoutes.get('/app/teams/:slug', async (c) => {
 
           {role === 'owner' ? (
             <div class="card card-pad" style="display:flex;flex-direction:column;gap:12px">
+              <div class="integ-head">
+                <span class="integ-mark" aria-hidden="true">AZ</span>
+                <div class="integ-title">
+                  <div class="card-title">Azure DevOps</div>
+                  {ado ? <span class="pill pill-active">Connected</span> : <span class="pill pill-muted">Not connected</span>}
+                </div>
+              </div>
               <div>
-                <div class="card-title">Azure DevOps</div>
                 <div class="card-note">
                   Where the <a href={`/app/teams/${team.slug}/delivery`}>delivery flow</a> gets
                   applied: STMA commits the rendered pipeline file into this repository and
@@ -1627,22 +1345,28 @@ dashboardRoutes.get('/app/teams/:slug', async (c) => {
                 action={`/app/teams/${team.slug}/integrations/azure-devops`}
                 style="display:flex;flex-direction:column;gap:10px"
               >
-                <input
-                  class="in"
-                  type="text"
-                  name="locator"
-                  aria-label="Azure DevOps repository, as organization/project/repo"
-                  value={ado ? `${ado.organization}/${ado.project}/${ado.repo}` : ''}
-                  placeholder="organization/project/repo — or paste the repo URL"
-                />
-                <input
-                  class="in"
-                  type="password"
-                  name="token"
-                  autocomplete="off"
-                  aria-label="Azure DevOps personal access token"
-                  placeholder={ado ? 'Stored — type a new token only to replace it' : 'Personal access token'}
-                />
+                <label class="ifield">
+                  <span>Repository</span>
+                  <input
+                    class="in"
+                    type="text"
+                    name="locator"
+                    aria-label="Azure DevOps repository, as organization/project/repo"
+                    value={ado ? `${ado.organization}/${ado.project}/${ado.repo}` : ''}
+                    placeholder="organization/project/repo — or paste the repo URL"
+                  />
+                </label>
+                <label class="ifield">
+                  <span>Personal access token</span>
+                  <input
+                    class="in"
+                    type="password"
+                    name="token"
+                    autocomplete="off"
+                    aria-label="Azure DevOps personal access token"
+                    placeholder={ado ? 'Stored — type a new token only to replace it' : 'Personal access token'}
+                  />
+                </label>
                 <div style="display:flex;gap:8px;flex-wrap:wrap">
                   <button class="btn btn-sm btn-primary" type="submit" name="action" value="save">
                     {ado ? 'Update connection' : 'Connect Azure DevOps'}
@@ -1664,8 +1388,14 @@ dashboardRoutes.get('/app/teams/:slug', async (c) => {
 
           {role === 'owner' ? (
             <div class="card card-pad" style="display:flex;flex-direction:column;gap:12px">
+              <div class="integ-head">
+                <span class="integ-mark" aria-hidden="true">JI</span>
+                <div class="integ-title">
+                  <div class="card-title">Jira</div>
+                  {jira ? <span class="pill pill-active">Connected</span> : <span class="pill pill-muted">Not connected</span>}
+                </div>
+              </div>
               <div>
-                <div class="card-title">Jira</div>
                 <div class="card-note">
                   For delivery flows whose tickets live in Jira: STMA verifies the connection and
                   reads issue titles — it never writes to the tracker. Needs the site, the account
@@ -1687,30 +1417,39 @@ dashboardRoutes.get('/app/teams/:slug', async (c) => {
                 action={`/app/teams/${team.slug}/integrations/jira`}
                 style="display:flex;flex-direction:column;gap:10px"
               >
-                <input
-                  class="in"
-                  type="text"
-                  name="site"
-                  aria-label="Jira site, like acme.atlassian.net"
-                  value={jira?.site ?? ''}
-                  placeholder="acme.atlassian.net"
-                />
-                <input
-                  class="in"
-                  type="email"
-                  name="email"
-                  aria-label="Atlassian account email"
-                  value={jira?.email ?? ''}
-                  placeholder="you@company.com"
-                />
-                <input
-                  class="in"
-                  type="password"
-                  name="token"
-                  autocomplete="off"
-                  aria-label="Jira API token"
-                  placeholder={jira ? 'Stored — type a new token only to replace it' : 'API token'}
-                />
+                <label class="ifield">
+                  <span>Site</span>
+                  <input
+                    class="in"
+                    type="text"
+                    name="site"
+                    aria-label="Jira site, like acme.atlassian.net"
+                    value={jira?.site ?? ''}
+                    placeholder="acme.atlassian.net"
+                  />
+                </label>
+                <label class="ifield">
+                  <span>Account email</span>
+                  <input
+                    class="in"
+                    type="email"
+                    name="email"
+                    aria-label="Atlassian account email"
+                    value={jira?.email ?? ''}
+                    placeholder="you@company.com"
+                  />
+                </label>
+                <label class="ifield">
+                  <span>API token</span>
+                  <input
+                    class="in"
+                    type="password"
+                    name="token"
+                    autocomplete="off"
+                    aria-label="Jira API token"
+                    placeholder={jira ? 'Stored — type a new token only to replace it' : 'API token'}
+                  />
+                </label>
                 <div style="display:flex;gap:8px;flex-wrap:wrap">
                   <button class="btn btn-sm btn-primary" type="submit" name="action" value="save">
                     {jira ? 'Update connection' : 'Connect Jira'}
@@ -1732,8 +1471,14 @@ dashboardRoutes.get('/app/teams/:slug', async (c) => {
 
           {role === 'owner' ? (
             <div class="card card-pad" style="display:flex;flex-direction:column;gap:12px">
+              <div class="integ-head">
+                <span class="integ-mark" aria-hidden="true">CU</span>
+                <div class="integ-title">
+                  <div class="card-title">ClickUp</div>
+                  {!env.clickup ? <span class="pill pill-muted">Not configured</span> : clickup ? (clickup.pausedAt ? <span class="pill pill-warn">Paused</span> : <span class="pill pill-active">Connected</span>) : <span class="pill pill-muted">Not connected</span>}
+                </div>
+              </div>
               <div>
-                <div class="card-title">ClickUp</div>
                 <div class="card-note">
                   Connect in ClickUp's own consent screen, then map each STMA project to one exact
                   ClickUp List. Agents can pick up tasks and report finishes or handoffs without
@@ -2975,14 +2720,15 @@ dashboardRoutes.get('/join/:code', async (c) => {
           {creator ? `${creator} invited you` : 'You were invited'} to join as{' '}
           {row.invite.role === 'owner' ? (
             <>
-              an <b style="color:var(--ink)">owner</b>. As well as sharing environment snapshots and
-              joining debug sessions, you will be able to publish the rules every agent on this team
-              is given, connect providers, change the plan and remove people.
+              an <b style="color:var(--ink)">owner</b>. As well as seeing the team's agent map, work
+              and sessions and connecting your own agents, you will be able to publish the rules
+              every agent on this team is given, connect providers, change the plan and remove
+              people.
             </>
           ) : (
             <>
-              a <b style="color:var(--ink)">member</b>. You'll be able to share environment snapshots
-              and join debug sessions with this team.
+              a <b style="color:var(--ink)">member</b>. You'll see the team's agent map, work and
+              sessions, and connect your own agents to it.
             </>
           )}
         </p>
@@ -3352,7 +3098,7 @@ const TokensPage = (props: {
             </details>
           </div>
         </div>
-        <div class="banner">
+        <div class="banner banner-info">
           <span class="ic">i</span>
           <span>
             Each browser approval creates a unique installation ID and short-lived, automatically
@@ -3767,7 +3513,7 @@ const AccountPage = (props: {
       {error ? <Banner kind="error" text={error} /> : null}
       {notice ? <Banner kind="success" text={notice} /> : null}
       <PageHead
-        crumb="/ account"
+        trail={[{ label: 'All workspaces', href: '/app' }, { label: 'Account' }]}
         title="Account"
         sub="Your sign-in and the end of the road. Agent credentials and machines live on Agent connections."
       />
@@ -4475,7 +4221,7 @@ dashboardRoutes.post('/app/account/email/code', async (c) => {
   if (!env.twoFactor) return accountBack(c, 'This server does not use email confirmation codes.');
   if (!user.email) return accountBack(c, 'This account has no email address yet.');
   if (user.emailVerifiedAt) return accountBack(c, 'That address is already confirmed.', true);
-  const issued = await issueAuthCode(c.get('db'), user.id, 'email_verify');
+  const issued = await issueAuthCode(c.get('db'), user.id, 'email_verify', user.email);
   if (!issued.ok) {
     return accountBack(c, 'Too many codes requested. Wait a few minutes, then try again.');
   }
@@ -4497,7 +4243,10 @@ dashboardRoutes.post('/app/account/email/verify', async (c) => {
   const db = c.get('db');
   const code = typeof (await c.req.parseBody()).code === 'string' ? String((await c.req.parseBody()).code).trim() : '';
   if (!/^\d{6}$/.test(code)) return accountBack(c, 'Enter the 6-digit code we emailed you.');
-  const result = await checkUserCode(db, user.id, 'email_verify', code);
+  if (!user.email) return accountBack(c, 'This account has no email address yet.');
+  // Bound to the address on the account now: a code mailed before an operator
+  // moved the account elsewhere proves the old mailbox, not this one.
+  const result = await checkUserCode(db, user.id, 'email_verify', code, user.email);
   if (result.status === 'invalid') {
     return accountBack(
       c,
@@ -4537,7 +4286,7 @@ dashboardRoutes.post('/app/account/email/change', async (c) => {
   if (!(await emailIsFree(db, wanted))) {
     return accountBack(c, 'An account already uses that address.');
   }
-  const issued = await issueAuthCode(db, user.id, 'email_change');
+  const issued = await issueAuthCode(db, user.id, 'email_change', wanted);
   if (!issued.ok) return accountBack(c, 'Too many codes requested. Wait a few minutes, then try again.');
   const sent = await sendMail(env, { to: wanted, ...emailChangeCodeEmail(issued.code, CODE_TTL_MINUTES) });
   if (!sent.ok) return accountBack(c, 'We could not email that address. Check it and try again.');
@@ -4561,7 +4310,9 @@ dashboardRoutes.post('/app/account/email/change/confirm', async (c) => {
   const code = typeof body.code === 'string' ? body.code.trim() : '';
   if (!isEmail(wanted)) return accountBack(c, 'Start the change again — the new address was lost.');
   if (!/^\d{6}$/.test(code)) return accountBack(c, 'Enter the 6-digit code we emailed you.');
-  const result = await checkUserCode(db, user.id, 'email_change', code);
+  // The address comes back from the form, so the code has to vouch for it: it
+  // was mailed to one address and counts beside that one only.
+  const result = await checkUserCode(db, user.id, 'email_change', code, wanted);
   if (result.status === 'invalid') {
     return accountBack(
       c,

@@ -1,6 +1,6 @@
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -64,6 +64,17 @@ export const ENGINE_FOR_MAJOR: Readonly<Record<string, string>> = {
   // range that ever wrote one of these directories. There is no 16 to support:
   // no release of this server has ever depended on a PGlite that bundled it.
   '17': '@electric-sql/pglite@0.3.16',
+};
+
+/**
+ * The tarball each pinned engine must have arrived as — the same digest the
+ * repository's lockfile records for the `pglite-pg17` alias the suite runs, and
+ * a test holds the two together. npm checks a download against the integrity
+ * its registry announced; this checks that announcement against ours, before
+ * anything that arrived is imported.
+ */
+export const ENGINE_INTEGRITY: Readonly<Record<string, string>> = {
+  '17': 'sha512-mZkZfOd9OqTMHsK+1cje8OSzfAQcpD7JmILXTl5ahdempjUDdmg4euf1biDex5/LfQIDJ3gvCu6qDgdnDxfJmA==',
 };
 
 /** The flag on the server binary that asks for the upgrade. */
@@ -267,18 +278,30 @@ async function loadEngine(
   return engine;
 }
 
+/**
+ * Fetch the pinned engine into a directory nobody else could have prepared.
+ *
+ * This used a fixed `os.tmpdir()/stma-engine-pg<major>`, imported whatever was
+ * already there, and ran npm inside it (audit 2026-09-21): on a shared machine
+ * another user could plant a module at that path — or an `.npmrc` that points
+ * the fetch elsewhere — and the upgrade would run it as whoever typed the
+ * command, with their data directory in reach. The "what major does this write"
+ * question comes after the import, so it could not catch that. Now each run
+ * gets a fresh `mkdtemp` directory (a random name; mode 0700 on POSIX, the
+ * user's own temp on Windows) and the installed tarball's integrity is checked
+ * against `ENGINE_INTEGRITY` before the module is loaded. It costs one download
+ * per upgrade, and an upgrade is a command somebody types once.
+ */
 function fetchEngine(spec: string, major: string, log: (line: string) => void): string {
-  const home = path.join(os.tmpdir(), `stma-engine-pg${major}`);
+  const home = mkdtempSync(path.join(os.tmpdir(), `stma-engine-pg${major}-`));
   const entry = path.join(home, 'node_modules', '@electric-sql', 'pglite', 'dist', 'index.js');
-  if (existsSync(entry)) return entry;
 
-  mkdirSync(home, { recursive: true });
   // npm walks up looking for one, and would install into whatever it found.
   writeFileSync(
     path.join(home, 'package.json'),
     `${JSON.stringify({ name: 'stma-upgrade-engine', version: '0.0.0', private: true }, null, 2)}\n`,
   );
-  log(`Fetching ${spec} — the engine that can open PostgreSQL ${major} (once)…`);
+  log(`Fetching ${spec} — the engine that can open PostgreSQL ${major}…`);
   // One command string, not a name plus arguments: Node will not spawn npm.cmd
   // without a shell on Windows, and a shell does not quote the arguments for
   // us. The only interpolation is our own pinned constant and a temp path.
@@ -291,7 +314,26 @@ function fetchEngine(spec: string, major: string, log: (line: string) => void): 
       `Could not fetch ${spec} into ${home}. Install it somewhere yourself and point ${ENGINE_ENV} at its dist/index.js, then run this again. Nothing was touched.`,
     );
   }
+  const arrived = installedIntegrity(home);
+  if (arrived !== ENGINE_INTEGRITY[major]) {
+    throw new Error(
+      `The ${spec} that arrived is not the published one this build pins (integrity ${arrived ?? 'unknown'}), so it was not loaded. Check the npm registry this machine uses, or point ${ENGINE_ENV} at a copy you trust. Nothing was touched.`,
+    );
+  }
   return entry;
+}
+
+/** The integrity npm recorded for the engine it just installed, from its own lockfile. */
+function installedIntegrity(home: string): string | undefined {
+  try {
+    const lock = JSON.parse(readFileSync(path.join(home, 'node_modules', '.package-lock.json'), 'utf8')) as {
+      packages?: Record<string, { integrity?: unknown }>;
+    };
+    const integrity = lock.packages?.['node_modules/@electric-sql/pglite']?.integrity;
+    return typeof integrity === 'string' ? integrity : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** What the old directory says it has already migrated. */

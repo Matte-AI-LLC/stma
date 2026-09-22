@@ -1,10 +1,12 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { eq } from 'drizzle-orm';
 import { afterAll, beforeAll, expect, it } from 'vitest';
 import { memberships, teams, users } from '../src/db/schema';
 import { loadEnv } from '../src/env';
+import { helpSections } from '../src/routes/help';
 import { startServer, type StartedServer } from '../src/server';
 
 /**
@@ -623,13 +625,17 @@ it('shows a stranger the documentation and an honest sentence, not a product pag
     expect(helpHtml).toContain('That access code is not valid');
     expect(helpHtml).toContain('Too many sign-in attempts for this email address');
     // A stranger has no account, so no enrollment code and no running agent:
-    // those two sections are console content and follow the same rule as the
-    // guide's, table of contents included.
-    expect(helpHtml).not.toContain('id="connect"');
-    expect(helpHtml).not.toContain('href="#connect"');
-    expect(helpHtml).not.toContain('href="#working"');
+    // every section about connecting and running agents is console content and
+    // follows the same rule as the guide's, index and contents included.
+    for (const gated of ['connect', 'working', 'coordinate', 'refusals', 'environments', 'integrations', 'limits']) {
+      expect(helpHtml, `#${gated} is console content`).not.toContain(`id="${gated}"`);
+      expect(helpHtml, `#${gated} must not be in the index`).not.toContain(`href="#${gated}"`);
+    }
     expect(helpHtml).not.toContain('stma adapter repair --pin-runtime --apply');
-    // What is left still has to be worth reading on its own.
+    // What is left still has to be worth reading on its own, and the index at
+    // the top is how somebody gets to it.
+    expect(helpHtml).toContain('class="helpidx"');
+    expect(helpHtml).toContain('href="#signin"');
     expect(helpHtml).toContain('id="selfhost"');
     expect(helpHtml).toContain('id="expected"');
 
@@ -653,7 +659,15 @@ it('shows a stranger the documentation and an honest sentence, not a product pag
     ).text();
     expect(memberHelp).toContain('id="connect"');
     expect(memberHelp).toContain('id="working"');
+    expect(memberHelp).toContain('id="coordinate"');
+    expect(memberHelp).toContain('id="refusals"');
+    expect(memberHelp).toContain('id="environments"');
+    expect(memberHelp).toContain('id="integrations"');
     expect(memberHelp).toContain('stma adapter repair --pin-runtime --apply');
+    // Plan ceilings exist only where plans decide something. This instance is
+    // not the hosted service, so the section is not a door it has.
+    expect(memberHelp).not.toContain('id="limits"');
+    expect(memberHelp).not.toContain('Device limit reached');
   } finally {
     await teaser.close();
     rmSync(dir, { recursive: true, force: true });
@@ -679,13 +693,88 @@ it('names the walls people actually hit, in the words the product prints', async
     'stale_ground',
     'unknown_or_inactive_run',
     'PostgreSQL 17',
+    // The 2026-09-22 sweep: the refusals an agent meets, the environment and
+    // integration answers, and the two boot refusals a self-hoster hits first.
+    'Invalid email or password.',
+    'has not been confirmed. Sign-in codes and password resets go there',
+    'Unknown parameter',
+    'is not an id STMA issued',
+    'Loop guard: more than',
+    'a cross-project environment diff is not meaningful',
+    'This snapshot carried no envVarNames',
+    'The token was refused',
+    'Jira refused the credentials on both API doors',
+    'X-Hub-Signature-256 mismatch',
+    'DATABASE_URL is required in production',
+    'is not a CIDR range like',
   ]) {
     expect(html, `somebody searching for "${printed}" must land on an answer`).toContain(printed);
   }
-  // This instance sets no SUPPORT_EMAIL, so the page must not invent a door —
-  // and must still not end in silence.
-  expect(html).not.toContain('mailto:support@stma.ai');
+  // An index that names each section, and a count beside it, is how a page this
+  // long stays usable.
+  expect(html).toContain('class="helpidx"');
+  expect(html).toContain('href="#refusals"');
+  // This instance sets no SUPPORT_EMAIL or PRIVACY_EMAIL, so the page must not
+  // invent a door — and must still not end in silence.
+  expect(html).not.toContain('mailto:');
   expect(html).toContain('publishes no support address');
+});
+
+it('quotes only what the product actually prints', () => {
+  // The page is worth having only if somebody can search for the string on their
+  // screen and find it, so every quote names the file that prints it and the
+  // literal that must appear there. This reads those files: when a message is
+  // reworded and the page is not, the page has quietly become a FAQ, and this
+  // goes red instead of a person discovering it while they are already stuck.
+  const packages = path.resolve(fileURLToPath(new URL('.', import.meta.url)), '../..');
+  const sources = new Map<string, string>();
+  const source = (rel: string) => {
+    const cached = sources.get(rel);
+    if (cached !== undefined) return cached;
+    const text = readFileSync(path.join(packages, rel), 'utf8');
+    sources.set(rel, text);
+    return text;
+  };
+
+  let checked = 0;
+  for (const section of helpSections()) {
+    for (const entry of section.entries) {
+      for (const quote of entry.quotes ?? []) {
+        const find = quote.find ?? quote.text;
+        // The example values a quote fills in may not contradict the fixed words.
+        expect(quote.text, `the quote must contain the words it claims: ${find}`).toContain(find);
+        if (!quote.from) {
+          // Printed by another program, or by the private hosted layer, whose
+          // source is not in the tree this suite runs in. Either way it says so.
+          expect(
+            Boolean(quote.by || quote.hostedOnly),
+            `"${find}" must name who prints it`,
+          ).toBe(true);
+          continue;
+        }
+        // Only the packages tree: this file ships to the public mirror, which
+        // has no `ee/` and no `docs/`.
+        expect(quote.from, `${quote.from} is not a public package source`).toMatch(
+          /^(server|cli|shared)\/src\//,
+        );
+        expect(source(quote.from), `${quote.from} no longer prints: ${find}`).toContain(find);
+        checked += 1;
+      }
+    }
+  }
+  // A reference, not a handful of examples. The number only ever goes up.
+  expect(checked).toBeGreaterThanOrEqual(80);
+});
+
+it('indexes every section it draws, and draws every section it indexes', async () => {
+  const html = await (await fetch(`${srv.url}/help`)).text();
+  const drawn = [...html.matchAll(/<section class="doc-section" id="([a-z-]+)"/g)].map((m) => m[1]!);
+  const indexed = new Set(
+    [...html.matchAll(/href="#([a-z-]+)"/g)].map((m) => m[1]!),
+  );
+  expect(drawn.length, 'the page should have its sections').toBeGreaterThan(5);
+  for (const id of drawn) expect([...indexed], `#${id} must be reachable from the index`).toContain(id);
+  for (const id of indexed) expect(drawn, `the index must not point at a missing #${id}`).toContain(id);
 });
 
 it('links help from every footer a signed-out reader can reach', async () => {

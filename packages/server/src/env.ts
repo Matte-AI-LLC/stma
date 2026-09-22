@@ -1,3 +1,5 @@
+import { isIP } from 'node:net';
+
 export interface Env {
   nodeEnv: string;
   port: number;
@@ -88,6 +90,20 @@ export interface Env {
    */
   trustedProxyHops: number;
   /**
+   * Which addresses may be one of those hops (TRUSTED_PROXY_CIDRS,
+   * comma-separated CIDRs; `cloudflare` stands for Cloudflare's published
+   * ranges). Empty keeps the count alone.
+   *
+   * A count cannot tell a proxy from a client. The Container App's own address
+   * still answers, and a request sent straight to it arrives one entry short:
+   * with one hop trusted, the limiter then read the entry the client typed —
+   * measured on production 2026-09-21, a forged address went into the log as
+   * the caller's. With a list, a hop is stepped over only when the address that
+   * appended it is on the list, so a direct request is counted against the
+   * address that actually connected.
+   */
+  trustedProxyCidrs: string[];
+  /**
    * Where a person writes when the product goes wrong. Empty means the instance
    * has no support channel and nothing offers one.
    *
@@ -96,6 +112,15 @@ export interface Env {
    * and send its own operator none. `SUPPORT_EMAIL` sets it either way.
    */
   supportEmail: string;
+  /**
+   * Where a data-protection request goes: access, correction, deletion,
+   * portability, objection — the GDPR and KVKK doors. Same rule as
+   * `supportEmail` and for the same reason: defaulted for the hosted service
+   * only, because on an instance somebody else runs, the controller is that
+   * operator and our address would take requests we cannot answer.
+   * `PRIVACY_EMAIL` sets it either way.
+   */
+  privacyEmail: string;
   /**
    * Demo credentials printed on the sign-in page, for a throwaway environment
    * where hunting for them is the friction.
@@ -253,6 +278,38 @@ export function bootNodeEnv(
   return argv.includes('--dev') ? 'development' : 'production';
 }
 
+/**
+ * Cloudflare's edge ranges, as published at cloudflare.com/ips-v4 and /ips-v6
+ * (read 2026-09-21; unchanged since 2021). Re-read them if Cloudflare announces
+ * a change: an edge address missing here is counted as the client, which groups
+ * that edge's visitors together — coarse, never forgeable.
+ */
+export const CLOUDFLARE_RANGES = [
+  '173.245.48.0/20', '103.21.244.0/22', '103.22.200.0/22', '103.31.4.0/22', '141.101.64.0/18',
+  '108.162.192.0/18', '190.93.240.0/20', '188.114.96.0/20', '197.234.240.0/22', '198.41.128.0/17',
+  '162.158.0.0/15', '104.16.0.0/13', '104.24.0.0/14', '172.64.0.0/13', '131.0.72.0/22',
+  '2400:cb00::/32', '2606:4700::/32', '2803:f800::/32', '2405:b500::/32', '2405:8100::/32',
+  '2a06:98c0::/29', '2c0f:f248::/32',
+] as const;
+
+/** A list that does not parse stops the boot: a typo here must not quietly trust nobody. */
+export function parseProxyCidrs(raw: string | undefined): string[] {
+  const entries = (raw ?? '')
+    .split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean)
+    .flatMap((entry) => (entry === 'cloudflare' ? [...CLOUDFLARE_RANGES] : [entry]));
+  for (const entry of entries) {
+    const [address, prefix] = entry.split('/');
+    const family = isIP(address ?? '');
+    const bits = Number(prefix);
+    if (!family || !/^\d{1,3}$/.test(prefix ?? '') || bits > (family === 4 ? 32 : 128)) {
+      throw new Error(`TRUSTED_PROXY_CIDRS: "${entry}" is not a CIDR range like 203.0.113.0/24 or 2001:db8::/32.`);
+    }
+  }
+  return [...new Set(entries)];
+}
+
 export function loadEnv(overrides: Partial<Env> = {}): Env {
   const e = process.env;
   // Read once, before the object is built: two fields below key off it, and an
@@ -302,7 +359,9 @@ export function loadEnv(overrides: Partial<Env> = {}): Env {
     publicMode: e.SITE_MODE === 'teaser' ? 'teaser' : 'full',
     hosted: hostedInstance,
     trustedProxyHops: Math.max(0, Math.min(8, Number(e.TRUSTED_PROXY_HOPS ?? '0') || 0)),
-    supportEmail: (e.SUPPORT_EMAIL ?? (hostedInstance ? 'support@stma.ai' : '')).trim(),
+    trustedProxyCidrs: parseProxyCidrs(e.TRUSTED_PROXY_CIDRS),
+    supportEmail: (e.SUPPORT_EMAIL ?? (hostedInstance ? 'support@matteai.com' : '')).trim(),
+    privacyEmail: (e.PRIVACY_EMAIL ?? (hostedInstance ? 'gdpr@matteai.com' : '')).trim(),
     // Never on the hosted service, whatever the variable says. The panel exists
     // for a throwaway environment where hunting for the test credentials is the
     // friction; on the service people actually sign in to, a list of example
@@ -360,7 +419,7 @@ export function loadEnv(overrides: Partial<Env> = {}): Env {
   }
   if (env.nodeEnv === 'production' && !env.databaseUrl && env.embeddedDb) {
     console.warn(
-      '[stma] Embedded database mode: single instance only — persist the data directory (default packages/server/.data) with a volume.',
+      `[stma] Embedded database mode: single instance only — persist the data directory (${env.pgliteDir}) with a volume.`,
     );
   }
   if (env.nodeEnv === 'production' && env.devMode) {

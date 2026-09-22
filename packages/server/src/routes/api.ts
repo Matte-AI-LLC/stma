@@ -24,6 +24,7 @@ import {
   redeemAgentEnrollment,
 } from '../domain/enrollments';
 import { burnPasswordCheck, hashPassword, verifyPassword } from '../lib/crypto';
+import { reservedUsername } from '../lib/admin';
 import { emailIsFree, isEmail, maskEmail, normalizeEmail, usernameFromEmail } from '../lib/email';
 import { logLine } from '../lib/log';
 import { notifyTeam } from '../lib/notify';
@@ -324,7 +325,7 @@ apiRoutes.post('/api/invites/redeem', async (c) => {
     if (!(await emailIsFree(db, email))) {
       return c.json({ error: 'that email is already registered' }, 409);
     }
-    username = await usernameFromEmail(db, email);
+    username = await usernameFromEmail(db, email, (name) => reservedUsername(c.get('env'), name));
     newUser = { username, email, passwordHash: await hashPassword(password) };
   }
 

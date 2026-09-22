@@ -503,10 +503,17 @@ it('redeems an invite with an email and issues a token', async () => {
 
 // --------------------------------------------------------------------- admin
 
-it('grants /admin through ADMIN_EMAILS and keeps everyone else on 404', async () => {
+it('grants /admin through a confirmed ADMIN_EMAILS address and keeps everyone else on 404', async () => {
   // ' Ops@STMA.test ' matches ops@stma.test — trimmed and case-insensitive.
   await signup(srv, 'ops@stma.test', 'opspassword1', '18');
   const ops = await signIn('ops@stma.test', 'opspassword1', '18');
+  // Listed but not yet proved: signing up with an operator's address is not
+  // being the operator (audit 2026-09-21, F1).
+  expect((await fetch(`${srv.url}/admin`, { headers: ops.header() })).status).toBe(404);
+  const sent = await post(srv, '/app/account/email/code', {}, ops.header());
+  expect(where(sent)).toContain('Code sent to ops@stma.test');
+  const confirmed = await post(srv, '/app/account/email/verify', { code: codeFor('ops@stma.test') }, ops.header());
+  expect(where(confirmed)).toContain('Address confirmed');
   expect((await fetch(`${srv.url}/admin`, { headers: ops.header() })).status).toBe(200);
   expect((await fetch(`${srv.url}/admin/users`, { headers: ops.header() })).status).toBe(200);
 
@@ -752,7 +759,7 @@ it('masks inbound hook tokens in the access log', async () => {
 // ----------------------------------------------- the mail a locked-out reader gets
 
 it('sends somebody whose password just changed to the door that still opens', () => {
-  const mail = passwordChangedEmail('https://stma.ai', 'support@stma.ai');
+  const mail = passwordChangedEmail('https://stma.ai', 'support@matteai.com');
   const both = `${mail.text}\n${mail.html}`;
 
   // `/login` is a wall for the one reader this mail is written for: if somebody
@@ -766,8 +773,8 @@ it('sends somebody whose password just changed to the door that still opens', ()
   expect(mail.html).toContain('reset your password now');
   expect(both).not.toContain('sign in at');
 
-  expect(mail.text).toContain('support@stma.ai');
-  expect(mail.html).toContain('mailto:support@stma.ai');
+  expect(mail.text).toContain('support@matteai.com');
+  expect(mail.html).toContain('mailto:support@matteai.com');
 });
 
 it('offers no support address when the instance has none', () => {

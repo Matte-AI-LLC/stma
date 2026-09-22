@@ -35,18 +35,40 @@ export const deviceWindowStart = (now = new Date()): Date =>
  */
 export function normalizeDeviceLabel(raw: string | null | undefined): string | null {
   if (typeof raw !== 'string') return null;
-  const cleaned = raw
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9._-]+/g, '-')
-    .replace(/^[-._]+|[-._]+$/g, '');
+  const cleaned = trimSeparators(
+    raw
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9._-]+/g, '-'),
+  );
   if (cleaned.length === 0) return null;
   if (cleaned.length <= DEVICE_LABEL_MAX) return cleaned;
   // Two long names that agree on their first DEVICE_LABEL_MAX characters used to
   // share one slot, so one machine read back the other's environment. Keep the
   // readable head and a short digest of the whole thing.
   const digest = createHash('sha256').update(cleaned).digest('hex').slice(0, 6);
-  return `${cleaned.slice(0, DEVICE_LABEL_MAX - 7).replace(/[-._]+$/g, '')}-${digest}`;
+  return `${trimSeparators(cleaned.slice(0, DEVICE_LABEL_MAX - 7), 'end')}-${digest}`;
+}
+
+const SEPARATORS = new Set(['-', '.', '_']);
+
+/**
+ * Strip `-`, `.` and `_` from the ends, in one pass each way.
+ *
+ * This was `/^[-._]+|[-._]+$/g`, which is quadratic on a long run of separators
+ * that does not reach the end of the string: the second branch is tried at every
+ * position of the run and backtracks the whole run each time. `POST
+ * /api/invites/redeem` handed it an uncapped string before looking at the invite
+ * code, and one anonymous request held the process for everybody — measured at
+ * 1.3 s for 40 KB, about 50 s at the body limit (audit 2026-09-21). Same output,
+ * linear time.
+ */
+function trimSeparators(value: string, ends: 'both' | 'end' = 'both'): string {
+  let start = 0;
+  let end = value.length;
+  if (ends === 'both') while (start < end && SEPARATORS.has(value[start]!)) start += 1;
+  while (end > start && SEPARATORS.has(value[end - 1]!)) end -= 1;
+  return value.slice(start, end);
 }
 
 /** First usable label among the candidates, falling back to DEFAULT_DEVICE. */

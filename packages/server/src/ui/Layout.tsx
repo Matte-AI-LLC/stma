@@ -1,5 +1,5 @@
 import type { Child } from 'hono/jsx';
-import { CSS_URL, FAVICON_URL, JS_URL } from './assets';
+import { CSS_URL, FAVICON_URL, FONT_SANS_URL, JS_URL } from './assets';
 import type { User } from '../types';
 import { ConsoleShell, Logo, type KeyHint, type RailKey } from './Console';
 
@@ -7,14 +7,25 @@ import { ConsoleShell, Logo, type KeyHint, type RailKey } from './Console';
 // the nine pages that always imported it from the layout keep working.
 export { Logo };
 
-export const Head = ({ title }: { title?: string }) => (
+/** What a link preview and a search result say when a page does not say better. */
+export const SITE_DESCRIPTION =
+  'STMA is AgentOps for teams that build with coding agents: a live map of every agent run, collision warnings before two agents touch the same ground, team rules delivered to every run, handoffs that survive a session limit, and evidence a reviewer can check.';
+
+export const Head = ({ title, description }: { title?: string; description?: string }) => (
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>{title ? `${title} — STMA` : 'STMA — Speak to my Agent'}</title>
-    {/* The console must render on restricted/offline networks. Use the local
-        system-font fallbacks; no third-party render-blocking font stylesheet. */}
+    <title>{title ? `${title} — STMA` : 'STMA — AgentOps for coding agents'}</title>
+    <meta name="description" content={description ?? SITE_DESCRIPTION} />
+    <meta property="og:title" content={title ? `${title} — STMA` : 'STMA — AgentOps for coding agents'} />
+    <meta property="og:description" content={description ?? SITE_DESCRIPTION} />
+    <meta property="og:site_name" content="STMA · Speak to my Agent" />
+    <meta name="theme-color" content="#fbfbf9" />
+    {/* The console must render on restricted/offline networks: no third-party
+        font stylesheet. The faces come from this origin (ui/assets.ts). */}
     <link rel="icon" type="image/svg+xml" href={FAVICON_URL} />
+    {/* Fetched in parallel with the stylesheet that names it, instead of after. */}
+    <link rel="preload" href={FONT_SANS_URL} as="font" type="font/woff2" crossorigin="anonymous" />
     <link rel="stylesheet" href={CSS_URL} />
     <script src={JS_URL} defer></script>
   </head>

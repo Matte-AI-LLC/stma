@@ -1,4 +1,4 @@
-import 'dotenv/config';
+import './dotenv';
 import { DATA_DIRECTORY_ERROR } from './db';
 import { runUpgradeCommand, upgradeTarget } from './db/upgrade';
 import { bootNodeEnv, DEFAULT_PGLITE_DIR, loadEnv } from './env';

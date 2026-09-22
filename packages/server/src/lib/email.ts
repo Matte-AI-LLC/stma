@@ -3,7 +3,7 @@
  * `users.email` goes through `normalizeEmail` so the unique index sees one
  * canonical form; `users.username` stays the display name and is derived here.
  */
-import { eq } from 'drizzle-orm';
+import { eq, sql } from 'drizzle-orm';
 import type { Db } from '../db';
 import { users } from '../db/schema';
 import { slugify } from './slug';
@@ -34,10 +34,34 @@ export function maskEmail(value: string): string {
 }
 
 /**
+ * Whether a name is already held, ignoring case. The unique index is
+ * case-sensitive, and a GitHub login keeps its case, so `RootOps` could be
+ * created beside `rootops` — a lookalike account, and until 2026-09-21 a second
+ * operator whenever the lowercase one was listed.
+ */
+export async function usernameTaken(db: Db, candidate: string): Promise<boolean> {
+  const taken = await db
+    .select({ id: users.id })
+    .from(users)
+    .where(sql`lower(${users.username}) = ${candidate.toLowerCase()}`)
+    .limit(1);
+  return taken.length > 0;
+}
+
+/**
  * A free display username derived from the email local part: `ada.lovelace@x.io`
  * → `ada-lovelace`, `-2`, `-3`… on collision.
+ *
+ * `reserved` says which names a new account may never take — the operator list,
+ * whose names grant /admin to whoever holds them. Without it, signing up as
+ * `rootops@anywhere` claimed a listed `rootops` nobody held yet, or took back
+ * the name of a deleted operator (deletion frees it).
  */
-export async function usernameFromEmail(db: Db, email: string): Promise<string> {
+export async function usernameFromEmail(
+  db: Db,
+  email: string,
+  reserved: (candidate: string) => boolean = () => false,
+): Promise<string> {
   const local = email.slice(0, Math.max(0, email.lastIndexOf('@')));
   // slugify() falls back to "team" for input without letters or digits, which
   // would be a confusing username — use a neutral base instead.
@@ -45,12 +69,8 @@ export async function usernameFromEmail(db: Db, email: string): Promise<string> 
   if (base.length < 2) base = 'user';
   for (let i = 1; i <= 200; i++) {
     const candidate = i === 1 ? base : `${base}-${i}`;
-    const taken = await db
-      .select({ id: users.id })
-      .from(users)
-      .where(eq(users.username, candidate))
-      .limit(1);
-    if (taken.length === 0) return candidate;
+    if (reserved(candidate)) continue;
+    if (!(await usernameTaken(db, candidate))) return candidate;
   }
   // Unreachable in practice; keeps the signature total.
   return `${base}-${Date.now().toString(36)}`;

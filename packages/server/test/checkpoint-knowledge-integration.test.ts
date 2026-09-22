@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { and, eq } from 'drizzle-orm';
+import { and, eq, inArray } from 'drizzle-orm';
 import { afterAll, beforeAll, expect, it } from 'vitest';
 import { createAgentEnrollment, redeemAgentEnrollment } from '../src/domain/enrollments';
 import { evidenceForRun } from '../src/domain/evidence';
@@ -714,4 +714,119 @@ it('carries checkpoint and Knowledge context through handoff, then requires exac
   expect(evidence.checks.find((check) => check.key === 'knowledge')).toMatchObject({
     state: 'attention',
   });
+});
+
+it('accepts a receiving run that began on a stale copy of the branch once it reports the handed-over commit', async () => {
+  // The agent lab's L3, 2026-09-21: the receiver checked out the handed-over
+  // branch while its local copy of it was stale, so the hook opened the run on
+  // the stale commit; a fast-forward then put the checkout exactly on the
+  // handed-over commit, and the next heartbeat recorded that. The resume named
+  // that run and was refused because its *start* was the stale commit, with no
+  // way out named — so the agent started a second run of its own, and the write
+  // guard then stopped it on itself.
+  const source = await rest(sourceToken, '/api/agent/runs/start', {
+    requestId: randomUUID(),
+    installationId: sourceInstallationId,
+    team: TEAM,
+    project: PROJECT,
+    repositoryIdentity: REPOSITORY,
+    intent: 'kh3-resume-marker',
+    branch: 'feat/stale-branch',
+    checkpoint: checkpoint('start', SHA.handoffStart),
+    claims: [{ resourceType: 'path', resourceKey: 'docs/knowledge', access: 'write' }],
+  });
+  expect(source.response.status).toBe(200);
+  expect(source.data.knowledgeContext?.contextId).toBeTruthy();
+  const tested = await rest(sourceToken, `/api/agent/runs/${source.data.run.id}/heartbeat`, {
+    checkpoint: checkpoint('tested', SHA.handoffTested),
+  });
+  expect(tested.response.status).toBe(200);
+  const handed = await call(sourceToken, 'handoff_work', {
+    request_id: randomUUID(),
+    run_id: source.data.run.id,
+    branch: 'feat/stale-branch',
+    summary: 'Handed over from a branch the receiver has only a stale copy of.',
+    next_steps: ['Fast-forward to the handed-over commit before changing anything.'],
+    reason: 'end_of_day',
+  });
+  expect(handed.isError, handed.text).toBe(false);
+  expect((await call(receiverToken, 'update_handoff', { session_id: handed.data.sessionId, action: 'accept' })).isError).toBe(false);
+
+  // The hook's run on the stale copy of the branch.
+  const stale = await call(receiverToken, 'start_run', {
+    request_id: randomUUID(),
+    team: TEAM,
+    project: PROJECT,
+    repository_identity: REPOSITORY,
+    task: 'KH3-STALE-COPY',
+    intent: 'Receive the handoff from a stale local branch.',
+    checkpoint: {
+      request_id: randomUUID(),
+      kind: 'start',
+      repository_identity: REPOSITORY,
+      commit_sha: SHA.handoffStart,
+      worktree_clean: true,
+      tests: [],
+    },
+  });
+  expect(stale.isError, stale.text).toBe(false);
+  const runId = stale.data.runId as string;
+  const resume = () =>
+    call(receiverToken, 'update_handoff', {
+      session_id: handed.data.sessionId,
+      action: 'resume',
+      run_id: runId,
+      repository_identity: REPOSITORY,
+      commit_sha: SHA.handoffTested,
+      worktree_clean: true,
+    });
+
+  // Before the run has said it is here, it is still refused — and the refusal
+  // now names the way through, which is not a second run.
+  const early = await resume();
+  expect(early.isError).toBe(true);
+  expect(early.text).toContain('has not reported this commit since');
+  expect(early.text).toContain('resume with the same run_id');
+  expect(early.text).toContain('Do not start another run');
+
+  // What the hook's heartbeat records after the fast-forward.
+  const reported = await call(receiverToken, 'update_run', {
+    run_id: runId,
+    checkpoint: {
+      request_id: randomUUID(),
+      kind: 'delivery',
+      repository_identity: REPOSITORY,
+      commit_sha: SHA.handoffTested,
+      worktree_clean: true,
+      tests: [],
+    },
+  });
+  expect(reported.isError, reported.text).toBe(false);
+  const deliveryId = reported.data.checkpoint.checkpoint.id as string;
+
+  const resumed = await resume();
+  expect(resumed.isError, resumed.text).toBe(false);
+  expect(resumed.data.verification).toMatchObject({ verified: true, basis: 'observed_checkout' });
+  // The resumed context is bound to the report that proved where the run is,
+  // and the run's start is left exactly where it began.
+  const [offer] = await srv.db.select().from(handoffs).where(eq(handoffs.sessionId, handed.data.sessionId));
+  const [bound] = await srv.db
+    .select()
+    .from(knowledgeContexts)
+    .where(eq(knowledgeContexts.id, offer!.resumedKnowledgeContextId!));
+  expect(bound).toMatchObject({ runId, checkpointId: deliveryId });
+
+  // One live run in the checkout, which is the whole point.
+  const live = await srv.db
+    .select()
+    .from(agentRuns)
+    .where(
+      and(
+        eq(agentRuns.installationId, receiverInstallationId),
+        eq(agentRuns.teamId, teamId),
+        inArray(agentRuns.status, ['starting', 'active', 'waiting', 'blocked']),
+      ),
+    );
+  expect(live.map((run) => run.id)).toContain(runId);
+  expect(live.filter((run) => run.taskKey === 'KH3-STALE-COPY')).toHaveLength(1);
 });

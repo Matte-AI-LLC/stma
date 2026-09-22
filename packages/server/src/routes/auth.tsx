@@ -34,6 +34,7 @@ import {
   loginGate,
   recordLoginFailure,
 } from '../auth/attempts';
+import { reservedUsername } from '../lib/admin';
 import { burnPasswordCheck, hashPassword, randomCode, verifyPassword } from '../lib/crypto';
 import { emailIsFree, isEmail, maskEmail, normalizeEmail, usernameFromEmail } from '../lib/email';
 import { logLine } from '../lib/log';
@@ -64,10 +65,12 @@ authRoutes.get('/login', (c) => {
       <body>
         <div class="auth-wrap">
           <div class="auth-card">
-            <Logo lg />
+            <a class="auth-home" href="/" aria-label="STMA home">
+              <Logo lg />
+            </a>
             <div>
               <h1>Sign in to STMA</h1>
-              <p class="lede">Speak to my Agent — your team's agents, debugging together.</p>
+              <p class="lede">AgentOps for teams that build with coding agents.</p>
             </div>
             {error ? (
               <div class="banner banner-error">
@@ -115,8 +118,9 @@ authRoutes.get('/login', (c) => {
                   // explanation — and the invite path that does work is invisible.
                   <p class="m0 small muted" style="text-align:center">
                     No account yet? STMA is invite-only during the private beta. Ask someone on
-                    your team — their agent can create an invite for you with{' '}
-                    <code>create_invite</code>, and you redeem it from your terminal. The{' '}
+                    your team — their agent can create one for you with{' '}
+                    <code>create_invite</code>, or they can send you the link from the workspace's
+                    People tab. Open that link in this browser and it does the rest. The{' '}
                     <a href="/docs#terminal">guide</a> walks through it.
                   </p>
                 )}
@@ -229,7 +233,9 @@ authRoutes.get('/signup', (c) => {
       <body>
         <div class="auth-wrap">
           <div class="auth-card">
-            <Logo lg />
+            <a class="auth-home" href="/" aria-label="STMA home">
+              <Logo lg />
+            </a>
             <div>
               <h1>Create your STMA account</h1>
               <p class="lede">
@@ -294,6 +300,14 @@ authRoutes.get('/signup', (c) => {
               <button class="btn btn-primary" style="width:100%;height:44px" type="submit">
                 Create account
               </button>
+              {/* Only where these are the terms that apply: on an instance somebody
+                  else runs, its operator's terms do, and /terms says so itself. */}
+              {env.hosted ? (
+                <p class="m0 small muted" style="text-align:center">
+                  Creating an account means you accept the <a href="/terms">Terms of Service</a>.
+                  The <a href="/privacy">Privacy Policy</a> explains what we keep and why.
+                </p>
+              ) : null}
               <p class="m0 small muted" style="text-align:center">
                 Already have one? <a href={`/login?next=${encodeURIComponent(next)}`}>Sign in</a>
               </p>
@@ -347,7 +361,7 @@ authRoutes.post('/auth/local/signup', async (c) => {
     const inserted = await db
       .insert(users)
       .values({
-        username: await usernameFromEmail(db, email),
+        username: await usernameFromEmail(db, email, (name) => reservedUsername(env, name)),
         email,
         passwordHash: await hashPassword(password),
         // The cohort, on the row, in the same statement that creates the
@@ -382,7 +396,7 @@ authRoutes.post('/auth/local/signup', async (c) => {
    * from here; making it softer after a gate is not.
    */
   if (env.twoFactor) {
-    const issued = await issueAuthCode(db, user.id, 'email_verify');
+    const issued = await issueAuthCode(db, user.id, 'email_verify', email);
     if (issued.ok) {
       // Still not awaited — the paragraph above is the reason, and a mail
       // round trip does not belong on the critical path of creating an
@@ -514,7 +528,9 @@ const VerifyPage = ({ next, error, notice }: { next: string; error?: string; not
     <body>
       <div class="auth-wrap">
         <div class="auth-card">
-          <Logo lg />
+          <a class="auth-home" href="/" aria-label="STMA home">
+            <Logo lg />
+          </a>
           <div>
             <h1>Check your email</h1>
             <p class="lede">
@@ -698,7 +714,9 @@ const ForgotPage = ({ error, support }: { error?: string; support: string }) => 
     <body>
       <div class="auth-wrap">
         <div class="auth-card">
-          <Logo lg />
+          <a class="auth-home" href="/" aria-label="STMA home">
+            <Logo lg />
+          </a>
           <div>
             <h1>Reset your password</h1>
             <p class="lede">
@@ -747,7 +765,9 @@ const ResetPage = ({
     <body>
       <div class="auth-wrap">
         <div class="auth-card">
-          <Logo lg />
+          <a class="auth-home" href="/" aria-label="STMA home">
+            <Logo lg />
+          </a>
           <div>
             <h1>Choose a new password</h1>
             <p class="lede">
@@ -1018,7 +1038,7 @@ authRoutes.post('/auth/dev', async (c) => {
         .insert(users)
         .values(
           asEmail
-            ? { username: await usernameFromEmail(db, identifier), email: identifier }
+            ? { username: await usernameFromEmail(db, identifier, (name) => reservedUsername(env, name)), email: identifier }
             : { username: identifier },
         )
         .returning();
@@ -1062,7 +1082,14 @@ authRoutes.get('/auth/github/callback', async (c) => {
     }
     const accessToken = await exchangeGithubCode(env, code);
     const profile = await fetchGithubProfile(accessToken);
-    const user = await upsertGithubUser(c.get('db'), profile);
+    // The same doors the signup form has: closed signups stay closed, and a
+    // beta that asks for an access code does not let GitHub skip it. There is
+    // no code field here, so while one is required an existing linked account
+    // is the only thing GitHub can sign in to.
+    const user = await upsertGithubUser(c.get('db'), profile, {
+      allowCreate: env.signupsOpen && !accessCodeRequired(env),
+      reserved: (candidate) => reservedUsername(env, candidate),
+    });
     await createSession(c, user.id);
     logLine({ evt: 'auth', a: 'github_login', u: user.username });
     return c.redirect(sanitizeNext(saved.next));

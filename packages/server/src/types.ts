@@ -49,5 +49,11 @@ export type AppEnv = {
     lifecycle: AppLifecycleHooks;
     /** Optional surfaces supplied by that composition; not inferred from hosted metering. */
     capabilities: AppCapabilities;
+    /**
+     * Where this page's forms may be sent on to by the redirect that answers
+     * them, beside this origin: the CSP's `form-action` (`lib/csp.ts`). Set by
+     * the OAuth consent page and the billing page, and by nothing else.
+     */
+    formTargets?: string[];
   };
 };

@@ -1,7 +1,7 @@
 import { membershipUser } from '../lib/securityHooks';
-import { MESSAGE_KINDS } from '@bridge/shared';
+import { THREAD_MESSAGE_KINDS, isThreadMessageKind } from '@bridge/shared';
 import { and, count, desc, eq, ilike, inArray, ne, or, sql } from 'drizzle-orm';
-import { Hono, type Context } from 'hono';
+import { Hono, type Context, type MiddlewareHandler } from 'hono';
 import type { Db } from '../db';
 import {
   agentInstallations,
@@ -16,6 +16,7 @@ import {
 } from '../db/schema';
 import { loginRedirect } from '../auth/session';
 import { fmtDate, initials, timeAgo } from '../lib/format';
+import { isCanonicalUuid } from '../lib/ids';
 import { notifyTeam } from '../lib/notify';
 import { notifySessionActivity } from '../lib/notifications';
 import { pageWindow, slicePage } from '../lib/pagination';
@@ -42,6 +43,15 @@ import { z } from 'zod/v3';
 
 export const sessionsRoutes = new Hono<AppEnv>();
 
+// A thread is named by the id this server wrote, in the spelling it wrote it.
+// The database also reads `{…}` or a dash-less id as the same row, which let a
+// spelling decide whether a guard compared anything (`lib/ids.ts`); and an id
+// that is not a uuid at all reached a uuid column and answered 500.
+const threadId: MiddlewareHandler<AppEnv> = async (c, next) =>
+  isCanonicalUuid(c.req.param('id')) ? next() : c.notFound();
+sessionsRoutes.use('/app/sessions/:id', threadId);
+sessionsRoutes.use('/app/sessions/:id/*', threadId);
+
 /** Sessions per page in the list, and messages per page inside a thread. */
 const LIST_PAGE_SIZE = 25;
 const THREAD_PAGE_SIZE = 100;
@@ -55,8 +65,6 @@ async function myTeams(db: Db, userId: string) {
     .orderBy(teams.name);
 }
 
-const isKind = (k: unknown): k is (typeof MESSAGE_KINDS)[number] =>
-  typeof k === 'string' && (MESSAGE_KINDS as readonly string[]).includes(k);
 
 // ---------------------------------------------------------------- the reader
 
@@ -875,7 +883,7 @@ sessionsRoutes.get('/app/sessions/:id', async (c) => {
             ></textarea>
             <div class="page-head" style="align-items:center">
               <select class="in" name="kind">
-                {MESSAGE_KINDS.filter((k) => k !== 'announcement').map((k) => (
+                {THREAD_MESSAGE_KINDS.map((k) => (
                   <option value={k} selected={k === 'question'}>
                     {k}
                   </option>
@@ -1040,10 +1048,11 @@ const workPage = async (c: Context<AppEnv>) => {
         ) : (
           <FlowEmpty title="No tracked handoffs yet">
             <p>
-              Ask your connected agent to offer a real task using handoff_work. Reading or replying
-              to a message does not accept it.
+              Work appears here when a lead assigns a task to a named agent (Assign work on a
+              project page, or <code>assign_work</code>) or an agent hands its work over with{' '}
+              <code>handoff_work</code>. Reading or replying to a message does not accept it.
             </p>
-            <a href="/app/tokens">Connect an agent</a>
+            <a class="btn btn-sm" href="/app/tokens">Connect an agent</a>
           </FlowEmpty>
         )}
       </FlowSection>
@@ -1101,7 +1110,10 @@ sessionsRoutes.post('/app/sessions/:id/messages', async (c) => {
   if (!found) return c.notFound();
   const body = await c.req.parseBody();
   const content = typeof body.body === 'string' ? body.body.trim().slice(0, 20_000) : '';
-  const kind = isKind(body.kind) ? body.kind : 'note';
+  // A browser reply is conversation. `handoff` and `announcement` are what the
+  // product writes through its own flows, and a posted one used to turn any open
+  // thread into work waiting in every teammate's inbox.
+  const kind = isThreadMessageKind(body.kind) ? body.kind : 'note';
   if (content) {
     const posted = await db
       .insert(messages)

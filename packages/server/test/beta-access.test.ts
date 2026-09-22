@@ -254,6 +254,11 @@ it('tells a beta workspace how long its history lasts, in the number the sweep u
  * and reported as already past.
  */
 it('answers, per workspace, the cohort and the distance to the plan it lands on', async () => {
+  // An operator address counts once a code mailed to it came back (audit
+  // 2026-09-21, F1). This server sends no codes, so the fixture records the
+  // proof the way the confirm form would; the gate itself is tested in
+  // `audit-2026-09-21.test.ts`.
+  await beta.db.update(users).set({ emailVerifiedAt: new Date() }).where(eq(users.email, ADMIN));
   const { header } = await signIn(ADMIN);
   // The second wave, so the page has to render both a named cohort and the one
   // the operator gave no name to. A workspace is what the ledger lists, so the
@@ -371,29 +376,32 @@ it('leaves an unconfigured instance exactly as it was', async () => {
 
 it('puts a support address on the hosted landing page, and none on a self-hosted one', async () => {
   const landing = await (await fetch(beta.url)).text();
-  expect(landing).toContain('mailto:support@stma.ai');
+  expect(landing).toContain('mailto:support@matteai.com');
   expect(landing).toContain('>Support<');
 
   // The troubleshooting page has one job the footer link does not: it must not
   // be a dead end. Everything it can answer without a person comes first, and
-  // the address is where the page ends.
+  // the address is where the page ends — with the data-protection address beside
+  // it, because "delete my data" is not a support ticket.
   const help = await (await fetch(`${beta.url}/help`)).text();
-  expect(help).toContain('mailto:support@stma.ai');
+  expect(help).toContain('mailto:support@matteai.com');
   expect(help).not.toContain('publishes no support address');
+  expect(help).toContain('mailto:gdpr@matteai.com');
 
   // And the signup page — the first wall a cohort code meets, and until now the
   // one page with nothing to link to when it refused.
   const signup = await (await fetch(`${beta.url}/signup`)).text();
   expect(signup).toContain('Access code refused');
   expect(signup).toContain('/help#signin');
-  expect(signup).toContain('mailto:support@stma.ai');
+  expect(signup).toContain('mailto:support@matteai.com');
 
   // Same rule the access-code call to action follows: a page must not offer a
   // door that is not there. A self-hosted instance telling its users to write to
   // our address would send us mail we cannot act on, and its operator none.
   const own = loadEnv({ ...BASE, pgliteDir: betaDir, hosted: false });
   expect(own.supportEmail).toBe('');
-  expect(loadEnv({ ...BASE, pgliteDir: betaDir, hosted: true }).supportEmail).toBe(
-    'support@stma.ai',
-  );
+  expect(own.privacyEmail).toBe('');
+  const ours = loadEnv({ ...BASE, pgliteDir: betaDir, hosted: true });
+  expect(ours.supportEmail).toBe('support@matteai.com');
+  expect(ours.privacyEmail).toBe('gdpr@matteai.com');
 });

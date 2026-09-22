@@ -47,10 +47,23 @@ import {
 } from './extensions';
 import { clientJs } from './ui/client';
 import { NotFoundPage, NotFoundPublic } from './ui/NotFound';
-import { ASSET_CACHE, ASSET_PATHS, CSS_URL, FAVICON_URL, JS_URL, LEGACY_CACHE, faviconSvg } from './ui/assets';
-import { css } from './ui/styles';
+import {
+  ASSET_CACHE,
+  ASSET_PATHS,
+  CSS_URL,
+  FAVICON_URL,
+  FONT_MONO_URL,
+  FONT_SANS_URL,
+  JS_URL,
+  LEGACY_CACHE,
+  faviconSvg,
+  fontMono,
+  fontSans,
+  stylesheet,
+} from './ui/assets';
 import { VERSION } from './version';
 import { connectorAsset } from './lib/connectorAsset';
+import { formTargetSources } from './lib/csp';
 
 /** Reject cross-origin browser form POSTs. Token-authenticated machine endpoints are exempt. */
 const originGuard: MiddlewareHandler<AppEnv> = async (c, next) => {
@@ -178,11 +191,25 @@ export function createApp(
    * only promises to revalidate, which back/forward navigation does not do.
    * Signed-out pages are left alone — they are documents, and they cache well.
    */
+  /*
+   * …and not only a page. The activity CSV carried no directive at all, on a
+   * `.csv` address, and stma.ai sits behind a CDN that caches by extension when
+   * the origin says nothing: measured 2026-09-21, a `.csv` path outside `/app`
+   * answered MISS then HIT, and `/admin` is not bypassed at all. The one thing
+   * keeping a member's export from being served to the next anonymous request
+   * was a zone rule this repository cannot see. So anything answered to a
+   * signed-in request, and anything under `/app` or `/admin` whoever asked, is
+   * `private, no-store` unless its handler chose otherwise — the hashed assets
+   * and the setup pack say what they want and keep it.
+   */
   app.use('*', async (c, next) => {
     await next();
-    if (!c.get('user')) return;
+    const privatePath = /^\/(?:app|admin)(?:\/|$)/.test(c.req.path);
+    if (!c.get('user') && !privatePath) return;
     if ((c.res.headers.get('content-type') ?? '').startsWith('text/html')) {
       c.res.headers.set('cache-control', 'no-store');
+    } else if (!c.res.headers.has('cache-control')) {
+      c.res.headers.set('cache-control', 'private, no-store');
     }
   });
 
@@ -207,23 +234,32 @@ export function createApp(
    * HSTS only in production, and only over TLS: asserting it from a local
    * http server would pin a developer's own browser to https on localhost.
    */
-  const CSP = [
-    "default-src 'self'",
-    "base-uri 'self'",
-    "object-src 'none'",
-    "frame-ancestors 'none'",
-    "form-action 'self'",
-    "img-src 'self' data:",
-    "style-src 'self' 'unsafe-inline'",
-    "script-src 'self'",
-    "connect-src 'self'",
-  ].join('; ');
+  const csp = (formTargets: readonly string[] = []) =>
+    [
+      "default-src 'self'",
+      "base-uri 'self'",
+      "object-src 'none'",
+      "frame-ancestors 'none'",
+      // `form-action` also governs the redirect that answers a form, not only
+      // where the form posts (Chromium enforces it on every hop), and three
+      // forms here are answered with a redirect off this origin: OAuth consent
+      // to the client's callback, Checkout and the billing portal to Stripe.
+      // With `'self'` alone all three stopped at the browser from the day this
+      // header landed (audit 2026-09-21), so a page with such a form names the
+      // one destination it sends people on to (`formTargets`) and nothing else
+      // does.
+      ["form-action 'self'", ...formTargets].join(' '),
+      "img-src 'self' data:",
+      "style-src 'self' 'unsafe-inline'",
+      "script-src 'self'",
+      "connect-src 'self'",
+    ].join('; ');
   app.use('*', async (c, next) => {
     await next();
     c.res.headers.set('x-content-type-options', 'nosniff');
     c.res.headers.set('referrer-policy', 'same-origin');
     c.res.headers.set('x-frame-options', 'DENY');
-    c.res.headers.set('content-security-policy', CSP);
+    c.res.headers.set('content-security-policy', csp(formTargetSources(c.get('formTargets'))));
     if (deps.env.nodeEnv === 'production' && new URL(c.req.url).protocol === 'https:') {
       c.res.headers.set('strict-transport-security', 'max-age=31536000; includeSubDomains');
     }
@@ -237,10 +273,15 @@ export function createApp(
     'cache-control': cache,
   });
   const svgHeaders = (cache: string) => ({ 'content-type': 'image/svg+xml', 'cache-control': cache });
-  app.get(CSS_URL, (c) => c.body(css, 200, cssHeaders(ASSET_CACHE)));
+  app.get(CSS_URL, (c) => c.body(stylesheet, 200, cssHeaders(ASSET_CACHE)));
   app.get(JS_URL, (c) => c.body(clientJs, 200, jsHeaders(ASSET_CACHE)));
   app.get(FAVICON_URL, (c) => c.body(faviconSvg, 200, svgHeaders(ASSET_CACHE)));
-  app.get('/style.css', (c) => c.body(css, 200, cssHeaders(LEGACY_CACHE)));
+  // Only ever at a content-hashed path: a font has no page already in a browser
+  // asking for an old unhashed name, so there is no compatibility shim to keep.
+  const fontHeaders = { 'content-type': 'font/woff2', 'cache-control': ASSET_CACHE };
+  app.get(FONT_SANS_URL, (c) => c.body(new Uint8Array(fontSans), 200, fontHeaders));
+  app.get(FONT_MONO_URL, (c) => c.body(new Uint8Array(fontMono), 200, fontHeaders));
+  app.get('/style.css', (c) => c.body(stylesheet, 200, cssHeaders(LEGACY_CACHE)));
   app.get('/app.js', (c) => c.body(clientJs, 200, jsHeaders(LEGACY_CACHE)));
   app.get('/favicon.svg', (c) => c.body(faviconSvg, 200, svgHeaders(LEGACY_CACHE)));
   // Health is also the version handshake. It was already the one endpoint every

@@ -1,6 +1,6 @@
 {
   "name": "@matteai/stma-server",
-  "version": "0.16.0",
+  "version": "0.16.1",
   "type": "module",
   "scripts": {
     "build:connector": "tsup --config tsup.connector.config.ts",
@@ -18,7 +18,7 @@
     "@electric-sql/pglite": "^0.5.8",
     "@hono/node-server": "^2.1.1",
     "@modelcontextprotocol/sdk": "^1.13.0",
-    "dotenv": "^17.4.2",
+    "dotenv": "^18.0.3",
     "drizzle-orm": "^0.45.2",
     "hono": "^4.7.0",
     "postgres": "^3.4.5",

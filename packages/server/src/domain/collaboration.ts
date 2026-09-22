@@ -415,6 +415,9 @@ export async function transitionHandoff(
       }
     }
     let receiverStartCheckpoint: typeof runCheckpoints.$inferSelect | undefined;
+    // The receiving run's record that proves where it is: its start, or the newest
+    // report it made since when the start is somewhere else (see below).
+    let receiverProofCheckpoint: typeof runCheckpoints.$inferSelect | undefined;
     if (action === 'resume' && offer.knowledgeContextId) {
       if (!receiverRunId) {
         return {
@@ -479,10 +482,42 @@ export async function transitionHandoff(
             'The receiving run has no immutable start checkpoint. Report repository identity, commit and clean worktree in start_run first.',
         };
       }
+      receiverProofCheckpoint = receiverStartCheckpoint;
       if (observed && !verifiedByStart) {
         const receiverVerified = verifyCheckpointResume(receiverStartCheckpoint, observed);
         if ('error' in receiverVerified) {
-          return { error: `Receiving start checkpoint ${receiverVerified.error}` };
+          // A run can begin somewhere and arrive here since. Measured in the agent
+          // lab (2026-09-21): the receiver checked out the handed-over branch while
+          // its local copy of that branch was stale, the hook opened the run on the
+          // stale commit, and a fast-forward then put the checkout exactly on the
+          // handed-over commit. The start can never match again, the refusal named
+          // no way out, and the agent started a second run of its own — which the
+          // write guard then treated as somebody else holding the ground, stopping
+          // the agent on itself. Every heartbeat after the fast-forward had already
+          // recorded where the run was: the newest of those reports is the same
+          // kind of evidence the start is, this run's own immutable client report,
+          // so a clean one of exactly this repository and commit is the proof. The
+          // start is still where the run began and nothing rewrites it.
+          const [latest] = await tx
+            .select()
+            .from(runCheckpoints)
+            .where(
+              and(
+                eq(runCheckpoints.runId, receiverRun.id),
+                eq(runCheckpoints.installationId, grant!.installationId!),
+                eq(runCheckpoints.teamId, session.teamId),
+              ),
+            )
+            .orderBy(desc(runCheckpoints.createdAt), desc(runCheckpoints.id))
+            .limit(1);
+          const fromLatest =
+            latest && latest.worktreeClean ? verifyCheckpointResume(latest, observed) : undefined;
+          if (!fromLatest || 'error' in fromLatest) {
+            return {
+              error: `Receiving start checkpoint ${receiverVerified.error} That run began at ${receiverStartCheckpoint.commitSha.slice(0, 7)} and has not reported this commit since. Report where this checkout is on that run — update_run with a delivery checkpoint, which a hooked checkout also records after any command — then resume with the same run_id. Do not start another run for this work.`,
+            };
+          }
+          receiverProofCheckpoint = latest;
         }
       } else if (!receiverStartCheckpoint.worktreeClean) {
         return { error: 'The receiving start checkpoint reports a dirty worktree.' };
@@ -582,7 +617,7 @@ export async function transitionHandoff(
           query: previous?.query ?? undefined,
           maxItems: 10,
           runId: receiverRunId,
-          checkpointId: receiverStartCheckpoint?.id,
+          checkpointId: receiverProofCheckpoint?.id,
         },
         grant,
         { purpose: 'handoff_resume', retainResponse: true },

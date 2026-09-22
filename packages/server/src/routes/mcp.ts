@@ -2,7 +2,9 @@ import {
   MCP_SERVER_NAME,
   MCP_SERVER_VERSION,
   MESSAGE_KINDS,
+  THREAD_MESSAGE_KINDS,
   compareSnapshots,
+  isThreadMessageKind,
   snapshotSchema,
 } from '@bridge/shared';
 import { RESPONSE_ALREADY_SENT } from '@hono/node-server/utils/response';
@@ -228,10 +230,17 @@ export function buildMcpServer(
   );
   const tokenId = token?.id ?? null;
 
+  // The schema keeps every kind so a caller that sends one of the other two is
+  // told why rather than handed an enum error; the description lists what may
+  // actually be written, which is what an agent reads before choosing.
   const kindParam = z
     .enum(MESSAGE_KINDS)
     .optional()
-    .describe(`Message kind: ${MESSAGE_KINDS.join(', ')}.`);
+    .describe(
+      `Message kind: ${THREAD_MESSAGE_KINDS.join(', ')}. Handoffs and announcements are not message kinds you write: use handoff_work, assign_work or announce.`,
+    );
+  const kindRefusal = (kind: string) =>
+    `A "${kind}" message is written by ${kind === 'announcement' ? 'announce' : 'handoff_work or assign_work'}, not by a thread message. Nothing was written. Use one of: ${THREAD_MESSAGE_KINDS.join(', ')}.`;
   const viaParam = z
     .string()
     .max(60)
@@ -940,6 +949,7 @@ export function buildMcpServer(
       },
     },
     async ({ title, team, repo, body, kind, attachments, via }) => {
+      if (kind !== undefined && !isThreadMessageKind(kind)) return err(kindRefusal(kind));
       const resolved = await resolveTeam(db, user.id, team, env.hosted, grant);
       if ('error' in resolved) return err(resolved.error);
       let projectId: string | null = null;
@@ -1134,6 +1144,7 @@ export function buildMcpServer(
       },
     },
     async ({ session_id, body, kind, attachments, via }) => {
+      if (kind !== undefined && !isThreadMessageKind(kind)) return err(kindRefusal(kind));
       const found = await sessionForMember(db, session_id, user.id);
       if (!found) return err('No such session in your teams.');
       const guard = await hitCounter(

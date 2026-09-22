@@ -438,6 +438,10 @@ const activityCsv = async (c: Context<AppEnv>) => {
   return c.body(`\uFEFF${lines.join('\r\n')}\r\n`, 200, {
     'content-type': 'text/csv; charset=utf-8',
     'content-disposition': `attachment; filename="stma-${team.slug}-activity-${stamp}.csv"`,
+    // Said here as well as by the app-wide rule: a `.csv` address is one a CDN
+    // caches by its extension when the origin says nothing, and this one is a
+    // workspace's history (audit 2026-09-21).
+    'cache-control': 'private, no-store',
   });
 };
 

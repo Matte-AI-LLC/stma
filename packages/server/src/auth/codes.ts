@@ -28,6 +28,31 @@ export const AUTH_CODE_PURPOSES = [
 ] as const;
 export type AuthCodePurpose = (typeof AUTH_CODE_PURPOSES)[number];
 
+/**
+ * The purposes whose code proves an *address*, and so is bound to the one it was
+ * mailed to.
+ *
+ * A code used to carry the account and the purpose and nothing else, and the
+ * address change read its target back from the confirming form: prove a mailbox
+ * you own, then submit any unregistered address beside that code, and the
+ * account held it marked confirmed (audit 2026-09-21). Since a confirmed address
+ * on `ADMIN_EMAILS` is what makes an operator, that was a way in to /admin as
+ * well as a broken promise. The address is now part of what the stored digest
+ * commits to, so a code is worthless beside any address but its own — and no
+ * column was needed to say so.
+ */
+const BOUND_TO_ADDRESS: ReadonlySet<AuthCodePurpose> = new Set(['email_verify', 'email_change']);
+
+/** What is stored: the code alone, or the code and the address it was mailed to. */
+const codeDigest = (code: string, sentTo?: string): string =>
+  sha256hex(sentTo === undefined ? code : `${code}\n${sentTo.trim().toLowerCase()}`);
+
+function boundAddress(purpose: AuthCodePurpose, sentTo: string | undefined): string | undefined {
+  if (!BOUND_TO_ADDRESS.has(purpose)) return undefined;
+  if (!sentTo) throw new Error(`A ${purpose} code proves an address and must name the one it was mailed to.`);
+  return sentTo;
+}
+
 /** How long an emailed code stays usable. */
 export const CODE_TTL_MINUTES = 10;
 /** Wrong guesses allowed per code; the code dies at this many. */
@@ -50,7 +75,10 @@ export async function issueAuthCode(
   db: Db,
   userId: string,
   purpose: AuthCodePurpose,
+  /** The address the code is being mailed to. Required for the address purposes. */
+  sentTo?: string,
 ): Promise<IssuedCode> {
+  const bound = boundAddress(purpose, sentTo);
   const now = Date.now();
   const recent = await db
     .select({ id: authCodes.id })
@@ -80,7 +108,7 @@ export async function issueAuthCode(
   const expiresAt = new Date(now + CODE_TTL_MINUTES * MINUTE);
   const inserted = await db
     .insert(authCodes)
-    .values({ userId, purpose, codeHash: sha256hex(code), expiresAt })
+    .values({ userId, purpose, codeHash: codeDigest(code, bound), expiresAt })
     .returning({ id: authCodes.id });
   return { ok: true, id: inserted[0]!.id, code, expiresAt };
 }
@@ -99,10 +127,13 @@ async function check(
   db: Db,
   row: typeof authCodes.$inferSelect | undefined,
   code: string,
+  sentTo?: string,
 ): Promise<CodeCheck> {
   if (!row || row.consumedAt || row.expiresAt.getTime() <= Date.now()) return { status: 'gone' };
   if (row.attempts >= MAX_CODE_ATTEMPTS) return { status: 'gone' };
-  if (sha256hex(code) === row.codeHash) {
+  // A right code beside the wrong address is a wrong code: it spends an
+  // attempt like any other guess, so it cannot be tried against a list.
+  if (codeDigest(code, sentTo) === row.codeHash) {
     // Single use: only the update that actually flips consumed_at wins, so two
     // parallel submissions of the same code cannot both create a session.
     const won = await db
@@ -140,20 +171,27 @@ export async function checkChallenge(
   return check(db, rows[0], code);
 }
 
-/** Verify the newest live code a signed-in user holds for a purpose. */
+/**
+ * Verify the newest live code a signed-in user holds for a purpose. For the
+ * address purposes, `sentTo` is the address the caller is about to trust — the
+ * one on the account, or the one about to replace it — and the code only counts
+ * if it was mailed there.
+ */
 export async function checkUserCode(
   db: Db,
   userId: string,
   purpose: AuthCodePurpose,
   code: string,
+  sentTo?: string,
 ): Promise<CodeCheck> {
+  const bound = boundAddress(purpose, sentTo);
   const rows = await db
     .select()
     .from(authCodes)
     .where(and(eq(authCodes.userId, userId), eq(authCodes.purpose, purpose)))
     .orderBy(desc(authCodes.createdAt))
     .limit(1);
-  return check(db, rows[0], code);
+  return check(db, rows[0], code, bound);
 }
 
 /** The user a pending challenge belongs to, without spending an attempt. */

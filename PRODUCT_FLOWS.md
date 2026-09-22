@@ -188,6 +188,11 @@ Guards and dead ends:
 - Agent connections with zero memberships do not create a credential that can reach nothing. The
   page sends the person back to teams.
 - Closed signup and invite-only states must explain which invitation or owner action is needed.
+- **The hosted signup form says that creating an account accepts the Terms**, and links them and
+  the Privacy Policy. An instance somebody else runs shows neither line and neither do its
+  documents claim to bind its users: `/terms` and `/privacy` describe the hosted service, and
+  where `STMA_HOSTED` is unset they carry a note saying that this server's own operator is the
+  controller and its own terms apply.
 - A sole owner cannot leave/delete their account while the team would be orphaned; ownership must
   be transferred or the team deleted.
 
@@ -272,7 +277,13 @@ Authorization invariants:
   reason changing the password does: a borrowed session must not be able to move where the account's
   codes go.
 - **An address arrives confirmed only by a code that reached it.** Nothing else sets
-  `email_verified_at`, and a migration does not assert it for rows that predate the column.
+  `email_verified_at`, and a migration does not assert it for rows that predate the column. A
+  confirmation code counts only beside the address it was mailed to, and every other writer of the
+  address — an operator setting it, GitHub moving it — leaves it unconfirmed.
+- **An operator is proved, not typed.** `/admin` opens for a listed username the account already
+  held, or for a listed address the account has confirmed. Signing up with a listed address, or as
+  a listed name, or with a GitHub login that differs from one only in case, makes nobody an
+  operator: a new account is never given a listed name.
 - **Session facts die with the session.** The browser string, the address and the last-seen time are
   the session's own data, shown only to its owner, and swept with the row on expiry.
 
@@ -713,6 +724,12 @@ completion/handoff should close its own run without closing another installation
   untrusted data, never executable instructions.
 - Announcements are a team-wide coordination channel. CI/webhooks and project agents may publish
   project-tagged announcements there.
+- **A thread message is conversation.** `open_session`, `post_message` and the browser form write
+  `question`, `answer`, `hypothesis`, `info-request`, `resolution` or `note`; a `handoff` is written
+  only by `handoff_work` or `assign_work` and an announcement only by `announce`, so no message can
+  make a thread read as work waiting in somebody's inbox, outside the handoff allowance and its
+  checks. What a teammate typed reaches another agent's prompt hook quoted and on one line, and a
+  desktop notification as data, never as script.
 - `inbox` separates unread conversations from pending handoffs. For an agent a brief is never an
   unread reply — it is work, and the handoff queue carries it — and a thread that carries
   dispatched work counts as unread only for the agents it involves: the one it names, the one that
@@ -899,8 +916,10 @@ completion/handoff should close its own run without closing another installation
 - A handoff carries a Knowledge Hub context/version reference rather than copying its body. Resume
   re-resolves current knowledge through the receiver's current grant, reports version changes and
   never mutates the sender's historical manifest. For a Knowledge-linked resume, the accepting
-  installation must name its own active run with an immutable start checkpoint; the new context is
-  bound to both. An exact resume replay returns that recorded context, including after the receiving
+  installation must name its own active run with an immutable start checkpoint at the observed
+  checkout, or — when that run began elsewhere, as on a stale copy of the branch — whose newest
+  clean checkpoint is exactly the observed repository and commit; the new context is bound to the
+  run and to the checkpoint that proved it. An exact resume replay returns that recorded context, including after the receiving
   run becomes terminal, instead of resolving a later publication.
 - Directed-handoff notifications are claimed through a database lease. Transient delivery failure
   retries with bounded backoff up to three total attempts; routine notices remain one-shot, and a

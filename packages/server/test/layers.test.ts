@@ -433,6 +433,18 @@ describe('the API surface is additive', () => {
     // that cannot see `start_run` cannot be told what it would buy.
     expect(await list(hosted, hostedToken)).toEqual(await list(selfHost, selfHostToken));
   });
+
+  it('documents every one of them in the guide, and counts them right', async () => {
+    // The guide ships with the server, so an agent's human reading /docs should
+    // find every tool the server answers — each on its own linkable row — and
+    // the sentence that counts them should not be a number from two releases ago.
+    // Signed out on purpose: the tool reference is the public half of the guide.
+    const html = await (await fetch(`${selfHost.url}/docs`)).text();
+    for (const tool of PUBLIC_TOOLS) {
+      expect(html, `/docs has no row for ${tool}`).toContain(`id="tool-${tool}"`);
+    }
+    expect(html).toContain(`${PUBLIC_TOOLS.length} MCP tools`);
+  });
 });
 
 describe('client and server can name themselves', () => {

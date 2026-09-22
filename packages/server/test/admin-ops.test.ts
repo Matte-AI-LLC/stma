@@ -1,10 +1,10 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { desc } from 'drizzle-orm';
+import { desc, eq } from 'drizzle-orm';
 import { afterAll, beforeAll, expect, it } from 'vitest';
 import { connectDb } from '../src/db';
-import { errorEvents } from '../src/db/schema';
+import { debugSessions, errorEvents } from '../src/db/schema';
 import { loadEnv } from '../src/env';
 import { trimErrorEvents } from '../src/lib/errors';
 import { MAX_PATHS, MAX_TOOLS, createMetricsStore, templatePath } from '../src/lib/metrics';
@@ -54,6 +54,23 @@ beforeAll(async () => {
       databaseUrl: undefined,
       pgliteDir: dataDir,
     }),
+    {
+      // A route that fails the way a real one does: a query the database
+      // refuses. The product's own routes stopped offering one — a thread
+      // address that is not a uuid is a 404 now (audit 2026-09-21, F6) — and a
+      // test of the error log should not depend on a route being broken.
+      extensions: [
+        {
+          name: 'admin-ops-fixture',
+          register(app, { db }) {
+            app.get('/app/boom/:id', async (c) => {
+              await db.select().from(debugSessions).where(eq(debugSessions.id, c.req.param('id')));
+              return c.text('unreachable');
+            });
+          },
+        },
+      ],
+    },
   );
   delete process.env.ADMIN_USERNAMES;
 }, 60_000);
@@ -125,9 +142,9 @@ it('renders the tiles for an admin and counts the requests it has served', async
 });
 
 it('persists a 500 into the error log and shows it, with secrets redacted', async () => {
-  // An id that is not a uuid makes the session lookup throw inside the route —
-  // a genuine 500 through app.onError. The id also carries a PAT-shaped secret.
-  const boom = await fetch(`${srv.url}/app/sessions/${FAKE_PAT}`, { headers: ada.header() });
+  // An id that is not a uuid makes the lookup throw inside the route — a
+  // genuine 500 through app.onError. The id also carries a PAT-shaped secret.
+  const boom = await fetch(`${srv.url}/app/boom/${FAKE_PAT}`, { headers: ada.header() });
   expect(boom.status).toBe(500);
 
   const html = await (await fetch(`${srv.url}/admin/ops`, { headers: ada.header() })).text();
@@ -142,7 +159,7 @@ it('persists a 500 into the error log and shows it, with secrets redacted', asyn
   // Redaction: neither the message nor the stored path may leak the token.
   expect(html).not.toContain(FAKE_PAT);
   expect(html).toContain('[REDACTED]');
-  expect(html).toContain('/app/sessions/[REDACTED]');
+  expect(html).toContain('/app/boom/[REDACTED]');
   // The 5xx is reflected in the load view too.
   expect(html).toContain('spark-bar bad');
 });

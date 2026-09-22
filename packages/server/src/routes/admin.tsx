@@ -76,7 +76,7 @@ import {
   setPlanGrant,
   type PlanGrant,
 } from '../lib/planGrants';
-import { mailHealth, mailTransport } from '../lib/mailer';
+import { emailChangedNotice, mailHealth, mailTransport, sendMail } from '../lib/mailer';
 import { metrics } from '../lib/metrics';
 import { criticalAudit, SecurityRefusal } from '../lib/securityHooks';
 import { track } from '../lib/track';
@@ -3012,9 +3012,17 @@ adminRoutes.post('/admin/users/:id/email', async (c) => {
   if (!(await emailIsFree(db, email, id))) {
     return back('Another account already uses that email.');
   }
-  await db.update(users).set({ email }).where(eq(users.id, id));
+  // Unconfirmed, whatever the old address was: an operator typing an address
+  // proves nothing about who reads it, and `email_verified_at` is what the
+  // operator gate itself trusts. The account confirms it like any other, from
+  // Account, with a code sent there.
+  await db.update(users).set({ email, emailVerifiedAt: null }).where(eq(users.id, id));
   logLine({ evt: 'admin', a: 'set_email', u: actor.username, target: target.username });
-  return back(`${target.username} now signs in with ${email}.`, true);
+  // The address being left is told, as it is when a person moves their own:
+  // followed by a reset, this action hands the account to whoever reads the
+  // new one, and the old inbox is the only place that can still notice.
+  if (target.email) void sendMail(c.get('env'), { to: target.email, ...emailChangedNotice(email, c.get('env').baseUrl) });
+  return back(`${target.username} now signs in with ${email}, unconfirmed until a code sent there comes back.`, true);
 });
 
 // ---------------------------------------------------------------- CRM

@@ -38,6 +38,8 @@ import {
   NEWS_TIMEOUT_MS,
   dueForCheck,
   handoffKey,
+  oneLine,
+  quoted,
   rememberAnnounced,
   renderNews,
   unseen,
@@ -333,10 +335,26 @@ async function connection(config: LocalConfig): Promise<{ server: string; token:
     if ((config.server && config.server.replace(/\/$/, '') !== saved.server) || (process.env.STMA_URL && process.env.STMA_URL.replace(/\/$/, '') !== saved.server)) throw Error('Server override does not match the saved MCP connection. No credential was sent.');
     return saved;
   }
-  const server = (process.env.STMA_URL ?? config.server ?? 'http://localhost:3000').replace(/\/$/, '');
   const token = process.env.STMA_TOKEN;
   if (!token) throw new Error('Use adapter activate for browser OAuth, or provide an approved legacy STMA_TOKEN. Never paste a token into a command.');
+  // The two branches above never let checkout state redirect a stored
+  // credential; this one used to. `.stma/` is local state STMA writes and git
+  // ignores, but a repository can commit one, and the legacy token then went to
+  // whatever server that file named (audit 2026-09-21). A server read from a
+  // checkout whose history carries `.stma/` was written by whoever wrote the
+  // repository, so the token goes only where the person running this says.
+  if (!process.env.STMA_URL && config.server && repositoryCarriesStmaState()) {
+    throw new Error(
+      'This checkout commits a .stma/ directory, so the server named there came with the repository. STMA_TOKEN is only sent to a server you name: set STMA_URL. No credential was sent.',
+    );
+  }
+  const server = (process.env.STMA_URL ?? config.server ?? 'http://localhost:3000').replace(/\/$/, '');
   return { server, token };
+}
+
+/** Whether the checkout's own history carries STMA state, which STMA never commits. */
+function repositoryCarriesStmaState(): boolean {
+  return Boolean(shell('git', ['ls-files', '--', '.stma']));
 }
 
 async function apiRequest<T>(
@@ -1947,12 +1965,17 @@ async function watch(flags: Flags): Promise<void> {
           // The first pass reports the backlog quietly: everything is "new" to a
           // process that just started, and waking somebody for a week-old
           // handoff is how a notifier gets muted.
-          const who = handoff.mine ? 'your other machine' : (handoff.from ?? 'a teammate');
-          const branch = handoff.resume?.branch ? ` on ${handoff.resume.branch}` : '';
+          // Every field here was typed by a teammate and lands in a terminal
+          // and a desktop notification, so it goes through `oneLine` first:
+          // no escape sequence reaches the terminal and no quote leaves the
+          // title (audit 2026-09-21).
+          const from = handoff.from ? oneLine(handoff.from, 64) : 'a teammate';
+          const who = handoff.mine ? 'your other machine' : from;
+          const branch = handoff.resume?.branch ? ` on ${oneLine(handoff.resume.branch, 120)}` : '';
           const line =
             handoff.kind === 'assignment' && handoff.assignedTo?.thisAgent
-              ? `assigned to this agent — "${handoff.title}" by ${handoff.from ?? 'a teammate'}${branch}`
-              : `work waiting — "${handoff.title}" from ${who}${branch}`;
+              ? `assigned to this agent — ${quoted(handoff.title)} by ${from}${branch}`
+              : `work waiting — ${quoted(handoff.title)} from ${who}${branch}`;
           console.log(`${new Date().toISOString().slice(11, 19)}  ${line}`);
           if (!firstPass) notifyDesktop('STMA', line);
         }
@@ -1965,21 +1988,38 @@ async function watch(flags: Flags): Promise<void> {
   }
 }
 
-/** Best effort, per platform. A missing notifier is never an error. */
+/**
+ * Best effort, per platform. A missing notifier is never an error.
+ *
+ * The text reaches AppleScript as an argument, never as source. It used to be
+ * spliced into the script between double quotes, and a session title is typed
+ * by any member of the workspace: `&(do shell script "…")&` closed the string
+ * and ran a command on every Mac watching the team (audit 2026-09-21).
+ * `on run argv` hands the words to the script as data, whatever they contain.
+ */
+export function desktopNotification(platform: NodeJS.Platform, title: string, body: string): { command: string; args: string[] } | undefined {
+  if (platform === 'darwin') {
+    return {
+      command: 'osascript',
+      args: ['-e', 'on run argv', '-e', 'display notification (item 2 of argv) with title (item 1 of argv)', '-e', 'end run', title, body],
+    };
+  }
+  if (platform === 'win32') return undefined;
+  // `--` so a body that starts with a dash is text, not an option.
+  return { command: 'notify-send', args: ['--', title, body] };
+}
+
 function notifyDesktop(title: string, body: string): void {
   try {
-    if (process.platform === 'darwin') {
-      execFileSync('osascript', ['-e', `display notification "${body}" with title "${title}"`], {
-        stdio: 'ignore',
-      });
+    const native = desktopNotification(process.platform, title, body);
+    if (native) {
+      execFileSync(native.command, native.args, { stdio: 'ignore' });
     } else if (process.platform === 'win32') {
       execFileSync(
         'powershell',
         ['-NoProfile', '-Command', `[console]::beep(880,150)`],
         { stdio: 'ignore' },
       );
-    } else {
-      execFileSync('notify-send', [title, body], { stdio: 'ignore' });
     }
   } catch {
     /* no notifier on this machine */

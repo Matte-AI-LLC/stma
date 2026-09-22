@@ -68,7 +68,7 @@ const NotificationsPage = (props: {
       {notice ? <Banner kind="success" text={notice} /> : null}
       {error ? <Banner kind="error" text={error} /> : null}
       <PageHead
-        crumb="/ settings / notifications"
+        trail={[{ label: 'Account', href: '/app/account' }, { label: 'Notifications' }]}
         title="Notification settings"
         sub="Choose which asynchronous replies reach you by email or personal webhook. This page configures delivery; it is not a notification inbox."
         actions={<a class="btn btn-sm" href="/app/account">Back to account</a>}

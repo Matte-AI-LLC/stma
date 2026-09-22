@@ -461,6 +461,57 @@ it('offers freeze wherever the page reloads itself', async () => {
   }
 });
 
+// ------------------------------------------------------ the typefaces, served
+
+it('serves Geist and Geist Mono from this origin, content-hashed and immutable', async () => {
+  // The design system has named these two faces since the first screen, and no
+  // page ever loaded them: `Head` takes no third-party font stylesheet, so every
+  // visitor without Geist installed read the product in their system font.
+  const html = await (await fetch(`${srv.url}/`)).text();
+  const preload = /href="(\/fonts\/geist\.[0-9a-f]{10}\.woff2)"/.exec(html)?.[1];
+  expect(preload, 'the page must preload the sans face it will use').toBeTruthy();
+
+  const cssUrl = /href="(\/style\.[0-9a-f]{10}\.css)"/.exec(html)![1]!;
+  const sheet = await (await fetch(`${srv.url}${cssUrl}`)).text();
+  expect(sheet).toContain("font-family: 'Geist'");
+  expect(sheet).toContain("font-family: 'Geist Mono'");
+  // A slow connection shows the words first and swaps the face in after.
+  expect(sheet).toContain('font-display: swap');
+  const monoUrl = /url\((\/fonts\/geist-mono\.[0-9a-f]{10}\.woff2)\)/.exec(sheet)?.[1];
+  expect(monoUrl, 'the stylesheet must point at a fingerprinted mono face').toBeTruthy();
+
+  for (const url of [preload!, monoUrl!]) {
+    const font = await fetch(`${srv.url}${url}`);
+    expect(font.status, url).toBe(200);
+    expect(font.headers.get('content-type')).toBe('font/woff2');
+    expect(font.headers.get('cache-control')).toContain('immutable');
+    const bytes = new Uint8Array(await font.arrayBuffer());
+    // wOF2, the signature of the format the stylesheet asked for.
+    expect(String.fromCharCode(...bytes.slice(0, 4))).toBe('wOF2');
+    expect(bytes.byteLength).toBeGreaterThan(20_000);
+  }
+});
+
+// ------------------------------------------------------ the landing page
+
+it('says what the product is now, and offers no door that is not there', async () => {
+  const html = await (await fetch(`${srv.url}/`)).text();
+  // The scope is the whole operation, not two agents comparing notes.
+  expect(html).toContain('AgentOps');
+  expect(html).not.toContain('Let your agents compare notes');
+  // The six pillars, each named by the verb the console uses for it.
+  for (const verb of ['See', 'Coordinate', 'Govern', 'Dispatch', 'Reproduce', 'Prove']) {
+    expect(html, `the landing page must carry the ${verb} pillar`).toContain(`· ${verb}</span>`);
+  }
+  // The product is drawn, not described: the mock is the console's own shapes.
+  expect(html).toContain('class="lx-window"');
+  expect(html).toContain('class="lxg"');
+  // Self-hosting needs no invitation, and the command is on the page.
+  expect(html).toContain('npx @matteai/stma serve');
+  // This instance has no managed billing composed, so it sells nothing.
+  expect(html).not.toContain('href="/pricing"');
+});
+
 it('serves the stylesheet from a URL that changes when the stylesheet does', async () => {
   const html = await (await fetch(`${srv.url}/`)).text();
   const cssUrl = /href="(\/style\.[0-9a-f]{10}\.css)"/.exec(html)?.[1];

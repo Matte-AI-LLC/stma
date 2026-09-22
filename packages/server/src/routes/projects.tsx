@@ -827,7 +827,9 @@ projectsRoutes.get('/app/teams/:slug/projects/:project', async (c) => {
                         {row.run.branch ? ` · ${row.run.branch}` : ''}
                       </div>
                     </div>
-                    <span class="mono small muted hide-sm">{held.join(', ') || 'no claims'}</span>
+                    <span class="mono small muted hide-sm introw-claims" title={held.join(', ')}>
+                      {held.join(', ') || 'no claims'}
+                    </span>
                     {sev ? (
                       <span class={`pill ${sev === 'critical' ? 'pill-danger' : 'pill-warn'}`}>
                         {sev}

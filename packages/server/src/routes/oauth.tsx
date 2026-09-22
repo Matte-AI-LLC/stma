@@ -256,6 +256,10 @@ async function consentPage(
   params: OAuthParams,
   entered: { error?: string; name?: string; device?: string; access?: string; companion?: string } = {},
 ) {
+  // Allow and Cancel are both answered by a redirect to this client's callback,
+  // which `form-action 'self'` stopped in the browser (`lib/csp.ts`). The URI was
+  // checked against the client's registration before this page was drawn.
+  c.set('formTargets', [params.redirectUri]);
   const choices = await connectionTeams(c, user.id);
   const inferredClient = clientTypeFor(client);
   // A per-checkout Claude Code server name carries the checkout folder; offer it
@@ -383,7 +387,7 @@ async function consentPage(
               </select>
             </div>
           </details>
-          <div class="banner">
+          <div class="banner banner-info">
             <span class="ic">i</span>
             {localAdapter ? (
               <span>This approves the STMA CLI's local adapter for one checkout. The CLI installs the project-local hooks it described in your terminal; STMA's server installs nothing, and this does not authorize repository edits.</span>

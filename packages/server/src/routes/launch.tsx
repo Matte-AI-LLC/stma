@@ -47,8 +47,8 @@ launchRoutes.get('/app/teams/:slug/setup', async (c) => {
       head={
         <PageHead
           trail={teamTrail(access.team, { label: 'Connect & test' })}
-          title="Two agents, one result"
-          sub="One account. Authorize each client through the same MCP address, then run two secret-free checks."
+          title="Connect and test"
+          sub="Prove the connection end to end before the real work: two agents, one short exchange, confirmed by the server."
         />
       }
     >

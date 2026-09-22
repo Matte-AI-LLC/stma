@@ -47,7 +47,9 @@ export const NotFoundPublic = ({ path }: { path: string }) => (
     <body>
       <div class="auth-wrap">
         <div class="auth-card">
-          <Logo lg />
+          <a class="auth-home" href="/" aria-label="STMA home">
+            <Logo lg />
+          </a>
           <div>
             <h1>Page not found</h1>
             <p class="lede">

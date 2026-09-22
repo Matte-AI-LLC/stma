@@ -1,4 +1,5 @@
 import { and, eq } from 'drizzle-orm';
+import { isCanonicalUuid } from './ids';
 import type { Db } from '../db';
 import { agentRuns, debugSessions, projects } from '../db/schema';
 import { projectForTeam } from '../domain/access';
@@ -56,7 +57,13 @@ export function grantAllowsProject(
   return grant.scope !== 'project' || (Boolean(projectId) && grant.projectId === projectId);
 }
 
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/**
+ * An id this guard does not check is an id it refuses. It used to skip any
+ * value that did not look canonical and let the tool query with it, and the
+ * database read `{…}` or a dash-less id as the same row (`lib/ids.ts`).
+ */
+const idError = (field: string, value: unknown) =>
+  `${field} "${String(value).slice(0, 80)}" is not an id STMA issued. Nothing was read or written.`;
 
 const scopeError = (grant: AgentGrant, attempted: string) =>
   `This credential is ${grantLabel(grant)} scoped and cannot access ${attempted}. ` +
@@ -134,7 +141,8 @@ export async function guardMcpToolCall(
   }
 
   const sessionId = args.session_id;
-  if (typeof sessionId === 'string' && UUID_RE.test(sessionId)) {
+  if (sessionId !== undefined && !isCanonicalUuid(sessionId)) return idError('session_id', sessionId);
+  if (typeof sessionId === 'string') {
     const rows = await db
       .select({
         teamId: debugSessions.teamId,
@@ -157,7 +165,8 @@ export async function guardMcpToolCall(
   }
 
   const runId = args.run_id;
-  if (typeof runId === 'string' && UUID_RE.test(runId)) {
+  if (runId !== undefined && !isCanonicalUuid(runId)) return idError('run_id', runId);
+  if (typeof runId === 'string') {
     const requiresOwnedRun = ['update_run', 'finish_run', 'handoff_work', 'check_environment'].includes(tool);
     const rows = await db
       .select({
@@ -208,8 +217,8 @@ export async function guardRunGrantScope(
   grant: AgentGrant,
   runId: string,
 ): Promise<string | null> {
+  if (!isCanonicalUuid(runId)) return idError('run', runId);
   if (grant.scope === 'personal' && !grant.installationId) return null;
-  if (!UUID_RE.test(runId)) return null;
   const rows = await db
     .select({
       teamId: agentRuns.teamId,
