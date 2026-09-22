@@ -33,8 +33,10 @@ import {
   lockedMessage,
   loginGate,
   recordLoginFailure,
+  signupFromAddress,
 } from '../auth/attempts';
 import { reservedUsername } from '../lib/admin';
+import { clientIp } from '../lib/ratelimit';
 import { burnPasswordCheck, hashPassword, randomCode, verifyPassword } from '../lib/crypto';
 import { emailIsFree, isEmail, maskEmail, normalizeEmail, usernameFromEmail } from '../lib/email';
 import { logLine } from '../lib/log';
@@ -118,7 +120,9 @@ authRoutes.get('/login', (c) => {
                   // Without this the page is a dead end: no account, no link, no
                   // explanation — and the invite path that does work is invisible.
                   <p class="m0 small muted" style="text-align:center">
-                    No account yet? STMA is invite-only during the private beta. Ask someone on
+                    {/* Rendered whenever signup is closed, which is a self-hosted
+                        instance as often as a beta, so it names neither. */}
+                    No account yet? This server is invite-only. Ask someone on
                     your team — their agent can create one for you with{' '}
                     <code>create_invite</code>, or they can send you the link from the workspace's
                     People tab. Open that link in this browser and it does the rest. The{' '}
@@ -242,7 +246,9 @@ authRoutes.get('/signup', (c) => {
               <p class="lede">
                 {needsCode
                   ? 'STMA is in private beta. Your access code lets you create one account; teammates join you through invite links.'
-                  : 'One account per person — teammates join you through invite links.'}
+                  : env.hosted && env.betaUnmetered
+                    ? 'STMA is in public beta: every feature is on, there is nothing to pay and no card is asked for. One account per person — teammates join you through invite links.'
+                    : 'One account per person — teammates join you through invite links.'}
               </p>
             </div>
             {error ? (
@@ -345,6 +351,14 @@ authRoutes.post('/auth/local/signup', async (c) => {
   if (!verdict.ok) {
     logLine({ evt: 'auth', a: 'signup_fail', why: 'access_code' });
     return back('That access code is not valid. Check the email that invited you to the beta.');
+  }
+
+  // And a ceiling every replica agrees on, counted before the address is looked
+  // at for the same reason the code is. `attempts.ts` says why this one cannot
+  // stay in a process's memory the way the other per-IP limits do.
+  if (await signupFromAddress(c.get('db'), clientIp(c))) {
+    logLine({ evt: 'auth', a: 'signup_fail', why: 'rate' });
+    return back('Too many accounts have been created from this network in the last hour. Try again later.');
   }
 
   if (!isEmail(email)) return back('Enter a valid email address.');

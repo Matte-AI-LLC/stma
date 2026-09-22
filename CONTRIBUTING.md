@@ -62,5 +62,5 @@ tests and the build on every push; a nightly job runs the same suite on Linux,
 Windows and macOS, plus a lab that drives three real machines against a live
 instance.
 
-Security issues go to **security@stma.ai**, not to a public issue — see
+Security issues go to **support@matteai.com**, not to a public issue — see
 [SECURITY.md](SECURITY.md).

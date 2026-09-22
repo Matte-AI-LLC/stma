@@ -396,7 +396,10 @@ const CopyCommand = ({ command }: { command: string }) => (
 export const Landing = ({ site, baseUrl }: { site: SiteInfo; baseUrl: string }) => {
   const mcpUrl = `${baseUrl}/mcp`;
   const door = siteDoor(site);
-  const beta = site.teaser || site.hosted;
+  // Which beta, if any: siteInfo derives it, so the badge, the note, the run
+  // card and the footer cannot disagree about which door this page is showing.
+  const beta = site.beta;
+  const betaName = beta === 'public' ? 'Public beta' : 'Private beta';
   const primary = door
     ? { href: door.href, label: door.long }
     : { href: '/docs', label: 'Read the docs' };
@@ -411,7 +414,7 @@ export const Landing = ({ site, baseUrl }: { site: SiteInfo; baseUrl: string }) 
             <div class="container">
               <span class="lx-eyebrow">
                 <span class="dot" />
-                {beta ? <b>Private beta</b> : null}
+                {beta ? <b>{betaName}</b> : null}
                 {beta ? <span class="sep">·</span> : null}
                 AgentOps for coding agents
               </span>
@@ -426,11 +429,12 @@ export const Landing = ({ site, baseUrl }: { site: SiteInfo; baseUrl: string }) 
               </p>
               {beta ? (
                 <p class="lx-note">
-                  The hosted service is in private beta.{' '}
-                  {site.codeDoor
-                    ? 'An access code creates an account'
-                    : 'Accounts are created by invitation'}
-                  : every feature on, nothing to pay, no card.
+                  {beta === 'public'
+                    ? 'The hosted service is in public beta: sign up with an email address and connect your first agent in a few minutes.'
+                    : site.codeDoor
+                      ? 'The hosted service is in private beta. An access code creates an account.'
+                      : 'The hosted service is in private beta. Accounts are created by invitation.'}{' '}
+                  Every feature is on, there is nothing to pay and no card is asked for.
                 </p>
               ) : null}
               <div class="lx-ctas">
@@ -667,7 +671,7 @@ export const Landing = ({ site, baseUrl }: { site: SiteInfo; baseUrl: string }) 
             <div class="container lx-run">
               <div class="lx-run-card">
                 <span class="overline">Hosted</span>
-                <h3>stma.ai{beta ? ' — private beta' : ''}</h3>
+                <h3>stma.ai{beta ? ` — ${betaName.toLowerCase()}` : ''}</h3>
                 <p>
                   The console, the MCP server, email notifications and integrations, operated for
                   you.{' '}

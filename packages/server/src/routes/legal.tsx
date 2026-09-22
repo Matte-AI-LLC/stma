@@ -25,10 +25,18 @@ import { Mail } from '../ui/Mail';
 export const legalRoutes = new Hono<AppEnv>();
 
 /** The day this version took effect. A new revision changes it. */
-const EFFECTIVE = '22 September 2026';
+const EFFECTIVE = '23 September 2026';
 const SUPPORT = 'support@matteai.com';
 const PRIVACY = 'gdpr@matteai.com';
-const SECURITY = 'security@stma.ai';
+/**
+ * One technical mailbox, not two. `security@stma.ai` was written into these
+ * documents before anybody checked whether it existed, and it does not: a
+ * reported vulnerability would have bounced, which is worse than having no
+ * address at all. Everything technical, a vulnerability report included, goes
+ * to the address a person actually reads (owner's decision, 2026-09-23). Only
+ * data-protection requests are separate, because the law names that route.
+ */
+const SECURITY = SUPPORT;
 const COMPANY = 'Matte AI LLC';
 const ADDRESS = '30 N Gould St, # 47622, Sheridan, WY 82801, USA';
 
@@ -394,21 +402,27 @@ const termsSections = (): Section[] => [
   },
   {
     id: 'beta',
-    head: 'Private beta and free use',
+    head: 'Beta and free use',
     body: (
       <>
-        <P head="The private beta.">
-          The Service is in a private beta. New accounts need an access code or an invitation. While
-          the private beta runs we charge nothing for the Service, and no plan limit applies except
-          how long activity history is kept, which follows the plan the workspace is on, normally
-          the free plan (see the <a href="/privacy#retention">Privacy Policy</a>).
+        {/* Written so it holds whichever door is open. How an account is
+            created is a product detail that changes — it changed on
+            2026-09-23, when the beta went from invitation-only to public —
+            and a clause that has to be revised every time that happens is a
+            clause that will one day be wrong. */}
+        <P head="The beta.">
+          The Service is in beta. While the beta runs we charge nothing for the Service, and no plan
+          limit applies except how long activity history is kept, which follows the plan the
+          workspace is on, normally the free plan (see the{' '}
+          <a href="/privacy#retention">Privacy Policy</a>). How accounts are created, and whether an
+          invitation or a code is needed, can change while the beta runs.
         </P>
         <P head="As it is.">
           Beta and free use are provided as they are. Features, limits and availability can change,
           and parts of the Service may be marked as a preview.
         </P>
         <P head="When the beta ends.">
-          We will email account holders at least 14 days before the private beta ends. After that,
+          We will email account holders at least 14 days before the beta ends. After that,
           each workspace continues on its own plan, which is the free plan unless the workspace has
           bought or been given another, with that plan's limits.
         </P>
@@ -760,7 +774,8 @@ const termsSections = (): Section[] => [
         We send notices to the email address on your account, and notices about a workspace to its
         owners. Send notices to us by email to <Mail to={SUPPORT} />; formal legal notices should
         also be sent by post to {COMPANY}, {ADDRESS}. Data protection requests go to{' '}
-        <Mail to={PRIVACY} /> and security reports to <Mail to={SECURITY} />.
+        <Mail to={PRIVACY} />; everything else, a security report included, goes to the support
+        address above.
       </P>
     ),
   },
@@ -809,13 +824,10 @@ const termsSections = (): Section[] => [
         </P>
         <List>
           <li>
-            Questions, support, billing and legal notices: <Mail to={SUPPORT} />
+            Questions, support, billing, security reports and legal notices: <Mail to={SUPPORT} />
           </li>
           <li>
             Data protection requests (GDPR, KVKK): <Mail to={PRIVACY} />
-          </li>
-          <li>
-            Security reports: <Mail to={SECURITY} />
           </li>
         </List>
       </>
@@ -832,8 +844,8 @@ const privacySections = (): Section[] => [
     body: (
       <P>
         The controller of your personal data is {COMPANY}, {ADDRESS}. For anything about personal
-        data, including requests to exercise your rights, write to <Mail to={PRIVACY} />. Other
-        questions go to <Mail to={SUPPORT} />, and security reports to <Mail to={SECURITY} />.
+        data, including requests to exercise your rights, write to <Mail to={PRIVACY} />.
+        Everything else, a security report included, goes to <Mail to={SUPPORT} />.
       </P>
     ),
   },
@@ -895,8 +907,8 @@ const privacySections = (): Section[] => [
             <b>Account data:</b> your email address; your password, stored only as a scrypt hash; a
             username taken from your email address, which the members of your workspaces see; a
             display name and avatar if you sign in with GitHub; when you confirmed your email address;
-            which private beta wave you signed up through, never the access code itself; and when
-            the account was created.
+            which beta wave you signed up through where a code was used, never the access code
+            itself; and when the account was created.
           </li>
           <li>
             <b>Sign-in with GitHub</b>, only where it is offered: your GitHub user ID, login, name,
@@ -1211,7 +1223,7 @@ const privacySections = (): Section[] => [
             ['Preflight results', '90 days, and never more than 200 per workspace'],
             [
               'Workspace activity log and agent run trail',
-              "Set by the workspace's plan: 90 days on the free plan, which during the private beta covers every workspace that has not been given another plan; 365 days on Solo; not removed by age on Team and Enterprise. A cap on the number of entries applies to every plan, and when a workspace moves to a plan with a shorter limit, older history is deleted at the next cleanup",
+              "Set by the workspace's plan: 90 days on the free plan, which during the beta covers every workspace that has not been given another plan; 365 days on Solo; not removed by age on Team and Enterprise. A cap on the number of entries applies to every plan, and when a workspace moves to a plan with a shorter limit, older history is deleted at the next cleanup",
             ],
             ['Announcements', '180 days, and a cap on the number of messages'],
             [
@@ -1440,10 +1452,7 @@ const privacySections = (): Section[] => [
           Data protection (GDPR, KVKK): <Mail to={PRIVACY} />
         </li>
         <li>
-          Support and other questions: <Mail to={SUPPORT} />
-        </li>
-        <li>
-          Security reports: <Mail to={SECURITY} />
+          Support, security reports and other questions: <Mail to={SUPPORT} />
         </li>
         <li>
           Post: {COMPANY}, {ADDRESS}

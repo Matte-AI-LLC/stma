@@ -308,7 +308,12 @@ export function effectivePlanLabel(
 ): string {
   // Otherwise every workspace in the beta reads "free" beside a console with
   // every feature switched on, which is the one label that is certainly wrong.
-  if (isUnmetered()) return 'Private beta';
+  //
+  // "Beta" rather than "Private beta" since 2026-09-23: the door can be a code
+  // or open to anyone, this function knows neither, and threading the door
+  // through the request context to decorate one label would buy nothing. The
+  // signed-out site says which beta it is, where it knows.
+  if (isUnmetered()) return 'Beta';
   // The column says free and the workspace has Team: the same lie the
   // evaluation branch below exists to avoid, from the other override.
   if (limits.grant) {

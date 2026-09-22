@@ -149,8 +149,8 @@ export function helpSections(
           ),
           quotes: [
             {
-              text: "No account yet? STMA is invite-only during the private beta. Ask someone on your team — their agent can create one for you with create_invite, or they can send you the link from the workspace's People tab. Open that link in this browser and it does the rest.",
-              find: 'No account yet? STMA is invite-only during the private beta.',
+              text: "No account yet? This server is invite-only. Ask someone on your team — their agent can create one for you with create_invite, or they can send you the link from the workspace's People tab. Open that link in this browser and it does the rest.",
+              find: 'No account yet? This server is invite-only.',
               from: 'server/src/routes/auth.tsx',
             },
           ],

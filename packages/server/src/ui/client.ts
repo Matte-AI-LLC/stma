@@ -101,18 +101,50 @@ export const clientJs = `(function () {
     if (f) f.submit();
   });
 
+  // Every notice can be put away, and the control is added here rather than in
+  // the markup for the reason the scope pickers are <details>: dismissing is a
+  // script-only act, so without script there is nothing the button could do and
+  // it should not be drawn. A band marked data-keep is one whose state ends when
+  // somebody acts on it — the unconfirmed address — and it keeps no control.
+  //
+  // The dismissal lasts the browser session, keyed on what the band says. A
+  // warning whose wording changes is a different warning and comes back, which
+  // is what "this snapshot is 41 days old" does the day it turns 42.
+  function bandKey(el) {
+    return (el.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 120);
+  }
+  document.querySelectorAll('.banner:not([data-keep]), .band2:not([data-keep])').forEach(function (band) {
+    // Read before the control is added, or the key would carry the button's own
+    // glyph and never match the one stored when it was clicked.
+    var key = bandKey(band);
+    band.setAttribute('data-band-key', key);
+    try {
+      if (sessionStorage.getItem('stma.band.' + key)) { band.remove(); return; }
+    } catch (_) {}
+    if (band.querySelector('[data-dismiss]')) return;
+    var x = document.createElement('button');
+    x.type = 'button';
+    x.className = 'x';
+    x.setAttribute('data-dismiss', '');
+    x.setAttribute('aria-label', 'Dismiss');
+    x.textContent = '×';
+    band.appendChild(x);
+  });
+
   // Scope pickers are <details>, so they work with no script. With one, a click
   // anywhere else closes them, and opening one closes the other: a menu left
-  // hanging over the page reads as a page that is stuck.
+  // hanging over the page reads as a page that is stuck. The rail's workspace
+  // switcher is one of them; as an <a> it has no open attribute to remove, so
+  // naming it here costs nothing when there is nowhere to switch to.
   document.addEventListener('click', function (e) {
-    var inside = e.target.closest && e.target.closest('.scope-pick');
-    document.querySelectorAll('.scope-pick[open]').forEach(function (menu) {
+    var inside = e.target.closest && e.target.closest('.scope-pick, details.rail-ws');
+    document.querySelectorAll('.scope-pick[open], details.rail-ws[open]').forEach(function (menu) {
       if (menu !== inside) menu.removeAttribute('open');
     });
   });
   document.addEventListener('keydown', function (e) {
     if (e.key !== 'Escape') return;
-    document.querySelectorAll('.scope-pick[open]').forEach(function (menu) {
+    document.querySelectorAll('.scope-pick[open], details.rail-ws[open]').forEach(function (menu) {
       menu.removeAttribute('open');
     });
   });
@@ -155,8 +187,12 @@ export const clientJs = `(function () {
     }
     var dismiss = e.target.closest('[data-dismiss]');
     if (dismiss) {
-      var banner = dismiss.closest('.banner');
-      if (banner) banner.remove();
+      var banner = dismiss.closest('.banner, .band2');
+      if (banner) {
+        var bk = banner.getAttribute('data-band-key') || bandKey(banner);
+        try { sessionStorage.setItem('stma.band.' + bk, '1'); } catch (_) {}
+        banner.remove();
+      }
       return;
     }
     var opener = e.target.closest('[data-open-dialog]');

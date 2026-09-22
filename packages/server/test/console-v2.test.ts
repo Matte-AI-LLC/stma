@@ -117,8 +117,12 @@ it('creates a project before enrollment and still discovers projects from agent 
   const manualList = await page('/app/teams/v2-team/projects');
   expect(manualList.html).toContain('/app/teams/v2-team/projects/manual-api');
 
+  // Agent connections issues a connection and nothing else (2026-09-23): the
+  // project form was furniture above the thing somebody came to that page for.
+  // The route it posted to still answers, because a redirect target is not a
+  // form, and that is what the next call proves.
   const picker = await page('/app/tokens?team=v2-team');
-  expect(picker.html).toContain('New project');
+  expect(picker.html).not.toContain('New project');
   const fromConnections = await form(
     `${srv.url}/app/projects`,
     {
@@ -328,7 +332,7 @@ it('draws the rail of the scope the page is in: account, workspace or project', 
   expect(project.html).toContain('href="/app/agents?team=v2-team&amp;project=payments-api"');
   expect(project.html).toContain('href="/app/teams/v2-team/projects/payments-api/work"');
   expect(project.html).toContain('href="/app/teams/v2-team/projects/payments-api/governance"');
-  expect(project.html).not.toContain('class="rail-group">Workspace</span>');
+  expect(project.html).not.toContain('class="rail-group later">What is happening</span>');
   // The scope bar names both, and marks the project as the scope you are in.
   expect(project.html).toMatch(/class="scope-at in"[^>]*>\s*payments-api/);
 
@@ -342,7 +346,7 @@ it('draws the rail of the scope the page is in: account, workspace or project', 
   expect(trail).toMatch(/<span aria-current="page">Governance<\/span>$/);
   // Without the filter it is a workspace page again.
   const everyProject = await page('/app/teams/v2-team/governance');
-  expect(everyProject.html).toContain('class="rail-group">Workspace</span>');
+  expect(everyProject.html).toContain('class="rail-group later">What is happening</span>');
   expect(everyProject.html).toContain('class="rail-group later">Rules set here</span>');
   // The pair has to read as one sentence, because it is the inheritance rule the
   // whole console is built on: set at the workspace, in effect in the project. It
@@ -392,7 +396,7 @@ it('draws the rail of the scope the page is in: account, workspace or project', 
 
   // A project of another workspace is not a scope: the rail stays at workspace level.
   const stray = await page('/app/agents?team=v2-team&project=no-such-project');
-  expect(stray.html).toContain('class="rail-group">Workspace</span>');
+  expect(stray.html).toContain('class="rail-group later">What is happening</span>');
 });
 
 it('puts a project in the address of its own sections, and keeps the filter form answering', async () => {
@@ -549,21 +553,27 @@ it('splits the team page into tabs, and keeps the tab in the URL', async () => {
 });
 
 it('offers the workspace switcher only when there is somewhere to switch to', async () => {
+  // It lives at the top of the rail since 2026-09-23, which is the column that
+  // says place; the scope bar keeps the name as a crumb and switches nothing.
   const one = await page('/app/teams/v2-team');
   // One workspace: a link to it, not a control that cannot do anything.
+  expect(one.html).toContain('<a class="rail-ws" href="/app/teams/v2-team" title="This workspace">');
   expect(one.html).toContain('<a class="scope-at" href="/app/teams/v2-team" title="This workspace">');
   expect(one.html).not.toContain('title="Switch workspace"');
 
   await form(`${srv.url}/app/teams`, { name: 'Second Team' }, { cookie });
   const two = await page('/app/teams/v2-team');
+  expect(two.html).toContain('<details class="rail-ws">');
   expect(two.html).toContain('title="Switch workspace"');
   expect(two.html).toContain('All workspaces');
   expect(two.html).toContain('Second Team');
+  // And still exactly one control for the question.
+  expect(two.html.match(/title="Switch workspace"/g)?.length).toBe(1);
 
   // A scoped route, not membership creation order, owns the rail context: the
   // newest workspace is Second Team, and this page is still about the first.
   const firstTeam = await page('/app/teams/v2-team');
-  expect(firstTeam.html).toContain('class="rail-group">Workspace</span>');
+  expect(firstTeam.html).toContain('<details class="rail-ws">');
   // The rail lists this scope's sections and nothing that pours every workspace together.
   expect(firstTeam.html).not.toContain('Across workspaces');
   expect(firstTeam.html).toContain('href="/app/agents?team=v2-team"');

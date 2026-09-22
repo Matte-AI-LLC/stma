@@ -69,7 +69,9 @@ export async function connectDb(env: Env): Promise<Connection> {
     : defaultMigrationsDir;
 
   if (env.databaseUrl) {
-    const client = postgres(env.databaseUrl, { max: 10, onnotice: () => {} });
+    // `databasePoolMax` says why this is not a constant: with several replicas
+    // the connection budget is the ceiling on how many there may be.
+    const client = postgres(env.databaseUrl, { max: env.databasePoolMax, onnotice: () => {} });
     const db = drizzlePg(client, { schema });
     // Advisory locks belong to a PostgreSQL session, not to the app pool. Use a
     // dedicated one-connection client with no lifetime/idle recycling for the

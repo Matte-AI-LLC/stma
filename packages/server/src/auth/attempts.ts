@@ -76,3 +76,43 @@ export function lockedMessage(resetAt: Date): string {
     .toISOString()
     .slice(11, 16)} UTC.`;
 }
+
+/**
+ * How many accounts one address may create in an hour.
+ *
+ * The per-IP limits in `app.tsx` live in one process's memory, which is right
+ * for a high-volume endpoint — a counter row per anonymous hit would make the
+ * limiter an amplifier — and wrong for this one. Two facts changed on
+ * 2026-09-23 and they point the same way: the door stopped asking for an access
+ * code, which was the only volumetric brake checked before an email is even
+ * looked at, and the app is allowed to scale to four replicas, which makes
+ * every in-memory per-IP ceiling four times as generous because the requests
+ * spread across instances.
+ *
+ * So account creation gets a counter every replica agrees on. It is the right
+ * endpoint for a row: a signup that succeeds writes a user, a workspace and a
+ * membership, so one more row per address per hour is not the thing to save.
+ * Ten, because a company behind one NAT signing its team up in one sitting is
+ * an ordinary morning and being refused would read as the product being broken.
+ */
+export const SIGNUP_IP_WINDOW_MS = 60 * 60_000;
+export const SIGNUP_IP_MAX = 10;
+
+const SIGNUP_BUCKET = 'signup-ip';
+
+/**
+ * Count one signup attempt from this address. True when it is over the line.
+ *
+ * Counted before the email is looked at, like the access code it replaces, so
+ * the answer cannot be used to ask whether an address already has an account.
+ */
+export async function signupFromAddress(db: Db, ip: string): Promise<boolean> {
+  const hit = await hitCounter(
+    db,
+    SIGNUP_BUCKET,
+    sha256hex(ip).slice(0, 32),
+    SIGNUP_IP_WINDOW_MS,
+    SIGNUP_IP_MAX,
+  );
+  return hit.exceeded;
+}

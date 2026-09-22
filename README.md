@@ -63,9 +63,9 @@ and future projects. Existing project-only agents should stay on the same projec
 **One shared address matters.** Two separate `localhost` servers cannot see each other. To
 self-host, [start one instance](#try-it-in-one-command), make it reachable at a secured HTTPS
 address from both machines, and set `BASE_URL` to that address before connecting clients. Keep
-development servers private. The hosted service is a private beta: creating an account needs an
-access code, and everything is switched on for the accounts that have one. Without a code, use
-your existing account, ask the instance owner, or self-host — the self-host path needs no
+development servers private. The hosted service is a **public beta**: anybody can create an
+account with an email address, everything is switched on and nothing is billed. You can also
+self-host — the self-host path needs no
 invitation and is not a reduced product.
 
 STMA does not wake a sleeping agent. MCP is client-initiated: the server cannot start local commands
@@ -655,9 +655,9 @@ nothing to do and touches nothing.
 
 ### Hosted pricing
 
-**The hosted service is in a private beta and nothing is for sale yet.** An access code creates
-one account; every workspace has every feature and none of the plan limits on members, projects,
-integrations, snapshot devices, calls or handoffs, there is no card and no trial clock, and the plan pages say so
+**The hosted service is in a public beta and nothing is for sale yet.** Signing up needs an email
+address and nothing else; every workspace has every feature and none of the plan limits on members,
+projects, integrations, snapshot devices, calls or handoffs, there is no card and no trial clock, and the plan pages say so
 rather than offering a checkout. History is the one exception, on purpose: the activity feed and
 the agent run trail keep Cloud Free's 90 days, so the end of the beta deletes nothing. The table
 below is the pricing the beta is testing toward — read it as the plan, not as today's bill.
@@ -665,7 +665,10 @@ Nothing switches off underneath an existing workspace without a conversation fir
 
 An instance you run yourself is unaffected either way. `SIGNUP_ACCESS_CODES` and `BETA_UNMETERED`
 are ordinary switches shipped in this source: the first makes signup invite-only without closing
-it, the second lifts the ceilings on a hosted instance that is not charging.
+it — the hosted service ran that way until 23 September 2026 — and the second lifts the ceilings on
+a hosted instance that is not charging. The signed-out site reads them: a hosted instance with
+codes set says *private beta*, one with an open door says *public beta*, and one that has stopped
+lifting ceilings says neither, because by then somebody is paying.
 
 Hosted billing counts **humans**, never agents, devices, worktrees, sessions, calls or CI runs.
 Cloud Free is permanent rather than a trial clock. A one-human workspace can purchase Team before
@@ -1124,6 +1127,12 @@ Three things are worth knowing before you turn the number up.
 - **Per-IP rate limits are per instance, on purpose.** A shared counter row per anonymous request
   would turn the limiter into an amplifier, so the in-memory `Map` stays. With N instances those
   ceilings are up to N times as generous; everything keyed to an account is exact at any count.
+- **The connection budget is the real ceiling, and it is arithmetic.** Each instance holds a pool
+  of `DATABASE_POOL_MAX` connections plus one for the live channel's listener, and takes one more
+  briefly at boot for the migration lock. A rolling deploy can run the old and new sets at the
+  same time, so size it for **twice** the instance count against your server's `max_connections`,
+  and leave room for the few the server reserves for itself. Ten per instance is the default and
+  is right for one; it is the first thing to lower when you raise the count.
 - **`EMBEDDED_DB=1` is one instance, full stop.** The embedded engine is a PostgreSQL compiled
   into the Node process that uses it, so a second process cannot share the database — and would
   not hear its notifications either.
@@ -1137,6 +1146,7 @@ Three things are worth knowing before you turn the number up.
 | `PGLITE_DIR` | no | Embedded database directory (default `.data/pglite`) |
 | `BASE_URL` | prod | Public origin, used for OAuth redirects, invite links and snippets |
 | `DATABASE_URL` | prod* | Postgres connection string. Unset → embedded PGlite (dev, or prod with `EMBEDDED_DB=1`) |
+| `DATABASE_POOL_MAX` | no | Connections this instance's pool may open (default `10`, clamped to 1–100). The live channel's listener and the boot-time migration lock are **extra**, one each. Lower it when you run several instances: the ceiling is `max_connections` on your server, and a rolling deploy can have the old and new sets open at once |
 | `EMBEDDED_DB` | no | `1` allows production on the embedded database — **one instance only**, persist `packages/server/.data`. On `DATABASE_URL` you may run several: rate limits, the loop guard and the live `/app/stream` channel are all shared through Postgres (the last over `LISTEN`/`NOTIFY`). See [Running more than one instance](#running-more-than-one-instance) |
 | `STMA_UPGRADE_ENGINE` | no | Only read by `--upgrade-data`: the module entry (`dist/index.js`) of a PGlite copy that can open the *older* data directory. Set it to run the upgrade with no registry access; unset, the pinned engine is fetched into a fresh private temp directory and checked against the digest this build pins before it is loaded. Never read on a normal boot |
 | `RESEND_API_KEY` | no | Resend API key for account emails (sign-in codes, password reset). Without it codes are only logged and email 2FA defaults off |
@@ -1221,7 +1231,7 @@ mirror, npm tarballs or public image.
 ## Legal and security
 
 Terms of service and the privacy policy are served at `/terms` and `/privacy`, linked from
-every public footer. Vulnerability reports go to **security@stma.ai** — see
+every public footer. Vulnerability reports go to **support@matteai.com** — see
 [SECURITY.md](SECURITY.md). Contribution setup and the rules this repo actually enforces are
 in [CONTRIBUTING.md](CONTRIBUTING.md).
 

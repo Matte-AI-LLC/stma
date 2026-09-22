@@ -144,30 +144,12 @@ export const ScopeBar = ({ user }: { user: User }) => {
       <nav class="scope-path" aria-label="Scope">
         {inWorkspace ? (
           <>
-            {rail.list.length < 2 && !user.organizationSecurity ? (
-              <a class="scope-at" href={`/app/teams/${rail.team}`} title="This workspace">
-                {workspace}
-              </a>
-            ) : (
-              <details class="scope-pick">
-                <summary class="scope-at" title="Switch workspace">
-                  {workspace}
-                  <span class="caret">▾</span>
-                </summary>
-                <div class="scope-menu">
-                  <span class="scope-cap">Workspaces</span>
-                  {rail.list.map((t) => (
-                    <a class={t.slug === rail.team ? 'on' : undefined} href={`/app/teams/${t.slug}`}>
-                      <span class="grow">{t.name}</span>
-                      <span class="r">{t.role}</span>
-                    </a>
-                  ))}
-                  <span class="sep"></span>
-                  <a href="/app">All workspaces</a>
-                  {user.organizationSecurity ? <a href="/app/organizations">Organizations</a> : null}
-                </div>
-              </details>
-            )}
+            {/* A crumb, not a control: switching workspace is the rail's job
+                since 2026-09-23, and two pickers onto one question is how they
+                start answering it differently. */}
+            <a class="scope-at" href={`/app/teams/${rail.team}`} title="This workspace">
+              {workspace}
+            </a>
             <span class="scope-sep">/</span>
             <details class="scope-pick">
               <summary class={`scope-at${rail.project ? ' in' : ' all'}`} title="Switch project">
@@ -194,31 +176,12 @@ export const ScopeBar = ({ user }: { user: User }) => {
               </div>
             </details>
           </>
-        ) : rail.list.length === 0 && !user.organizationSecurity ? (
+        ) : (
+          /* Outside a workspace the rail already lists every one of them by
+             name, so this is a crumb here too. */
           <a class="scope-at all" href="/app">
             All workspaces
           </a>
-        ) : (
-          <details class="scope-pick">
-            <summary class="scope-at all" title="Open a workspace">
-              All workspaces
-              <span class="caret">▾</span>
-            </summary>
-            <div class="scope-menu">
-              <span class="scope-cap">Workspaces</span>
-              {rail.list.map((t) => (
-                <a href={`/app/teams/${t.slug}`}>
-                  <span class="grow">{t.name}</span>
-                  <span class="r">{t.role}</span>
-                </a>
-              ))}
-              <span class="sep"></span>
-              <a class="on" href="/app">
-                All workspaces
-              </a>
-              {user.organizationSecurity ? <a href="/app/organizations">Organizations</a> : null}
-            </div>
-          </details>
         )}
       </nav>
       {/* The account is a scope too, the outermost one, and it is not a place the
@@ -232,7 +195,12 @@ export const ScopeBar = ({ user }: { user: User }) => {
         <div class="scope-menu right">
           <a href="/app/account">Account</a>
           <a href="/app/notifications">Notifications</a>
-          <a href="/app/tokens">My agent connections</a>
+          {/* Keeps the workspace you are standing in. Without it this menu was
+              the one control on a workspace page that silently dropped you back
+              to the account scope, which is what the rail then drew. */}
+          <a href={rail.team ? `/app/tokens?team=${encodeURIComponent(rail.team)}` : '/app/tokens'}>
+            My agent connections
+          </a>
           <a href="/docs">Docs</a>
           {/* Beside Docs rather than in the rail: the rail lists the current
               scope's sections, and "what went wrong" belongs to no scope. */}
@@ -263,6 +231,56 @@ const scopeQuery = (team: string, project?: string | null): string =>
  * had no sections at all, so everything about it was reached by leaving it.
  * Inside a project the rail is that project's; the way out is its first line.
  */
+/**
+ * Which workspace this rail belongs to, and the way to another one.
+ *
+ * The rail is where the console says *place*, and it said every place except
+ * the outermost one: nine section links under a group header reading
+ * "Workspace", with the workspace's own name nowhere on it. Switching meant
+ * finding the scope bar's small crumb above the content or, for anybody who did
+ * not, walking back out to the account page and in again — which is what the
+ * owner asked for on 2026-09-23, with a screenshot of the rail.
+ *
+ * A `details` element like every other picker here, so it works with no script,
+ * and a plain link when there is nowhere to switch to: a control that cannot do
+ * anything is worse than no control. That rule and this list moved here from
+ * `ScopeBar`, which keeps the name as a crumb — one switch, in the column the
+ * console gives to place.
+ */
+const RailWorkspace = ({ user, ws }: { user: User; ws: string }) => {
+  const rail = user.rail ?? EMPTY_RAIL;
+  const name = rail.list.find((t) => t.slug === ws)?.name ?? ws;
+  if (rail.list.length < 2 && !user.organizationSecurity) {
+    return (
+      <a class="rail-ws" href={`/app/teams/${ws}`} title="This workspace">
+        <span class="cap">Workspace</span>
+        <span class="n">{name}</span>
+      </a>
+    );
+  }
+  return (
+    <details class="rail-ws">
+      <summary title="Switch workspace">
+        <span class="cap">Workspace</span>
+        <span class="n">{name}</span>
+        <span class="caret">▾</span>
+      </summary>
+      <div class="rail-ws-menu">
+        <span class="scope-cap">Workspaces</span>
+        {rail.list.map((t) => (
+          <a class={t.slug === ws ? 'on' : undefined} href={`/app/teams/${t.slug}`}>
+            <span class="grow">{t.name}</span>
+            <span class="r">{t.role}</span>
+          </a>
+        ))}
+        <span class="sep"></span>
+        <a href="/app">All workspaces</a>
+        {user.organizationSecurity ? <a href="/app/organizations">Organizations</a> : null}
+      </div>
+    </details>
+  );
+};
+
 export const Rail = ({ user, active }: { user: User; active?: RailKey }) => {
   const rail = user.rail ?? EMPTY_RAIL;
   const ws = rail.scope === 'account' ? null : rail.team;
@@ -274,6 +292,7 @@ export const Rail = ({ user, active }: { user: User; active?: RailKey }) => {
         <Logo inv />
         <span class="name">STMA</span>
       </a>
+      {ws ? <RailWorkspace user={user} ws={ws} /> : null}
       <button
         class="rail-nav-toggle"
         type="button"
@@ -285,8 +304,10 @@ export const Rail = ({ user, active }: { user: User; active?: RailKey }) => {
       <div class="rail-nav" id="rail-destinations">
         {ws && project ? (
           <>
+            {/* The switcher above already names the workspace, so this says
+                where it goes instead of repeating it. */}
             <a class="rail-link rail-up" href={teamHref(ws, '/projects')}>
-              ← {rail.list.find((t) => t.slug === ws)?.name ?? ws}
+              ← All projects
             </a>
             <span class="rail-group">{project.name}</span>
             <RailLink
@@ -348,8 +369,9 @@ export const Rail = ({ user, active }: { user: User; active?: RailKey }) => {
             {/* Two groups, not one list of nine: a place and what is
                 happening in it. The project rail has the same split and reads
                 because it is shorter, which is a reason to name the split
-                rather than to rely on the length. */}
-            <span class="rail-group">Workspace</span>
+                rather than to rely on the length. The first group needs no
+                header of its own since the switcher above carries the word and
+                the workspace's name with it. */}
             <RailLink href={teamHref(ws, '')} label="Overview" active={active === 'team'} />
             <RailLink
               href={teamHref(ws, '/projects')}
@@ -614,18 +636,25 @@ export const PageHead = ({
 );
 
 /** The one thing on this page that is wrong right now, with what to do about it. */
+/**
+ * `keep` marks a notice that may not be put away. Everything else grows a
+ * dismiss control from `ui/client.ts`, because a band with no way to close it
+ * is furniture on every page load after the first one somebody has read.
+ */
 export const Band = ({
   kind,
   tag,
   children,
   actions,
+  keep,
 }: {
   kind: 'danger' | 'warn' | 'info';
   tag: string;
   children: Child;
   actions?: Child;
+  keep?: boolean;
 }) => (
-  <div class={`band2 band-${kind}`}>
+  <div class={`band2 band-${kind}`} data-keep={keep ? '' : undefined}>
     <span class="tag">{tag}</span>
     <span style="min-width:0">{children}</span>
     {actions ? <div class="acts">{actions}</div> : null}
@@ -746,6 +775,7 @@ export const ConsoleShell = ({
         <Band
           kind="warn"
           tag="Email"
+          keep
           actions={
             <a class="btn btn-sm" href="/app/account">
               Confirm it

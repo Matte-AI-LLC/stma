@@ -136,7 +136,6 @@ import { Field, Lead, PageHead, teamTrail, Vr } from '../ui/Console';
 import { AppLayout, Head, Logo } from '../ui/Layout';
 import { Landing } from '../ui/Landing';
 import { siteInfo } from '../ui/Site';
-import { ProjectCreateBar } from '../ui/ProjectCreate';
 import { Mail } from '../ui/Mail';
 
 export const dashboardRoutes = new Hono<AppEnv>();
@@ -411,7 +410,7 @@ dashboardRoutes.get('/app', async (c) => {
               <tr>
                 <td>
                   <div class="cellrow">
-                    <span class={`tile tile-28 ${r.role === 'owner' ? 'tile-green' : 'tile-gray'}`}>
+                    <span class={`tile tile-24 ${r.role === 'owner' ? 'tile-green' : 'tile-gray'}`}>
                       {initials(r.team.name)}
                     </span>
                     <div>
@@ -804,7 +803,7 @@ dashboardRoutes.get('/app/teams/:slug', async (c) => {
           <span class="chip">
             you are <b>{role}</b>
           </span>
-          <span class="tile tile-28 tile-green">{initials(team.name)}</span>
+          <span class="tile tile-24 tile-green">{initials(team.name)}</span>
         </>
       }
       head={
@@ -3027,15 +3026,11 @@ const TokensPage = (props: {
         </div>
       ) : (
       <>
-      {ownerTeams.length > 0 ? (
-        <ProjectCreateBar
-          workspaces={ownerTeams.map(({ name, slug }) => ({ name, slug }))}
-          selectedWorkspace={
-            selectedTeam?.role === 'owner' ? selectedTeam.slug : ownerTeams[0]!.slug
-          }
-          returnTo="tokens"
-        />
-      ) : null}
+      {/* No "New project" here (2026-09-23, the owner's word). This page issues a
+          connection; a project is created on Projects, or by the first agent
+          that pushes a snapshot. A fold offering an unrelated form above the
+          thing somebody came for is furniture, and the connect form already
+          lists the projects that exist. */}
 
       {terminalCommand && newEnrollment ? (
         <ConnectCommand

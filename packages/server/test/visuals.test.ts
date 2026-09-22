@@ -625,3 +625,31 @@ it('draws the diagram no wider than the prose it explains', async () => {
   // how tall 860px of width turns out to be.
   expect(html).toContain('viewBox="0 0 1000 650"');
 });
+
+/**
+ * Geist Mono is for text a machine wrote or will read, not for labels.
+ *
+ * It had become the console's label face — 97 rules on 2026-09-23, breadcrumbs
+ * and role chips and counts and the whole status strip among them — and a page
+ * where a third of the words are typewritten reads as a terminal emulator. The
+ * rule is written at `--mono` in the stylesheet; this keeps the chrome honest
+ * by naming the pieces that drifted, and keeps the pieces that should be
+ * typewritten typewritten, because the fix for "too much mono" must not become
+ * "no mono" and take the commands and paths with it.
+ */
+it('keeps the typewriter face for machine text and off the console chrome', async () => {
+  const { css } = await import('../src/ui/styles');
+  // Anchored at the line start so `a.holds { … }` is not read as `.holds`.
+  const rule = (selector: string): string =>
+    new RegExp(`^${selector.replace(/[.]/g, '\.')} \{([^}]*)\}`, 'm').exec(css)?.[1] ?? '';
+  for (const selector of ['.crumb', '.chip', '.rail-badge', '.legend', '.msg-time', '.invmeta']) {
+    expect(rule(selector), `${selector} is chrome and must not be typewritten`).not.toContain(
+      'var(--mono)',
+    );
+  }
+  // And the other half of the rule: these carry text somebody would paste.
+  expect(css).toContain('code { font-family: var(--mono); }');
+  for (const selector of ['.holds', '.toolrow .tn', '.flow-scope,.flow-device']) {
+    expect(rule(selector), `${selector} carries machine text`).toContain('var(--mono)');
+  }
+});

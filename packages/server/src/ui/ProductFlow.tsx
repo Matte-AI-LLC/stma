@@ -67,7 +67,7 @@ export const Identity = ({
     <span>{human}</span>
     {agent && (
       <>
-        <span class="tile tile-28 tile-green" aria-hidden="true">
+        <span class="tile tile-24 tile-green" aria-hidden="true">
           {initials(agent)}
         </span>
         <span>{agent}</span>

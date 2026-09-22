@@ -30,6 +30,18 @@ export type SiteInfo = {
   pricing: boolean;
   /** Signup takes an access code (the private beta's door). */
   codeDoor: boolean;
+  /**
+   * Which beta this instance is running, if any.
+   *
+   * A door that asks for a code is a private beta; a door anybody can walk
+   * through is a public one; and once people are paying it is not a beta at
+   * all. `BETA_UNMETERED` decides that last part because that flag *is*
+   * "nothing to pay yet" — the same fact `effectivePlanLabel` reads inside the
+   * console, so the page a stranger sees and the plan label a member sees can
+   * never disagree. Derived rather than configured: a second variable saying
+   * "call it public now" is one more thing to forget on the day the door opens.
+   */
+  beta: 'private' | 'public' | null;
   /** Signup is open at all. */
   signupsOpen: boolean;
   /** The pre-launch face: `SITE_MODE=teaser`. */
@@ -41,16 +53,29 @@ export type SiteInfo = {
 export function siteInfo(c: Context<AppEnv>): SiteInfo {
   const env = c.get('env');
   const signupsOpen = env.localAuth && env.signupsOpen;
+  const codeDoor = signupsOpen && accessCodeRequired(env);
+  const openToAnyone = signupsOpen && !codeDoor && env.publicMode !== 'teaser';
   return {
     user: c.get('user'),
     support: env.supportEmail,
     privacy: env.privacyEmail,
     // Pricing sells plans; a teaser page does not sell anything yet.
     pricing: c.get('capabilities').managedBilling && env.publicMode !== 'teaser',
-    codeDoor: signupsOpen && accessCodeRequired(env),
+    codeDoor,
     signupsOpen,
     teaser: env.publicMode === 'teaser',
     hosted: env.hosted,
+    // The pre-launch face is a private beta whatever else is set — nobody can
+    // sign up at all. Otherwise the beta is the hosted service while nobody is
+    // paying, and the door decides which one it is.
+    beta:
+      env.publicMode === 'teaser'
+        ? 'private'
+        : env.hosted && env.betaUnmetered
+          ? openToAnyone
+            ? 'public'
+            : 'private'
+          : null,
   };
 }
 
@@ -157,7 +182,7 @@ export const SiteFooter = ({ site }: { site: SiteInfo }) => (
       <div class="foot-base">
         <span>© 2026 Matte AI LLC</span>
         <span>
-          {site.hosted || site.teaser ? 'Private beta · ' : ''}v{VERSION}
+          {site.beta ? `${site.beta === 'public' ? 'Public' : 'Private'} beta · ` : ''}v{VERSION}
         </span>
       </div>
     </div>

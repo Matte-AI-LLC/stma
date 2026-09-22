@@ -1052,7 +1052,15 @@ const workPage = async (c: Context<AppEnv>) => {
               project page, or <code>assign_work</code>) or an agent hands its work over with{' '}
               <code>handoff_work</code>. Reading or replying to a message does not accept it.
             </p>
-            <a class="btn btn-sm" href="/app/tokens">Connect an agent</a>
+            {/* Carries the workspace, or the page it opens drops out of one:
+                a link from inside a scope that lands you outside it is the
+                console losing its place. */}
+            <a
+              class="btn btn-sm"
+              href={workTeam ? `/app/tokens?team=${encodeURIComponent(workTeam.slug)}` : '/app/tokens'}
+            >
+              Connect an agent
+            </a>
           </FlowEmpty>
         )}
       </FlowSection>

@@ -225,7 +225,7 @@ it('gives a beta workspace every feature and no ceiling that refuses work', asyn
   const label = await (
     await fetch(`${beta.url}/app/teams/northwind`, { headers: header() })
   ).text();
-  expect(label).toContain('plan Private beta');
+  expect(label).toContain('plan Beta');
   expect(label).not.toContain('plan free');
 });
 
@@ -404,4 +404,103 @@ it('puts a support address on the hosted landing page, and none on a self-hosted
   const ours = loadEnv({ ...BASE, pgliteDir: betaDir, hosted: true });
   expect(ours.supportEmail).toBe('support@matteai.com');
   expect(ours.privacyEmail).toBe('gdpr@matteai.com');
+});
+
+/**
+ * The door opened on 2026-09-23, and the page has to say which beta it is.
+ *
+ * Three states, one derivation (`siteInfo` in `ui/Site.tsx`): the pre-launch
+ * face is private whatever else is set, a hosted instance that is not charging
+ * is a beta and its door decides which, and once the ceilings are back it is
+ * not a beta at all. Asserted here rather than in a unit test because the thing
+ * that matters is what a stranger reads, in the footer and in the hero.
+ */
+it('says public beta once the door takes no code, and stops saying beta when the ceilings return', async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'stma-public-'));
+  const open = await startServer(
+    loadEnv({ ...BASE, pgliteDir: dir, hosted: true, betaUnmetered: true, publicMode: 'full' }),
+  );
+  const metered = mkdtempSync(path.join(tmpdir(), 'stma-metered-'));
+  const selling = await startServer(
+    loadEnv({ ...BASE, pgliteDir: metered, hosted: true, betaUnmetered: false, publicMode: 'full' }),
+  );
+  try {
+    const landing = await (await fetch(`${open.url}/`)).text();
+    expect(landing).toContain('<b>Public beta</b>');
+    expect(landing).toContain('in public beta');
+    expect(landing).toContain('Public beta · v');
+    // No code is asked for, so the door says so and the signup page agrees.
+    expect(landing).not.toContain('I have an access code');
+    expect(landing).toContain('Get started free');
+    const signup = await (await fetch(`${open.url}/signup`)).text();
+    expect(signup).not.toContain('Access code');
+    expect(signup).toContain('STMA is in public beta');
+
+    // The teaser instance is a private beta even though its door is shut.
+    const teaser = await (await fetch(`${beta.url}/`)).text();
+    expect(teaser).toContain('<b>Private beta</b>');
+
+    // Ceilings back: nobody is on the house, so the word goes away entirely.
+    const sold = await (await fetch(`${selling.url}/`)).text();
+    expect(sold).not.toContain('Public beta');
+    expect(sold).not.toContain('Private beta');
+    expect(sold).toContain('AgentOps for coding agents');
+  } finally {
+    await open.close();
+    await selling.close();
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(metered, { recursive: true, force: true });
+  }
+});
+
+/**
+ * With no access code there is no volumetric brake on account creation that a
+ * second replica does not weaken, so signup counts against a shared counter.
+ * Ten per address per hour; the eleventh is refused without saying anything
+ * about the address, because the count is spent before the email is read.
+ */
+it('holds account creation to a ceiling every replica agrees on', async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'stma-signup-rate-'));
+  const open = await startServer(
+    loadEnv({ ...BASE, pgliteDir: dir, hosted: true, betaUnmetered: true, publicMode: 'full' }),
+  );
+  try {
+    const ip = { 'x-forwarded-for': '203.0.113.77' };
+    const made: number[] = [];
+    for (let n = 0; n < 11; n += 1) {
+      const res = await form(
+        `${open.url}/auth/local/signup`,
+        { email: `crowd-${n}@example.dev`, password: 'correct horse battery' },
+        ip,
+      );
+      made.push(res.status);
+      if (n === 10) {
+        expect(decodeURIComponent(res.headers.get('location') ?? '')).toContain(
+          'Too many accounts have been created from this network',
+        );
+      }
+    }
+    expect(made.filter((s) => s === 302)).toHaveLength(11);
+    // The eleventh created nothing: it was refused before the address was read.
+    const eleventh = await fetch(`${open.url}/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ email: 'crowd-10@example.dev', password: 'correct horse battery' }),
+      redirect: 'manual',
+    });
+    expect(decodeURIComponent(eleventh.headers.get('location') ?? '')).not.toContain('/app');
+
+    // Another address is not held by somebody else's burst.
+    const elsewhere = await form(
+      `${open.url}/auth/local/signup`,
+      { email: 'quiet@example.dev', password: 'correct horse battery' },
+      { 'x-forwarded-for': '198.51.100.9' },
+    );
+    expect(decodeURIComponent(elsewhere.headers.get('location') ?? '')).not.toContain(
+      'Too many accounts',
+    );
+  } finally {
+    await open.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

@@ -5,8 +5,10 @@ reach further than the service itself. Reports are welcome and taken seriously.
 
 ## Reporting a vulnerability
 
-Email **security@stma.ai** with enough detail to reproduce: the endpoint or tool,
-the request, what you expected and what happened. A proof-of-concept helps; a
+Email **support@matteai.com** with enough detail to reproduce: the endpoint or tool,
+the request, what you expected and what happened. One mailbox, read by the people
+who can act on it: a separate `security@` address that nobody watches is worse
+than none, because a report to it looks delivered and is not. A proof-of-concept helps; a
 video is never required.
 
 - We acknowledge within **3 business days** and give a first assessment within **7**.

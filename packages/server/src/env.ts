@@ -7,6 +7,19 @@ export interface Env {
   /** Public origin without trailing slash, e.g. https://bridge.example.com */
   baseUrl: string;
   databaseUrl?: string;
+  /**
+   * Connections this process's pool may open, beside the one the LISTEN
+   * channel holds and the one migrations take at boot.
+   *
+   * Ten is right for a server that is the only one talking to its database, and
+   * wrong the moment there are several: the connection budget is the real
+   * ceiling on replica count, and it is arithmetic rather than a guess. On
+   * 2026-09-23 production went to at most four replicas against a Burstable
+   * B1ms whose `max_connections` is 50, which a rolling deploy can meet with
+   * both revisions at full width — eight replicas at once. At four each that is
+   * 40 plus the listeners, and it fits; at ten each it would not.
+   */
+  databasePoolMax: number;
   pgliteDir: string;
   migrationsDir?: string;
   github?: { clientId: string; clientSecret: string };
@@ -347,6 +360,7 @@ export function loadEnv(overrides: Partial<Env> = {}): Env {
     host: e.HOST ?? (nodeEnv === 'production' ? '0.0.0.0' : 'localhost'),
     baseUrl: (configuredBaseUrl || `http://localhost:${port}`).replace(/\/+$/, ''),
     databaseUrl: e.DATABASE_URL || undefined,
+    databasePoolMax: Math.min(Math.max(Number(e.DATABASE_POOL_MAX) || 10, 1), 100),
     pgliteDir: e.PGLITE_DIR ?? DEFAULT_PGLITE_DIR,
     migrationsDir: e.MIGRATIONS_DIR || undefined,
     github,
@@ -447,12 +461,14 @@ export function loadEnv(overrides: Partial<Env> = {}): Env {
       `[stma] Mail: sending as ${env.mailFrom}. Its domain must be verified with the mail provider, or every message is refused and nobody can sign in or reset a password. Failures show on /admin/ops.`,
     );
   }
-  // A private beta whose door is open is not a private beta, and the difference
-  // is one unset variable. Say it at boot rather than letting the first stranger
-  // discover it.
+  // A door open to anyone is a decision, not a mistake — it is what a public
+  // beta is — so this states the consequence instead of accusing the operator.
+  // The consequence is worth saying at boot: the access code was the one
+  // volumetric brake checked before an email is even looked at, and without it
+  // account creation is held only by the per-IP limits, which are per replica.
   if (env.hosted && env.signupsOpen && env.signupAccessCodes.length === 0 && env.nodeEnv !== 'test') {
     console.warn(
-      '[stma] WARNING: hosted signup is open to anyone — no SIGNUP_ACCESS_CODES are set. Set them for an invite-only beta, or SIGNUPS_OPEN=0 to close signup entirely.',
+      '[stma] hosted signup is open to anyone: no SIGNUP_ACCESS_CODES are set. New accounts are held by the shared per-IP signup counter and the per-IP limit on /auth/*. Set codes for an invite-only beta, or SIGNUPS_OPEN=0 to close signup entirely.',
     );
   }
   if (env.betaUnmetered && env.nodeEnv !== 'test') {

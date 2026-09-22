@@ -654,8 +654,10 @@ describe('policy from the UI', () => {
     expect(field('requiredChecks')).toContain('npm test');
     expect(field('runtimes')).toContain('node=22.14.0');
     expect(html).toMatch(/name="maxScopeItems"[^>]*value="7"/);
-    // It is a page answered by a POST, so it draws its own rail: the workspace's.
-    expect(html).toContain('class="rail-group">Workspace</span>');
+    // It is a page answered by a POST, so it draws its own rail: the workspace's,
+    // which since 2026-09-23 is named by the switcher at the top of it.
+    expect(html).toContain('class="rail-ws"');
+    expect(html).toContain('title="Switch workspace"');
     // Nothing was written.
     const live = (await page('/app/teams/bare-team/governance', ownerJar)).html;
     expect(live).not.toContain('Keep migrations backwards compatible.');

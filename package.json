@@ -1,7 +1,7 @@
 {
   "name": "stma",
   "private": true,
-  "version": "0.16.2",
+  "version": "0.17.0",
   "license": "Elastic-2.0",
   "description": "STMA — Speak to my Agent. AgentOps for teams that build with coding agents: one map of every run, collision warnings, team rules in every session, handoffs and evidence",
   "type": "module",

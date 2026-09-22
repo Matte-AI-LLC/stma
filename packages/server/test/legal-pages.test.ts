@@ -55,7 +55,7 @@ it('serves both documents to a stranger, with the addresses a person writes to',
     for (const route of ['/terms', '/privacy']) {
       const html = await page(srv, route);
       expect(html).toContain('Matte AI LLC');
-      expect(html).toContain('22 September 2026');
+      expect(html).toContain('23 September 2026');
       // Data protection and everything else go to different mailboxes, and both
       // are in both documents: somebody reading one must not have to find the
       // other to know where to write.
@@ -63,7 +63,13 @@ it('serves both documents to a stranger, with the addresses a person writes to',
         'gdpr@matteai.com',
       );
       expect(html, `${route} must offer the support address`).toContain('support@matteai.com');
-      expect(html, `${route} keeps the security address`).toContain('security@stma.ai');
+      // A vulnerability report goes to the same mailbox as everything else
+      // technical (2026-09-23): security@stma.ai was written into these
+      // documents before anybody checked whether it existed, and it does not,
+      // so a report to it would have bounced while looking delivered.
+      expect(html, `${route} must not name a mailbox nobody reads`).not.toContain(
+        'security@stma.ai',
+      );
     }
   }
 });
@@ -75,6 +81,7 @@ it('no longer says it is a draft, and no longer names the retired addresses', as
       expect(html, `${route} is not a draft any more`).not.toContain('not yet reviewed');
       expect(html).not.toContain('privacy@stma.ai');
       expect(html).not.toContain('legal@stma.ai');
+      expect(html).not.toContain('security@stma.ai');
     }
   }
 });
