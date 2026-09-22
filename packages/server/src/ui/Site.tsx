@@ -4,6 +4,7 @@ import { accessCodeRequired } from '../auth/accessCodes';
 import type { AppEnv, User } from '../types';
 import { VERSION } from '../version';
 import { Head, Logo } from './Layout';
+import { Mail, NoScan } from './Mail';
 
 /**
  * The signed-out site: header, footer and the page around them.
@@ -146,10 +147,10 @@ export const SiteFooter = ({ site }: { site: SiteInfo }) => (
             <h5>Contact</h5>
             {/* Before Terms in the old footer, because somebody reading a footer
                 in trouble is looking for this one; its own column now. */}
-            {site.support ? <a href={`mailto:${site.support}`}>Support</a> : null}
-            {site.support ? <span class="foot-addr">{site.support}</span> : null}
-            {site.privacy ? <a href={`mailto:${site.privacy}`}>Data protection</a> : null}
-            {site.privacy ? <span class="foot-addr">{site.privacy}</span> : null}
+            {site.support ? <Mail to={site.support} label="Support" /> : null}
+            {site.support ? <NoScan><span class="foot-addr">{site.support}</span></NoScan> : null}
+            {site.privacy ? <Mail to={site.privacy} label="Data protection" /> : null}
+            {site.privacy ? <NoScan><span class="foot-addr">{site.privacy}</span></NoScan> : null}
           </nav>
         ) : null}
       </div>

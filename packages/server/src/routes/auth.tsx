@@ -48,6 +48,7 @@ import {
 } from '../lib/mailer';
 import type { AppEnv, User } from '../types';
 import { Head, Logo } from '../ui/Layout';
+import { Mail } from '../ui/Mail';
 
 export const authRoutes = new Hono<AppEnv>();
 
@@ -701,7 +702,7 @@ const SupportNote = ({ support, what }: { support: string; what: string }) => (
     {support ? (
       <>
         {' '}
-        If that does not cover it, write to <a href={`mailto:${support}`}>{support}</a> from the
+        If that does not cover it, write to <Mail to={support} /> from the
         address on the account. Never put a password or a code in that mail.
       </>
     ) : null}

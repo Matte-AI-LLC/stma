@@ -3,6 +3,7 @@ import type { AppEnv } from '../types';
 import { AppLayout } from '../ui/Layout';
 import { SitePage, siteInfo } from '../ui/Site';
 import { VERSION } from '../version';
+import { Mail, NoScan } from '../ui/Mail';
 
 /**
  * `/help` — the page somebody goes to when it went wrong.
@@ -2022,7 +2023,12 @@ const Wall = ({ entry }: { entry: HelpEntry }) => (
         {entry.symptom ? <p class="wall-symptom">{entry.symptom}</p> : null}
         {(entry.quotes ?? []).map((quote) => (
           <>
-            <p class="wall-msg">{quote.text}</p>
+            {/* Verbatim means verbatim: a quoted message that carries an address,
+                even an example one, must not be rewritten by a CDN into
+                "[email protected]" (ui/Mail.tsx). */}
+            <NoScan>
+              <p class="wall-msg">{quote.text}</p>
+            </NoScan>
             {quote.by ? <span class="wall-by">Printed by {quote.by}, not by STMA.</span> : null}
           </>
         ))}
@@ -2134,7 +2140,7 @@ helpRoutes.get('/help', (c) => {
             <p class="m0">
               {support ? (
                 <>
-                  Write to <a href={`mailto:${support}`}>{support}</a>, from the address on the
+                  Write to <Mail to={support} />, from the address on the
                   account.
                 </>
               ) : (
@@ -2151,7 +2157,7 @@ helpRoutes.get('/help', (c) => {
             {privacy ? (
               <p class="m0">
                 A request about your personal data — a copy of it, a correction, its deletion, under
-                the GDPR or the KVKK — goes to <a href={`mailto:${privacy}`}>{privacy}</a> instead,
+                the GDPR or the KVKK — goes to <Mail to={privacy} /> instead,
                 which is where those requests are answered. The{' '}
                 <a href="/privacy">privacy policy</a> says what is kept and for how long.
               </p>

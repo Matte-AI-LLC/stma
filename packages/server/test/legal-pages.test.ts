@@ -162,3 +162,21 @@ it('accepts the Terms where they are ours to accept, and nowhere else', async ()
   // claim the reader is accepting ours.
   expect(await page(own, '/signup'), 'self-hosted signup').not.toContain(line);
 });
+
+it('publishes every address where a CDN cannot hide it', async () => {
+  // Cloudflare's Email Address Obfuscation rewrites mailto links and addresses in
+  // the text into a script-decoded placeholder. Measured on production
+  // 2026-09-22: the privacy policy's own contact sentence served
+  // "write to [email protected]", which is all a reader with no script gets, on
+  // the page whose job is to publish where a data-protection request goes.
+  // `<!--email_off-->` is Cloudflare's own opt-out, and it belongs around every
+  // address the product means to publish.
+  for (const route of ['/', '/privacy', '/terms', '/help']) {
+    const html = await page(hosted, route);
+    const outside = html.split(/<!--email_off-->[\s\S]*?<!--email_on-->/).join('');
+    expect(outside, `${route} leaves an address where the CDN will hide it`).not.toContain('mailto:');
+    expect(outside, `${route} leaves an address in text where the CDN will hide it`).not.toMatch(
+      /[a-z0-9._-]+@[a-z0-9.-]+\.[a-z]{2,}/i,
+    );
+  }
+});

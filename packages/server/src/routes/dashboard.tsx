@@ -137,6 +137,7 @@ import { AppLayout, Head, Logo } from '../ui/Layout';
 import { Landing } from '../ui/Landing';
 import { siteInfo } from '../ui/Site';
 import { ProjectCreateBar } from '../ui/ProjectCreate';
+import { Mail } from '../ui/Mail';
 
 export const dashboardRoutes = new Hono<AppEnv>();
 
@@ -3790,7 +3791,7 @@ const AccountPage = (props: {
           <div class="card-title">Get help</div>
           <div class="card-note">
             Write to{' '}
-            <a href={`mailto:${support}`}>{support}</a> from the address on this account. Never put a
+            <Mail to={support} /> from the address on this account. Never put a
             password, an access code or an agent token in that mail.
           </div>
         </div>

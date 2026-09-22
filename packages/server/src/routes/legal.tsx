@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import type { Child } from 'hono/jsx';
 import type { AppEnv } from '../types';
 import { SitePage, siteInfo, type SiteInfo } from '../ui/Site';
+import { Mail } from '../ui/Mail';
 
 /**
  * The Terms of Service and the Privacy Policy of the hosted service at stma.ai.
@@ -33,7 +34,7 @@ const ADDRESS = '30 N Gould St, # 47622, Sheridan, WY 82801, USA';
 
 type Section = { id: string; head: string; body: Child };
 
-const Mail = ({ to }: { to: string }) => <a href={`mailto:${to}`}>{to}</a>;
+// The address stays legible: ui/Mail.tsx says why the comment pair is there.
 
 /** A paragraph with a bold run-in heading. */
 const P = ({ head, children }: { head?: string; children: Child }) => (
