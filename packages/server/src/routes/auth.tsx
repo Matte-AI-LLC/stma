@@ -247,8 +247,8 @@ authRoutes.get('/signup', (c) => {
                 {needsCode
                   ? 'STMA is in private beta. Your access code lets you create one account; teammates join you through invite links.'
                   : env.hosted && env.betaUnmetered
-                    ? 'STMA is in public beta: every feature is on, there is nothing to pay and no card is asked for. One account per person — teammates join you through invite links.'
-                    : 'One account per person — teammates join you through invite links.'}
+                    ? 'STMA is in public beta: every feature is on, there is nothing to pay and no card is asked for. Use it on your own or with a team; teammates join through invite links.'
+                    : 'One account per person. Use it on your own or with a team; teammates join through invite links.'}
               </p>
             </div>
             {error ? (
@@ -285,11 +285,18 @@ authRoutes.get('/signup', (c) => {
                   type="email"
                   name="email"
                   autocomplete="email"
-                  placeholder="you@company.com"
+                  placeholder="you@example.com"
                   required
                 />
+                {/* Any address will do: STMA is for one person as much as for a team,
+                    and a placeholder reading "company" told somebody on their own
+                    that this was not for them (the owner's word, 2026-09-24). The
+                    code is announced here because it arrives before the person has
+                    asked for anything, and an unexplained code reads as a mistake. */}
                 <span class="help">
-                  You sign in with this address. Your teammates see a display name taken from it.
+                  {env.twoFactor
+                    ? 'You sign in with this address, and we email a 6-digit code to it to confirm it is yours. People you share a workspace with see a display name taken from it.'
+                    : 'You sign in with this address. People you share a workspace with see a display name taken from it.'}
                 </span>
               </div>
               <div class="field">

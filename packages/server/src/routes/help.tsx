@@ -112,13 +112,19 @@ export type HelpSection = {
  * the whole inventory — the suite — gets every entry.
  */
 export function helpSections(
-  meter: { hosted: boolean; beta: boolean } = { hosted: true, beta: true },
+  meter: { hosted: boolean; beta: boolean; codeDoor?: boolean } = { hosted: true, beta: true },
 ): HelpSection[] {
   return [
     {
       id: 'signin',
       title: 'Getting in',
-      blurb: 'Sign-in codes, lock-outs, resets, invitations and access codes',
+      // The index names access codes only where one is asked for: the entry
+      // itself is filtered out on an open door, and a summary still promising it
+      // sends a stranger looking for a wall that is not there.
+      blurb:
+        meter.codeDoor === false
+          ? 'Sign-in codes, lock-outs, resets and invitations'
+          : 'Sign-in codes, lock-outs, resets, invitations and access codes',
       console: false,
       intro: (
         <>
@@ -366,6 +372,11 @@ export function helpSections(
         {
           quotes: [
             {
+              text: 'We emailed a 6-digit code to you@example.com to confirm it is yours.',
+              find: 'We emailed a 6-digit code to',
+              from: 'server/src/ui/Console.tsx',
+            },
+            {
               text: 'you@example.com has not been confirmed. Sign-in codes and password resets go there and nowhere else, so if it is wrong, nobody can get this account back.',
               find: 'has not been confirmed. Sign-in codes and password resets go there and',
               from: 'server/src/ui/Console.tsx',
@@ -374,16 +385,19 @@ export function helpSections(
           where: 'Console · every page',
           means: (
             <>
-              No code from STMA has reached the address on the account yet. Everything that
-              recovers an account goes to that address, so a typo in it is how an account is lost
-              for good.
+              Nobody has entered a code from the address on the account yet. Signup emails one
+              straight away, before you have asked for anything, so the first of these two is what a
+              new account sees. Everything that recovers an account goes to that address, so a typo
+              in it is how an account is lost for good.
             </>
           ),
           todo: (
             <>
-              Press <b>Confirm it</b>, then <b>Email me a code</b>, and enter the six digits. If the
-              address is wrong, choose <b>Use a different address</b> there instead: the code goes
-              to the new address, and the old one is told.
+              Type the six digits from the email into the band and press <b>Confirm</b>. A code works
+              for ten minutes; once it has expired the band offers <b>Email me a code</b> instead. If
+              the address is wrong, press <b>Wrong address?</b> and choose{' '}
+              <b>Use a different address</b>: the code goes to the new address, and the old one is
+              told.
             </>
           ),
         },
@@ -1742,7 +1756,13 @@ export function helpSections(
               nothing.
             </>
           ),
-          todo: <>Nothing. When pricing starts you will hear it from us first.</>,
+          todo: (
+            <>
+              Nothing. <b>Account</b> shows the plan of every workspace you are in; when pricing
+              starts, a workspace's owner buys and manages its plan from there, and you will hear it
+              from us first.
+            </>
+          ),
         },
       ],
     },
@@ -2078,7 +2098,7 @@ helpRoutes.get('/help', (c) => {
   // nobody will give them.
   const codeDoor = accessCodeRequired(env);
   const signupClosed = !(env.localAuth && env.signupsOpen);
-  const sections = helpSections({ hosted: env.hosted, beta: env.betaUnmetered })
+  const sections = helpSections({ hosted: env.hosted, beta: env.betaUnmetered, codeDoor })
     .filter((section) => (showConsole || !section.console) && (!section.hosted || env.hosted))
     .map((section) => ({
       ...section,

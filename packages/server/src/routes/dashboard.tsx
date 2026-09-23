@@ -1436,7 +1436,7 @@ dashboardRoutes.get('/app/teams/:slug', async (c) => {
                     name="email"
                     aria-label="Atlassian account email"
                     value={jira?.email ?? ''}
-                    placeholder="you@company.com"
+                    placeholder="you@example.com"
                   />
                 </label>
                 <label class="ifield">
@@ -3493,17 +3493,127 @@ const clientName = (ua: string | null): string => {
   return os ? `${browser} on ${os}` : browser;
 };
 
+/**
+ * Which plan each of a person's workspaces is on, for Account.
+ *
+ * A plan is a workspace's, not a person's, and until 2026-09-24 the only way to
+ * see one was a small "plan …" link in a workspace's status strip. Account, the
+ * page people open to look for their subscription, said nothing about it at all
+ * (the owner's word). Owners first, because a person on their own owns exactly
+ * one workspace and that row is their plan. Bounded: somebody in more workspaces
+ * than this is an operator's case, and the page says where the rest are.
+ */
+const ACCOUNT_PLAN_ROWS = 25;
+type WorkspacePlans = {
+  rows: { slug: string; name: string; role: string; plan: string }[];
+  more: boolean;
+};
+
+async function workspacePlans(db: Db, userId: string, hosted: boolean): Promise<WorkspacePlans> {
+  const found = await db
+    .select({ team: teams, role: memberships.role })
+    .from(memberships)
+    .innerJoin(teams, eq(memberships.teamId, teams.id))
+    .where(membershipUser(userId))
+    .orderBy(teams.name)
+    .limit(ACCOUNT_PLAN_ROWS + 1);
+  const rows = await Promise.all(
+    found.slice(0, ACCOUNT_PLAN_ROWS).map(async ({ team, role }) => ({
+      slug: team.slug,
+      name: team.name,
+      role,
+      // The label every other page prints, so Account cannot name a plan the
+      // workspace's own page would not: the beta, a grant, an evaluation.
+      plan: effectivePlanLabel(team.plan, await effectiveLimits(db, team, hosted)),
+    })),
+  );
+  rows.sort((a, b) => Number(b.role === 'owner') - Number(a.role === 'owner'));
+  return { rows, more: found.length > ACCOUNT_PLAN_ROWS };
+}
+
+/** The label's plan id is a word in a sentence elsewhere; on this card it is a name. */
+const PLAN_NAMES: Record<string, string> = {
+  free: 'Cloud Free',
+  solo: 'Solo',
+  team: 'Team',
+  enterprise: 'Enterprise',
+};
+const planTitle = (label: string): string =>
+  label.replace(/^(free|solo|team|enterprise)\b/, (id) => PLAN_NAMES[id] ?? id);
+
+const PlanCard = ({ user, plans, beta }: { user: User; plans: WorkspacePlans; beta: boolean }) => (
+  <div class="card card-pad" id="plan" style="display:flex;flex-direction:column;gap:14px">
+    <div>
+      <div class="card-title">
+        Plan and billing{' '}
+        {beta ? <span class="pill pill-active">beta</span> : null}
+      </div>
+      <div class="card-note">
+        A plan belongs to a workspace: its owner chooses and pays for it, and everybody in it shares
+        it. Using STMA on your own, that is simply your workspace.{' '}
+        {beta
+          ? 'STMA is in beta, so every workspace has every feature, nothing is billed and no card is on file. When pricing starts, this is where a plan is bought and managed.'
+          : user.plans === 'billing'
+            ? 'An owner buys, changes or cancels a plan, and finds payment methods and invoices, on its Plan & billing page.'
+            : 'On this server plans are set by its operator.'}
+      </div>
+    </div>
+    {plans.rows.length ? (
+      <table class="tbl">
+        <thead>
+          <tr>
+            <th>Workspace</th>
+            <th>Your role</th>
+            <th>Plan</th>
+            {user.plans === 'billing' ? <th aria-label="Manage"></th> : null}
+          </tr>
+        </thead>
+        <tbody>
+          {plans.rows.map((row) => (
+            <tr>
+              <td>
+                <a href={`/app/teams/${row.slug}`}>{row.name}</a>
+              </td>
+              <td>{row.role}</td>
+              <td>
+                <b>{planTitle(row.plan)}</b>
+              </td>
+              {user.plans === 'billing' ? (
+                <td style="text-align:right">
+                  <a class="btn btn-sm" href={`/app/teams/${row.slug}/plan`}>
+                    {row.role === 'owner' ? 'Plan & billing' : 'View plan'}
+                  </a>
+                </td>
+              ) : null}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    ) : (
+      <p class="m0 small muted">You are not in a workspace yet, so there is no plan to show.</p>
+    )}
+    {plans.more ? (
+      <p class="m0 small muted">
+        Showing the first {ACCOUNT_PLAN_ROWS}. <a href="/app">All workspaces</a> lists every one.
+      </p>
+    ) : null}
+  </div>
+);
+
 const AccountPage = (props: {
   user: User;
   confirmByEmail: boolean;
   support: string;
   sessions: BrowserSession[];
+  plans?: WorkspacePlans;
+  beta: boolean;
   pendingEmail?: string;
   error?: string;
   notice?: string;
 }) => {
-  const { user, confirmByEmail, support, sessions, pendingEmail, error, notice } = props;
+  const { user, confirmByEmail, support, sessions, plans, beta, pendingEmail, error, notice } = props;
   const unconfirmed = confirmByEmail && Boolean(user.email) && !user.emailVerifiedAt;
+  const codeWaiting = unconfirmed ? user.verifyCodeExpiresAt : undefined;
   return (
     <AppLayout user={user} active="account" title="Account">
       {error ? <Banner kind="error" text={error} /> : null}
@@ -3533,7 +3643,9 @@ const AccountPage = (props: {
             <div class="card-note">
               <b>{user.email}</b> is where your sign-in codes and password resets go. Nowhere else.
               {unconfirmed
-                ? ' Nobody has shown they can read it yet, so confirm it or correct it while you are still signed in.'
+                ? codeWaiting
+                  ? ' We emailed a 6-digit code to it to confirm it is yours. Enter it below, or correct the address if it is wrong.'
+                  : ' Nobody has shown they can read it yet, so confirm it or correct it while you are still signed in.'
                 : ''}
             </div>
           </div>
@@ -3559,7 +3671,7 @@ const AccountPage = (props: {
           {unconfirmed ? (
             <form class="inline m0" method="post" action="/app/account/email/code">
               <button class="btn btn-sm" type="submit">
-                Email me a code
+                {codeWaiting ? 'Email me a new code' : 'Email me a code'}
               </button>
             </form>
           ) : null}
@@ -3642,6 +3754,7 @@ const AccountPage = (props: {
           </details>
         </div>
       ) : null}
+      {plans ? <PlanCard user={user} plans={plans} beta={beta} /> : null}
       {user.passwordHash ? (
         <div class="card card-pad" style="display:flex;flex-direction:column;gap:14px">
           <div>
@@ -3828,6 +3941,8 @@ dashboardRoutes.get('/app/account', async (c) => {
       confirmByEmail={c.get('env').twoFactor}
       support={c.get('env').supportEmail}
       sessions={await sessionsFor(c.get('db'), user.id, currentSessionId(c))}
+      plans={user.plans ? await workspacePlans(c.get('db'), user.id, c.get('env').hosted) : undefined}
+      beta={c.get('env').betaUnmetered}
       // Only ever an address this account just asked to move to, and only for
       // as long as the code lives; it names the form, it authorizes nothing.
       pendingEmail={isEmail(pending) ? pending : undefined}

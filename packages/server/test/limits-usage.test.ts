@@ -11,10 +11,11 @@ import {
   debugSessions,
   handoffs,
   launchAttempts,
+  rateCounters,
   teams,
   users,
 } from '../src/db/schema';
-import { hitCounter, readCounter, sweepCounters } from '../src/lib/counters';
+import { counterKey, hitCounter, readCounter, sweepCounters } from '../src/lib/counters';
 import { PLANS } from '../src/lib/entitlements';
 import { DAY_MS } from '../src/lib/counters';
 import {
@@ -144,13 +145,23 @@ it('counts in the database, so two processes share one budget', async () => {
 
 it('starts a fresh budget in a new window rather than resetting the old one', async () => {
   const db = srv.db;
-  // A one-second window: the second call lands in a different bucket.
-  await hitCounter(db, 'test', 'window', 1_000, 100);
-  const before = await readCounter(db, 'test', 'window', 1_000);
-  expect(before).toBeGreaterThan(0);
-  await new Promise((r) => setTimeout(r, 1_100));
+  // A one-second window. The count is taken from what the write returned, not
+  // from a second query: a read issued a moment later lands in the next window
+  // whenever the write fell near the end of this one, and under load the full
+  // suite measured exactly that (`expected 0 to be greater than 0`).
+  const hit = await hitCounter(db, 'test', 'window', 1_000, 100);
+  expect(hit.count).toBe(1);
+  const closedKey = counterKey('test', 'window', 1_000, hit.resetAt.getTime() - 1);
+  // Wait for the window the write named to close, wherever in it the write fell.
+  await new Promise((r) => setTimeout(r, Math.max(0, hit.resetAt.getTime() - Date.now()) + 50));
   const after = await readCounter(db, 'test', 'window', 1_000);
   expect(after, 'a new window starts empty').toBe(0);
+  // The closed window is a row of its own, left as it was for the sweep.
+  const [closed] = await db
+    .select({ count: rateCounters.count })
+    .from(rateCounters)
+    .where(eq(rateCounters.key, closedKey));
+  expect(closed?.count, 'the old window was not reset').toBe(1);
 });
 
 it('sweeps closed windows and leaves live ones alone', async () => {

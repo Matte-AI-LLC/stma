@@ -4,6 +4,7 @@ import { deleteCookie, getCookie, setCookie } from 'hono/cookie';
 import type { Db } from '../db';
 import { users, webSessions } from '../db/schema';
 import { isAdminUser } from '../lib/admin';
+import { liveCodeExpiry } from './codes';
 import { railFor } from '../lib/rail';
 import { randomHex, sha256hex } from '../lib/crypto';
 import { clientIp } from '../lib/ratelimit';
@@ -180,6 +181,15 @@ export const sessionUser: MiddlewareHandler<AppEnv> = async (c, next) => {
       // state the server cannot leave is noise, not a notice.
       user.addressUnconfirmed =
         c.get('env').twoFactor && Boolean(user.email) && !user.emailVerifiedAt;
+      // One indexed read, and only for the few accounts the band is drawn for.
+      if (user.addressUnconfirmed) {
+        user.verifyCodeExpiresAt = await liveCodeExpiry(db, user.id, 'email_verify');
+      }
+      user.plans = c.get('capabilities').managedBilling
+        ? 'billing'
+        : c.get('env').hosted
+          ? 'metered'
+          : undefined;
       // Only for pages that draw the rail. An API or MCP request must not pay
       // four counts for chrome it never renders.
       if (c.req.method === 'GET' && !c.req.path.startsWith('/api')) {

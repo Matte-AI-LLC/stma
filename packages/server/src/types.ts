@@ -27,6 +27,19 @@ export type User = typeof users.$inferSelect & {
    * already arrives with the session's user row, so this costs no query.
    */
   addressUnconfirmed?: boolean;
+  /**
+   * While the address is unconfirmed: when the newest code mailed to it stops
+   * working. Set means a code is waiting in that mailbox, so the band says it
+   * was sent and takes it on the spot instead of offering to send one.
+   */
+  verifyCodeExpiresAt?: Date;
+  /**
+   * Whether this server has plans at all, and whether it draws pages to buy
+   * them: `metered` on a hosted instance, `billing` where the hosted composition
+   * also serves Plan & billing. Unset on a self-hosted instance, which has no
+   * plan to show and nothing to manage.
+   */
+  plans?: 'metered' | 'billing';
 };
 export type Token = typeof tokens.$inferSelect;
 

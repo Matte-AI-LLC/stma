@@ -1654,7 +1654,9 @@ docsRoutes.get('/docs', (c) => {
               </p>
               <div class="card card-pad">
                 <p class="m0 small">
-                  Owners open <b>Plan &amp; billing</b> from the plan link on a team page. Checkout
+                  <b>Account</b> lists the plan of every workspace you are in, and each workspace has a{' '}
+                  <b>Plan &amp; billing</b> page under Workspace settings in the rail, where its
+                  owner buys and manages the plan. Checkout
                   and payment details stay on Stripe-hosted pages; STMA changes entitlement only
                   after a signed webhook confirms the subscription's current state. Cancellation
                   stays active through the paid period. Plan and billing-interval changes keep

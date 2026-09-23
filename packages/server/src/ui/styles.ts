@@ -1183,6 +1183,10 @@ a.chip:hover { border-color: var(--green); color: var(--green-strong); text-deco
   color: #fff; font: 500 10px/1 var(--sans); letter-spacing: .08em; text-transform: uppercase; flex: none;
 }
 .band2 .acts { margin-left: auto; display: flex; gap: 8px; flex: none; }
+/* The address band takes its code where it is read: an input the height of the
+   small buttons beside it, wide enough for six digits and its placeholder. */
+.band2 .acts form.inline { gap: 6px; flex-wrap: nowrap; }
+.band2 .acts input.in { width: 118px; height: 32px; padding: 0 10px; font-size: 13px; }
 .band2 b { font-weight: 600; }
 .band-danger { background: var(--red-bg); border-color: var(--red-bg-line); color: var(--red-ink); }
 .band-danger .tag { background: var(--red); }
@@ -1396,7 +1400,10 @@ a.holds:hover { border-color: var(--ctl-border); background: #fff; }
   .cbody .cmain { min-width: 420px; }
   .lrow.grid-runs, .lhead.grid-runs { grid-template-columns: 26px minmax(0, 1.4fr) minmax(0, 1.6fr) 92px; }
   .grid-runs > *:nth-child(4), .grid-runs > *:nth-child(5) { display: none; }
-  .docgrid { grid-template-columns: 1fr; gap: 18px; }
+  /* minmax(0, 1fr), not 1fr: a bare 1fr track has an automatic minimum, so the
+     diagram's min-width set the column and the whole guide scrolled sideways on
+     a phone while the figure's own scroll box sat idle inside it. */
+  .docgrid { grid-template-columns: minmax(0, 1fr); gap: 18px; }
   .sidetoc { position: static; flex-direction: row; flex-wrap: wrap; }
   .edgrid { grid-template-columns: 1fr; }
   .toolrow { grid-template-columns: 1fr; gap: 4px; }
@@ -1405,6 +1412,10 @@ a.holds:hover { border-color: var(--ctl-border); background: #fff; }
   .cbody .cmain { min-width: 0; width: 100%; }
   .cpad { padding: 20px 14px 32px; }
   .readiness-stack .btn { white-space: normal; text-align: left; }
+  /* A tool name or a console address is one unbreakable word, and one of them
+     in a table cell was enough to push the guide past the screen. anywhere,
+     not break-word: only anywhere lowers the minimum a table is laid out at. */
+  .doc-col code, .doc-col .tbl td, .doc-col .tbl th { overflow-wrap: anywhere; }
 }
 @media(max-width:900px) {
   /* Progressive enhancement: without JS every destination remains visible. */

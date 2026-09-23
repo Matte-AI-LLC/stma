@@ -44,6 +44,7 @@ export type RailKey =
   | 'notifications'
   | 'tokens'
   | 'account'
+  | 'plan'
   | 'docs'
   | 'admin';
 
@@ -194,6 +195,7 @@ export const ScopeBar = ({ user }: { user: User }) => {
         </summary>
         <div class="scope-menu right">
           <a href="/app/account">Account</a>
+          {user.plans ? <a href="/app/account#plan">Plan &amp; billing</a> : null}
           <a href="/app/notifications">Notifications</a>
           {/* Keeps the workspace you are standing in. Without it this menu was
               the one control on a workspace page that silently dropped you back
@@ -443,6 +445,12 @@ export const Rail = ({ user, active }: { user: User; active?: RailKey }) => {
               active={active === 'tokens'}
             />
             <RailLink href={teamHref(ws, '/setup')} label="Connect & test" active={active === 'setup'} />
+            {/* A plan is the workspace's, so its page is a workspace setting. Only
+                where the pages exist: a metered server without them has nothing
+                behind the link, and Account says which plan each workspace is on. */}
+            {user.plans === 'billing' ? (
+              <RailLink href={teamHref(ws, '/plan')} label="Plan & billing" active={active === 'plan'} />
+            ) : null}
           </>
         ) : (
           <>
@@ -661,6 +669,70 @@ export const Band = ({
   </div>
 );
 
+/**
+ * The unconfirmed address, and the way out of it, in one place.
+ *
+ * Signup mails a code before the person has asked for one, and the band used to
+ * say only that the address was not confirmed, so the mail that arrived beside it
+ * looked as if it had come from nowhere (the owner's word, 2026-09-24). When a
+ * code is waiting the band says it was sent and takes it right here; when none
+ * is, it sends one. Both answer on Account, where the result and the form for a
+ * different address live — and on Account itself the band keeps only its
+ * sentence, because the card below it holds the same controls.
+ */
+const AddressBand = ({ user, onAccount }: { user: User; onAccount: boolean }) => {
+  const until = user.verifyCodeExpiresAt;
+  const minutes = until ? Math.max(1, Math.ceil((until.getTime() - Date.now()) / 60_000)) : 0;
+  const actions = onAccount ? undefined : (
+    <>
+      {until ? (
+        <form class="inline m0" method="post" action="/app/account/email/verify">
+          <input
+            class="in"
+            type="text"
+            name="code"
+            inputmode="numeric"
+            autocomplete="one-time-code"
+            pattern="[0-9]{6}"
+            maxlength={6}
+            placeholder="6-digit code"
+            aria-label="Confirmation code"
+            required
+          />
+          <button class="btn btn-sm btn-primary" type="submit">
+            Confirm
+          </button>
+        </form>
+      ) : (
+        <form class="inline m0" method="post" action="/app/account/email/code">
+          <button class="btn btn-sm" type="submit">
+            Email me a code
+          </button>
+        </form>
+      )}
+      <a class="btn btn-sm" href="/app/account">
+        Wrong address?
+      </a>
+    </>
+  );
+  return (
+    <Band kind="warn" tag="Email" keep actions={actions}>
+      {until ? (
+        <>
+          We emailed a 6-digit code to <b>{user.email}</b> to confirm it is yours. It works for{' '}
+          {minutes} more {minutes === 1 ? 'minute' : 'minutes'}. Sign-in codes and password resets go
+          to this address and nowhere else.
+        </>
+      ) : (
+        <>
+          <b>{user.email}</b> has not been confirmed. Sign-in codes and password resets go there and
+          nowhere else, so if it is wrong, nobody can get this account back.
+        </>
+      )}
+    </Band>
+  );
+};
+
 /** Right panel: what you can do to the thing selected in the ledger. */
 export const Inspector = ({ children }: { children: Child }) => (
   <aside class="inspector">{children}</aside>
@@ -771,21 +843,7 @@ export const ConsoleShell = ({
        * names ends when somebody enters a code, and a notice you can wave away
        * is one that stops being read the day it starts mattering.
        */}
-      {user.addressUnconfirmed ? (
-        <Band
-          kind="warn"
-          tag="Email"
-          keep
-          actions={
-            <a class="btn btn-sm" href="/app/account">
-              Confirm it
-            </a>
-          }
-        >
-          <b>{user.email}</b> has not been confirmed. Sign-in codes and password resets go there and
-          nowhere else, so if it is wrong, nobody can get this account back.
-        </Band>
-      ) : null}
+      {user.addressUnconfirmed ? <AddressBand user={user} onAccount={active === 'account'} /> : null}
       {strip || scope ? (
         <div class="strip">
           <div class="strip-l">{strip}</div>

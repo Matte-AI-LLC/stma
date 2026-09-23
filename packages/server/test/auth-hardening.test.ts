@@ -25,6 +25,8 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, expect, it, vi } from 'vitest';
+import { and, eq } from 'drizzle-orm';
+import { authCodes, users } from '../src/db/schema';
 import { loadEnv } from '../src/env';
 import { mailOutbox } from '../src/lib/mailer';
 import { startServer, type StartedServer } from '../src/server';
@@ -574,10 +576,21 @@ it('A12: the console says the address is unconfirmed until it is confirmed', asy
     return res.text();
   };
 
-  // Not just Account: the pages somebody would actually be on.
-  for (const url of ['/app', '/app/tokens', '/app/account']) {
-    expect(await read(url), `${url} says so`).toContain('has not been confirmed');
+  // Not just Account: the pages somebody would actually be on. Signup has
+  // already mailed a code, so they say that, and take it on the spot: a band
+  // that only said "not confirmed" sat beside a mail that looked as if it had
+  // come from nowhere (the owner's word, 2026-09-24).
+  for (const url of ['/app', '/app/tokens']) {
+    const html = await read(url);
+    expect(html, `${url} says a code was sent`).toContain('We emailed a 6-digit code to');
+    expect(html, `${url} takes it in the band`).toContain('action="/app/account/email/verify"');
   }
+  // Account holds the same controls in its own card, so its band keeps only the
+  // sentence, and the card offers a new code rather than "a" code.
+  const account = await read('/app/account');
+  expect(account).toContain('We emailed a 6-digit code to it');
+  expect(account).toContain('Email me a new code');
+  expect(account.split('action="/app/account/email/verify"').length - 1, 'one code form on Account').toBe(1);
 
   // And the code mailed at signup actually works.
   const code = codeFor('a12@example.com');
@@ -585,9 +598,86 @@ it('A12: the console says the address is unconfirmed until it is confirmed', asy
   expect(where(done), 'confirmed').toContain('Address confirmed');
 
   for (const url of ['/app', '/app/tokens', '/app/account']) {
-    expect(await read(url), `${url} stops saying so`).not.toContain('has not been confirmed');
+    const html = await read(url);
+    expect(html, `${url} stops saying so`).not.toContain('has not been confirmed');
+    expect(html, `${url} stops asking for a code`).not.toContain('We emailed a 6-digit code to');
   }
 });
+
+/**
+ * A12b — the band never asks for a code that can no longer be entered.
+ *
+ * A code works for ten minutes. After that "we emailed a code" would send
+ * somebody to type a dead one, so the band goes back to saying the address is
+ * not confirmed and offers to send another; asking brings the first form back.
+ */
+it('A12b: once the code has expired, the band offers a new one instead', async () => {
+  const { jar: j } = await signup('a12b@example.com', 'a12bpassword12', '41');
+  const read = async (url: string) => {
+    const res = await fetch(srv.url + url, { headers: j.header(ip('41')), redirect: 'manual' });
+    expect(res.status, url).toBe(200);
+    return res.text();
+  };
+  expect(await read('/app')).toContain('We emailed a 6-digit code to');
+
+  const [who] = await srv.db.select({ id: users.id }).from(users).where(eq(users.email, 'a12b@example.com'));
+  await srv.db
+    .update(authCodes)
+    .set({ expiresAt: new Date(Date.now() - 60_000) })
+    .where(and(eq(authCodes.userId, who!.id), eq(authCodes.purpose, 'email_verify')));
+
+  const stale = await read('/app');
+  expect(stale).toContain('has not been confirmed');
+  expect(stale, 'offers a new code').toContain('action="/app/account/email/code"');
+  expect(stale, 'and takes none').not.toContain('action="/app/account/email/verify"');
+
+  const sent = await post('/app/account/email/code', {}, j.header(ip('41')));
+  expect(where(sent)).toContain('Code sent to a12b@example.com');
+  expect(await read('/app'), 'a fresh code brings the form back').toContain('We emailed a 6-digit code to');
+});
+
+/**
+ * The signup page is for one person as much as for a team (2026-09-24).
+ *
+ * The placeholder read "you@company.com", which told somebody on their own that
+ * the product was not for them, and the code that signup mails arrived with no
+ * word on this page that it would.
+ */
+it('A12c: the signup page does not assume a company, and says a code will come', async () => {
+  const html = await (await fetch(`${srv.url}/signup`)).text();
+  expect(html).not.toContain('@company');
+  expect(html).toContain('you@example.com');
+  expect(html).toContain('Use it on your own or with a team');
+  expect(html).toContain('we email a 6-digit code to it to confirm it is yours');
+});
+
+/**
+ * Account shows the plan of every workspace the person is in (2026-09-24).
+ *
+ * Until then a plan was visible only as a small link in one workspace's status
+ * strip, and Account said nothing about it. This server is hosted without the
+ * billing composition, so the plan is named and nothing links to pages that are
+ * not there; the private suite covers the composition's links.
+ */
+it('A12d: Account names each workspace and its plan, owners first', async () => {
+  const { jar: j } = await signup('a12d@example.com', 'a12dpassword12', '42');
+  const make = await post('/app/teams', { name: 'Plan Desk' }, j.header(ip('42')));
+  expect(make.status).toBe(302);
+  expect(where(make), 'the workspace was created').not.toContain('error');
+  const res = await fetch(`${srv.url}/app/account`, { headers: j.header(ip('42')), redirect: 'manual' });
+  expect(res.status).toBe(200);
+  const html = await res.text();
+  const card = html.slice(html.indexOf('id="plan"'));
+  expect(html).toContain('Plan and billing');
+  expect(card).toContain('Plan Desk');
+  expect(card).toContain('<td>owner</td>');
+  // The beta decides the label, as it does everywhere else a plan is printed.
+  expect(card).toContain('<b>Beta</b>');
+  expect(card).toContain('nothing is billed and no card is on file');
+  expect(card, 'no link to billing pages this server does not have').not.toContain('/plan"');
+  expect(html, 'and the account menu leads to it').toContain('href="/app/account#plan"');
+});
+
 
 /* ------------------------------------------------------------------ A13
  * routes/dashboard.tsx — the third and fourth password doors.

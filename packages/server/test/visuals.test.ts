@@ -626,6 +626,18 @@ it('draws the diagram no wider than the prose it explains', async () => {
   expect(html).toContain('viewBox="0 0 1000 650"');
 });
 
+it('keeps the guide inside a phone screen', async () => {
+  const { css } = await import('../src/ui/styles');
+  // Measured at 375px: /docs was 766px wide. A bare `1fr` track has an
+  // automatic minimum, so the diagram's min-width decided the column; with that
+  // fixed, a tool name in a table cell did the same to its table. Nothing in
+  // this suite runs a browser, so the two rules are pinned as written; the fix
+  // itself was measured in one (scrollWidth 375 on every signed-out page).
+  expect(css).toContain('.docgrid { grid-template-columns: minmax(0, 1fr)');
+  expect(css).not.toMatch(/\.docgrid \{ grid-template-columns: 1fr/);
+  expect(css).toContain('.doc-col code, .doc-col .tbl td, .doc-col .tbl th { overflow-wrap: anywhere; }');
+});
+
 /**
  * Geist Mono is for text a machine wrote or will read, not for labels.
  *

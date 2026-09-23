@@ -135,7 +135,7 @@ local data only when the client deliberately includes it in a tool call.
 | Recover a handoff | Work (`/app/handoffs`, or the project's `…/projects/<project>/work`) → session inspector | named human + accepting installation | explicit next action, no browser impersonation |
 | Publish rules | team → Governance | exact team/project | effective policy + receipts |
 | Define delivery | team → Delivery | exact team/project | published flow + setup pack/pipeline |
-| Change plan | team → Plan | exact billable team | Checkout/Portal/current plan |
+| See or change a plan | Account → Plan and billing, or the workspace rail → Plan & billing | every workspace the person is in; changes on the exact billable team | each workspace's plan in force; Checkout/Portal/current plan |
 | Remove access | People, Agent connections, Agent map, Account | exact membership/token/install | revoked or deleted state |
 | Get unstuck | `/help`, linked from every signed-out footer, the four password pages and the account menu | none — deliberately, the page is public | the wall named in the product's own words, with its next action |
 
@@ -261,6 +261,12 @@ Authorization invariants:
    can confirm or correct the address unaided. The signup mail stays unawaited and its failure is
    silent *to the person*, who is signed in and reading that band, and loud to the operator, who is
    the one who can fix it.
+   **The band says what arrived and takes it where it is read (2026-09-24).** The code reaches the
+   mailbox before the person has asked for anything, so while one can still be entered the band
+   says it was emailed and carries the input and **Confirm** itself; once it has expired it says
+   the address is not confirmed and offers **Email me a code**. The signup page says beforehand
+   that a code will come. On Account the band keeps only its sentence, because the address card
+   below it holds the same controls.
 2. **Changing the address mails the code to the NEW one**, and requires the current password. The
    account moves only when that code is entered, and the address being left behind is told, because
    losing the recovery channel is how an account is quietly taken over.
@@ -1048,7 +1054,13 @@ project credential, fetches the current effective policy from the server.
 The public deterministic core knows entitlements and self-hosting remains unmetered. Hosted billing
 is composed through the private operator layer; core code must not import it.
 
-1. Owner opens the current team's Plan page.
+1. A person sees, on **Account → Plan and billing**, the plan in force for every workspace they are
+   in, owners first: the same label the workspace's own pages print, so a grant, an evaluation or
+   the beta reads the same everywhere. A plan is the workspace's and its owner buys it; one person
+   on their own owns exactly one workspace, and that row is their plan. From there, and from
+   **Plan & billing** under the workspace rail's settings, an owner opens the Plan page and a
+   member views it. While the beta runs that page says there is nothing to pay, inside the
+   console, and still sells nothing.
 2. Checkout creates the first Solo/Team subscription. A one-human workspace may buy Team before
    inviting the second human; current membership is not a purchase prerequisite. Team entitlement
    then permits the documented 2–50-human collaboration range.

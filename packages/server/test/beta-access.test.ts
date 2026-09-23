@@ -539,6 +539,11 @@ it('shows the access-code wall only where there is one, and the closed-door wall
     );
     // And the page does not contradict the footer it carries.
     expect(openHelp).not.toContain('private beta');
+    // Nor does its own index promise the entry it just left out.
+    expect(openHelp, 'the index does not name a wall the page no longer describes').not.toContain(
+      'invitations and access codes',
+    );
+    expect(codeHelp).toContain('invitations and access codes');
 
     const shutHelp = await (await fetch(`${shut.url}/help`)).text();
     expect(shutHelp, 'signup is shut, so the entry that says so belongs here').toContain(

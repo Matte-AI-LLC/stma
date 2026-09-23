@@ -9,7 +9,7 @@
  * user id would need a new signing secret and could not be revoked mid-flight.)
  */
 import { randomInt } from 'node:crypto';
-import { and, desc, eq, gt, isNull, sql } from 'drizzle-orm';
+import { and, desc, eq, gt, isNull, lt, sql } from 'drizzle-orm';
 import type { Context } from 'hono';
 import { deleteCookie, getCookie, setCookie } from 'hono/cookie';
 import type { Db } from '../db';
@@ -111,6 +111,38 @@ export async function issueAuthCode(
     .values({ userId, purpose, codeHash: codeDigest(code, bound), expiresAt })
     .returning({ id: authCodes.id });
   return { ok: true, id: inserted[0]!.id, code, expiresAt };
+}
+
+/**
+ * When the newest code of this purpose that can still be entered stops working,
+ * or nothing when none can.
+ *
+ * For saying a code is on its way. Signup mails one before the person has asked
+ * for anything, and a console that only said "not confirmed" beside that mail
+ * made it look as if it had come from nowhere (the owner's word, 2026-09-24).
+ * The same three conditions `check` refuses on, so "a code is waiting" never
+ * points at one that would be answered as gone.
+ */
+export async function liveCodeExpiry(
+  db: Db,
+  userId: string,
+  purpose: AuthCodePurpose,
+): Promise<Date | undefined> {
+  const [row] = await db
+    .select({ expiresAt: authCodes.expiresAt })
+    .from(authCodes)
+    .where(
+      and(
+        eq(authCodes.userId, userId),
+        eq(authCodes.purpose, purpose),
+        isNull(authCodes.consumedAt),
+        gt(authCodes.expiresAt, new Date()),
+        lt(authCodes.attempts, MAX_CODE_ATTEMPTS),
+      ),
+    )
+    .orderBy(desc(authCodes.createdAt))
+    .limit(1);
+  return row?.expiresAt;
 }
 
 export type CodeCheck =
