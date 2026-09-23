@@ -336,7 +336,10 @@ export async function startAgentRun(
         if (previous) {
           if (previous.startRequestHash !== requestHash) {
             throw new StartRunRefused(
-              'This requestId was already used with different arguments. Retry unchanged, or use a new requestId for new work.',
+              // "request id" in words: MCP calls the argument request_id and REST calls it
+              // requestId, and the camelCase spelling in an MCP reply sent an agent that
+              // copied it to an argument the tool refuses before dispatch.
+              'This request id was already used with different arguments. Retry unchanged, or use a new request id for new work.',
             );
           }
           const found = await runForOwner(tx, previous.id, userId);

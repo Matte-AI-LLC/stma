@@ -40,7 +40,7 @@ export async function writeRunCheckpoint(
     return previous.requestHash === requestHash
       ? ({ checkpoint: previous, replayed: true } as const)
       : ({
-          error: 'This checkpoint requestId was already used with different repository facts.',
+          error: 'This checkpoint request id was already used with different repository facts.',
         } as const);
   }
   if (

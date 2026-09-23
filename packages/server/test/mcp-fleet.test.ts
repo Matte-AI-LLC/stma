@@ -217,6 +217,9 @@ it('replays one logical MCP start and rejects request_id reuse for new work', as
   const changed = await call('start_run', { ...args, task: 'RETRY-2' }, alice);
   expect(changed.isError).toBe(true);
   expect(changed.text).toContain('different arguments');
+  // The argument is request_id here and requestId over REST; the camelCase in
+  // an MCP reply sent an agent to an argument the tool refuses.
+  expect(changed.text).not.toContain('requestId');
   await call('finish_run', { run_id: first.data.runId }, alice);
 });
 
@@ -353,7 +356,31 @@ it('hands the work over: brief in the inbox, scope released, run closed', async 
     alice,
   );
   expect(unsafeCredentialBrief.isError).toBe(true);
-  expect(unsafeCredentialBrief.text).toContain('cannot tell the receiver to obtain, create, copy, use or configure a credential');
+  expect(unsafeCredentialBrief.text).toContain('Step 1 of next_steps mentions a credential or a source-only file');
+  expect(unsafeCredentialBrief.text).toContain('Leave that step out entirely');
+
+  // A warning is refused too, and the answer says so rather than restating the
+  // rule: in the agent lab an agent reworded a warning twice before it dropped
+  // it (2026-09-22). The rule stays; telling a prohibition from an instruction
+  // by pattern is how a real instruction gets through.
+  const warningBrief = await call(
+    'handoff_work',
+    {
+      ...args,
+      request_id: randomUUID(),
+      checkpoint,
+      next_steps: [
+        'Run the refund tests.',
+        'Do not copy the credential in .private/carrier-sandbox.key.',
+        'Do not open, read or copy the source-only local file .private/carrier-sandbox.key either.',
+      ],
+    },
+    alice,
+  );
+  expect(warningBrief.isError).toBe(true);
+  expect(warningBrief.text).toContain('Steps 2, 3 of next_steps mention a credential or a source-only file');
+  expect(warningBrief.text).toContain('a warning not to copy or use one included');
+  expect(warningBrief.text).toContain('asking the source machine to run the check');
   const stillHeldAfterUnsafeBrief = await call('list_active_agents', { team: 'fleet' }, alice);
   expect(stillHeldAfterUnsafeBrief.data.activeRuns.some((item: any) => item.runId === aliceRun)).toBe(true);
 

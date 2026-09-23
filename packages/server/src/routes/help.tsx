@@ -1137,7 +1137,8 @@ export function helpSections(
         {
           quotes: [
             {
-              text: 'A branch handoff next_steps cannot tell the receiver to obtain, create, copy, use or configure a credential.',
+              text: 'Step 2 of next_steps mentions a credential or a source-only file, so no handoff was created and the run still holds its claims.',
+              find: 'a credential or a source-only file, so no handoff was created and the run still holds its claims',
               from: 'server/src/mcp/fleet.ts',
             },
             {
@@ -1155,8 +1156,10 @@ export function helpSections(
           ),
           todo: (
             <>
-              Rewrite the steps so the <em>sending</em> machine runs the credential-dependent check
-              and passes on only its non-secret result. For a branch, record a delivery or tested
+              Leave out every step the refusal names, a warning not to copy a credential included:
+              the brief already tells the receiver that credentials never travel. If the receiver
+              needs a result that depends on one, add a step asking the <em>source</em> machine to
+              run the check and return only its non-secret result. For a branch, record a delivery or tested
               checkpoint for that exact commit first, with a clean worktree. A handoff of intent,
               with no branch, needs none.
             </>
@@ -1348,7 +1351,7 @@ export function helpSections(
               from: 'server/src/domain/handoffRequests.ts',
             },
             {
-              text: 'This requestId was already used with different arguments. Retry unchanged, or use a new requestId for new work.',
+              text: 'This request id was already used with different arguments. Retry unchanged, or use a new request id for new work.',
               from: 'server/src/domain/agents.ts',
             },
           ],

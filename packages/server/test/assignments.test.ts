@@ -254,6 +254,28 @@ it('refuses an ambiguous name and resolves it once the owner is named', async ()
   expect(again.data.sessionId).toBe(sessionId);
 });
 
+it('names the credential steps it refuses in an assignment, and writes nothing', async () => {
+  const refused = await call(
+    'assign_work',
+    {
+      request_id: randomUUID(),
+      to_agent: 'codex b',
+      to: 'lead',
+      task: 'PD-8 Carrier sandbox',
+      brief,
+      next_steps: ['Run the UI tests', 'Never paste the API key into the checkout.'],
+      team: 'parcel-desk',
+      project: 'parcel-desk-api',
+    },
+    codexA,
+  );
+  expect(refused.isError).toBe(true);
+  expect(refused.text).toContain('Step 2 of next_steps mentions a credential or a source-only file, so nothing was written');
+  expect(refused.text).toContain('Leave that step out entirely');
+  const inbox = await call('inbox', { team: 'parcel-desk' }, codexB);
+  expect(JSON.stringify(inbox.data.pendingHandoffs)).not.toContain('PD-8');
+});
+
 it('shows the assignment as the named agent\'s own, and as somebody else\'s to every other agent', async () => {
   const mine = await call('inbox', { team: 'parcel-desk' }, codexB);
   expect(mine.data.pendingHandoffs).toHaveLength(1);

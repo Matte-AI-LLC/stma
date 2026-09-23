@@ -229,6 +229,30 @@ const unsafeCredentialHandoffStep = (step: string): boolean => {
 };
 
 /**
+ * Which steps the credential rule refuses, as the 1-based positions an agent
+ * can act on.
+ *
+ * The refusal used to restate the rule, that a step "cannot tell the receiver
+ * to obtain, create, copy, use or configure a credential", and an agent whose
+ * step was a warning ("do not copy a credential") read that as a
+ * misunderstanding: it reworded the warning and was refused again (agent lab,
+ * 2026-09-22, L3). The rule stays, because telling a prohibition from an
+ * instruction by pattern is how a real instruction gets through. The answer
+ * changes: it names the steps and says to leave them out, a warning included,
+ * because the brief STMA writes already carries that warning for every
+ * receiver (`assignments.ts`, and the lifecycle steps below).
+ */
+const credentialStepPositions = (steps: readonly string[]): number[] =>
+  steps.flatMap((step, index) => (unsafeCredentialHandoffStep(step) ? [index + 1] : []));
+
+const whichSteps = (positions: readonly number[]): string =>
+  positions.length === 1
+    ? `Step ${positions[0]} of next_steps mentions`
+    : `Steps ${positions.join(', ')} of next_steps mention`;
+
+const thoseSteps = (positions: readonly number[]): string => (positions.length === 1 ? 'that step' : 'those steps');
+
+/**
  * The installation this token stands for, created on first use. Tokens are
  * already one-per-machine by convention, so the token id is a stable device
  * fingerprint that never leaves the server and is never a hostname.
@@ -1635,9 +1659,10 @@ export function registerFleetTools(
     },
     async ({ request_id, to_agent, to, device, task, brief, next_steps, branch, scope, team, project, via }) => {
       const steps = next_steps ?? [];
-      if (steps.some(unsafeCredentialHandoffStep)) {
+      const refusedSteps = credentialStepPositions(steps);
+      if (refusedSteps.length) {
         return err(
-          'An assignment step cannot tell the agent to obtain, create, copy, use or configure a credential. Ask the owner of that credential to run the check there and return only a non-secret result. Nothing was written.',
+          `${whichSteps(refusedSteps)} a credential or a source-only file, so nothing was written. Leave ${thoseSteps(refusedSteps)} out entirely, a warning not to copy or use one included: the assignment STMA writes already tells the agent that credentials never travel with the work. A check that needs a credential is run by whoever holds it, outside the steps.`,
         );
       }
       const committedDb = db;
@@ -1834,9 +1859,10 @@ export function registerFleetTools(
       },
     },
     async ({ request_id, branch, summary, next_steps, reason, to, to_agent, device, run_id, checkpoint, team, project, via }) => {
-      if (branch && (next_steps ?? []).some(unsafeCredentialHandoffStep)) {
+      const refusedSteps = branch ? credentialStepPositions(next_steps ?? []) : [];
+      if (refusedSteps.length) {
         return err(
-          'A branch handoff next_steps cannot tell the receiver to obtain, create, copy, use or configure a credential. Keep source-only credentials on the source machine and ask it to return only a non-secret result. No handoff was created and the run still holds its claims.',
+          `${whichSteps(refusedSteps)} a credential or a source-only file, so no handoff was created and the run still holds its claims. Leave ${thoseSteps(refusedSteps)} out entirely, a warning not to copy or use one included: the brief STMA writes already tells the receiver that credentials never travel with a handoff. If the receiver needs a result that depends on a credential, write a step asking the source machine to run the check and return only a non-secret result.`,
         );
       }
       const committedDb = db;
