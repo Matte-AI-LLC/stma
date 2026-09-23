@@ -174,8 +174,13 @@ const describeConflicts = (conflicts: ClaimConflict[]) =>
     theirState: c.existing.runState ?? null,
     theirLeaseEndsAt: c.existing.leaseEndsAt ?? null,
     holder: describeHolder(c.existing),
+    // Which side reads and which writes. A read holds nothing: between a read and
+    // a write nobody waits, and a reader is never "holding the write lock".
+    yourAccess: c.current.access,
+    theirAccess: c.existing.access,
     // Who was on the ground first. `yours`: the other run declared it after you
-    // and was told to wait. `theirs`: you are the one who waits.
+    // and was told to wait. `theirs`: you are the one who waits. Between a read
+    // and a write it is the writer's, and neither side waits.
     rightOfWay: (c as { rightOfWay?: 'yours' | 'theirs' }).rightOfWay ?? 'theirs',
   }));
 
@@ -191,7 +196,7 @@ const describeConflicts = (conflicts: ClaimConflict[]) =>
  */
 const conflictAdvice = (conflicts: RightOfWayConflict[]) => {
   const report = conflictReport(conflicts);
-  return [report.blocked, report.holding].filter(Boolean).join(' ') || undefined;
+  return [report.blocked, report.holding, report.reading, report.readBy].filter(Boolean).join(' ') || undefined;
 };
 
 /**
@@ -748,7 +753,7 @@ export function registerFleetTools(
           .enum(['planned', 'observed'])
           .optional()
           .describe(
-            'planned for scope chosen before editing; observed for paths later read from the dirty worktree. They are retained separately. Older clients default to planned.',
+            'planned for scope chosen before editing; observed for paths later read from the dirty worktree. They are retained separately. Older clients default to planned. Restating ground the file guard refused as stale_ground acknowledges it under either.',
           ),
         policy_hash: z
           .string()
@@ -840,6 +845,9 @@ export function registerFleetTools(
           : undefined,
         scope_source,
         toCheckpoint(checkpoint),
+        // The agent's own call: a scope it restates here acknowledges ground this
+        // reply tells it moved, whether it named the scope planned or observed.
+        true,
       );
       if (!result) return err(await staleRunError(db, user.id, grant, runId));
       if ('error' in result) return err(result.error);

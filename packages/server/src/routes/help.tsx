@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import { accessCodeRequired } from '../auth/accessCodes';
 import type { AppEnv } from '../types';
 import { AppLayout } from '../ui/Layout';
 import { SitePage, siteInfo } from '../ui/Site';
@@ -70,8 +71,18 @@ export type HelpEntry = {
   todo: unknown;
   /** Only where the hosted billing composition draws its plan pages. */
   billing?: boolean;
-  /** Only while the private beta is lifting the ceilings on a hosted instance. */
+  /** Only while the beta is lifting the ceilings on a hosted instance. */
   beta?: boolean;
+  /**
+   * Only where signup asks for an access code, and only where signup is shut.
+   *
+   * The door changes and this page is where a locked-out stranger is sent from
+   * the sign-in and password screens, so an entry describing a wall that is not
+   * there sends them looking for an access code they will never need. Both were
+   * unconditional until the beta went public on 2026-09-23.
+   */
+  codeDoor?: boolean;
+  signupClosed?: boolean;
 };
 
 export type HelpSection = {
@@ -97,8 +108,8 @@ export type HelpSection = {
  *
  * `meter` only decides wording that would otherwise be untrue on one kind of
  * instance; what is *shown* is filtered by the route. The defaults describe the
- * hosted service during its private beta, so a caller that wants the whole
- * inventory — the suite — gets every entry.
+ * hosted service during its beta with every door open, so a caller that wants
+ * the whole inventory — the suite — gets every entry.
  */
 export function helpSections(
   meter: { hosted: boolean; beta: boolean } = { hosted: true, beta: true },
@@ -107,7 +118,7 @@ export function helpSections(
     {
       id: 'signin',
       title: 'Getting in',
-      blurb: 'Access codes, sign-in codes, lock-outs, resets and invitations',
+      blurb: 'Sign-in codes, lock-outs, resets, invitations and access codes',
       console: false,
       intro: (
         <>
@@ -118,6 +129,7 @@ export function helpSections(
       ),
       entries: [
         {
+          codeDoor: true,
           quotes: [
             {
               text: 'That access code is not valid. Check the email that invited you to the beta.',
@@ -141,6 +153,7 @@ export function helpSections(
           ),
         },
         {
+          signupClosed: true,
           symptom: (
             <>
               There is no Create account link, and <code>/signup</code> sends you to the sign-in
@@ -155,12 +168,13 @@ export function helpSections(
             },
           ],
           where: 'Browser · sign in',
-          means: <>Registration is closed on this instance. During the private beta that is the normal state.</>,
+          means: <>Registration is closed on this instance. Nobody can create an account here on their own.</>,
           todo: (
             <>
-              You get in with an access code once the door is open — use the link in the email that
-              sent it — or with an invitation from somebody who already has a workspace here: an
-              owner makes one on the People tab, or their agent calls <code>create_invite</code>.
+              You get in with an invitation from somebody who already has a workspace here: an owner
+              makes one on the People tab, or their agent calls <code>create_invite</code>. Where
+              the operator has configured access codes, the code in your invitation email opens the
+              door instead.
             </>
           ),
         },
@@ -1617,20 +1631,19 @@ export function helpSections(
     {
       id: 'limits',
       title: 'Plans and limits',
-      blurb: 'Hosted plan ceilings, and what the private beta lifts',
+      blurb: 'Hosted plan ceilings, and what the beta lifts',
       console: true,
       hosted: true,
       intro: meter.beta ? (
         <>
-          Every ceiling below is lifted while this service is in its private beta — only how long
-          history is kept is not — so you should not meet them yet. They belong to the plan a
+          Every ceiling below is lifted while this service is in beta — only how long history is
+          kept is not — so you should not meet them yet. They belong to the plan a
           workspace is on, and a server you run yourself is never metered at all.
         </>
       ) : (
         <>
           These belong to the plan a workspace is on. A server you run yourself is never metered,
-          and during a private beta the hosted service lifts all of them but the age limit on
-          history.
+          and during a beta the hosted service lifts all of them but the age limit on history.
         </>
       ),
       entries: [
@@ -1718,12 +1731,12 @@ export function helpSections(
           beta: true,
           quotes: [
             { text: 'Nothing to pay yet', hostedOnly: true },
-            { text: 'Not selling yet — STMA is in private beta.', hostedOnly: true },
+            { text: 'Not selling yet — STMA is in beta.', hostedOnly: true },
           ],
           where: 'Browser · Plan & billing',
           means: (
             <>
-              STMA is in a private beta. Every workspace has every feature and none of the plan
+              STMA is in beta. Every workspace has every feature and none of the plan
               limits, and plans are not for sale yet, so there is no billing to manage. History is
               the one exception: kept for 90 days, as on Cloud Free, so the end of the beta deletes
               nothing.
@@ -2056,14 +2069,25 @@ helpRoutes.get('/help', (c) => {
   const support = env.supportEmail;
   const privacy = env.privacyEmail;
 
-  // Every door it draws is a door that is there: plan ceilings only where plans
-  // decide something, the beta's billing page only while that page says this.
+  // Every wall it describes is a wall that is there: plan ceilings only where
+  // plans decide something, the beta's billing page only while that page says
+  // this, the access-code refusal only where codes are configured, and the
+  // closed-registration entry only where registration is closed. This page is
+  // where a locked-out stranger is sent from sign-in and from all four password
+  // screens, so an entry about a door that is open sends them looking for a key
+  // nobody will give them.
+  const codeDoor = accessCodeRequired(env);
+  const signupClosed = !(env.localAuth && env.signupsOpen);
   const sections = helpSections({ hosted: env.hosted, beta: env.betaUnmetered })
     .filter((section) => (showConsole || !section.console) && (!section.hosted || env.hosted))
     .map((section) => ({
       ...section,
       entries: section.entries.filter(
-        (entry) => (billing || !entry.billing) && (env.betaUnmetered || !entry.beta),
+        (entry) =>
+          (billing || !entry.billing) &&
+          (env.betaUnmetered || !entry.beta) &&
+          (codeDoor || !entry.codeDoor) &&
+          (signupClosed || !entry.signupClosed),
       ),
     }))
     .filter((section) => section.entries.length > 0);

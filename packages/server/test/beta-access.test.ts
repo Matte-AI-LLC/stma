@@ -504,3 +504,50 @@ it('holds account creation to a ceiling every replica agrees on', async () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+/**
+ * /help describes the walls this instance actually has.
+ *
+ * The page is where a locked-out stranger is sent from sign-in and from all
+ * four password screens, so on the day the door opened (2026-09-23) two of its
+ * entries became worse than useless: one explained a refused access code and
+ * one told the reader registration was closed and they needed an invitation.
+ * Both are still right for an instance that works that way, which is what the
+ * two servers here are for.
+ */
+it('shows the access-code wall only where there is one, and the closed-door wall only where signup is shut', async () => {
+  const codeHelp = await (await fetch(`${beta.url}/help`)).text();
+  expect(codeHelp, 'an instance that asks for a code explains a refused one').toContain(
+    'That access code is not valid',
+  );
+
+  const dir = mkdtempSync(path.join(tmpdir(), 'stma-openhelp-'));
+  const open = await startServer(
+    loadEnv({ ...BASE, pgliteDir: dir, hosted: true, betaUnmetered: true, publicMode: 'full' }),
+  );
+  const shutDir = mkdtempSync(path.join(tmpdir(), 'stma-shuthelp-'));
+  const shut = await startServer(
+    loadEnv({ ...BASE, pgliteDir: shutDir, hosted: true, signupsOpen: false, publicMode: 'full' }),
+  );
+  try {
+    const openHelp = await (await fetch(`${open.url}/help`)).text();
+    expect(openHelp, 'no code is asked for, so no entry about a refused one').not.toContain(
+      'That access code is not valid',
+    );
+    expect(openHelp, 'anybody can sign up, so registration is not closed').not.toContain(
+      'Registration is closed on this instance',
+    );
+    // And the page does not contradict the footer it carries.
+    expect(openHelp).not.toContain('private beta');
+
+    const shutHelp = await (await fetch(`${shut.url}/help`)).text();
+    expect(shutHelp, 'signup is shut, so the entry that says so belongs here').toContain(
+      'Registration is closed on this instance',
+    );
+  } finally {
+    await open.close();
+    await shut.close();
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(shutDir, { recursive: true, force: true });
+  }
+});

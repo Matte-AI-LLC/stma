@@ -692,9 +692,11 @@ export const Landing = ({ site, baseUrl }: { site: SiteInfo; baseUrl: string }) 
               <div class="lx-run-card">
                 <span class="overline">Self-hosted</span>
                 <h3>Your hardware, one command</h3>
+                {/* The contrast is the machine, not the door: with a public beta
+                    nobody needs an invitation for the hosted one either. */}
                 <p>
-                  An embedded database and no setup: the same server, source-available on npm today,
-                  with no invitation needed.
+                  An embedded database and no setup: the same server, source-available on npm
+                  today, on hardware you control and with no account anywhere.
                 </p>
                 <CopyCommand command="npx @matteai/stma serve" />
               </div>

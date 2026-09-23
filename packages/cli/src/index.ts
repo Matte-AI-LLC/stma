@@ -1511,7 +1511,9 @@ function collisionNotices(conflicts: unknown): string[] {
           ? text
           : 'a path it claimed',
   });
-  return [report.blocked, report.holding].filter((line): line is string => Boolean(line)).map((line) => `STMA — ${line}`);
+  return [report.blocked, report.holding, report.reading, report.readBy]
+    .filter((line): line is string => Boolean(line))
+    .map((line) => `STMA — ${line}`);
 }
 
 /**

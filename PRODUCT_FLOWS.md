@@ -600,6 +600,14 @@ declaration; ground dropped and declared again starts over. Where neither side i
 both are treated as the later one. Before this, two agents on one file each stopped for the other
 and a run could halt another's edits by declaring its file.
 
+**A read holds nothing.** Between a read claim and a write claim the writer has the right of way
+whoever declared first, the guard never refuses an edit because another run is reading, and
+nobody is listed as waiting: the reader is told that what it read may change and to re-read it,
+the writer that its change goes ahead. The overlap is named as a read ("One run may read files
+while the other changes them.") and is one step less severe than the same ground written twice.
+Until 2026-09-23 every read against a write was reported as two runs writing the same path, so a
+reviewer that declared a file read-only could stop the agent changing it.
+
 A collision also says **what the holding run is doing and how long it holds the ground for**: the
 conflict carries `theirState` and `theirLeaseEndsAt`, and one sentence built from them appears in
 the tool reply, in the write guard's refusal, in the hook's explanation and in the agent map's
@@ -751,7 +759,15 @@ completion/handoff should close its own run without closing another installation
   and start another on the new branch, so a handoff received on a different branch resumes from
   a run whose start checkpoint is the handed-over commit. The write guard refuses `stale_ground`
   only until the run re-declares the claim after the report; the `update_run` report itself keeps
-  naming what moved.
+  naming what moved. An `update_run` the agent sends that restates that ground acknowledges it
+  whichever `scope_source` it names (recorded as the run's `ground_acknowledged` event); the
+  hooks' own heartbeats, which report the dirty worktree, never acknowledge anything. Where a
+  live holder with the right of way also stands on the ground, the refusal is `work_conflict` and
+  names it; the moved ground is reported once the holder lets go.
+- A handoff addressed to an agent by name that carries a branch is announced as work that
+  continues on that branch: switching the checkout to that existing branch is part of the handoff,
+  not a new branch, and the commands are the receiving agent's own, never copied from the brief.
+  The "commit only on the branch this checkout is already on" rule belongs to assignments.
 - `handoff_work` writes a structured resume block derived from the run, releases its claims and
   closes it. A branch handoff must reference an immutable delivery/tested checkpoint recorded on
   that run, either earlier or atomically in the handoff call; otherwise it is refused and the run

@@ -44,14 +44,17 @@ const HOLDER_STATE_WORDS: Record<AgentRunStatus, string> = {
 export const holderNeedsAPerson = (state: AgentRunStatus | undefined): boolean =>
   state === 'waiting' || state === 'blocked';
 
-function describeHold(leaseEndsAt: string | undefined, now: Date): string | undefined {
+function describeHold(leaseEndsAt: string | undefined, now: Date, reading = false): string | undefined {
   if (!leaseEndsAt) return undefined;
   const ends = new Date(leaseEndsAt).getTime();
   if (!Number.isFinite(ends)) return undefined;
   const minutes = Math.round((ends - now.getTime()) / 60_000);
-  if (minutes <= 0) return 'its hold has run out';
-  if (minutes === 1) return 'holds it for about another minute';
-  return `holds it for about another ${minutes} minutes`;
+  if (minutes <= 0) return reading ? 'its read has run out' : 'its hold has run out';
+  // A read holds nothing, so it is never called a hold: "holds it" is how a real
+  // agent came to tell its human that a reviewer "holds the write lock".
+  const verb = reading ? 'reading it' : 'holds it';
+  if (minutes === 1) return `${verb} for about another minute`;
+  return `${verb} for about another ${minutes} minutes`;
 }
 
 /**
@@ -63,26 +66,43 @@ function describeHold(leaseEndsAt: string | undefined, now: Date): string | unde
 export function describeHolder(claim: ConflictClaim, now: Date = new Date()): string {
   const parts = [`${claim.agentName} (${claim.owner})`];
   if (claim.runState) parts.push(HOLDER_STATE_WORDS[claim.runState]);
-  const hold = describeHold(claim.leaseEndsAt, now);
+  const hold = describeHold(claim.leaseEndsAt, now, claim.access === 'read');
   if (hold) parts.push(hold);
   return parts.join(', ');
 }
 
+/**
+ * One side reads while the other writes. Two reads never collide, so a read on
+ * either side is the whole test. A missing `access` is a write: that is what
+ * every claim meant before reads were told apart, and what an older client sends.
+ */
+export const isReadOverlap = (conflict: {
+  current: { access?: ClaimAccessMode };
+  existing: { access?: ClaimAccessMode };
+}): boolean => conflict.current.access === 'read' || conflict.existing.access === 'read';
+
 /** A conflict as its two sides see it: my claim, their claim, and who was first. */
 export interface RightOfWayConflict {
   severity?: ConflictSeverity;
-  /** `yours`: the other run declared it after you. `theirs`: you are the one who waits. */
+  /**
+   * `yours`: the other run declared it after you. `theirs`: you are the one who
+   * waits. Between a read and a write the writer has it, whoever came first.
+   */
   rightOfWay?: 'yours' | 'theirs';
-  current: { resourceKey: string };
+  current: { resourceKey: string; access?: ClaimAccessMode };
   existing: ConflictClaim;
 }
 
-/** The two things a collision can say to one run, each about its own ground. */
+/** The things a collision can say to one run, each about its own ground. */
 export interface ConflictReport {
   /** Ground another run declared first. This run waits for that ground. */
   blocked?: string;
   /** Ground this run declared first. The other run was told to wait for it. */
   holding?: string;
+  /** Ground this run only reads while another run changes it: re-read, do not stop. */
+  reading?: string;
+  /** Ground this run changes while another run reads it: carry on, nobody waits. */
+  readBy?: string;
   /** A holder parked on a person will not free its ground by itself. */
   needsAPerson: boolean;
 }
@@ -125,26 +145,48 @@ function nameList(items: string[], limit: number): string {
  *
  * So both sentences are built here from the same rows, and each one names the
  * ground it is about. Same reason as `describeHolder`, one level up.
+ *
+ * A read against a write is neither half (T3 Mac round, 2026-09-23). It was
+ * told as a write collision with the right of way to whoever declared first, so
+ * a reviewer that declared `src/carrier.mjs` read-only was reported to the agent
+ * actually changing it as the one holding it — "leave alone … which declared it
+ * first" — and that agent told its human the reviewer held the write lock and
+ * stopped. A read holds nothing: the writer carries on, and the reader is told
+ * that what it read may change. Neither waits.
  */
 export function conflictReport(
   conflicts: RightOfWayConflict[],
   { now = new Date(), safe = (text) => text }: ConflictWords = {},
 ): ConflictReport {
-  const blocked = conflicts.filter((conflict) => conflict.rightOfWay !== 'yours');
-  const holding = conflicts.filter((conflict) => conflict.rightOfWay === 'yours');
+  const writes = conflicts.filter((conflict) => !isReadOverlap(conflict));
+  const blocked = writes.filter((conflict) => conflict.rightOfWay !== 'yours');
+  const holding = writes.filter((conflict) => conflict.rightOfWay === 'yours');
+  const reading = conflicts.filter((conflict) => conflict.current.access === 'read');
+  const readBy = conflicts.filter(
+    (conflict) => conflict.current.access !== 'read' && conflict.existing.access === 'read',
+  );
   const needsAPerson = blocked.some((conflict) => holderNeedsAPerson(conflict.existing.runState));
   const ground = (side: RightOfWayConflict[]) =>
     nameList(
       side.map((conflict) => safe(conflict.current.resourceKey, 'resource')),
       NAMED_RESOURCES,
     );
-  const report: ConflictReport = { needsAPerson };
-
-  if (blocked.length > 0) {
-    const holders = nameList(
-      blocked.map((conflict) => safe(describeHolder(conflict.existing, now), 'holder')),
+  const others = (side: RightOfWayConflict[]) =>
+    nameList(
+      side.map((conflict) => safe(describeHolder(conflict.existing, now), 'holder')),
       NAMED_HOLDERS,
     );
+  const report: ConflictReport = { needsAPerson };
+
+  if (reading.length > 0) {
+    report.reading = `Another run is changing ground you are only reading (${ground(reading)}, changed by ${others(reading)}): what you read there may change. A read holds nothing and waits for nobody, so carry on, but re-read those files before you rely on them, and again once that run is done.`;
+  }
+  if (readBy.length > 0) {
+    report.readBy = `Ground you are changing is also being read by ${others(readBy)} (${ground(readBy)}). A read holds nothing and does not make you wait: carry on with your change; that run was told its copy may change.`;
+  }
+
+  if (blocked.length > 0) {
+    const holders = others(blocked);
     report.blocked = [
       blocked[0]?.severity === 'critical'
         ? 'STOP and tell your human before writing. Another live run holds the same migration or contract; claims are advisory, so nothing prevents you both from writing it. Coordinate through open_session or announce.'
@@ -430,7 +472,27 @@ function severityFor(type: ClaimResourceType, a: string, b: string): ConflictSev
   return 'high';
 }
 
+/**
+ * A read against a write is one step less severe than the same ground written
+ * twice: somebody's copy may go stale, but nobody's change is at risk of being
+ * overwritten. So reading a migration another run is changing is no longer the
+ * team's red alarm, while two runs writing it still is.
+ */
+const SOFTER: Record<ConflictSeverity, ConflictSeverity> = {
+  critical: 'high',
+  high: 'medium',
+  medium: 'low',
+  low: 'low',
+};
+
 function reasonFor(type: ClaimResourceType, access: ClaimAccessMode): string {
+  if (access === 'read') {
+    if (type === 'migration') return 'One run reads the migration chain while the other changes it.';
+    if (type === 'contract') return 'One run reads the shared contract while the other changes it.';
+    if (type === 'config') return 'One run reads shared configuration while the other changes it.';
+    if (type === 'component') return 'One run reads a component while the other changes it.';
+    return 'One run may read files while the other changes them.';
+  }
   if (type === 'migration') return 'Both runs may change the same migration chain.';
   if (type === 'contract') return 'Both runs may change the same shared contract.';
   if (type === 'config') return 'The runs overlap on shared configuration.';
@@ -508,11 +570,15 @@ export function detectClaimConflicts(
     for (const b of existing) {
       if (a.runId === b.runId || (a.access === 'read' && b.access === 'read')) continue;
       if (!claimsOverlap(a, b)) continue;
-      const writeAccess: ClaimAccessMode =
-        a.access === 'write' || b.access === 'write' ? 'write' : 'read';
+      // Both sides write, or one of them only reads. This was `||` until
+      // 2026-09-23, which after the read/read skip above is always true: every
+      // read against a write was reported as two runs writing the same path, and
+      // the sentence for a read was never reachable.
+      const overlap: ClaimAccessMode = a.access === 'write' && b.access === 'write' ? 'write' : 'read';
+      const severity = severityFor(a.resourceType, a.resourceKey, b.resourceKey);
       out.push({
-        severity: severityFor(a.resourceType, a.resourceKey, b.resourceKey),
-        reason: reasonFor(a.resourceType, writeAccess),
+        severity: overlap === 'write' ? severity : SOFTER[severity],
+        reason: reasonFor(a.resourceType, overlap),
         current: a,
         existing: b,
       });

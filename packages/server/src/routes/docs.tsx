@@ -873,7 +873,9 @@ docsRoutes.get('/docs', (c) => {
                     spent so far, same discipline: only a figure you read counts as measured, and
                     only measured figures are ever summed. Use <code>scope_source</code> to keep
                     planned ground separate from paths observed later in the dirty worktree; an
-                    optional delivery/test checkpoint is immutable and retry-safe.
+                    optional delivery/test checkpoint is immutable and retry-safe. When the file
+                    guard stops an edit because the ground moved, restating that ground here is
+                    what acknowledges it, whichever <code>scope_source</code> you name.
                   </td>
                 </tr>
                 <tr id="tool-finish_run">
@@ -1444,7 +1446,10 @@ docsRoutes.get('/docs', (c) => {
                     read, red where two live runs want to write the same thing. In a collision
                     the run that declared the ground first keeps the right of way: it is told to
                     carry on and its edits stay allowed, while the run that came later is told to
-                    wait and is the one the file guard refuses. Two runs usually reach for the same
+                    wait and is the one the file guard refuses. A read holds nothing: between a
+                    run that only reads a file and one that changes it the change goes ahead
+                    whoever declared first, and the reader is told what it read may change.
+                    Two runs usually reach for the same
                     files in a different order, so each is first on some of the ground: the reply an
                     agent reads then says both halves as two sentences, each naming its own files,
                     the one it must leave alone and the one it keeps. Click a run to see

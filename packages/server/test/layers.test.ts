@@ -209,6 +209,23 @@ describe('the npm layer is installable', () => {
     ]);
     expect(manifest('packages/cli/package.json').files).toEqual(['README.md', 'LICENSE', 'dist']);
   });
+
+  it('actually ships the licence it says it ships', () => {
+    // `files` naming a path that does not exist is silent: npm packs what it
+    // finds and says nothing about the rest, so @matteai/stma-server went out
+    // under Elastic-2.0 with no licence text in the tarball from its first
+    // release until 2026-09-23. Checked for every non-glob entry that is not a
+    // build output, because those are the ones a build would create anyway.
+    for (const pkg of ['packages/server', 'packages/cli']) {
+      for (const entry of manifest(`${pkg}/package.json`).files as string[]) {
+        if (entry === 'dist' || entry === 'drizzle') continue;
+        expect(
+          existsSync(path.join(repo, pkg, entry)),
+          `${pkg}/package.json declares ${entry} and it is not there`,
+        ).toBe(true);
+      }
+    }
+  });
 });
 
 describe('the commercial boundary is mechanical', () => {

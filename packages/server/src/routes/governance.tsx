@@ -181,6 +181,15 @@ function eventDetail(type: string, detail: unknown): string {
       .filter(Boolean)
       .join(' · ');
   }
+  if (type === 'ground_acknowledged') {
+    // The agent restated ground it had just been told moved: what lets the write
+    // guard allow the edit it refused with stale_ground.
+    const claims = Array.isArray(d.claims) ? (d.claims as { resourceKey?: unknown }[]) : [];
+    const keys = claims.map((claim) => String(claim?.resourceKey ?? '')).filter(Boolean);
+    return ['acknowledged moved ground', keys.slice(0, 3).join(', ') + (keys.length > 3 ? ` +${keys.length - 3}` : '')]
+      .filter(Boolean)
+      .join(' · ');
+  }
   if (type === 'pr_opened' || type === 'pr_merged' || type === 'pr_closed') {
     return [`PR #${d.number ?? '?'}`, d.title].filter(Boolean).join(' · ');
   }

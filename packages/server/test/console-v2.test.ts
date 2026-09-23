@@ -632,8 +632,12 @@ it('shows a stranger the documentation and an honest sentence, not a product pag
     const help = await fetch(`${teaser.url}/help`);
     expect(help.status, '/help must answer a stranger').toBe(200);
     const helpHtml = await help.text();
-    expect(helpHtml).toContain('That access code is not valid');
     expect(helpHtml).toContain('Too many sign-in attempts for this email address');
+    // The access-code refusal is NOT here: this fixture configures no codes, so
+    // that wall does not exist on it, and an entry describing a wall that is not
+    // there sends a locked-out stranger looking for a key nobody will give them.
+    // beta-access.test.ts holds the other half, on an instance that does ask.
+    expect(helpHtml).not.toContain('That access code is not valid');
     // A stranger has no account, so no enrollment code and no running agent:
     // every section about connecting and running agents is console content and
     // follows the same rule as the guide's, index and contents included.
@@ -693,7 +697,9 @@ it('names the walls people actually hit, in the words the product prints', async
   expect(res.status, '/help must be readable with no account').toBe(200);
   const html = await res.text();
   for (const printed of [
-    'That access code is not valid',
+    // 'That access code is not valid' is deliberately absent: it renders only
+    // where signup asks for a code, which this fixture does not. See
+    // beta-access.test.ts.
     'Too many sign-in codes were requested',
     'invite code is invalid, expired or used up',
     'Run this in a regular interactive terminal',

@@ -3,6 +3,7 @@ import {
   describeHolder,
   detectClaimConflicts,
   holderNeedsAPerson,
+  isReadOverlap,
   quotaStateFor,
   type ClaimConflict,
   type ConflictClaim,
@@ -747,7 +748,15 @@ agentsRoutes.get('/app/agents', async (c) => {
                         ? ' — it will not free the ground by itself.'
                         : ''}
                     </span>
-                    {rightOfWay ? (
+                    {/* Between a read and a write nobody waits, whoever came
+                        first: the same rule the guard applies. */}
+                    {isReadOverlap(worst) ? (
+                      <span class="muted small" style="display:block">
+                        {worst.current.access === 'read'
+                          ? 'This run only reads it while the other changes it. A read holds nothing, so neither waits.'
+                          : 'The other run only reads it. A read holds nothing, so this change goes ahead and neither waits.'}
+                      </span>
+                    ) : rightOfWay ? (
                       <span class="muted small" style="display:block">
                         {rightOfWay === 'mine'
                           ? 'This run declared it first and keeps the right of way; the other was told to wait.'

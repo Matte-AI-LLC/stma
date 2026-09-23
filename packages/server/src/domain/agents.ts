@@ -7,6 +7,7 @@ import {
   detectClaimConflicts,
   findDuplicates,
   holderNeedsAPerson,
+  isReadOverlap,
   issueFromTaskKey,
   quotaStateFor,
   pathClaimsOverlap,
@@ -562,6 +563,13 @@ async function replaceRunClaimsForFound(
  * The run that declared the ground first and has held it since keeps going; the
  * later one waits. Unknown on either side means nobody was provably first, and
  * both are treated as the later one, which is how it always behaved.
+ *
+ * Between a read and a write the writer has the right of way, whoever declared
+ * first, and nobody waits (T3 Mac round, 2026-09-23). Measured: a reviewer
+ * declared a file read-only, the agent changing it was told to leave it alone
+ * because the reviewer "declared it first", and the guard would have refused
+ * that agent's edit with work_conflict. A read holds nothing to protect; the
+ * reader is the one whose copy may go stale, and it is told so.
  */
 export type RunConflict = ClaimConflict & { rightOfWay: 'yours' | 'theirs' };
 
@@ -650,6 +658,9 @@ async function conflictsForRun(db: Db, found: RunOwner, runId: string, claims: W
     if (!known || row.firstDeclaredAt < known) myFirst.set(key, row.firstDeclaredAt);
   }
   const conflicts: RunConflict[] = detectClaimConflicts(current, existing).map((conflict) => {
+    if (isReadOverlap(conflict)) {
+      return { ...conflict, rightOfWay: conflict.current.access === 'write' ? 'yours' : 'theirs' };
+    }
     const mine = myFirst.get(claimDeclarationKey(conflict.current));
     const theirs = theirFirst.get(`${conflict.existing.runId}\0${claimDeclarationKey(conflict.existing)}`);
     return { ...conflict, rightOfWay: mine && theirs && mine < theirs ? 'yours' : 'theirs' };
@@ -940,6 +951,12 @@ export async function heartbeatAgentRun(
   usage?: AgentQuota,
   claimSource: ClaimSource = 'planned',
   checkpointInput?: RunCheckpointInput & { kind: 'delivery' | 'tested' },
+  /**
+   * The agent sent this itself (`update_run`), as opposed to a hook reporting
+   * the dirty worktree. Only an explicit restatement can acknowledge moved
+   * ground: see `ground_acknowledged` below.
+   */
+  explicit = false,
 ) {
   return db.transaction(async (transaction) => {
     const tx = transaction as unknown as Db;
@@ -1000,6 +1017,35 @@ export async function heartbeatAgentRun(
       access: claim.access as WorkClaim['access'],
     }));
     const stale = await staleGroundFor(tx, found.run, held);
+    // The agent restated ground this very reply tells it moved: that is the
+    // acknowledgment the write guard waits for, whichever source it named. It
+    // used to count only as rewritten `planned` rows, and the refusal says
+    // "re-declare your scope with update_run" without naming a source — measured
+    // in the T3 Mac round (2026-09-23), an agent re-declared with
+    // `scope_source: "observed"` three times and the guard refused it for the
+    // rest of the run. An `observed` row cannot carry it instead: the hook
+    // rewrites those from the dirty worktree on its own heartbeats, which must
+    // never acknowledge anything, and would delete an agent's row the moment
+    // another file is dirty. So it is an event of the run, written only here.
+    if (explicit && claims && claims.length > 0 && stale.length > 0) {
+      const moved = claims.filter((claim) =>
+        stale.some(
+          (entry) =>
+            entry.resourceType === claim.resourceType &&
+            entry.resourceKey.toLowerCase() === claim.resourceKey.toLowerCase(),
+        ),
+      );
+      if (moved.length > 0) {
+        await addAgentEvent(tx, runId, 'ground_acknowledged', {
+          claims: moved.map((claim) => ({
+            resourceType: claim.resourceType,
+            resourceKey: claim.resourceKey,
+            access: claim.access,
+          })),
+          source: claimSource,
+        });
+      }
+    }
     return {
       runId,
       status: nextStatus,
@@ -1050,20 +1096,45 @@ export async function guardRunWrite(
     const conflicts = await conflictsForRun(tx, found, runId, input.claims);
     // Only ground somebody else held first stops an edit. A run that declares a
     // file another run is already working in is told to wait; it must not be able
-    // to stop that run's edits by doing so.
-    const blocking = conflicts.filter((conflict) => conflict.rightOfWay === 'theirs');
-    if (blocking.length) reason = 'work_conflict';
+    // to stop that run's edits by doing so. A read stops nothing and waits for
+    // nothing, whoever declared it first (see RunConflict).
+    const blocking = conflicts.filter((conflict) => conflict.rightOfWay === 'theirs' && !isReadOverlap(conflict));
+    const waiting = conflicts.filter((conflict) => conflict.rightOfWay === 'yours' && !isReadOverlap(conflict));
     // Ground that moved before this run last declared the claim was acknowledged
     // by that declaration; the guard refuses only what the agent has not been
-    // told about yet (or was told about and has not re-declared since).
-    const stale = await staleGroundFor(tx, found.run, input.claims, new Map(held.map((c) => [claimDeclarationKey(c), c.createdAt])));
+    // told about yet (or was told about and has not re-declared since). A
+    // declaration is a rewritten `planned` row or an explicit update_run that
+    // restated the moved ground under either source (`ground_acknowledged`).
+    const declaredAt = new Map(held.map((c) => [claimDeclarationKey(c), c.createdAt]));
+    const acknowledged = await tx
+      .select({ detail: agentEvents.detail, createdAt: agentEvents.createdAt })
+      .from(agentEvents)
+      .where(and(eq(agentEvents.runId, runId), eq(agentEvents.type, 'ground_acknowledged')))
+      .orderBy(desc(agentEvents.createdAt))
+      .limit(50);
+    for (const ack of acknowledged) {
+      const restated = (ack.detail as { claims?: WorkClaim[] } | null)?.claims;
+      for (const claim of Array.isArray(restated) ? restated : []) {
+        const key = claimDeclarationKey(claim);
+        const known = declaredAt.get(key);
+        if (!known || ack.createdAt > known) declaredAt.set(key, ack.createdAt);
+      }
+    }
+    const stale = await staleGroundFor(tx, found.run, input.claims, declaredAt);
     if (stale.length) reason = 'stale_ground';
+    // A live holder outranks ground that moved: it is the one fact the agent can
+    // act on now (name who holds it, or wait for them), and once it lets go the
+    // moved ground is reported on the next try. It used to be the other way
+    // round, and an agent stopped by a live holder was told only that "another
+    // run finished on this ground", so it could not say who it was waiting for
+    // (T3 Mac round, 2026-09-23).
+    if (blocking.length) reason = 'work_conflict';
     const allowed = !reason;
     if (allowed) await replaceRunClaimsForFound(tx, found, claims, claimLeaseMinutes);
     await addAgentEvent(tx, runId, 'write_guard_decision', {
       allowed, reason: reason ?? 'scope_reserved', installationId: found.installation.id,
       claimCount: input.claims.length, otherRunIds: [...new Set(blocking.map((c) => c.existing.runId))],
-      waitingRunIds: [...new Set(conflicts.filter((c) => c.rightOfWay === 'yours').map((c) => c.existing.runId))],
+      waitingRunIds: [...new Set(waiting.map((c) => c.existing.runId))],
     });
     return { allowed, reason: reason ?? 'scope_reserved', runId,
       conflictRuns: [...new Set(blocking.map((c) => c.existing.runId))],
@@ -1076,7 +1147,7 @@ export async function guardRunWrite(
       // itself waiting for somebody is how two agents wait for each other.
       conflictNeedsAPerson: blocking.some((c) => holderNeedsAPerson(c.existing.runState)),
       // Runs that declared this ground after this one and are waiting for it.
-      waitingAgents: [...new Set(conflicts.filter((c) => c.rightOfWay === 'yours').map((c) => describeHolder(c.existing)))],
+      waitingAgents: [...new Set(waiting.map((c) => describeHolder(c.existing)))],
       coverage: 'installed_file_tool_hook_only',
       policyHash: 'error' in policy ? null : policy.hash,
       // The published `content:` deny lines, verbatim. The path is clear by the
