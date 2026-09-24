@@ -17,6 +17,7 @@ import {
   teams,
   tokens,
   users,
+  webSessions,
 } from '../db/schema';
 import { describeCohort } from '../auth/accessCodes';
 import {
@@ -27,7 +28,15 @@ import {
   cohortSummaries,
   nearestTheLine,
 } from '../domain/betaCohorts';
-import { adminConfigured, isAdminUser } from '../lib/admin';
+import { adminConfigured, isAdminEmail, isAdminUser, isAdminUsername } from '../lib/admin';
+import { DEMO_WORKSPACE, seedDemoWorkspace } from '../domain/demoWorkspace';
+import {
+  REVIEW_ACCESS_MAX_DAYS,
+  parseReviewLastDay,
+  reviewAccessActive,
+  reviewAccessLastDay,
+  reviewAccessRefusal,
+} from '../lib/reviewAccess';
 import { ceilingHistory, setTeamPlan, type CeilingChangeRow } from '../lib/ceilings';
 import { DEVICE_WINDOW_DAYS } from '../lib/devices';
 import {
@@ -2666,6 +2675,7 @@ adminRoutes.get('/admin/users', async (c) => {
                     {u.passwordHash ? <span class="pill pill-member">password</span> : null}
                     {u.githubId != null ? <span class="pill pill-member">github</span> : null}
                     {isAdminUser(env, u) ? <span class="pill pill-owner">admin</span> : null}
+                    {reviewAccessActive(u) ? <span class="pill pill-open">review access</span> : null}
                     {!u.passwordHash && u.githubId == null && !isAdminUser(env, u) ? (
                       <span class="muted small">—</span>
                     ) : null}
@@ -2705,6 +2715,12 @@ adminRoutes.get('/admin/users/:id', async (c) => {
     account.githubId != null ? 'GitHub' : '',
     isAdminUser(env, account) ? 'admin' : '',
   ].filter(Boolean).join(', ') || 'none — sign-in blocked';
+  const reviewing = reviewAccessActive(account);
+  const reviewRefused = reviewing
+    ? null
+    : reviewAccessRefusal(account, { operator: listedOperator(env, account), twoFactor: env.twoFactor });
+  const suggestedLastDay = new Date(Date.now() + 29 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const latestLastDay = new Date(Date.now() + REVIEW_ACCESS_MAX_DAYS * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
 
   return c.html(
     <AppLayout user={actor} active="admin" title={`Admin — ${account.username}`}>
@@ -2743,6 +2759,51 @@ adminRoutes.get('/admin/users/:id', async (c) => {
             </form>
           )}
         </div>
+      </div>
+
+      <div class="card card-pad" style="margin-top:14px" id="review-access">
+        <div class="card-title">Review access</div>
+        <p class="small muted">
+          For a reviewer who is given this account's password and cannot read its mailbox, such as
+          Claude's connector directory. Until the end of the chosen day (UTC, at most{' '}
+          {REVIEW_ACCESS_MAX_DAYS} days away) signing in skips the emailed code. The password and
+          its throttle still apply, each such sign-in is mailed to the account's address, the
+          browser session it opens lasts a day, and while it runs the account keeps its address,
+          cannot be deleted and is never an operator.
+        </p>
+        {reviewing ? (
+          <div class="inline" style="gap:10px;flex-wrap:wrap">
+            <span class="pill pill-open">on through {reviewAccessLastDay(account.reviewAccessUntil!)} (UTC)</span>
+            <form class="inline m0" method="post" action={`/admin/users/${account.id}/review-access/off`} data-confirm={`Turn off review access for ${account.username}? Every browser signed in to this account is signed out. Agent connections it authorized, the Claude app included, keep working until they are revoked.`}>
+              <button class="btn btn-sm btn-danger" type="submit">Turn off</button>
+            </form>
+          </div>
+        ) : reviewRefused ? (
+          <p class="muted">{reviewRefused}</p>
+        ) : (
+          <form method="post" action={`/admin/users/${account.id}/review-access`} class="inline" style="gap:10px;flex-wrap:wrap">
+            <label class="field m0"><span>Last day (UTC)</span><input class="in" type="date" name="last_day" value={suggestedLastDay} max={latestLastDay} required /></label>
+            <button class="btn btn-primary" type="submit">Turn on review access</button>
+          </form>
+        )}
+      </div>
+
+      <div class="card card-pad" style="margin-top:14px" id="demo-workspace">
+        <div class="card-title">Demo workspace</div>
+        <p class="small muted">
+          Builds {DEMO_WORKSPACE}, owned by this account, the way the product would have written it:
+          three connected agents on three machines, published rules and knowledge, two machines'
+          environment snapshots that disagree, a finished assignment, a solved problem, a handoff and
+          an assignment waiting, and an open question. For a reviewer or a demonstration. Only for an
+          account with no workspace yet.
+        </p>
+        {workspaceRows.length > 0 ? (
+          <p class="muted">This account already belongs to a workspace, so it gets no demo.</p>
+        ) : (
+          <form method="post" action={`/admin/users/${account.id}/demo-workspace`} data-confirm={`Build the ${DEMO_WORKSPACE} demo workspace for ${account.username}? It takes a few seconds and mails this account about the handoff it contains.`}>
+            <button class="btn btn-primary" type="submit">Build the demo workspace</button>
+          </form>
+        )}
       </div>
 
       <div class="card scroll-x" style="margin-top:14px">
@@ -2995,6 +3056,97 @@ adminRoutes.post('/admin/users/:id/memberships/:teamId/remove', async (c) => {
  * created before email login (and dev/OAuth accounts without a verified address)
  * have none, and nobody but an operator can set the first one.
  */
+/** Listed as an operator by name or address, confirmed or not. */
+function listedOperator(
+  env: Pick<AppEnv['Variables']['env'], 'adminUsernames' | 'adminEmails'>,
+  account: { username: string; email: string | null },
+): boolean {
+  return isAdminUsername(env, account.username) || isAdminEmail(env, account.email);
+}
+
+adminRoutes.post('/admin/users/:id/review-access', async (c) => {
+  const actor = c.get('user')!;
+  const env = c.get('env');
+  const db = c.get('db');
+  const id = c.req.param('id');
+  if (!UUID_RE.test(id)) return c.notFound();
+  const back = (msg: string, ok = false) =>
+    c.redirect(`/admin/users/${id}?${ok ? 'ok' : 'error'}=${encodeURIComponent(msg)}#review-access`);
+  const account = (await db.select().from(users).where(eq(users.id, id)).limit(1))[0];
+  if (!account) return c.notFound();
+  const refused = reviewAccessRefusal(account, { operator: listedOperator(env, account), twoFactor: env.twoFactor });
+  if (refused) return back(refused);
+  const parsed = parseReviewLastDay((await c.req.parseBody()).last_day);
+  if ('error' in parsed) return back(parsed.error);
+  await db.update(users).set({ reviewAccessUntil: parsed.until }).where(eq(users.id, id));
+  logLine({
+    evt: 'admin',
+    a: 'review_access_on',
+    u: actor.username,
+    target: account.username,
+    until: parsed.until.toISOString(),
+  });
+  return back(
+    `${account.username} signs in without an emailed code through ${reviewAccessLastDay(parsed.until)} (UTC).`,
+    true,
+  );
+});
+
+adminRoutes.post('/admin/users/:id/review-access/off', async (c) => {
+  const actor = c.get('user')!;
+  const db = c.get('db');
+  const id = c.req.param('id');
+  if (!UUID_RE.test(id)) return c.notFound();
+  const back = (msg: string, ok = false) =>
+    c.redirect(`/admin/users/${id}?${ok ? 'ok' : 'error'}=${encodeURIComponent(msg)}#review-access`);
+  const account = (await db.select().from(users).where(eq(users.id, id)).limit(1))[0];
+  if (!account) return c.notFound();
+  // Ending access ends the sessions it opened. Which of them came through the
+  // review door is not recorded, so every browser goes: this is a demo account.
+  await db.update(users).set({ reviewAccessUntil: null }).where(eq(users.id, id));
+  await db.delete(webSessions).where(eq(webSessions.userId, id));
+  logLine({ evt: 'admin', a: 'review_access_off', u: actor.username, target: account.username });
+  return back(`${account.username} signs in with an emailed code again, and every browser was signed out.`, true);
+});
+
+/**
+ * This server's own origin as the request reached it, for calls it makes to
+ * itself (the demo's agents talk to `/mcp` like any agent). Read from the
+ * socket, because behind a proxy the Host header names somebody else.
+ */
+function ownOrigin(c: Context<AppEnv>): string | null {
+  const socket = (c.env as { incoming?: { socket?: { localAddress?: string; localPort?: number } } } | undefined)
+    ?.incoming?.socket;
+  if (!socket?.localPort) return null;
+  let host = socket.localAddress || '127.0.0.1';
+  if (host.startsWith('::ffff:')) host = host.slice(7);
+  if (host.includes(':')) host = `[${host}]`;
+  return `http://${host}:${socket.localPort}`;
+}
+
+adminRoutes.post('/admin/users/:id/demo-workspace', async (c) => {
+  const actor = c.get('user')!;
+  const db = c.get('db');
+  const id = c.req.param('id');
+  if (!UUID_RE.test(id)) return c.notFound();
+  const back = (msg: string, ok = false) =>
+    c.redirect(`/admin/users/${id}?${ok ? 'ok' : 'error'}=${encodeURIComponent(msg)}#demo-workspace`);
+  const account = (await db.select().from(users).where(eq(users.id, id)).limit(1))[0];
+  if (!account) return c.notFound();
+  const origin = ownOrigin(c);
+  if (!origin) return back('This server cannot tell its own address, so the demo agents would have nowhere to call.');
+  const result = await seedDemoWorkspace({
+    db,
+    env: c.get('env'),
+    lifecycle: c.get('lifecycle'),
+    operator: { id: actor.id, username: actor.username },
+    account: { id: account.id, username: account.username },
+    origin,
+  });
+  if ('error' in result) return back(result.error);
+  return back(`Built ${result.team.name} (${result.team.slug}) for ${account.username}, with ${result.agents.join(', ')}.`, true);
+});
+
 adminRoutes.post('/admin/users/:id/email', async (c) => {
   const actor = c.get('user')!;
   const db = c.get('db');

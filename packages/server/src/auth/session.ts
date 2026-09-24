@@ -19,11 +19,16 @@ const SEEN_EVERY_MS = 5 * 60_000;
 const describeClient = (c: Context<AppEnv>): string | null =>
   c.req.header('user-agent')?.slice(0, 300) ?? null;
 
-export async function createSession(c: Context<AppEnv>, userId: string): Promise<string> {
+export async function createSession(
+  c: Context<AppEnv>,
+  userId: string,
+  ttlDays?: number,
+): Promise<string> {
   const db = c.get('db');
   const env = c.get('env');
   const sid = randomHex(32);
-  const expiresAt = new Date(Date.now() + env.sessionTtlDays * 24 * 60 * 60 * 1000);
+  const days = ttlDays ?? env.sessionTtlDays;
+  const expiresAt = new Date(Date.now() + days * 24 * 60 * 60 * 1000);
   await db.insert(webSessions).values({
     id: sid,
     userId,
@@ -37,7 +42,7 @@ export async function createSession(c: Context<AppEnv>, userId: string): Promise
     sameSite: 'Lax',
     path: '/',
     secure: env.baseUrl.startsWith('https://'),
-    maxAge: env.sessionTtlDays * 24 * 60 * 60,
+    maxAge: days * 24 * 60 * 60,
   });
   return sid;
 }

@@ -1,4 +1,5 @@
-import { and, desc, eq, inArray, isNotNull, isNull, or, sql } from 'drizzle-orm';
+import { CLAUDE_APP_CLIENT } from '@bridge/shared';
+import { and, desc, eq, inArray, isNotNull, isNull, ne, or, sql } from 'drizzle-orm';
 import { alias } from 'drizzle-orm/pg-core';
 import type { Db } from '../db';
 import { agentInstallations, projects, teams, tokens } from '../db/schema';
@@ -76,8 +77,15 @@ const isAdapterSql = sql`${agentInstallations.capabilities} @> ${JSON.stringify(
  * An installation somebody can give work to: not an adapter, paired or not.
  * An adapter's credential reaches `/api/agent/*` from a hook; nothing drives
  * MCP tools with it, so `update_handoff accept` is a call it will never make.
+ * Nor a Claude app connection (2026-09-24): one of those serves a person's
+ * chat on every device at once, so work addressed to it has nowhere to land,
+ * and it is nobody's companion for the same reason.
  */
-export const takesWork = and(isNull(agentInstallations.companionOf), sql`not (${isAdapterSql})`);
+export const takesWork = and(
+  isNull(agentInstallations.companionOf),
+  sql`not (${isAdapterSql})`,
+  ne(agentInstallations.clientType, CLAUDE_APP_CLIENT),
+);
 
 export interface Reach {
   scope: string;

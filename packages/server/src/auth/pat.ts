@@ -54,6 +54,7 @@ export const mcpAuth: MiddlewareHandler<AppEnv> = async (c, next) => {
       installationDeviceLabel: agentInstallations.deviceLabel,
       installationRevokedAt: agentInstallations.revokedAt,
       installationCompanionOf: agentInstallations.companionOf,
+      installationClientType: agentInstallations.clientType,
     })
     .from(tokens)
     .innerJoin(users, eq(tokens.userId, users.id))
@@ -173,6 +174,7 @@ export const mcpAuth: MiddlewareHandler<AppEnv> = async (c, next) => {
     deviceLabel:
       row.installationDeviceLabel ?? (row.token.name.split(' · ')[0]?.trim() || null),
     companionInstallationId: row.installationCompanionOf ?? null,
+    clientType: row.installationClientType ?? null,
   };
   c.set('mcpUser', row.user);
   c.set('mcpToken', row.token);

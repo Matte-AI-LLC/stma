@@ -47,8 +47,10 @@ import {
   loginCodeEmail,
   passwordChangedEmail,
   passwordResetCodeEmail,
+  reviewSignInEmail,
   sendMail,
 } from '../lib/mailer';
+import { REVIEW_SESSION_DAYS, reviewAccessActive, reviewAccessLastDay } from '../lib/reviewAccess';
 import type { Env } from '../env';
 import type { AppEnv, User } from '../types';
 import { Head, Logo } from '../ui/Layout';
@@ -571,6 +573,17 @@ authRoutes.post('/auth/local/login', async (c) => {
     return fail(failed.locked ? lockedMessage(failed.resetAt) : undefined);
   }
   await clearLoginFailures(db, email);
+  // An account an operator opened for a directory reviewer, who has the
+  // password and not the mailbox (`lib/reviewAccess.ts`). Everything above
+  // still ran, the throttle included; the address is told instead of asked.
+  if (env.twoFactor && reviewAccessActive(user)) {
+    await createSession(c, user.id, REVIEW_SESSION_DAYS);
+    logLine({ evt: 'auth', a: 'review_login', u: user.username });
+    if (user.email) {
+      void sendMail(env, { to: user.email, ...reviewSignInEmail(env.baseUrl, reviewAccessLastDay(user.reviewAccessUntil!)) });
+    }
+    return c.redirect(next);
+  }
   if (env.twoFactor) return startLoginChallenge(c, user, next);
   await createSession(c, user.id);
   logLine({ evt: 'auth', a: 'login', u: user.username });

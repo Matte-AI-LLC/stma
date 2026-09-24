@@ -1435,6 +1435,7 @@ export function registerFleetTools(
   );
 
   server.registerTool('record_delivery_receipt', {
+    title: 'Record delivery setup receipt',
     description: 'Record a versioned, unverified delivery setup report. Scope, mode and flow/policy hashes must match the issued pack. Never include secrets. This is not human approval or provider verification.',
     inputSchema: { receipt: setupReceiptSchema },
   }, async ({ receipt }) => {
@@ -1442,6 +1443,7 @@ export function registerFleetTools(
     return 'error' in result ? err(result.error!) : text(result);
   });
   server.registerTool('launch_check', {
+    title: 'Check a launched connection',
     description: 'Perform one explicit, idempotent connection check. Uses authenticated installation origins, never IDs in message text. Does not access local files or wake agents.',
     inputSchema: { launch_id: z.string().uuid(), action: z.enum(['send', 'reply', 'status']) },
   }, async ({ launch_id, action }) => {
@@ -1450,6 +1452,7 @@ export function registerFleetTools(
     return 'error' in result ? err(result.error!) : text(result);
   });
   server.registerTool('update_handoff', {
+    title: 'Update a handoff',
     description: 'Explicitly accept, resume or complete a handoff, in that order: accept when you take the work, resume when you begin it, complete when it is done. Complete is refused until the handoff was resumed, and every reply names the next call. A chat reply does not accept work. Completion is a client report, not verified delivery. A handoff that carries code is verified on resume: inspect the checkout, then send repository_identity, the full commit_sha from `git rev-parse HEAD` and worktree_clean together; local changes require human consent. An assignment carries no code and needs none of the three.',
     inputSchema: {
       session_id: z.string().uuid(),

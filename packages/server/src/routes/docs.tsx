@@ -20,6 +20,14 @@ docsRoutes.get('/docs', (c) => {
   const mcpUrl = `${base}/mcp`;
   const codexOAuth = `codex mcp add stma --url ${mcpUrl}`;
   const claudeOAuth = `claude mcp add --transport http --scope local stma-CHECKOUT ${mcpUrl}`;
+  // claude.ai's own prefilled "Add custom connector" dialog
+  // (claude.com/docs/connectors/building/directory-vs-custom): it fills the
+  // form and the person confirms, so it grants nothing by itself.
+  const claudeAppLink = `https://claude.ai/customize/connectors?${new URLSearchParams({
+    modal: 'add-custom-connector',
+    connectorName: 'STMA',
+    connectorUrl: mcpUrl,
+  })}`;
   const adapterCmd =
     `stma adapter activate --target codex --team TEAM --project PROJECT --server ${base}`;
 
@@ -162,6 +170,7 @@ docsRoutes.get('/docs', (c) => {
           <a href="#how">How it works</a>
           <a href="#web">Add people / a repository</a>
           <a href="#connect">Connect an agent</a>
+          <a href="#claude-app">From the Claude app</a>
           <a href="#control-plane">Agent control plane</a>
           <a href="#knowledge">Knowledge Hub</a>
           <a href="#tools">Tool reference</a>
@@ -504,6 +513,44 @@ docsRoutes.get('/docs', (c) => {
                   </div>
                 </div>
               </div>
+            </div>
+          </section>
+
+          <section class="doc-section" id="claude-app">
+            <h2>From the Claude app</h2>
+            <p class="m0">
+              Claude on the web, desktop and phone can use STMA as a connector, which makes it a console
+              you talk to: ask what your agents are doing, what is waiting for you or what collided
+              today, and give one of them work.
+            </p>
+            <div class="card card-pad" style="margin-top:14px;display:flex;flex-direction:column;gap:10px">
+              <div class="row">
+                <a class="btn btn-primary" href={claudeAppLink} target="_blank" rel="noopener">
+                  Add STMA to Claude
+                </a>
+                <span class="small muted">
+                  Opens Claude's <b>Add custom connector</b> dialog with this server filled in; you confirm it there.
+                </span>
+              </div>
+              <p class="m0">
+                Claude then asks you to sign in to STMA once. The consent page asks for no machine: one
+                connection serves every Claude app on your account. Choose <b>Personal</b> to let it
+                answer across your workspaces, or one workspace or project to keep it there. Leave
+                Claude's detected settings as they are, <b>Sign in now</b> and{' '}
+                <b>Register automatically</b>.
+              </p>
+              <p class="m0">
+                Claude reads without asking and asks you before every write: posting, assigning,
+                resolving, anything a teammate would see. The connection is your console, not an
+                agent in a checkout, so nobody can assign it work and it installs no hooks. Claude
+                Code in a checkout connected with <code>stma connect</code> keeps its own connection;
+                a local entry for the same address hides the Claude app's there.
+              </p>
+              <p class="m0 small muted">
+                Things to ask: "What are my agents doing right now?", "What is waiting for me in
+                STMA?", "Did anything collide today?", "Give the label printer fix to lead-b2 in
+                payments-api."
+              </p>
             </div>
           </section>
 

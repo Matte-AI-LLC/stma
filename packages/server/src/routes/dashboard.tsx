@@ -42,6 +42,7 @@ import {
   invalidateOtherSessions,
   loginRedirect,
   revokeSession,
+  sanitizeNext,
   sessionHandle,
   sessionsFor,
   type BrowserSession,
@@ -143,6 +144,7 @@ import {
 import { isSafeWebhookUrl } from '../lib/notify';
 import { notifyJoinRefused, notifyMemberJoined, notifyTeamJoined } from '../lib/notifications';
 import { fmtDate, initials, timeAgo } from '../lib/format';
+import { REVIEW_ACCOUNT_LOCKED, reviewAccessActive } from '../lib/reviewAccess';
 import { ensureRail, workspaceCounters } from '../lib/rail';
 import { slugify } from '../lib/slug';
 import { track } from '../lib/track';
@@ -914,7 +916,12 @@ dashboardRoutes.post('/app/teams', async (c) => {
     detail: 'created the workspace',
   });
   await c.get('lifecycle').teamMemberCountChanged?.({ db, teamId: team.id });
-  return c.redirect(`/app/teams/${team.slug}`);
+  // The OAuth consent page makes a first workspace through this form and wants
+  // its request back (2026-09-24): somebody who signed up on the way from
+  // Claude had nowhere to finish connecting. Only that one address is honoured,
+  // so the field cannot turn this form into a redirect to anywhere else.
+  const next = typeof body.next === 'string' ? sanitizeNext(body.next, '') : '';
+  return c.redirect(next.startsWith('/oauth/authorize?') ? next : `/app/teams/${team.slug}`);
 });
 
 async function renderTeamPage(c: Context<AppEnv>, refused?: InviteRefusal) {
@@ -5139,6 +5146,7 @@ dashboardRoutes.post('/app/account/email/verify', async (c) => {
 dashboardRoutes.post('/app/account/email/change', async (c) => {
   const user = c.get('user');
   if (!user) return loginRedirect(c);
+  if (reviewAccessActive(user)) return accountBack(c, REVIEW_ACCOUNT_LOCKED);
   const env = c.get('env');
   const db = c.get('db');
   if (!env.twoFactor) return accountBack(c, 'This server does not use email confirmation codes.');
@@ -5172,6 +5180,7 @@ dashboardRoutes.post('/app/account/email/change', async (c) => {
 dashboardRoutes.post('/app/account/email/change/confirm', async (c) => {
   const user = c.get('user');
   if (!user) return loginRedirect(c);
+  if (reviewAccessActive(user)) return accountBack(c, REVIEW_ACCOUNT_LOCKED);
   const env = c.get('env');
   const db = c.get('db');
   const body = await c.req.parseBody();
@@ -5321,6 +5330,7 @@ dashboardRoutes.post('/app/account/delete', async (c) => {
   if (!user) return loginRedirect(c);
   const db = c.get('db');
   const back = (msg: string) => c.redirect(`/app/account?error=${encodeURIComponent(msg)}`);
+  if (reviewAccessActive(user)) return back(REVIEW_ACCOUNT_LOCKED);
 
   const affectedTeams = await db
     .select({ teamId: memberships.teamId, teamSlug: teams.slug, role: memberships.role })

@@ -89,6 +89,7 @@ async function agent(name: string, scopedProject?: string): Promise<AgentGrant> 
     installationName: name,
     deviceLabel: name,
     companionInstallationId: null,
+    clientType: 'generic',
   };
 }
 beforeAll(async () => {

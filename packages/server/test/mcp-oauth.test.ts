@@ -97,6 +97,19 @@ async function initializeClient(accessToken: string) {
   return { response, body: await response.json() as { result?: unknown; error?: unknown } };
 }
 
+async function refresh(clientId: string, refreshToken: string) {
+  return fetch(`${srv.url}/oauth/token`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'refresh_token',
+      client_id: clientId,
+      refresh_token: refreshToken,
+      resource: `${srv.url}/mcp`,
+    }),
+  });
+}
+
 const verifier = 'correct-horse-battery-staple-codex-oauth-verifier-2026';
 const challenge = createHash('sha256').update(verifier).digest('base64url');
 const callback = 'http://127.0.0.1:43199/callback';
@@ -314,19 +327,25 @@ it('connects with browser consent, project scope, PKCE and rotating tokens; reus
   expect((await callTool(token.access_token, 'whoami')).response.status).toBe(401);
   expect((await callTool(next.access_token, 'whoami')).response.status).toBe(200);
 
-  const reused = await fetch(`${srv.url}/oauth/token`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      grant_type: 'refresh_token',
-      client_id: client.client_id,
-      refresh_token: token.refresh_token,
-      resource: `${srv.url}/mcp`,
-    }),
-  });
+  // Spent a moment ago, it is a retry whose answer was lost: answered again,
+  // and the connection lives. Only the newest access token works.
+  const replayed = await refresh(client.client_id, token.refresh_token);
+  expect(replayed.status).toBe(200);
+  const again = await replayed.json() as { access_token: string; refresh_token: string };
+  expect((await callTool(next.access_token, 'whoami')).response.status).toBe(401);
+  expect((await callTool(again.access_token, 'whoami')).response.status).toBe(200);
+  // A client that kept the first answer still refreshes with it, and that
+  // retires the replay's refresh token for good: presenting it now is reuse.
+  const kept = await refresh(client.client_id, next.refresh_token);
+  expect(kept.status).toBe(200);
+  const latest = await kept.json() as { access_token: string; refresh_token: string };
+  expect((await callTool(latest.access_token, 'whoami')).response.status).toBe(200);
+  // Once a later token has been spent, the first one is reuse again, inside
+  // the window or not, and reuse revokes the connection.
+  const reused = await refresh(client.client_id, token.refresh_token);
   expect(reused.status).toBe(400);
   expect(await reused.json()).toMatchObject({ error: 'invalid_grant' });
-  expect((await callTool(next.access_token, 'whoami')).response.status).toBe(401);
+  expect((await callTool(latest.access_token, 'whoami')).response.status).toBe(401);
   const [installation] = await srv.db
     .select()
     .from(agentInstallations)

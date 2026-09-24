@@ -30,6 +30,12 @@ export interface AgentGrant {
    * never use its own pairing to reach the agent's runs.
    */
   companionInstallationId: string | null;
+  /**
+   * The installation's client type (`claude-code`, `codex`, `claude-app`, …),
+   * null for a legacy token with no installation. Authority never reads it:
+   * it decides which introduction the MCP server gives (`serverInstructions`).
+   */
+  clientType: string | null;
 }
 
 export function isTokenScope(value: string): value is TokenScope {

@@ -11,7 +11,7 @@ import { metrics } from './lib/metrics';
 import { setHosted, setUnmetered, withEntitlements } from './lib/entitlements';
 import { SecurityRefusal, withSecurityHooks } from './lib/securityHooks';
 import { ensureRail } from './lib/rail';
-import { clientIp, rateLimit } from './lib/ratelimit';
+import { clientIp, fromAnthropic, rateLimit } from './lib/ratelimit';
 import { activityRoutes } from './routes/activity';
 import { adminRoutes } from './routes/admin';
 import { agentsRoutes } from './routes/agents';
@@ -171,7 +171,9 @@ export function createApp(
   app.use('/auth/*', rateLimit({ windowMs: 60_000, max: 30, key: clientIp }));
   app.use('/api/invites/*', rateLimit({ windowMs: 60_000, max: 20, key: clientIp }));
   app.use('/api/agent-enrollments/*', rateLimit({ windowMs: 60_000, max: 20, key: clientIp }));
-  app.use('/oauth/*', rateLimit({ windowMs: 60_000, max: 60, key: clientIp }));
+  // Ten times the ceiling for Anthropic's egress block, which carries every
+  // claude.ai user's registrations and refreshes (`ANTHROPIC_EGRESS`).
+  app.use('/oauth/*', rateLimit({ windowMs: 60_000, max: (c) => (fromAnthropic(c) ? 600 : 60), key: clientIp }));
   app.use('/api/hooks/*', rateLimit({ windowMs: 60_000, max: 120, key: clientIp }));
   app.use('/api/agent/*', rateLimit({ windowMs: 60_000, max: 600, key: clientIp }));
   app.use('/api/control/*', rateLimit({ windowMs: 60_000, max: 120, key: clientIp }));

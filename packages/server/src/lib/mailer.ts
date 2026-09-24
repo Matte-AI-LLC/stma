@@ -35,6 +35,7 @@ export type MailKind =
   | 'email_changed_notice'
   | 'password_changed'
   | 'failed_sign_ins'
+  | 'review_sign_in'
   | 'activity'
   | 'workspace_invite'
   | 'billing';
@@ -479,6 +480,27 @@ export function failedSignInsEmail(
       'If this was you, wait and try again, or reset your password.',
       `If it was not, change your password at <a href="${esc(`${baseUrl}/forgot`)}">${esc(`${baseUrl}/forgot`)}</a> and revoke any agent tokens you do not recognise.`,
     ]),
+  };
+}
+
+/**
+ * The account signed in without a code, because an operator gave it review
+ * access (`lib/reviewAccess.ts`). The code would have come to this address, so
+ * the notice does: the address holder is the one who can tell an expected
+ * reviewer from somebody who has the password.
+ */
+export function reviewSignInEmail(baseUrl: string, lastDay: string): Omit<MailMessage, 'to'> {
+  const line =
+    'Your STMA account was just signed in with its password alone. An operator gave it review ' +
+    `access, which skips the emailed code until the end of ${lastDay} (UTC).`;
+  const ask =
+    'If you did not expect this sign-in, ask the operator to turn review access off, and sign out ' +
+    'the other browsers from Account.';
+  return {
+    kind: 'review_sign_in',
+    subject: 'Review sign-in on your STMA account',
+    text: [line, ask, `${baseUrl}/app/account`].join('\n\n'),
+    html: wrap([line, ask, `<a href="${esc(`${baseUrl}/app/account`)}">${esc(`${baseUrl}/app/account`)}</a>`]),
   };
 }
 

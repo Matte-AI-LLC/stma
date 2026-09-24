@@ -1,5 +1,4 @@
 export const MCP_SERVER_NAME = 'stma';
-export const MCP_SERVER_VERSION = '0.1.0';
 
 /** Personal access tokens look like `stma_<40 hex chars>`. */
 export const PAT_PREFIX = 'stma_';

@@ -81,12 +81,28 @@ function isTrustedAddress(entry: string, trusted: BlockList): boolean {
 }
 
 /**
+ * Where Anthropic's hosted Claude apps connect from
+ * (claude.com/docs/connectors/building/authentication, 2026-09-24). Every
+ * claude.ai user's client registration, token exchange and refresh arrives
+ * from this one block, so a per-address ceiling written for one person's
+ * browser counts all of them together. Measured on production the day the
+ * first connection was made: nine addresses in it served one conversation.
+ */
+export const ANTHROPIC_EGRESS = ['160.79.104.0/21'] as const;
+
+/** Whether this request comes from Anthropic's published egress block. */
+export function fromAnthropic(c: Context<AppEnv>): boolean {
+  return isTrustedAddress(clientIp(c), trustedProxies(ANTHROPIC_EGRESS)!);
+}
+
+/**
  * Fixed-window in-memory rate limiter. Good enough for a single instance;
- * swap for a shared store when scaling horizontally.
+ * swap for a shared store when scaling horizontally. `max` may depend on the
+ * request, for a caller that speaks for many people from one address.
  */
 export function rateLimit(opts: {
   windowMs: number;
-  max: number;
+  max: number | ((c: Context<AppEnv>) => number);
   key: (c: Context<AppEnv>) => string;
 }): MiddlewareHandler<AppEnv> {
   const hits = new Map<string, { count: number; reset: number }>();
@@ -101,7 +117,7 @@ export function rateLimit(opts: {
       hits.set(key, { count: 1, reset: now + opts.windowMs });
     } else {
       entry.count += 1;
-      if (entry.count > opts.max) {
+      if (entry.count > (typeof opts.max === 'number' ? opts.max : opts.max(c))) {
         c.header('Retry-After', String(Math.max(1, Math.ceil((entry.reset - now) / 1000))));
         metrics.recordRateLimited();
         return c.json({ error: 'rate_limited' }, 429);

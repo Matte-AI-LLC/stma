@@ -51,7 +51,12 @@ export async function receiveSetupReceipt(
     .from(deliverySetups)
     .where(eq(deliverySetups.id, input.setupId));
   if (!setup || !(await collaborationAccess(db, userId, setup.teamId, setup.projectId, grant)))
-    return { error: 'Setup unavailable in this scope.' };
+    return {
+      error:
+        'No delivery setup with this setupId is available to this connection. A setup pack is ' +
+        "issued from a project's Delivery page (Agent setup), and the receipt repeats the setupId, " +
+        'flowHash and policyHash printed in it.',
+    };
   const manifest = setup.manifest as ReturnType<typeof agentSetupManifest>;
   if (manifest.flowHash !== input.flowHash || manifest.policyHash !== input.policyHash)
     return { error: 'Receipt does not match the issued setup. Generate a fresh pack.' };

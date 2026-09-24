@@ -237,6 +237,14 @@ Authorization invariants:
   address. The last two matter although they sit behind a session, because `/app/*` carries no
   per-IP limit at all and what the password still buys there is permanence — lock the owner out,
   or redirect every future reset.
+- **Review access is the one exception to the second factor, and it is narrow.** An operator can
+  mark a single account, with a last day at most 60 days away, so that a reviewer who holds its
+  password but not its mailbox can sign in (a directory review is the case). Until that day its
+  password sign-in skips the emailed code; nothing else about the account loosens. The throttle
+  still counts and locks, each such sign-in is mailed to the account's address, the browser
+  session lasts a day, the account cannot move its address or delete itself, and it can never be
+  an operator. A listed operator, an account without a password and one whose address was never
+  confirmed cannot be given it. It lapses by the clock; ending it early signs every browser out.
 - **An emailed code never reaches the operator log.** Each code email puts its six digits in the
   subject on purpose, so the log line carries a stable `kind` (`login_code`, `password_reset_code`,
   …) and never the subject. A second factor readable by whoever can read the logs is not one, and
@@ -425,7 +433,9 @@ skipping OAuth, bounded by project-only scope and one-click revocation.
    host. The client type is displayed read-only from its registered OAuth metadata; a form value
    cannot relabel a Codex callback as Claude. The person names the agent and machine, chooses
    descriptive role and `project`, `team` or explicit `personal` access, then allows or denies.
-   No authorization code is issued before allow.
+   No authorization code is issued before allow. A person with no workspace yet, typically one who
+   signed up on the way from a client, creates one on this page; the one workspace form sends them
+   back to the same authorization request, and it honours no other return address.
 6. The one-use authorization code is stored only as a hash and bound to client, callback, resource,
    scope and PKCE challenge. The token endpoint atomically consumes it and creates one durable
    installation plus one credential family.
@@ -438,7 +448,12 @@ skipping OAuth, bounded by project-only scope and one-click revocation.
    expired or revoked access. After reload, `whoami` verifies the visible identity and scope; project
    connections also read effective policy.
 9. Reusing an already-rotated refresh token is treated as theft/replay: STMA revokes the entire
-   credential family, disables the linked installation and releases its active runs/claims.
+   credential family, disables the linked installation and releases its active runs/claims. One
+   exception, for a lost response: a token presented again within two minutes of being spent, while
+   no later token of that connection has been spent, is answered with a fresh pair. The refresh
+   token answered the first time stays usable until one of the two is spent, and spending either
+   retires the other, so a retired token presented later is reuse at once. Only the newest access
+   token is ever live.
 10. OAuth revocation and the console Revoke action disable the same token/installation boundary.
     Client-local removal remains a separate client action; server revocation cannot stop a process.
 11. This connection grants MCP access only. Local runtime, git hooks, collision guard and file guard
@@ -481,6 +496,29 @@ Guards and dead ends:
   checks; the human consent POST remains same-origin protected and revalidates every hidden field.
 - Legacy Connector v2 and direct token creation remain compatibility paths. The connector is closed
   under **Legacy setup prompt**; direct token creation is not presented in the UI and stays personal.
+
+### The Claude app (hosted connector)
+
+**Actor:** one person, through Claude on the web, desktop, phone or Cowork.
+
+1. The person adds `{BASE_URL}/mcp` as a connector in Claude, directly or through the guide's
+   prefilled link to Claude's own Add custom connector dialog, which they confirm there.
+2. Claude registers as a client whose only callback is Anthropic's hosted one. That callback, not
+   the name the client gives, makes it the `claude-app` client type: a code sent there can only be
+   redeemed by Anthropic.
+3. The consent page asks for no machine; the device label is `claude.ai`. It proposes `personal`
+   access, because the connection answers across the person's workspaces, and offers a workspace or
+   a project instead.
+4. The installation is the person's console. It reads and, when asked, writes like any client, but
+   it is never an assignee or an adapter's companion: one connection serves every Claude app of the
+   account, so work addressed to it has nowhere to land. Claude Code loads the same connector unless
+   the checkout has its own entry for the same address, which hides it; `stma connect` keeps a
+   checkout its own agent identity.
+5. Every tool carries a title and `readOnlyHint`, and every tool that writes carries
+   `destructiveHint`, so the Claude apps run reads without asking and ask before each write by
+   default. Claude Code does not use these hints for permissions.
+6. `whoami` returns `planLabel` beside the stored `plan`: the label the console prints, so the beta,
+   a grant or an evaluation reads the same in a chat as on the page.
 
 ## F3 — Solo, multiple agents, multiple machines
 

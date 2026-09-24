@@ -63,6 +63,15 @@ export const users = pgTable(
      */
     signupCohort: text('signup_cohort'),
     avatarUrl: text('avatar_url'),
+    /**
+     * Until when this account signs in with its password alone (`lib/reviewAccess.ts`).
+     *
+     * A directory reviewer is handed a username and a password and cannot read
+     * the mailbox the second factor goes to. An operator sets this from the
+     * account's admin page, with an end date, and it lapses by the clock: null
+     * or past means the ordinary sign-in. It never makes an operator.
+     */
+    reviewAccessUntil: timestamp('review_access_until', { withTimezone: true }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [uniqueIndex('users_email_unique').on(t.email).where(sql`email is not null`)],

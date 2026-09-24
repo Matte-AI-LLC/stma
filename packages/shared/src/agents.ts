@@ -7,9 +7,19 @@ export const AGENT_CLIENT_TYPES = [
   'codex',
   'cursor',
   'other',
+  'claude-app',
 ] as const;
 export const agentClientTypeSchema = z.enum(AGENT_CLIENT_TYPES);
 export type AgentClientType = z.infer<typeof agentClientTypeSchema>;
+
+/**
+ * The Claude apps (web, desktop, mobile, Cowork) connecting through claude.ai's
+ * hosted connector (2026-09-24). One connection serves every one of them for a
+ * Claude account, so it is a person's console rather than a checkout's agent:
+ * it answers and dispatches, and nobody can hand it work, because there is no
+ * one place where that work would be picked up.
+ */
+export const CLAUDE_APP_CLIENT = 'claude-app' satisfies AgentClientType;
 
 export const AGENT_RUN_STATUSES = [
   'starting',

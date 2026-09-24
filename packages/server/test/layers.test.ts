@@ -6,6 +6,7 @@ import { serverSpec } from '../../cli/src/serve';
 import { VERSION as CLI_VERSION } from '../../cli/src/version';
 import { bootNodeEnv, loadEnv } from '../src/env';
 import { PLANS, UNMETERED, planLimits } from '../src/lib/entitlements';
+import { TOOL_ANNOTATIONS } from '../src/mcp/annotations';
 import { FLEET_TOOL_PARAMS } from '../src/mcp/fleet';
 import { TOOL_PARAMS } from '../src/routes/mcp';
 import { startServer, type StartedServer } from '../src/server';
@@ -435,6 +436,14 @@ describe('the API surface is additive', () => {
 
   it('answers exactly the tools this version promises', async () => {
     expect(await list(hosted, hostedToken)).toEqual([...PUBLIC_TOOLS].sort());
+  });
+
+  it('says what every one of them does to the world, and nothing else', () => {
+    // Claude's connector directory flags a tool without a title and a read-only
+    // or destructive hint. `requireAnnotations` refuses to register such a tool;
+    // this holds the table itself to the pinned list, so an entry cannot outlive
+    // the tool it describes.
+    expect(Object.keys(TOOL_ANNOTATIONS).sort()).toEqual([...PUBLIC_TOOLS].sort());
   });
 
   it('declares argument validation for every one of them', () => {

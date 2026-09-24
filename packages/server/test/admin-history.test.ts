@@ -884,6 +884,7 @@ describe('membership history', () => {
       ['invites.ts', 'invite redemption — records on the transaction'],
       ['dashboard.tsx', 'create, leave, role, remove, team delete, account delete — records all but the team delete, which it could not outlive'],
       ['admin.tsx', 'operator add, role, remove — records all three'],
+      ['demoWorkspace.ts', "the operator's demo workspace, owned by the account — records the owner row"],
       ['routes.tsx', 'EE assignWorkspace — records when the core role moves'],
       ['store.ts', 'EE deactivateMember — records one row per workspace, one group'],
     ]);

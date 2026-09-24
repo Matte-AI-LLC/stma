@@ -1,4 +1,4 @@
-import { AGENT_ROLES, type AgentClientType, type AgentRole } from '@bridge/shared';
+import { AGENT_ROLES, CLAUDE_APP_CLIENT, type AgentClientType, type AgentRole } from '@bridge/shared';
 import { createHash } from 'node:crypto';
 import { and, eq, gt, inArray, isNull } from 'drizzle-orm';
 import { Hono } from 'hono';
@@ -23,6 +23,19 @@ export const oauthRoutes = new Hono<AppEnv>();
 const OAUTH_SCOPE = 'stma';
 const AUTHORIZATION_CODE_TTL_MS = 5 * 60_000;
 const ACCESS_TOKEN_TTL_MS = 60 * 60_000;
+/**
+ * A refresh token presented again this soon after it was spent is a retry, not
+ * a theft (2026-09-24). Claude's hosted connectors give a refresh thirty
+ * seconds; when the rotation committed and the response was lost, the retry
+ * used to read as reuse and revoke the connection, and the person reconnected
+ * by hand. It is answered like the first request now, with a fresh pair. Only
+ * the newest access token is ever live, as before; the refresh token answered
+ * the first time stays usable until one of the two is spent, and spending
+ * either retires the other for good. Outside the window, or once a later
+ * refresh token has been spent, a spent token is still reuse and still revokes
+ * everything. The window is measured from the spend and a replay does not move it.
+ */
+export const REFRESH_REPLAY_GRACE_MS = 2 * 60_000;
 const CLIENT_ID_RE = /^stma_client_[a-f0-9]{48}$/;
 const CODE_RE = /^stma_oauth_code_[a-f0-9]{64}$/;
 const REFRESH_RE = /^stma_refresh_[a-f0-9]{64}$/;
@@ -233,7 +246,32 @@ async function connectionTeams(c: Context<AppEnv>, userId: string): Promise<Conn
   }));
 }
 
+/**
+ * Where the hosted Claude apps come back to after consent
+ * (claude.com/docs/connectors/building/authentication). claude.com is listed
+ * beside claude.ai because Anthropic's earlier guidance named it too.
+ */
+const HOSTED_CLAUDE_CALLBACKS = new Set([
+  'https://claude.ai/api/mcp/auth_callback',
+  'https://claude.com/api/mcp/auth_callback',
+]);
+
+/** The device label of a Claude app connection, which has no machine of its own. */
+const HOSTED_CLAUDE_DEVICE = 'claude.ai';
+
+/**
+ * A client that returns only to Anthropic's callback is the Claude apps' hosted
+ * connector, whatever it calls itself: a code sent there can only be redeemed
+ * by Anthropic. It registers as plain "Claude", which the name rule below read
+ * as Claude Code, so the first real connection from claude.ai (2026-09-24) was
+ * asked for a machine and named "claude-code-agent".
+ */
+function isHostedClaude(client: RegisteredClient): boolean {
+  return client.redirectUris.length > 0 && client.redirectUris.every((uri) => HOSTED_CLAUDE_CALLBACKS.has(uri));
+}
+
 function clientTypeFor(client: RegisteredClient): AgentClientType {
+  if (isHostedClaude(client)) return CLAUDE_APP_CLIENT;
   // Clients append the MCP server name, e.g. "Claude Code (stma-parcel-desk-codex-3f9a)".
   // A per-checkout server name carries a folder name, so only the product part may decide.
   const name = client.clientName.split('(')[0]!.toLowerCase();
@@ -262,17 +300,35 @@ async function consentPage(
   c.set('formTargets', [params.redirectUri]);
   const choices = await connectionTeams(c, user.id);
   const inferredClient = clientTypeFor(client);
+  // The Claude apps are a person's console across workspaces, not an agent in
+  // one checkout: no machine to name, and Personal is the scope a chat that is
+  // asked "what are my agents doing" needs. Project only stays one click away.
+  const hostedClaude = inferredClient === CLAUDE_APP_CLIENT;
   // A per-checkout Claude Code server name carries the checkout folder; offer it
   // as the default so two agents on one machine do not both arrive as "claude-code-agent".
   const checkoutName = inferredClient === 'claude-code' ? claudeCheckoutAgentName(client.clientName) : undefined;
   const redirectHost = new URL(params.redirectUri).host;
   const preferred =
     entered.access ??
-    (choices[0]?.projects[0]
-      ? `project:${choices[0].projects[0].id}`
-      : choices[0]
-        ? `team:${choices[0].id}`
-        : 'personal');
+    (hostedClaude
+      ? 'personal'
+      : choices[0]?.projects[0]
+        ? `project:${choices[0].projects[0].id}`
+        : choices[0]
+          ? `team:${choices[0].id}`
+          : 'personal');
+  // Where a workspace created from this page sends its maker back to: this same
+  // request, which is still valid, so the client that is waiting gets its code.
+  const retry = `/oauth/authorize?${new URLSearchParams({
+    response_type: params.responseType,
+    client_id: params.clientId,
+    redirect_uri: params.redirectUri,
+    code_challenge: params.codeChallenge,
+    code_challenge_method: params.codeChallengeMethod,
+    state: params.state,
+    scope: params.scope,
+    resource: params.resource,
+  })}`;
   // Only the first-party local adapter is asked who it sits beside. Every other
   // client *is* the agent, and has nobody to listen for.
   const localAdapter = isLocalAdapterClient(client.clientName);
@@ -281,9 +337,11 @@ async function consentPage(
   // default ("agent-agent") says nothing there; the target the CLI registered
   // under does.
   const adapterTarget = localAdapter ? /\(([a-z0-9-]{1,40})\)/.exec(client.clientName)?.[1] : undefined;
-  const defaultName = localAdapter
-    ? `${adapterTarget ?? 'checkout'}-local-adapter`
-    : (checkoutName ?? `${inferredClient === 'generic' ? 'agent' : inferredClient}-agent`);
+  const defaultName = hostedClaude
+    ? CLAUDE_APP_CLIENT
+    : localAdapter
+      ? `${adapterTarget ?? 'checkout'}-local-adapter`
+      : (checkoutName ?? `${inferredClient === 'generic' ? 'agent' : inferredClient}-agent`);
   c.header('Cache-Control', 'no-store');
   return c.html(
     <AppLayout user={user} active="tokens" title="Authorize agent connection">
@@ -296,12 +354,35 @@ async function consentPage(
             issue a short-lived access token and a rotating refresh token. The client stores them;
             they are never placed in a prompt or repository.
           </p>
+          {hostedClaude ? (
+            <p class="muted" style="margin:8px 0 0">
+              This is the Claude app: one connection for your account on the web, desktop and
+              phone. Claude can read your workspaces and, when you ask, write for you, and it asks
+              you before each write unless you change that in Claude. It is your console, so it is
+              not offered as an agent to give work to.
+            </p>
+          ) : null}
         </div>
         {entered.error ? (
           <div class="banner banner-error"><span class="ic">!</span><span>{entered.error}</span></div>
         ) : null}
         {choices.length === 0 ? (
-          <div class="banner banner-error"><span class="ic">!</span><span>Create or join a workspace before authorizing an agent.</span></div>
+          // Somebody who signed up on the way here has no workspace yet, and a
+          // banner telling them to make one somewhere else lost the request that
+          // was waiting for them. The workspace is made by the one form that
+          // makes workspaces, which then sends them back to this request.
+          <form class="card card-pad" method="post" action="/app/teams" style="display:flex;flex-direction:column;gap:10px">
+            <b>Create your first workspace</b>
+            <span class="muted">
+              A connection belongs to a workspace, and you are not in one yet. Name it and you come
+              straight back here to finish connecting.
+            </span>
+            <input type="hidden" name="next" value={retry} />
+            <div class="row">
+              <input class="in" name="name" aria-label="Workspace name" placeholder="Workspace name" maxlength={60} required />
+              <button class="btn btn-primary" type="submit">Create workspace</button>
+            </div>
+          </form>
         ) : null}
         <form class="authform" method="post" action="/oauth/authorize">
           {Object.entries({
@@ -322,11 +403,13 @@ async function consentPage(
               The stable identity teammates see on runs and handoffs.
             </span>
           </div>
-          <div class="field">
-            <label for="oauth-device">Machine</label>
-            <input class="in" id="oauth-device" name="device" placeholder="guest-macbook" value={entered.device ?? ''} maxlength={60} required />
-            <span class="help">A readable label only; STMA does not infer or upload your hostname.</span>
-          </div>
+          {hostedClaude ? null : (
+            <div class="field">
+              <label for="oauth-device">Machine</label>
+              <input class="in" id="oauth-device" name="device" placeholder="guest-macbook" value={entered.device ?? ''} maxlength={60} required />
+              <span class="help">A readable label only; STMA does not infer or upload your hostname.</span>
+            </div>
+          )}
           <div class="field">
             <label>Client reported by OAuth</label>
             <div><code>{inferredClient}</code></div>
@@ -345,9 +428,13 @@ async function consentPage(
                   ))}
                 </optgroup>
               ))}
-              <option value="personal">Personal — all current workspace memberships</option>
+              <option value="personal" selected={preferred === 'personal'}>Personal — all current workspace memberships</option>
             </select>
-            <span class="help">Project only is the default and least-privilege choice.</span>
+            <span class="help">
+              {hostedClaude
+                ? 'Personal follows your memberships, which is what a chat that answers across workspaces needs. A workspace or a project keeps it to one.'
+                : 'Project only is the default and least-privilege choice.'}
+            </span>
           </div>
           {localAdapter ? (
             <div class="field">
@@ -434,12 +521,15 @@ oauthRoutes.post('/oauth/authorize', async (c) => {
   if (body.decision !== 'allow') {
     return c.redirect(redirectOAuth(params.redirectUri, { error: 'access_denied', state: params.state }));
   }
-  const name = stringValue(body.name, 80);
-  const device = normalizeDeviceLabel(stringValue(body.device, 60));
   // The client registration, not an editable browser field, owns this label.
   // It is still self-reported OAuth metadata, but a Codex callback must not be
   // turned into a Claude installation by changing one form value.
   const clientType = clientTypeFor(checked.client);
+  // A Claude app connection has no machine, so the page asks for none and the
+  // label says where it lives; a posted value cannot rename that either.
+  const hostedClaude = clientType === CLAUDE_APP_CLIENT;
+  const name = stringValue(body.name, 80);
+  const device = hostedClaude ? HOSTED_CLAUDE_DEVICE : normalizeDeviceLabel(stringValue(body.device, 60));
   const requestedRole = stringValue(body.role, 40);
   const role = (AGENT_ROLES as readonly string[]).includes(requestedRole)
     ? (requestedRole as AgentRole)
@@ -660,7 +750,18 @@ oauthRoutes.post('/oauth/token', async (c) => {
         .where(eq(oauthRefreshTokens.tokenHash, sha256hex(rawRefresh)))
         .limit(1);
       if (!row || row.refresh.clientId !== clientId || row.refresh.resource !== resource || row.refresh.revokedAt || row.token.revokedAt) return null;
-      if (row.refresh.usedAt) {
+      let replay = Boolean(row.refresh.usedAt) && Date.now() - row.refresh.usedAt!.getTime() <= REFRESH_REPLAY_GRACE_MS;
+      if (replay) {
+        // Only while the connection has not moved on. A refresh token spent after
+        // this one means the client did get its answer, so this is reuse.
+        const [later] = await db
+          .select({ id: oauthRefreshTokens.id })
+          .from(oauthRefreshTokens)
+          .where(and(eq(oauthRefreshTokens.tokenId, row.token.id), gt(oauthRefreshTokens.usedAt, row.refresh.usedAt!)))
+          .limit(1);
+        if (later) replay = false;
+      }
+      if (row.refresh.usedAt && !replay) {
         const now = new Date();
         await db.update(oauthRefreshTokens).set({ revokedAt: now }).where(eq(oauthRefreshTokens.tokenId, row.token.id));
         await db.update(tokens).set({ revokedAt: now }).where(eq(tokens.id, row.token.id));
@@ -711,12 +812,35 @@ oauthRoutes.post('/oauth/token', async (c) => {
           userId: row.token.userId,
         };
       }
-      const spent = await db
-        .update(oauthRefreshTokens)
-        .set({ usedAt: new Date() })
-        .where(and(eq(oauthRefreshTokens.id, row.refresh.id), isNull(oauthRefreshTokens.usedAt), isNull(oauthRefreshTokens.revokedAt)))
-        .returning({ id: oauthRefreshTokens.id });
-      if (!spent[0]) return null;
+      if (!replay) {
+        const spentAt = new Date();
+        const spent = await db
+          .update(oauthRefreshTokens)
+          .set({ usedAt: spentAt })
+          .where(and(eq(oauthRefreshTokens.id, row.refresh.id), isNull(oauthRefreshTokens.usedAt), isNull(oauthRefreshTokens.revokedAt)))
+          .returning({ id: oauthRefreshTokens.id });
+        if (spent[0]) {
+          // A replay answered earlier may have left a second live refresh token
+          // whose response the client did not keep. Spending this one retires it,
+          // so a connection holds one live refresh token again. It is marked spent
+          // before the window began, so presenting it later is reuse at once and
+          // never a replay: a token nobody should still hold gets no grace.
+          await db
+            .update(oauthRefreshTokens)
+            .set({ usedAt: new Date(spentAt.getTime() - REFRESH_REPLAY_GRACE_MS - 1_000) })
+            .where(and(eq(oauthRefreshTokens.tokenId, row.token.id), isNull(oauthRefreshTokens.usedAt), isNull(oauthRefreshTokens.revokedAt)));
+        } else {
+          // Another request spent this token a moment ago: the same client racing
+          // itself, a proactive refresh beside a reactive one. That is a replay.
+          const [again] = await db
+            .select({ usedAt: oauthRefreshTokens.usedAt, revokedAt: oauthRefreshTokens.revokedAt })
+            .from(oauthRefreshTokens)
+            .where(eq(oauthRefreshTokens.id, row.refresh.id))
+            .limit(1);
+          if (!again?.usedAt || again.revokedAt) return null;
+          replay = true;
+        }
+      }
       const access = generatePat();
       const refreshToken = `stma_refresh_${randomHex(32)}`;
       const expiresAt = new Date(Date.now() + ACCESS_TOKEN_TTL_MS);
@@ -729,7 +853,7 @@ oauthRoutes.post('/oauth/token', async (c) => {
         scope: row.refresh.scope,
       });
       await db.update(oauthClients).set({ lastUsedAt: new Date() }).where(eq(oauthClients.id, clientId));
-      return { kind: 'rotated' as const, accessToken: access.token, refreshToken, expiresAt, scope: row.refresh.scope, tokenId: row.token.id };
+      return { kind: 'rotated' as const, replay, accessToken: access.token, refreshToken, expiresAt, scope: row.refresh.scope, tokenId: row.token.id };
     });
     if (!rotated) return oauthJsonError(c, 'invalid_grant', 'The refresh token is expired, revoked, reused or does not match this client.', 400);
     if (rotated.kind === 'reuse' || rotated.kind === 'access_lost') {
@@ -750,7 +874,7 @@ oauthRoutes.post('/oauth/token', async (c) => {
         400,
       );
     }
-    logLine({ evt: 'mcp_oauth', a: 'token_refreshed', token: rotated.tokenId });
+    logLine({ evt: 'mcp_oauth', a: rotated.replay ? 'refresh_replayed' : 'token_refreshed', token: rotated.tokenId });
     c.header('Cache-Control', 'no-store');
     c.header('Pragma', 'no-cache');
     return c.json({

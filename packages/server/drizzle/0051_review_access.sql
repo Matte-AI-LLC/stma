@@ -1,0 +1,1 @@
+ALTER TABLE "users" ADD COLUMN "review_access_until" timestamp with time zone;

@@ -994,6 +994,16 @@ by STMA. The consent page suggests the checkout folder as the agent name. Older 
 should be updated before continuing. Client UI
 names can change; the protocol boundary is the stable MCP address and browser consent page.
 
+**The Claude app** (Claude on the web, desktop, phone or in Cowork) connects the same way, as a
+connector: add `{BASE_URL}/mcp` under Claude's connectors, or follow **Add STMA to Claude** in the
+guide (`/docs#claude-app`), which opens Claude's own Add custom connector dialog with the address
+filled in for you to confirm. Claude detects **Sign in now** and **Register automatically**; keep
+both. The consent page asks for no machine, because one connection serves every Claude app on the
+account, and proposes Personal access so it can answer across your workspaces. It is your console,
+not an agent in a checkout: nobody can assign it work, it installs nothing, and Claude asks you
+before each write it makes, since every tool that writes is marked destructive. Claude Code in a
+checkout that has its own entry for the same address uses that entry, which hides the connector.
+
 The OAuth connection is MCP-only. It does not install git hooks, file guards, runtimes or repository
 files. Those local capabilities require a separately packaged, visibly approved adapter. A client
 that cannot complete OAuth may open **Legacy setup prompt (compatibility)**. That fallback retains
