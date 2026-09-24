@@ -418,7 +418,7 @@ describe('governance page', () => {
   it('gives a non-member no access', async () => {
     const { status, html } = await page('/app/teams/governance-lab/governance', strangerJar);
     expect(status).toBe(404);
-    expect(html).toContain('Team not found');
+    expect(html).toContain('Workspace not found');
     expect(html).not.toContain('GOV-DRIFT');
     expect(html).not.toContain('Never edit a released invoice migration.');
   });

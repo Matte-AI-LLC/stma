@@ -73,6 +73,7 @@ export const AppLayout = ({
   keys,
   keysNote,
   bleed,
+  addressControls,
   children,
 }: {
   user: User;
@@ -86,6 +87,8 @@ export const AppLayout = ({
   keys?: KeyHint[];
   keysNote?: string;
   bleed?: boolean;
+  /** False where the page takes the address code itself; see `ConsoleProps`. */
+  addressControls?: boolean;
   children?: Child;
 }) => (
   <html lang="en">
@@ -102,6 +105,7 @@ export const AppLayout = ({
         keys={keys}
         keysNote={keysNote}
         bleed={bleed}
+        addressControls={addressControls}
       >
         {children}
       </ConsoleShell>

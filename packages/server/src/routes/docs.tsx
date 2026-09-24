@@ -355,10 +355,14 @@ docsRoutes.get('/docs', (c) => {
           <section class="doc-section" id="web">
             <h2>After the first reply — only what you need</h2>
             <p>
-              <b>Add another person:</b> an owner opens the team's People tab and creates an invite,
-              or asks their agent to call <code>create_invite</code>. The invitee joins with their own
-              account; every agent gets its own scoped connection. Adding a human is different from
-              adding another agent of your own. Hosted multi-person workspaces need a plan that allows them.
+              <b>Add another person:</b> an owner opens <b>Members and invites</b> in the workspace
+              rail, types their addresses and presses <b>Send invitations</b>. Each person gets an
+              email with an invitation that works for their address alone, once, for seven days. A
+              link to pass on yourself is there too, for as many people as you choose, and an owner's
+              agent can make one with <code>create_invite</code>. The invitee joins with their own
+              account, and the owners are emailed when they do; every agent gets its own scoped
+              connection. Adding a human is different from adding another agent of your own. Hosted
+              multi-person workspaces need a plan that allows them.
             </p>
             <p>
               <b>Share repository context:</b> ask an agent to call <code>onboard_repo</code>, review
@@ -377,10 +381,14 @@ docsRoutes.get('/docs', (c) => {
 
           <section class="doc-section" id="terminal">
             <h2>Joining someone else's workspace</h2>
-            <p>An owner invites a person from People or through <code>create_invite</code>.
-              The generated invitation names the service and workspace and asks once before opening
-              the browser. Sign in with your own account and review membership there. Never give
-              an agent your password, MFA code or account token.</p>
+            <p>An owner invites a person from <b>Members and invites</b>, by email or with a link,
+              or through <code>create_invite</code>. Opening the invitation shows whose workspace it
+              is and what it grants before anything happens; without an account you create one from
+              it, even on a server whose signup is otherwise closed, and come straight back. An
+              invitation sent by email works only for an account with that address, confirmed with
+              the code we send it. The generated agent instruction names the service and workspace and
+              asks once before opening the browser. Sign in with your own account and review membership
+              there. Never give an agent your password, MFA code or account token.</p>
             <p>Joining installs no MCP connection. Once membership is confirmed, open{' '}
               <a href="/app/tokens">Agent connections</a>, add the shared MCP address to your own
               client and authorize your own project-scoped installation. It never shares the inviter's identity.
@@ -1338,10 +1346,11 @@ docsRoutes.get('/docs', (c) => {
                   <td>
                     Create a workspace from <b>New workspace</b> — a name is all that is required; the tag
                     (the short id in URLs and agent config) and a team chat webhook are optional and
-                    marked as such. Owners create and revoke invite links; members see the roster
-                    but never receive those access-bearing URLs. A team's own page is four tabs for
-                    owners: <b>Overview</b> (projects, team
-                    health, what agents share), <b>People</b> (members and invite links),
+                    marked as such. Owners invite people by email or with a link and revoke either;
+                    members see the roster but never receive those access-bearing URLs. A team's own
+                    page is four tabs for owners: <b>Overview</b> (projects, team
+                    health, what agents share), <b>People</b> (members, invitations waiting and, on a
+                    metered plan, how many places are left),
                     <b>Integrations</b> (Slack/Discord, inbound CI and GitHub hooks, GitHub, Azure
                     DevOps, Jira and OAuth-based ClickUp project/List connections — owners) and <b>Settings</b> (leave, remove a
                     member, delete the team). Members do not see the empty owner-only Integrations

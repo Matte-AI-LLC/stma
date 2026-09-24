@@ -550,7 +550,7 @@ it('highlights the rail item you are actually on', async () => {
     ['/app/agents?team=pictures', 'Agent map'],
     ['/app/sessions?team=pictures', 'Sessions'],
     ['/app/handoffs?team=pictures', 'Work'],
-    ['/app/teams/pictures?tab=people', 'Members'],
+    ['/app/teams/pictures?tab=people', 'Members and invites'],
     ['/app/notifications', 'Notifications'],
     ['/app/sessions', 'All workspaces'],
     ['/app/teams/pictures/governance', 'Governance'],

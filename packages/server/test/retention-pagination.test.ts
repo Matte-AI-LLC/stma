@@ -702,7 +702,7 @@ describe('ownership transfer', () => {
     const refused = await roleChange(owner, slug, ownerId, 'member');
     expect(refused.status).toBe(302);
     expect(decodeURIComponent(refused.headers.get('location')!)).toContain(
-      'A team needs at least one owner',
+      'A workspace needs at least one owner',
     );
     const roleAfter = await db
       .select({ role: memberships.role })
@@ -736,7 +736,7 @@ describe('ownership transfer', () => {
     // …and the new sole owner cannot demote themselves either.
     const lastOne = await roleChange(second, slug, secondId, 'member');
     expect(decodeURIComponent(lastOne.headers.get('location')!)).toContain(
-      'A team needs at least one owner',
+      'A workspace needs at least one owner',
     );
   });
 

@@ -36,6 +36,7 @@ export type MailKind =
   | 'password_changed'
   | 'failed_sign_ins'
   | 'activity'
+  | 'workspace_invite'
   | 'billing';
 
 export interface MailMessage {
@@ -358,6 +359,49 @@ export function emailChangedNotice(next: string, baseUrl: string): Omit<MailMess
     subject: 'Your STMA email address was changed',
     text: [line, act, `${baseUrl}/login`, SIGNOFF].join('\n\n'),
     html: wrap([line, act, `<a href="${esc(`${baseUrl}/login`)}">${esc(`${baseUrl}/login`)}</a>`, SIGNOFF]),
+  };
+}
+
+/**
+ * An owner of a workspace asked us to invite this address.
+ *
+ * The only mail STMA sends to somebody who may have no account and never asked
+ * for anything, so it is written for that reader. Nothing a user typed reaches
+ * the subject: a workspace name is sixty characters of anybody's choosing, and
+ * a subject line is exactly where a message pretending to be something else
+ * would put it. In the body the name is quoted as a name, the inviter is the
+ * display name every member already sees, and the last line says that ignoring
+ * the mail changes nothing, because for somebody who was not expecting it that
+ * is the whole answer.
+ */
+export function workspaceInviteEmail(input: {
+  inviter: string;
+  workspace: string;
+  role: 'owner' | 'member';
+  url: string;
+  days: number;
+}): Omit<MailMessage, 'to'> {
+  const { inviter, workspace, role, url, days } = input;
+  const asRole =
+    role === 'owner'
+      ? 'as an owner, which also lets you publish the rules its agents follow, connect providers, change its plan and remove people'
+      : 'as a member';
+  const line = `${inviter} invited you to the workspace "${workspace}" on STMA, ${asRole}.`;
+  const what =
+    'STMA is AgentOps for people who build with coding agents: one place to see what every agent is doing, hand work from one to another and set the rules they follow.';
+  const terms = `The invitation works for ${days} days, once, and only for an account with this email address. If you do not have one yet, the link lets you create it.`;
+  const ignore = 'If you were not expecting this, ignore this email. Nothing happens unless you accept.';
+  return {
+    kind: 'workspace_invite',
+    subject: 'You are invited to a workspace on STMA',
+    text: [line, what, `Accept the invitation: ${url}`, terms, ignore].join('\n\n'),
+    html: wrap([
+      esc(line),
+      esc(what),
+      `<a href="${esc(url)}">Accept the invitation</a>`,
+      `<span style="color:#6b7075;font-size:13px">${esc(terms)}</span>`,
+      `<span style="color:#6b7075;font-size:13px">${esc(ignore)}</span>`,
+    ]),
   };
 }
 

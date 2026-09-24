@@ -530,10 +530,11 @@ it('splits the team page into tabs, and keeps the tab in the URL', async () => {
   expect(overview.html).not.toContain('<h3>Connect your agent</h3>');
   expect(overview.html).toContain('?tab=people');
   // Members and invites are one tab away, not three screens down the scroll.
-  expect(overview.html).not.toContain('Invite links');
+  expect(overview.html).not.toContain('No invitations waiting');
 
   const people = await page('/app/teams/v2-team?tab=people');
-  expect(people.html).toContain('Invite links');
+  expect(people.html).toContain('Invite people');
+  expect(people.html).toContain('No invitations waiting');
   expect(people.html).toContain('Members');
 
   const integrations = await page('/app/teams/v2-team?tab=integrations');

@@ -39,6 +39,13 @@ export const NOOP_LIFECYCLE_HOOKS: AppLifecycleHooks = {};
 export interface AppCapabilities {
   managedBilling: boolean;
   organizationSecurity: boolean;
+  /**
+   * What each person past a plan's included seats costs, where the composition
+   * sells seats. The People tab prints it beside the invite forms, so an owner
+   * sees the price of a join before sending the invitation, and core imports no
+   * price table to do it.
+   */
+  seatPricing?: { plan: string; included: number; monthlyCents: number; yearlyCents: number };
 }
 
 export const NO_APP_CAPABILITIES: AppCapabilities = { managedBilling: false, organizationSecurity: false };

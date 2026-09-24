@@ -6,7 +6,7 @@ import {
   AGENT_ROLES,
   type AgentClientType,
 } from '@bridge/shared';
-import { and, count, countDistinct, desc, eq, gt, inArray, isNull, max } from 'drizzle-orm';
+import { and, count, countDistinct, desc, eq, gt, inArray, isNull, lt, max, or } from 'drizzle-orm';
 import { Hono } from 'hono';
 import { deleteCookie, getCookie, setCookie } from 'hono/cookie';
 import type { Context } from 'hono';
@@ -56,6 +56,9 @@ import {
   type DeviceSummary,
 } from '../lib/devices';
 import { effectiveLimits, effectivePlanLabel } from '../lib/entitlements';
+import { hitCounter } from '../lib/counters';
+import { humanMembership } from '../lib/seats';
+import type { AppCapabilities } from '../extensions';
 import { logLine } from '../lib/log';
 import {
   hasNoOwner,
@@ -70,6 +73,7 @@ import {
   passwordChangeCodeEmail,
   passwordChangedEmail,
   sendMail,
+  workspaceInviteEmail,
 } from '../lib/mailer';
 import {
   LOGIN_FAIL_WINDOW_MS,
@@ -110,7 +114,18 @@ import {
   setClickupCommentOnFinish,
   setClickupPaused,
 } from '../domain/integrations';
-import { claimInviteMembership } from '../domain/invites';
+import {
+  INVITE_TTL_DAYS,
+  LINK_USES,
+  MAX_INVITE_ADDRESSES,
+  claimInviteMembership,
+  createLinkInvite,
+  inviteCodeFromNext,
+  issueEmailInvites,
+  liveInvite,
+  memberCapacity,
+  type LinkUses,
+} from '../domain/invites';
 import { revokeAgentInstallation } from '../domain/agents';
 import { connectionPairings, setCompanion, type ConnectionPairing } from '../domain/companions';
 import { adoHealth, adoLocator, describeAdoFailure, parseAdoLocator } from '../lib/azureDevops';
@@ -126,14 +141,16 @@ import {
   sealClickupPending,
 } from '../lib/clickup';
 import { isSafeWebhookUrl } from '../lib/notify';
-import { notifyTeamJoined } from '../lib/notifications';
+import { notifyJoinRefused, notifyMemberJoined, notifyTeamJoined } from '../lib/notifications';
 import { fmtDate, initials, timeAgo } from '../lib/format';
 import { ensureRail, workspaceCounters } from '../lib/rail';
 import { slugify } from '../lib/slug';
 import { track } from '../lib/track';
+import type { Env } from '../env';
 import type { AppEnv, User } from '../types';
 import { Field, Lead, PageHead, teamTrail, Vr } from '../ui/Console';
 import { AppLayout, Head, Logo } from '../ui/Layout';
+import { NoScan } from '../ui/Mail';
 import { Landing } from '../ui/Landing';
 import { siteInfo } from '../ui/Site';
 import { Mail } from '../ui/Mail';
@@ -201,20 +218,6 @@ async function enrollmentRowsFor(db: Db, userId: string) {
     .limit(50);
 }
 
-async function validInvite(db: Db, code: string) {
-  const rows = await db
-    .select({ invite: invites, team: teams })
-    .from(invites)
-    .innerJoin(teams, eq(invites.teamId, teams.id))
-    .where(eq(invites.code, code))
-    .limit(1);
-  const row = rows[0];
-  if (!row) return undefined;
-  if (row.invite.expiresAt <= new Date()) return undefined;
-  if (row.invite.maxUses != null && row.invite.uses >= row.invite.maxUses) return undefined;
-  return row;
-}
-
 /**
  * Member ids arrive as path parameters. Comparing a non-uuid against a uuid column
  * is a database error, not an empty result, so shape is checked before querying:
@@ -264,7 +267,7 @@ const RoleForm = ({
   const label = to === 'owner' ? 'Make owner' : self ? 'Step down' : 'Demote';
   const body =
     to === 'owner'
-      ? `${member} will be able to invite and remove members, publish policy, change team settings and delete the team.`
+      ? `${member} will be able to invite and remove people, publish policy, change workspace settings and delete the workspace.`
       : self
         ? `You keep access to ${teamName} as a member, but lose owner-only actions. Another owner has to promote you back.`
         : `${member} keeps access to ${teamName} as a member, but loses owner-only actions.`;
@@ -305,6 +308,297 @@ const DeviceNames = ({ devices }: { devices: DeviceSummary[] }) =>
     </div>
   ) : null;
 
+
+// ---------------------------------------------------------------- invitations
+
+/** `$12`, the way the pricing page prints it. */
+const dollars = (cents: number): string => `$${(cents / 100).toLocaleString('en-US')}`;
+
+/**
+ * An emailed invitation that was refused, handed back where it was typed.
+ *
+ * Up to ten addresses is too much typing to lose to one mistake, and the
+ * addresses must not travel back through a redirect's query string, which is
+ * where this page's other refusals go. `renderPolicyEditor` set the shape: the
+ * POST answers with the page itself, 422, every field as typed.
+ */
+type InviteRefusal = { error: string; emails: string; role: 'owner' | 'member' };
+
+type WaitingInvite = { invite: typeof invites.$inferSelect; creator: string | null };
+type Capacity = Awaited<ReturnType<typeof memberCapacity>>;
+
+/** The plan that decides, by name: a complimentary grant is a plan too. */
+const planInForce = (plan: string, capacity: Capacity): string => {
+  const id = capacity.limits.grant?.plan ?? plan;
+  return PLAN_NAMES[id] ?? id;
+};
+
+/** Why nobody else can join right now, in the words the invite card and a refusal share. */
+function fullSentence(plan: string, capacity: Capacity): string {
+  return capacity.limit === 1
+    ? `The ${planInForce(plan, capacity)} plan is for one person, so there is no room for anybody else. To work with other people, move this workspace to Team.`
+    : `Its plan allows ${capacity.limit} people, and every place is taken.`;
+}
+
+/**
+ * Invitation emails are the one mail STMA sends to an address nobody here has
+ * proved anything about, through the account every sign-in code depends on.
+ * Twenty per owner a day, and `INVITE_EMAILS_PER_DAY` for the whole server;
+ * past either the invitation still exists and the owner copies its link.
+ */
+const INVITE_MAILS_PER_ACCOUNT = 20;
+
+async function mayEmailInvitation(db: Db, limit: number, userId: string): Promise<boolean> {
+  const mine = await hitCounter(db, 'invite_mail', userId, DAY, INVITE_MAILS_PER_ACCOUNT);
+  if (mine.exceeded) return false;
+  const all = await hitCounter(db, 'invite_mail', 'server', DAY, limit);
+  return !all.exceeded;
+}
+
+/**
+ * The owner's half of adding a person: who is invited, what it grants, what the
+ * plan leaves room for and, on a paid Team, what a join costs.
+ *
+ * Email first where the server can confirm addresses, because an invitation
+ * bound to one address cannot be passed on, and a link second, because some
+ * people are reached in a chat rather than a mailbox. The link now asks how many
+ * people it is for: an unlimited link pasted into the wrong channel lets in
+ * everybody who reads it, and on Team each of them is a seat.
+ */
+const InviteCard = ({
+  team,
+  rows,
+  baseUrl,
+  capacity,
+  byEmail,
+  senderConfirmed,
+  refused,
+  seat,
+  billingPages,
+  beta,
+}: {
+  team: { slug: string; name: string; plan: string };
+  rows: WaitingInvite[];
+  baseUrl: string;
+  capacity: Capacity;
+  /** The server confirms addresses, which an emailed invitation depends on. */
+  byEmail: boolean;
+  senderConfirmed: boolean;
+  refused?: InviteRefusal;
+  seat?: AppCapabilities['seatPricing'];
+  billingPages: boolean;
+  beta: boolean;
+}) => {
+  // The price of a join is said only where a join has one: a paid Team. A
+  // complimentary grant and an evaluation carry Team's ceilings and no bill.
+  const priced =
+    seat &&
+    capacity.limited &&
+    team.plan === seat.plan &&
+    !capacity.limits.grant &&
+    !capacity.limits.evaluationEndsAt
+      ? seat
+      : undefined;
+  const roleSelect = (id: string) => (
+    <select class="in" id={id} name="role" style="width:auto" aria-label="What the invitation grants">
+      <option value="member" selected={refused?.role !== 'owner'}>
+        Joins as a member
+      </option>
+      <option value="owner" selected={refused?.role === 'owner'}>
+        Joins as an owner
+      </option>
+    </select>
+  );
+  return (
+    <div class="card" id="invites">
+      <div class="card-head">
+        <div>
+          <div class="card-title">Invite people</div>
+          <div class="card-note">
+            An invitation says what it grants. A member sees everything in the workspace and does
+            the work; an owner can also publish rules, connect providers, change the plan and
+            remove people.
+          </div>
+        </div>
+        {capacity.limited ? (
+          <span class="mono muted" title="People in this workspace, and how many its plan allows">
+            {capacity.humans} / {capacity.limit}
+          </span>
+        ) : null}
+      </div>
+      <div class="card-pad col" style="gap:14px">
+        {beta ? (
+          <p class="m0 small muted">
+            While the beta runs, a workspace can have any number of people and nothing is billed.
+          </p>
+        ) : null}
+        {priced ? (
+          <p class="m0 small muted">
+            Team includes {priced.included} people. Each person beyond {priced.included} adds{' '}
+            {dollars(priced.monthlyCents)} a month to the bill, or {dollars(priced.yearlyCents)} a
+            year on annual billing, from the day they join. Agents and machines never do.
+          </p>
+        ) : null}
+        {capacity.full ? (
+          <div class="banner banner-warn m0">
+            <span class="ic">!</span>
+            <span>
+              <b>This workspace is full.</b> {fullSentence(team.plan, capacity)}{' '}
+              {billingPages ? <a href={`/app/teams/${team.slug}/plan`}>Open Plan &amp; billing</a> : null}
+            </span>
+          </div>
+        ) : (
+          <>
+            {byEmail && senderConfirmed ? (
+              <form
+                method="post"
+                action={`/app/teams/${team.slug}/invites/email`}
+                class="col m0"
+                style="gap:10px"
+              >
+                <Field
+                  id="invite-emails"
+                  label="Email addresses"
+                  required
+                  help={`Up to ${MAX_INVITE_ADDRESSES}, separated by commas or new lines. Each person gets their own invitation: it works for ${INVITE_TTL_DAYS} days, once, and only for an account with that address.`}
+                >
+                  <textarea
+                    class="in"
+                    id="invite-emails"
+                    name="emails"
+                    rows={2}
+                    maxlength={2000}
+                    required
+                    aria-required="true"
+                    aria-describedby="invite-emails-help"
+                    placeholder="ana@example.com, sam@example.com"
+                  >
+                    {refused?.emails ?? ''}
+                  </textarea>
+                </Field>
+                <div class="row" style="gap:8px;align-items:center;flex-wrap:wrap">
+                  {roleSelect('invite-email-role')}
+                  <button class="btn btn-sm btn-primary" type="submit">
+                    Send invitations
+                  </button>
+                </div>
+              </form>
+            ) : byEmail ? (
+              <p class="m0 small">
+                To invite people by email, confirm your own address first: invitations go out in
+                your name. The band at the top of this page takes the code. You can share a link
+                in the meantime.
+              </p>
+            ) : (
+              <p class="m0 small muted">
+                This server does not confirm email addresses, so an invitation is a link you pass on
+                yourself.
+              </p>
+            )}
+            <form
+              method="post"
+              action={`/app/teams/${team.slug}/invites`}
+              class="m0 row"
+              style="gap:8px;align-items:center;flex-wrap:wrap"
+            >
+              <span class="small">{byEmail && senderConfirmed ? 'Or share a link' : 'Share a link'}</span>
+              {roleSelect('invite-link-role')}
+              <select class="in" name="uses" style="width:auto" aria-label="How many people the link can let in">
+                <option value="1">for 1 person</option>
+                <option value="5" selected>
+                  for up to 5 people
+                </option>
+                <option value="25">for up to 25 people</option>
+                <option value="unlimited">for anyone who has it</option>
+              </select>
+              <button class="btn btn-sm" type="submit">
+                Create link
+              </button>
+            </form>
+          </>
+        )}
+      </div>
+      <div class="card-head" style="border-top:1px solid var(--line)">
+        <span class="card-title">Waiting</span>
+        <span class="mono muted">{rows.length}</span>
+      </div>
+      {rows.length === 0 ? (
+        <div class="card-pad muted small">No invitations waiting.</div>
+      ) : (
+        rows.map((row) => {
+          const url = `${baseUrl}/join/${row.invite.code}`;
+          const addressed = row.invite.email;
+          return (
+            <div class="invrow">
+              <div class="invrow-main">
+                {addressed ? (
+                  <div class="invurl">
+                    <NoScan>{addressed}</NoScan>
+                  </div>
+                ) : (
+                  <div class="invurl">{url}</div>
+                )}
+                <button class="btn btn-sm" type="button" data-copy={url}>
+                  {addressed ? 'Copy link' : 'Copy'}
+                </button>
+                {addressed && byEmail ? (
+                  <form method="post" action={`/app/teams/${team.slug}/invites/${row.invite.id}/resend`} class="m0">
+                    <button class="btn btn-sm" type="submit">
+                      Send again
+                    </button>
+                  </form>
+                ) : null}
+                <form
+                  method="post"
+                  action={`/app/teams/${team.slug}/invites/${row.invite.id}/revoke`}
+                  class="m0"
+                  data-confirm={
+                    addressed
+                      ? 'The invitation stops working at once, including the link in the email already sent.'
+                      : 'Anyone who has not used this link yet will no longer be able to join with it.'
+                  }
+                  data-confirm-title={addressed ? 'Revoke this invitation?' : 'Revoke this invite link?'}
+                  data-confirm-action="Revoke"
+                >
+                  <button class="btn btn-sm btn-danger" type="submit">
+                    Revoke
+                  </button>
+                </form>
+              </div>
+              <div class="invmeta">
+                <span class="with-dot">
+                  <span class="dot" />
+                  Waiting
+                </span>
+                {/* Said on every row, not only the unusual one: a list
+                    where the dangerous entry is the one with extra words
+                    teaches people to skim past the words. */}
+                <span class={row.invite.role === 'owner' ? 'pill pill-danger' : 'pill'}>
+                  {row.invite.role === 'owner' ? 'joins as an owner' : 'joins as a member'}
+                </span>
+                {addressed ? (
+                  <span>
+                    {row.invite.sentAt
+                      ? `Emailed ${timeAgo(row.invite.sentAt) ?? 'just now'}`
+                      : 'Not emailed: copy the link and send it yourself'}
+                  </span>
+                ) : (
+                  <span>
+                    {row.invite.maxUses != null
+                      ? `${row.invite.uses} of ${row.invite.maxUses} used`
+                      : `${row.invite.uses} used, no limit`}
+                  </span>
+                )}
+                <span>Expires {fmtDate(row.invite.expiresAt)}</span>
+                {row.creator ? <span>Invited by {row.creator}</span> : null}
+              </div>
+            </div>
+          );
+        })
+      )}
+    </div>
+  );
+};
 
 // ---------------------------------------------------------------- landing
 
@@ -385,8 +679,9 @@ dashboardRoutes.get('/app', async (c) => {
             <h2>Start with one workspace</h2>
             <p>
               Just connecting your own computers? Choose <b>New workspace</b>, name it “My workspace”,
-              then connect each agent. No teammate invitation needed. Joining someone else?
-              Open the invite link they sent you.
+              then connect each agent. No teammate invitation needed. Working with other people?
+              Create the workspace, then invite them from <b>Members and invites</b>. Joining
+              somebody else's? Open the invitation they sent you.
             </p>
             <button class="btn btn-primary" type="button" data-open-dialog="#new-team">
               New workspace
@@ -622,21 +917,21 @@ dashboardRoutes.post('/app/teams', async (c) => {
   return c.redirect(`/app/teams/${team.slug}`);
 });
 
-dashboardRoutes.get('/app/teams/:slug', async (c) => {
+async function renderTeamPage(c: Context<AppEnv>, refused?: InviteRefusal) {
   const user = c.get('user');
   if (!user) return loginRedirect(c);
   const db = c.get('db');
   const env = c.get('env');
-  const found = await teamForMember(db, c.req.param('slug'), user.id);
+  const found = await teamForMember(db, c.req.param('slug') ?? '', user.id);
   if (!found) {
     return c.html(
       <AppLayout user={user} active="teams" title="Not found">
         <div class="card card-pad joincard">
           <span class="tile tile-44 tile-gray">×</span>
-          <h2 class="title m0">Team not found</h2>
+          <h2 class="title m0">Workspace not found</h2>
           <p class="m0 sub">Either it does not exist or you are not a member.</p>
           <a class="btn" href="/app" style="align-self:flex-start">
-            Back to teams
+            Back to workspaces
           </a>
         </div>
       </AppLayout>,
@@ -644,12 +939,14 @@ dashboardRoutes.get('/app/teams/:slug', async (c) => {
     );
   }
   const { team, role } = found;
+  // A POST never computes the rail, and a refused invitation answers with this page.
+  if (refused) await ensureRail(db, user, team.slug);
   const TABS = (
     role === 'owner'
       ? ['overview', 'people', 'integrations', 'settings']
       : ['overview', 'people', 'settings']
   ) as readonly ('overview' | 'people' | 'integrations' | 'settings')[];
-  const asked = c.req.query('tab');
+  const asked = refused ? 'people' : c.req.query('tab');
   const tab = (TABS as readonly string[]).includes(asked ?? '')
     ? (asked as 'overview' | 'people' | 'integrations' | 'settings')
     : 'overview';
@@ -668,9 +965,20 @@ dashboardRoutes.get('/app/teams/:slug', async (c) => {
           .select({ invite: invites, creator: users.username })
           .from(invites)
           .leftJoin(users, eq(invites.createdBy, users.id))
-          .where(and(eq(invites.teamId, team.id), gt(invites.expiresAt, new Date())))
+          .where(
+            and(
+              eq(invites.teamId, team.id),
+              gt(invites.expiresAt, new Date()),
+              // Waiting, not merely unexpired: an emailed invitation somebody
+              // accepted has done its job and leaves the list.
+              or(isNull(invites.maxUses), lt(invites.uses, invites.maxUses)),
+            ),
+          )
           .orderBy(desc(invites.createdAt))
       : [];
+  // Only where the invite card is drawn, which is the one reader of the ceiling here.
+  const capacity =
+    role === 'owner' && tab === 'people' ? await memberCapacity(db, team, env.hosted) : undefined;
   const devicesByUser = await devicesByMember(db, team.id);
   const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
   const teamProjects = await db
@@ -741,7 +1049,7 @@ dashboardRoutes.get('/app/teams/:slug', async (c) => {
     .where(and(eq(agentRuns.teamId, team.id), gt(agentRuns.lastHeartbeatAt, weekAgo)));
   const activeAgents7d = activeAgentRows[0]?.n ?? 0;
 
-  const settingsError = c.req.query('error');
+  const settingsError = refused?.error ?? c.req.query('error');
   const notice = c.req.query('ok');
   const limits = await effectiveLimits(db, team, env.hosted);
   const planLabel = effectivePlanLabel(team.plan, limits);
@@ -822,11 +1130,11 @@ dashboardRoutes.get('/app/teams/:slug', async (c) => {
               <a class="btn btn-sm" href={`/app/teams/${team.slug}/governance`}>
                 Governance
               </a>
-              {/* The invite links live on People now, so the action goes there
+              {/* The invitations live on People, so the action goes there
                   rather than at an anchor this tab no longer has. */}
               {role === 'owner' ? (
                 <a class={`btn btn-sm${members.length > 1 ? ' btn-primary' : ''}`} href={`/app/teams/${team.slug}?tab=people#invites`}>
-                  Invite member
+                  Invite people
                 </a>
               ) : null}
             </>
@@ -852,6 +1160,12 @@ dashboardRoutes.get('/app/teams/:slug', async (c) => {
           </p>
           <a href={`/app/tokens?team=${encodeURIComponent(team.slug)}`}>Connect your agents</a>
           {' · '}<a href="/docs#quickstart">Follow the two-computer quick start</a>
+          {role === 'owner' ? (
+            <>
+              {' · '}
+              <a href={`/app/teams/${team.slug}?tab=people#invites`}>Working with other people? Invite them</a>
+            </>
+          ) : null}
         </div>
       ) : null}
 
@@ -987,7 +1301,7 @@ dashboardRoutes.get('/app/teams/:slug', async (c) => {
                           class="m0"
                           method="post"
                           action={`/app/teams/${team.slug}/members/${m.member.id}/remove`}
-                          data-confirm={`${m.member.username} loses access to this team immediately. Their snapshots, messages and activity stay attributed to them.`}
+                          data-confirm={`${m.member.username} loses access to this workspace immediately. Their snapshots, messages and activity stay attributed to them.`}
                           data-confirm-title={`Remove ${m.member.username} from ${team.name}?`}
                           data-confirm-action="Remove member"
                         >
@@ -1004,78 +1318,34 @@ dashboardRoutes.get('/app/teams/:slug', async (c) => {
           </div>
           ) : null}
 
-          {tab === 'people' && role === 'owner' ? (
-          <div class="card" id="invites">
-            <div class="card-head">
-              <div>
-                <div class="card-title">Invite links</div>
-                <div class="card-note">
-                  Anyone with the link can join. Choose what it grants: a member reads everything
-                  and does the work, an owner can also publish rules, connect providers, spend the
-                  plan and remove people.
-                </div>
-              </div>
-              <form method="post" action={`/app/teams/${team.slug}/invites`} class="m0 row" style="gap:8px;align-items:center">
-                {/* The role is chosen where the link is made, not where it is
-                    used: the person clicking it has no way to know what it
-                    grants, and no say in it either. */}
-                <select class="in" name="role" style="width:auto" aria-label="What this link grants">
-                  <option value="member" selected>Joins as a member</option>
-                  <option value="owner">Joins as an owner</option>
-                </select>
-                <button class="btn btn-sm" type="submit">
-                  Generate link (valid 7 days)
-                </button>
-              </form>
+          {/* A member looking for how to add somebody finds who can, rather
+              than a tab that simply has less on it. */}
+          {tab === 'people' && role !== 'owner' ? (
+            <div class="card card-pad">
+              <div class="card-title">Inviting people</div>
+              <p class="m0 small muted">
+                Only an owner of this workspace can invite people. Ask{' '}
+                {members
+                  .filter((m) => m.role === 'owner')
+                  .map((m) => m.member.username)
+                  .join(', ')}
+                .
+              </p>
             </div>
-            {activeInvites.length === 0 ? (
-              <div class="card-pad muted small">No active invite links.</div>
-            ) : (
-              activeInvites.map((row) => {
-                const url = `${env.baseUrl}/join/${row.invite.code}`;
-                return (
-                  <div class="invrow">
-                    <div class="invrow-main">
-                      <div class="invurl">{url}</div>
-                      <button class="btn btn-sm" type="button" data-copy={url}>
-                        Copy
-                      </button>
-                      <form
-                        method="post"
-                        action={`/app/teams/${team.slug}/invites/${row.invite.id}/revoke`}
-                        class="m0"
-                        data-confirm="Anyone who has not used this link yet will no longer be able to join with it."
-                        data-confirm-title="Revoke this invite link?"
-                        data-confirm-action="Revoke link"
-                      >
-                        <button class="btn btn-sm btn-danger" type="submit">
-                          Revoke
-                        </button>
-                      </form>
-                    </div>
-                    <div class="invmeta">
-                      <span class="with-dot">
-                        <span class="dot" />
-                        Active
-                      </span>
-                      {/* Said on every row, not only the unusual one: a list
-                          where the dangerous entry is the one with extra words
-                          teaches people to skim past the words. */}
-                      <span class={row.invite.role === 'owner' ? 'pill pill-danger' : 'pill'}>
-                        {row.invite.role === 'owner' ? 'joins as an owner' : 'joins as a member'}
-                      </span>
-                      <span>Expires {fmtDate(row.invite.expiresAt)}</span>
-                      <span>
-                        {row.invite.uses}
-                        {row.invite.maxUses != null ? ` / ${row.invite.maxUses}` : ''} uses
-                      </span>
-                      {row.creator ? <span>Created by {row.creator}</span> : null}
-                    </div>
-                  </div>
-                );
-              })
-            )}
-          </div>
+          ) : null}
+          {tab === 'people' && role === 'owner' && capacity ? (
+            <InviteCard
+              team={team}
+              rows={activeInvites}
+              baseUrl={env.baseUrl}
+              capacity={capacity}
+              byEmail={env.twoFactor}
+              senderConfirmed={Boolean(user.emailVerifiedAt)}
+              refused={refused}
+              seat={c.get('capabilities').seatPricing}
+              billingPages={c.get('capabilities').managedBilling}
+              beta={env.hosted && env.betaUnmetered}
+            />
           ) : null}
         </div>
 
@@ -1652,7 +1922,7 @@ dashboardRoutes.get('/app/teams/:slug', async (c) => {
             </div>
             <div class="row" style="justify-content:space-between">
               <span class="small" style="color:var(--txt-2)">
-                Leave this team. Everything you shared stays attributed to you.
+                Leave this workspace. Everything you shared stays attributed to you.
               </span>
               <form
                 method="post"
@@ -1660,10 +1930,10 @@ dashboardRoutes.get('/app/teams/:slug', async (c) => {
                 class="m0"
                 data-confirm={`You lose access to ${team.name} until someone invites you again. Snapshots, messages and activity you shared stay attributed to you.`}
                 data-confirm-title={`Leave ${team.name}?`}
-                data-confirm-action="Leave team"
+                data-confirm-action="Leave workspace"
               >
                 <button class="btn btn-sm btn-danger" type="submit">
-                  Leave team
+                  Leave workspace
                 </button>
               </form>
             </div>
@@ -1673,7 +1943,7 @@ dashboardRoutes.get('/app/teams/:slug', async (c) => {
                 style="justify-content:space-between;border-top:1px solid var(--line-2);padding-top:12px"
               >
                 <span class="small" style="color:var(--txt-2)">
-                  Delete this team for all {members.length}{' '}
+                  Delete this workspace for all {members.length}{' '}
                   {members.length === 1 ? 'member' : 'members'}.
                 </span>
                 <form
@@ -1682,10 +1952,10 @@ dashboardRoutes.get('/app/teams/:slug', async (c) => {
                   class="m0"
                   data-confirm={`Every project, session, snapshot and the activity trail of ${team.name} is permanently deleted for all members. Personal tokens are not touched. This cannot be undone.`}
                   data-confirm-title={`Delete ${team.name}?`}
-                  data-confirm-action="Delete team"
+                  data-confirm-action="Delete workspace"
                 >
                   <button class="btn btn-sm btn-danger" type="submit">
-                    Delete team
+                    Delete workspace
                   </button>
                 </form>
               </div>
@@ -1695,8 +1965,11 @@ dashboardRoutes.get('/app/teams/:slug', async (c) => {
         </div>
       </div>
     </AppLayout>,
+    refused ? 422 : 200,
   );
-});
+}
+
+dashboardRoutes.get('/app/teams/:slug', (c) => renderTeamPage(c));
 
 // ------------------------------------------------------- membership lifecycle
 
@@ -1709,7 +1982,7 @@ dashboardRoutes.post('/app/teams/:slug/leave', async (c) => {
   if (found.role === 'owner' && (await ownerCount(db, found.team.id)) <= 1) {
     return c.redirect(
       `/app/teams/${found.team.slug}?tab=settings&error=${encodeURIComponent(
-        'You are the only owner of this team. Delete the team instead, or make another member an owner first.',
+        'You are the only owner of this workspace. Delete it instead, or make another member an owner first.',
       )}`,
     );
   }
@@ -1739,7 +2012,7 @@ dashboardRoutes.post('/app/teams/:slug/leave', async (c) => {
     teamId: found.team.id,
     userId: user.id,
     action: 'member_left',
-    detail: `${user.username} left the team`,
+    detail: `${user.username} left the workspace`,
   });
   return c.redirect(`/app?ok=${encodeURIComponent(`You left ${found.team.name}.`)}`);
 });
@@ -1755,7 +2028,7 @@ dashboardRoutes.post('/app/teams/:slug/members/:userId/role', async (c) => {
   const db = c.get('db');
   const found = await teamForMember(db, c.req.param('slug'), user.id);
   if (!found) return c.notFound();
-  if (found.role !== 'owner') return c.text('Only team owners can change roles.', 403);
+  if (found.role !== 'owner') return c.text('Only an owner of the workspace can change roles.', 403);
   const body = await c.req.parseBody();
   const role = body.role === 'owner' ? 'owner' : body.role === 'member' ? 'member' : null;
   if (!role) return c.notFound();
@@ -1776,7 +2049,7 @@ dashboardRoutes.post('/app/teams/:slug/members/:userId/role', async (c) => {
   if (role === 'member' && (await ownerCount(db, found.team.id)) <= 1) {
     return c.redirect(
       `${back}&error=${encodeURIComponent(
-        'A team needs at least one owner. Make another member an owner first.',
+        'A workspace needs at least one owner. Make another member an owner first.',
       )}`,
     );
   }
@@ -1824,13 +2097,13 @@ dashboardRoutes.post('/app/teams/:slug/members/:userId/remove', async (c) => {
   const db = c.get('db');
   const found = await teamForMember(db, c.req.param('slug'), user.id);
   if (!found) return c.notFound();
-  if (found.role !== 'owner') return c.text('Only team owners can remove members.', 403);
+  if (found.role !== 'owner') return c.text('Only an owner of the workspace can remove people.', 403);
   const targetId = c.req.param('userId');
   if (!UUID_RE.test(targetId)) return c.notFound();
   if (targetId === user.id) {
     return c.redirect(
       `/app/teams/${found.team.slug}?tab=people&error=${encodeURIComponent(
-        'You cannot remove yourself. Leave the team or delete it instead.',
+        'You cannot remove yourself. Leave the workspace or delete it instead.',
       )}`,
     );
   }
@@ -1867,7 +2140,7 @@ dashboardRoutes.post('/app/teams/:slug/members/:userId/remove', async (c) => {
     detail: `${target.username} was removed by ${user.username}`,
   });
   return c.redirect(
-    `/app/teams/${found.team.slug}?tab=people&ok=${encodeURIComponent(`${target.username} was removed from the team.`)}`,
+    `/app/teams/${found.team.slug}?tab=people&ok=${encodeURIComponent(`${target.username} was removed from the workspace.`)}`,
   );
 });
 
@@ -1877,7 +2150,7 @@ dashboardRoutes.post('/app/teams/:slug/delete', async (c) => {
   const db = c.get('db');
   const found = await teamForMember(db, c.req.param('slug'), user.id);
   if (!found) return c.notFound();
-  if (found.role !== 'owner') return c.text('Only team owners can delete a team.', 403);
+  if (found.role !== 'owner') return c.text('Only an owner of the workspace can delete it.', 403);
   const teamId = found.team.id;
   const deletion = await c.get('lifecycle').beforeTeamDelete?.({ db, teamId });
   if (deletion && !deletion.ok) {
@@ -1921,7 +2194,7 @@ dashboardRoutes.post('/app/teams/:slug/delete', async (c) => {
     await tx.delete(memberships).where(eq(memberships.teamId, teamId));
     await tx.delete(teams).where(eq(teams.id, teamId));
   });
-  return c.redirect(`/app?ok=${encodeURIComponent(`Team ${found.team.name} was deleted.`)}`);
+  return c.redirect(`/app?ok=${encodeURIComponent(`The workspace ${found.team.name} was deleted.`)}`);
 });
 
 dashboardRoutes.post('/app/teams/:slug/settings', async (c) => {
@@ -2609,6 +2882,14 @@ dashboardRoutes.post('/app/teams/:slug/inbound-token', async (c) => {
   return c.redirect(`/app/teams/${found.team.slug}?tab=integrations`);
 });
 
+/** Where an invitation action answers: the People tab, at the invitation card. */
+const invitesBack = (c: Context<AppEnv>, slug: string, said: { ok?: string; error?: string } = {}) =>
+  c.redirect(
+    `/app/teams/${slug}?tab=people${said.ok ? `&ok=${encodeURIComponent(said.ok)}` : ''}${
+      said.error ? `&error=${encodeURIComponent(said.error)}` : ''
+    }#invites`,
+  );
+
 dashboardRoutes.post('/app/teams/:slug/invites', async (c) => {
   const user = c.get('user');
   if (!user) return loginRedirect(c);
@@ -2618,26 +2899,198 @@ dashboardRoutes.post('/app/teams/:slug/invites', async (c) => {
   // Two roles, and anything else is the safer one. A role is authority, so it
   // is read from a closed set rather than trusted from the form; only an owner
   // reaches this handler at all, which is what makes granting one legitimate.
-  // A caller that posts nothing at all still gets a member invite, which is
-  // what this route did before the field existed.
+  // How many people the link may let in is read the same way. A caller that
+  // posts nothing at all still gets the link this route always made, a member
+  // one with no limit, because that is what the old shape meant; the form
+  // sends its own default.
   let grants: 'owner' | 'member' = 'member';
+  let uses: LinkUses = 'unlimited';
   try {
-    if ((await c.req.parseBody()).role === 'owner') grants = 'owner';
-  } catch { /* no body is the old shape, and the old shape meant member */ }
-  await db.insert(invites).values({
-    teamId: found.team.id,
-    code: randomCode(9),
-    createdBy: user.id,
-    role: grants,
-    expiresAt: new Date(Date.now() + 7 * DAY),
-  });
+    const body = await c.req.parseBody();
+    if (body.role === 'owner') grants = 'owner';
+    if (typeof body.uses === 'string' && (LINK_USES as readonly string[]).includes(body.uses)) {
+      uses = body.uses as LinkUses;
+    }
+  } catch { /* no body is the old shape */ }
+  // A link into a workspace with no room would be refused at the door, and the
+  // person refused there is the one who can do nothing about it.
+  const capacity = await memberCapacity(db, found.team, c.get('env').hosted);
+  if (capacity.full) {
+    return invitesBack(c, found.team.slug, {
+      error: `This workspace is full. ${fullSentence(found.team.plan, capacity)}`,
+    });
+  }
+  await createLinkInvite(db, { teamId: found.team.id, createdBy: user.id, role: grants, uses });
   void track(db, {
     teamId: found.team.id,
     userId: user.id,
     action: 'invite_created',
-    detail: `joins as ${grants}`,
+    detail: `link, joins as ${grants}${uses === 'unlimited' ? '' : uses === '1' ? ', for 1 person' : `, for up to ${uses} people`}`,
   });
-  return c.redirect(`/app/teams/${found.team.slug}?tab=people#invites`);
+  return invitesBack(c, found.team.slug);
+});
+
+/** What one "Send invitations" did, in a sentence for the band. */
+function sendReport(sent: number, held: number, failed: number): { ok?: string; error?: string } {
+  const total = sent + held + failed;
+  if (held + failed === 0) {
+    return {
+      ok: `${total === 1 ? 'Invitation sent. It works' : `${total} invitations sent. Each works`} for ${INVITE_TTL_DAYS} days.`,
+    };
+  }
+  const unsent = held + failed;
+  const why =
+    held && failed
+      ? 'the daily allowance for invitation emails ran out and the mail provider refused the rest'
+      : held
+        ? 'the daily allowance for invitation emails is used up'
+        : `the mail provider refused ${unsent === 1 ? 'it' : 'them'}`;
+  const copy = `Copy ${unsent === 1 ? 'its link' : 'each link'} from the list below and send it yourself, or use Send again later.`;
+  return sent
+    ? { ok: `${sent} of ${total} invitations were emailed. ${unsent} ${unsent === 1 ? 'was' : 'were'} not, because ${why}. ${copy}` }
+    : { error: `${total === 1 ? 'The invitation was' : 'The invitations were'} created but not emailed, because ${why}. ${copy}` };
+}
+
+/**
+ * Invite people by address (2026-09-24).
+ *
+ * Until then the only way in was a link the owner had to carry to people
+ * themselves, which on a paid Team made a forwarded link a seat on their bill.
+ * An emailed invitation is for one address, works once and is sent by STMA.
+ *
+ * Two things are asked of the sender before anything goes out: that this server
+ * can confirm addresses at all, because the invitation is redeemable only by an
+ * account whose address is confirmed, and that the sender's own address is
+ * confirmed, because the mail goes out in their name to somebody who may never
+ * have heard of STMA. The mail budget comes after the invitation is written, so
+ * running out of it costs a copied link, never the invitation.
+ */
+dashboardRoutes.post('/app/teams/:slug/invites/email', async (c) => {
+  const user = c.get('user');
+  if (!user) return loginRedirect(c);
+  const db = c.get('db');
+  const env = c.get('env');
+  const found = await teamForMember(db, c.req.param('slug'), user.id);
+  if (!found || found.role !== 'owner') return c.notFound();
+  const body = await c.req.parseBody();
+  const typed = typeof body.emails === 'string' ? body.emails.slice(0, 2000) : '';
+  const role: 'owner' | 'member' = body.role === 'owner' ? 'owner' : 'member';
+  const refuse = (error: string) => renderTeamPage(c, { error, emails: typed, role });
+  if (!env.twoFactor) {
+    return refuse(
+      'This server does not confirm email addresses, so it cannot send an invitation only one address can use. Share a link instead.',
+    );
+  }
+  if (!user.emailVerifiedAt) {
+    return refuse(
+      'Confirm your own email address first: invitations go out in your name. The band at the top of this page takes the code.',
+    );
+  }
+  const emails = [...new Set(typed.split(/[\s,;]+/).map(normalizeEmail).filter(Boolean))];
+  if (emails.length === 0) return refuse('Enter at least one email address.');
+  if (emails.length > MAX_INVITE_ADDRESSES) {
+    return refuse(`Up to ${MAX_INVITE_ADDRESSES} addresses at a time, and this was ${emails.length}. Nothing was sent.`);
+  }
+  const bad = emails.filter((email) => !isEmail(email));
+  if (bad.length) {
+    return refuse(
+      `Nothing was sent: ${bad.map((email) => `"${email}"`).join(', ')} ${bad.length === 1 ? 'is not an email address' : 'are not email addresses'}.`,
+    );
+  }
+  const capacity = await memberCapacity(db, found.team, env.hosted);
+  if (capacity.full) return refuse(`This workspace is full. ${fullSentence(found.team.plan, capacity)}`);
+
+  const issued = await issueEmailInvites(db, { teamId: found.team.id, createdBy: user.id, role, emails });
+  const outcomes = await Promise.all(
+    issued.map(async ({ invite }) => {
+      if (!(await mayEmailInvitation(db, env.inviteEmailsPerDay, user.id))) return 'held' as const;
+      const sent = await sendMail(env, {
+        to: invite.email!,
+        ...workspaceInviteEmail({
+          inviter: user.username,
+          workspace: found.team.name,
+          role: invite.role === 'owner' ? 'owner' : 'member',
+          url: `${env.baseUrl}/join/${invite.code}`,
+          days: INVITE_TTL_DAYS,
+        }),
+      });
+      if (!sent.ok) return 'failed' as const;
+      await db.update(invites).set({ sentAt: new Date() }).where(eq(invites.id, invite.id));
+      return 'sent' as const;
+    }),
+  );
+  // Counts, never addresses: every member reads the feed, and whom an owner
+  // has asked in is theirs to tell until the person accepts.
+  void track(db, {
+    teamId: found.team.id,
+    userId: user.id,
+    action: 'invite_created',
+    detail: `emailed ${issued.length === 1 ? 'an invitation' : `${issued.length} invitations`}, joins as ${role}`,
+  });
+  return invitesBack(
+    c,
+    found.team.slug,
+    sendReport(
+      outcomes.filter((o) => o === 'sent').length,
+      outcomes.filter((o) => o === 'held').length,
+      outcomes.filter((o) => o === 'failed').length,
+    ),
+  );
+});
+
+/**
+ * Send an emailed invitation again, which also renews it: somebody reading a
+ * week-old invitation today should not find it dead tomorrow. Same code, so the
+ * first email's link keeps working too.
+ */
+dashboardRoutes.post('/app/teams/:slug/invites/:id/resend', async (c) => {
+  const user = c.get('user');
+  if (!user) return loginRedirect(c);
+  const db = c.get('db');
+  const env = c.get('env');
+  const found = await teamForMember(db, c.req.param('slug'), user.id);
+  if (!found || found.role !== 'owner') return c.notFound();
+  const id = c.req.param('id');
+  if (!UUID_RE.test(id)) return c.notFound();
+  const slug = found.team.slug;
+  const [row] = await db
+    .select()
+    .from(invites)
+    .where(and(eq(invites.id, id), eq(invites.teamId, found.team.id)))
+    .limit(1);
+  if (!row || !row.email || row.expiresAt <= new Date() || row.uses >= (row.maxUses ?? 1)) {
+    return invitesBack(c, slug, { error: 'That invitation is no longer waiting, so there is nothing to send again.' });
+  }
+  if (!env.twoFactor) return invitesBack(c, slug, { error: 'This server does not send invitation emails.' });
+  if (!user.emailVerifiedAt) {
+    return invitesBack(c, slug, {
+      error: 'Confirm your own email address first: invitations go out in your name.',
+    });
+  }
+  if (!(await mayEmailInvitation(db, env.inviteEmailsPerDay, user.id))) {
+    return invitesBack(c, slug, {
+      error:
+        'The daily allowance for invitation emails is used up. Copy the link and send it yourself, or try again tomorrow.',
+    });
+  }
+  const sent = await sendMail(env, {
+    to: row.email,
+    ...workspaceInviteEmail({
+      inviter: user.username,
+      workspace: found.team.name,
+      role: row.role === 'owner' ? 'owner' : 'member',
+      url: `${env.baseUrl}/join/${row.code}`,
+      days: INVITE_TTL_DAYS,
+    }),
+  });
+  if (!sent.ok) {
+    return invitesBack(c, slug, { error: 'The mail provider refused it. Copy the link and send it yourself.' });
+  }
+  await db
+    .update(invites)
+    .set({ sentAt: new Date(), expiresAt: new Date(Date.now() + INVITE_TTL_DAYS * DAY) })
+    .where(eq(invites.id, row.id));
+  return invitesBack(c, slug, { ok: `Sent again. It works for another ${INVITE_TTL_DAYS} days.` });
 });
 
 dashboardRoutes.post('/app/teams/:slug/invites/:id/revoke', async (c) => {
@@ -2655,29 +3108,158 @@ dashboardRoutes.post('/app/teams/:slug/invites/:id/revoke', async (c) => {
 
 // ---------------------------------------------------------------- join
 
+/**
+ * Somebody holding an invitation who is not signed in.
+ *
+ * This used to be a redirect to the sign-in form, which told a person with no
+ * account nothing about what they had been sent, and a small link under a
+ * password field is not a door. Now the page says whose workspace it is, what
+ * it grants and, for an emailed invitation, which address it is for, then
+ * offers the two ways in, both of which come back here.
+ */
+const InvitationLanding = ({
+  code,
+  found,
+  inviter,
+  canCreate,
+}: {
+  code: string;
+  found?: { team: { name: string }; invite: { role: string; email: string | null } };
+  inviter?: string;
+  canCreate: boolean;
+}) => {
+  const next = encodeURIComponent(`/join/${code}`);
+  return (
+    <html lang="en">
+      <Head title="Invitation" />
+      <body>
+        <div class="auth-wrap">
+          <div class="auth-card">
+            <a class="auth-home" href="/" aria-label="STMA home">
+              <Logo lg />
+            </a>
+            {found ? (
+              <>
+                <div>
+                  <h1>Join {found.team.name} on STMA</h1>
+                  <p class="lede">
+                    {inviter ? `${inviter} invited you` : 'You were invited'} to this workspace as{' '}
+                    {found.invite.role === 'owner' ? 'an owner' : 'a member'}. STMA is AgentOps for
+                    people who build with coding agents.
+                  </p>
+                </div>
+                {found.invite.email ? (
+                  <p class="m0 small">
+                    This invitation is for{' '}
+                    <b>
+                      <NoScan>{found.invite.email}</NoScan>
+                    </b>
+                    . Sign in or create your account with that address.
+                  </p>
+                ) : null}
+                {canCreate ? (
+                  <a class="btn btn-primary wide" href={`/signup?next=${next}`}>
+                    Create an account
+                  </a>
+                ) : null}
+                <a class={`btn wide${canCreate ? '' : ' btn-primary'}`} href={`/login?next=${next}`}>
+                  {canCreate ? 'I already have an account' : 'Sign in'}
+                </a>
+              </>
+            ) : (
+              <>
+                <div>
+                  <h1>This invitation is no longer valid</h1>
+                  <p class="lede">
+                    It expired, was revoked, or has been used as many times as it allows. Ask an
+                    owner of the workspace for a new one.
+                  </p>
+                </div>
+                <a class="btn wide" href="/login">
+                  Sign in
+                </a>
+              </>
+            )}
+            <p class="m0 small muted" style="text-align:center">
+              Stuck? <a href="/help#signin">Help</a> covers invitations.
+            </p>
+          </div>
+        </div>
+      </body>
+    </html>
+  );
+};
+
+async function usernameOf(db: Db, id: string | null): Promise<string | undefined> {
+  if (!id) return undefined;
+  return (await db.select({ username: users.username }).from(users).where(eq(users.id, id)).limit(1))[0]
+    ?.username;
+}
+
+/**
+ * A join the plan refused: written to the workspace's feed and told to its
+ * owners, once an hour per person, because they are the only people who can
+ * act on it and until 2026-09-24 nobody told them.
+ */
+async function recordRefusedJoin(db: Db, env: Env, teamId: string, user: User): Promise<void> {
+  const [recent] = await db
+    .select({ id: activity.id })
+    .from(activity)
+    .where(
+      and(
+        eq(activity.teamId, teamId),
+        eq(activity.userId, user.id),
+        eq(activity.action, 'join_refused'),
+        gt(activity.createdAt, new Date(Date.now() - 60 * 60 * 1000)),
+      ),
+    )
+    .limit(1);
+  if (recent) return;
+  await track(db, {
+    teamId,
+    userId: user.id,
+    action: 'join_refused',
+    detail: `${user.username} could not join: the workspace is at its plan's member limit`,
+  });
+  await notifyJoinRefused(db, env, { teamId, userId: user.id });
+}
+
 dashboardRoutes.get('/join/:code', async (c) => {
   const code = c.req.param('code');
   const user = c.get('user');
-  if (!user) return c.redirect(`/login?next=${encodeURIComponent(`/join/${code}`)}`);
   const db = c.get('db');
-  const row = await validInvite(db, code);
+  const env = c.get('env');
+  const row = await liveInvite(db, code);
+  if (!user) {
+    return c.html(
+      <InvitationLanding
+        code={code}
+        found={row}
+        inviter={row ? await usernameOf(db, row.invite.createdBy) : undefined}
+        // Signup opens for an invitation even where it is otherwise shut
+        // (`auth.tsx`), so a server with local accounts can always offer it.
+        canCreate={env.localAuth}
+      />,
+      row ? 200 : 404,
+    );
+  }
   if (!row) {
     return c.html(
-      <AppLayout user={user} title="Invite">
+      <AppLayout user={user} title="Invitation">
         <div class="card card-pad joincard">
-          <span class="overline">Team invitation</span>
+          <span class="overline">Workspace invitation</span>
           <span class="tile tile-44 tile-gray" style="font:500 20px/1 var(--sans)">
             ×
           </span>
           <h2 class="title m0" style="font-size:20px">
-            This invite link is no longer valid
+            This invitation is no longer valid
           </h2>
           <p class="m0" style="color:var(--txt-2)">
-            It expired, was revoked, or has been used the maximum number of times. Ask a team owner
-            for a fresh link.
+            It expired, was revoked, or has been used as many times as it allows. Ask an owner of
+            the workspace for a new one.
           </p>
           <a class="btn" href="/app" style="align-self:flex-start">
-            Back to teams
+            Back to workspaces
           </a>
         </div>
       </AppLayout>,
@@ -2689,20 +3271,23 @@ dashboardRoutes.get('/join/:code', async (c) => {
   const memberCount =
     (await db.select({ n: count() }).from(memberships).where(eq(memberships.teamId, row.team.id)))[0]
       ?.n ?? 0;
-  const creator = row.invite.createdBy
-    ? (
-        await db
-          .select({ username: users.username })
-          .from(users)
-          .where(eq(users.id, row.invite.createdBy))
-          .limit(1)
-      )[0]?.username
-    : undefined;
+  const creator = await usernameOf(db, row.invite.createdBy);
+  const forAddress = row.invite.email;
+  const wrongAddress = Boolean(forAddress) && (user.email ?? '').trim().toLowerCase() !== forAddress;
+  const unconfirmed = Boolean(forAddress) && !wrongAddress && !user.emailVerifiedAt;
+  const capacity = await memberCapacity(db, row.team, env.hosted);
+  const error = c.req.query('error');
+  const notice = c.req.query('ok');
+  const back = `/join/${code}`;
 
   return c.html(
-    <AppLayout user={user} title="Join team">
+    // The address band would offer a second code field on a page that already
+    // has one, and send whoever used it to Account instead of back here.
+    <AppLayout user={user} title="Join workspace" addressControls={!unconfirmed}>
+      {error ? <Banner kind="error" text={error} /> : null}
+      {notice ? <Banner kind="success" text={notice} /> : null}
       <div class="card card-pad joincard">
-        <span class="overline">Team invitation</span>
+        <span class="overline">Workspace invitation</span>
         <div class="join-team">
           <span class="tile tile-44 tile-green">{initials(row.team.name)}</span>
           <div>
@@ -2712,39 +3297,137 @@ dashboardRoutes.get('/join/:code', async (c) => {
             </div>
           </div>
         </div>
-        {/* What the link grants, before it is accepted. The person clicking it
-            had no say in which one it is, so the page has to be the one that
-            says so — and an owner invitation says what ownership is, because
-            "owner" on its own is a word, not an informed yes. */}
+        {/* What the invitation grants, before it is accepted. The person
+            opening it had no say in which one it is, so the page has to be the
+            one that says so, and an owner invitation says what ownership is,
+            because "owner" on its own is a word, not an informed yes. */}
         <p class="m0" style="color:var(--txt-2)">
           {creator ? `${creator} invited you` : 'You were invited'} to join as{' '}
           {row.invite.role === 'owner' ? (
             <>
-              an <b style="color:var(--ink)">owner</b>. As well as seeing the team's agent map, work
-              and sessions and connecting your own agents, you will be able to publish the rules
-              every agent on this team is given, connect providers, change the plan and remove
+              an <b style="color:var(--ink)">owner</b>. As well as seeing the workspace's agent map,
+              work and sessions and connecting your own agents, you will be able to publish the
+              rules every agent in it is given, connect providers, change the plan and remove
               people.
             </>
           ) : (
             <>
-              a <b style="color:var(--ink)">member</b>. You'll see the team's agent map, work and
-              sessions, and connect your own agents to it.
+              a <b style="color:var(--ink)">member</b>. You'll see the workspace's agent map, work
+              and sessions, and connect your own agents to it.
             </>
           )}
         </p>
-        <div class="row">
-          <form method="post" action={`/join/${code}`} class="m0">
-            <button class="btn btn-primary" type="submit">
-              Join team
-            </button>
-          </form>
-          <a class="btn" href="/app">
-            Decline
-          </a>
-        </div>
+        {wrongAddress ? (
+          <>
+            <div class="banner banner-warn m0">
+              <span class="ic">!</span>
+              <span>
+                This invitation was sent to{' '}
+                <b>
+                  <NoScan>{forAddress}</NoScan>
+                </b>
+                , and you are signed in as{' '}
+                <b>
+                  <NoScan>{user.email ?? user.username}</NoScan>
+                </b>
+                . It only works for an account with that address.
+              </span>
+            </div>
+            <p class="m0 small muted">
+              Sign out, then sign in or create an account with that address; you come straight back
+              here. Or ask {creator ?? 'whoever invited you'} to invite the address you are signed in
+              with.
+            </p>
+            <div class="row">
+              <form method="post" action="/logout" class="m0">
+                <input type="hidden" name="next" value={back} />
+                <button class="btn btn-primary" type="submit">
+                  Sign out and use that address
+                </button>
+              </form>
+              <a class="btn" href="/app">
+                Back to workspaces
+              </a>
+            </div>
+          </>
+        ) : unconfirmed ? (
+          <>
+            <p class="m0">
+              This invitation is for{' '}
+              <b>
+                <NoScan>{forAddress}</NoScan>
+              </b>
+              . Confirm that the address is yours to accept it:{' '}
+              {user.verifyCodeExpiresAt
+                ? 'enter the 6-digit code we emailed to it.'
+                : 'we email it a 6-digit code.'}
+            </p>
+            {user.verifyCodeExpiresAt ? (
+              <form class="inline m0" method="post" action="/app/account/email/verify">
+                <input type="hidden" name="back" value={back} />
+                <input
+                  class="in"
+                  style="max-width:160px"
+                  type="text"
+                  name="code"
+                  inputmode="numeric"
+                  autocomplete="one-time-code"
+                  pattern="[0-9]{6}"
+                  maxlength={6}
+                  placeholder="000000"
+                  aria-label="Confirmation code"
+                  required
+                />
+                <button class="btn btn-primary" type="submit">
+                  Confirm and continue
+                </button>
+              </form>
+            ) : null}
+            <form class="inline m0" method="post" action="/app/account/email/code">
+              <input type="hidden" name="back" value={back} />
+              <button class={`btn btn-sm${user.verifyCodeExpiresAt ? '' : ' btn-primary'}`} type="submit">
+                {user.verifyCodeExpiresAt ? 'Email me a new code' : 'Email me a code'}
+              </button>
+            </form>
+          </>
+        ) : capacity.full ? (
+          <>
+            <div class="banner banner-warn m0">
+              <span class="ic">!</span>
+              <span>
+                {row.team.name} is full: its plan allows{' '}
+                {capacity.limit === 1 ? 'one person' : `${capacity.limit} people`}, and there is no
+                room left. An owner can make room by moving it to a bigger plan or removing somebody.
+              </span>
+            </div>
+            <div class="row">
+              <form method="post" action={`/join/${code}`} class="m0">
+                <button class="btn btn-primary" type="submit">
+                  Tell the owners I tried
+                </button>
+              </form>
+              <a class="btn" href="/app">
+                Back to workspaces
+              </a>
+            </div>
+          </>
+        ) : (
+          <div class="row">
+            <form method="post" action={`/join/${code}`} class="m0">
+              <button class="btn btn-primary" type="submit">
+                Join workspace
+              </button>
+            </form>
+            <a class="btn" href="/app">
+              Decline
+            </a>
+          </div>
+        )}
         <span class="mono muted small">
-          Link expires {fmtDate(row.invite.expiresAt)} · used {row.invite.uses}
-          {row.invite.maxUses != null ? ` of ${row.invite.maxUses}` : ''} times
+          Expires {fmtDate(row.invite.expiresAt)} ·{' '}
+          {forAddress
+            ? 'works once'
+            : `used ${row.invite.uses}${row.invite.maxUses != null ? ` of ${row.invite.maxUses}` : ''} times`}
         </span>
       </div>
     </AppLayout>,
@@ -2756,24 +3439,58 @@ dashboardRoutes.post('/join/:code', async (c) => {
   const user = c.get('user');
   if (!user) return loginRedirect(c);
   const db = c.get('db');
+  const env = c.get('env');
   const claimed = await claimInviteMembership(db, { code, userId: user.id });
   if (!claimed.ok) {
     if (claimed.reason === 'member_limit') {
-      return c.redirect(
-        `/app?error=${encodeURIComponent(`Team member limit reached (${claimed.maxMembers} on the ${claimed.plan} plan).`)}`,
+      await recordRefusedJoin(db, env, claimed.team.id, user);
+      return c.html(
+        <AppLayout user={user} title="Workspace is full">
+          <div class="card card-pad joincard">
+            <span class="overline">Workspace invitation</span>
+            <h2 class="title m0" style="font-size:20px">
+              {claimed.team.name} is full
+            </h2>
+            <p class="m0" style="color:var(--txt-2)">
+              Its plan allows {claimed.maxMembers === 1 ? 'one person' : `${claimed.maxMembers} people`},
+              and there is no room left, so you were not added. Its owners have been told you tried.
+            </p>
+            <p class="m0 small muted">
+              Your invitation still works: once an owner makes room, open it again.
+            </p>
+            <a class="btn" href="/app" style="align-self:flex-start">
+              Back to workspaces
+            </a>
+          </div>
+        </AppLayout>,
+        409,
       );
     }
+    // An invitation for another address, one waiting for its address to be
+    // confirmed, or one that no longer works: the invitation page says which.
     return c.redirect(`/join/${code}`);
   }
   if (claimed.joined) {
-    await notifyTeamJoined(db, c.get('env'), { teamId: claimed.team.id, userId: user.id });
+    await notifyTeamJoined(db, env, { teamId: claimed.team.id, userId: user.id });
+    await notifyMemberJoined(db, env, { teamId: claimed.team.id, userId: user.id });
+    // The terminal door has always written this line and the browser door
+    // never did, so "every membership change writes to activity" was true of
+    // one of the two ways in (found 2026-09-24).
+    void track(db, {
+      teamId: claimed.team.id,
+      userId: user.id,
+      action: 'member_joined',
+      detail: user.username,
+    });
     await c.get('lifecycle').teamMemberCountChanged?.({ db, teamId: claimed.team.id });
-    return c.redirect(`/app/teams/${claimed.team.slug}`);
+    return c.redirect(
+      `/app/teams/${claimed.team.slug}?ok=${encodeURIComponent(`You joined ${claimed.team.name}.`)}`,
+    );
   }
-  // Already in this team, and the link said owner. An invite adds a membership;
-  // it does not change one, and quietly redirecting to the team page would let
-  // somebody believe a link had promoted them. Saying so beats both silently
-  // promoting on a link and leaving them to find out later.
+  // Already in this workspace, and the invitation said owner. An invitation
+  // adds a membership; it does not change one, and quietly redirecting to the
+  // workspace would let somebody believe it had promoted them. Saying so beats
+  // both silently promoting on a link and leaving them to find out later.
   const [existing] = await db
     .select({ role: memberships.role })
     .from(memberships)
@@ -2783,7 +3500,7 @@ dashboardRoutes.post('/join/:code', async (c) => {
   return c.redirect(
     stale
       ? `/app/teams/${claimed.team.slug}?ok=${encodeURIComponent(
-          "You are already in this team, so the link did not change anything. An invite adds a membership; it does not change one — an owner can promote you on the People tab.",
+          'You are already in this workspace, so the invitation did not change anything. An invitation adds a membership; it does not change one. An owner can promote you on the People tab.',
         )}`
       : `/app/teams/${claimed.team.slug}`,
   );
@@ -3505,7 +4222,7 @@ const clientName = (ua: string | null): string => {
  */
 const ACCOUNT_PLAN_ROWS = 25;
 type WorkspacePlans = {
-  rows: { slug: string; name: string; role: string; plan: string }[];
+  rows: { slug: string; name: string; role: string; plan: string; people: number }[];
   more: boolean;
 };
 
@@ -3517,11 +4234,23 @@ async function workspacePlans(db: Db, userId: string, hosted: boolean): Promise<
     .where(membershipUser(userId))
     .orderBy(teams.name)
     .limit(ACCOUNT_PLAN_ROWS + 1);
+  const listed = found.slice(0, ACCOUNT_PLAN_ROWS);
+  // People, because a plan's first ceiling is how many of them a workspace
+  // holds, and the column is the way to where they are added.
+  const counted = listed.length
+    ? await db
+        .select({ teamId: memberships.teamId, n: count() })
+        .from(memberships)
+        .where(and(inArray(memberships.teamId, listed.map((row) => row.team.id)), humanMembership()))
+        .groupBy(memberships.teamId)
+    : [];
+  const people = new Map(counted.map((row) => [row.teamId, row.n]));
   const rows = await Promise.all(
-    found.slice(0, ACCOUNT_PLAN_ROWS).map(async ({ team, role }) => ({
+    listed.map(async ({ team, role }) => ({
       slug: team.slug,
       name: team.name,
       role,
+      people: people.get(team.id) ?? 0,
       // The label every other page prints, so Account cannot name a plan the
       // workspace's own page would not: the beta, a grant, an evaluation.
       plan: effectivePlanLabel(team.plan, await effectiveLimits(db, team, hosted)),
@@ -3550,7 +4279,8 @@ const PlanCard = ({ user, plans, beta }: { user: User; plans: WorkspacePlans; be
       </div>
       <div class="card-note">
         A plan belongs to a workspace: its owner chooses and pays for it, and everybody in it shares
-        it. Using STMA on your own, that is simply your workspace.{' '}
+        it. Using STMA on your own, that is simply your workspace. Its owners invite people from
+        Members and invites.{' '}
         {beta
           ? 'STMA is in beta, so every workspace has every feature, nothing is billed and no card is on file. When pricing starts, this is where a plan is bought and managed.'
           : user.plans === 'billing'
@@ -3564,6 +4294,7 @@ const PlanCard = ({ user, plans, beta }: { user: User; plans: WorkspacePlans; be
           <tr>
             <th>Workspace</th>
             <th>Your role</th>
+            <th>People</th>
             <th>Plan</th>
             {user.plans === 'billing' ? <th aria-label="Manage"></th> : null}
           </tr>
@@ -3575,6 +4306,9 @@ const PlanCard = ({ user, plans, beta }: { user: User; plans: WorkspacePlans; be
                 <a href={`/app/teams/${row.slug}`}>{row.name}</a>
               </td>
               <td>{row.role}</td>
+              <td>
+                <a href={`/app/teams/${row.slug}?tab=people`}>{row.people}</a>
+              </td>
               <td>
                 <b>{planTitle(row.plan)}</b>
               </td>
@@ -4273,8 +5007,15 @@ dashboardRoutes.post('/app/installations/:id/companion', async (c) => {
 
 // ---------------------------------------------------------------- account
 
-const accountBack = (c: Context<AppEnv>, msg: string, ok = false) =>
-  c.redirect(`/app/account?${ok ? 'ok' : 'error'}=${encodeURIComponent(msg)}`);
+/**
+ * Where the address forms answer: Account, or the invitation they were sent
+ * from. An emailed invitation asks for the address to be confirmed first, and
+ * landing on Account afterwards would lose the page the person came for.
+ */
+const accountBack = (c: Context<AppEnv>, msg: string, ok = false, back?: unknown) =>
+  c.redirect(
+    `${typeof back === 'string' && inviteCodeFromNext(back) ? back : '/app/account'}?${ok ? 'ok' : 'error'}=${encodeURIComponent(msg)}`,
+  );
 
 /**
  * The same lock the sign-in form and the invite door apply, for the two places
@@ -4329,12 +5070,16 @@ dashboardRoutes.post('/app/account/email/code', async (c) => {
   const user = c.get('user');
   if (!user) return loginRedirect(c);
   const env = c.get('env');
-  if (!env.twoFactor) return accountBack(c, 'This server does not use email confirmation codes.');
-  if (!user.email) return accountBack(c, 'This account has no email address yet.');
-  if (user.emailVerifiedAt) return accountBack(c, 'That address is already confirmed.', true);
+  let back: unknown;
+  try {
+    back = (await c.req.parseBody()).back;
+  } catch { /* no body: the Account page's own button */ }
+  if (!env.twoFactor) return accountBack(c, 'This server does not use email confirmation codes.', false, back);
+  if (!user.email) return accountBack(c, 'This account has no email address yet.', false, back);
+  if (user.emailVerifiedAt) return accountBack(c, 'That address is already confirmed.', true, back);
   const issued = await issueAuthCode(c.get('db'), user.id, 'email_verify', user.email);
   if (!issued.ok) {
-    return accountBack(c, 'Too many codes requested. Wait a few minutes, then try again.');
+    return accountBack(c, 'Too many codes requested. Wait a few minutes, then try again.', false, back);
   }
   const sent = await sendMail(env, {
     to: user.email,
@@ -4342,9 +5087,9 @@ dashboardRoutes.post('/app/account/email/code', async (c) => {
   });
   if (!sent.ok) {
     logLine({ evt: 'auth', a: 'verify_code_fail', u: user.username, why: sent.error });
-    return accountBack(c, 'We could not email the code. Try again in a minute.');
+    return accountBack(c, 'We could not email the code. Try again in a minute.', false, back);
   }
-  return accountBack(c, `Code sent to ${user.email}. It is valid for ${CODE_TTL_MINUTES} minutes.`, true);
+  return accountBack(c, `Code sent to ${user.email}. It is valid for ${CODE_TTL_MINUTES} minutes.`, true, back);
 });
 
 /** Confirm the address on the account by entering the code mailed to it. */
@@ -4352,9 +5097,11 @@ dashboardRoutes.post('/app/account/email/verify', async (c) => {
   const user = c.get('user');
   if (!user) return loginRedirect(c);
   const db = c.get('db');
-  const code = typeof (await c.req.parseBody()).code === 'string' ? String((await c.req.parseBody()).code).trim() : '';
-  if (!/^\d{6}$/.test(code)) return accountBack(c, 'Enter the 6-digit code we emailed you.');
-  if (!user.email) return accountBack(c, 'This account has no email address yet.');
+  const body = await c.req.parseBody();
+  const back = body.back;
+  const code = typeof body.code === 'string' ? body.code.trim() : '';
+  if (!/^\d{6}$/.test(code)) return accountBack(c, 'Enter the 6-digit code we emailed you.', false, back);
+  if (!user.email) return accountBack(c, 'This account has no email address yet.', false, back);
   // Bound to the address on the account now: a code mailed before an operator
   // moved the account elsewhere proves the old mailbox, not this one.
   const result = await checkUserCode(db, user.id, 'email_verify', code, user.email);
@@ -4362,12 +5109,23 @@ dashboardRoutes.post('/app/account/email/verify', async (c) => {
     return accountBack(
       c,
       `That code is not right. ${result.attemptsLeft} attempt${result.attemptsLeft === 1 ? '' : 's'} left.`,
+      false,
+      back,
     );
   }
-  if (result.status !== 'ok') return accountBack(c, 'That code has expired or was already used. Request a new one.');
+  if (result.status !== 'ok') {
+    return accountBack(c, 'That code has expired or was already used. Request a new one.', false, back);
+  }
   await db.update(users).set({ emailVerifiedAt: new Date() }).where(eq(users.id, user.id));
   logLine({ evt: 'auth', a: 'email_verified', u: user.username });
-  return accountBack(c, 'Address confirmed. This is where your sign-in codes and password resets go.', true);
+  return accountBack(
+    c,
+    typeof back === 'string' && inviteCodeFromNext(back)
+      ? 'Address confirmed. You can accept the invitation now.'
+      : 'Address confirmed. This is where your sign-in codes and password resets go.',
+    true,
+    back,
+  );
 });
 
 /**

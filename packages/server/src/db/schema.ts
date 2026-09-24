@@ -174,6 +174,17 @@ export const invites = pgTable('invites', {
    * column existed means what it meant when it was written: member.
    */
   role: text('role').notNull().default('member'),
+  /**
+   * The address an invitation was emailed to, lowercased; null for a link to
+   * share. An emailed invitation is for that address only and works once: it
+   * is redeemed by an account holding exactly this address, confirmed, so the
+   * link in the mail is useless to anybody it is forwarded to. The owner can
+   * still copy it, which is why accepting one never counts as confirming the
+   * address (`claimInviteMembership`).
+   */
+  email: text('email'),
+  /** When the invitation email last went out; null if it never did. */
+  sentAt: timestamp('sent_at', { withTimezone: true }),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
 
@@ -1316,6 +1327,12 @@ export const notificationPrefs = pgTable('notification_prefs', {
   sessionResolved: boolean('session_resolved').notNull().default(true),
   /** Your account was added to a team. */
   teamJoined: boolean('team_joined').notNull().default(true),
+  /**
+   * Somebody joined a workspace you own, or could not because it is at its
+   * plan's member limit. On by default: an owner is the one person who can
+   * act on either, and on a paid Team every join is a seat on their bill.
+   */
+  memberJoined: boolean('member_joined').notNull().default(true),
   /** Team-wide announcements: broadcast to everyone, so off unless asked for. */
   announcements: boolean('announcements').notNull().default(false),
   /**

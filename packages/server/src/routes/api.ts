@@ -28,7 +28,7 @@ import { reservedUsername } from '../lib/admin';
 import { emailIsFree, isEmail, maskEmail, normalizeEmail, usernameFromEmail } from '../lib/email';
 import { logLine } from '../lib/log';
 import { notifyTeam } from '../lib/notify';
-import { notifyAnnouncement, notifyTeamJoined } from '../lib/notifications';
+import { notifyAnnouncement, notifyMemberJoined, notifyTeamJoined } from '../lib/notifications';
 import { redactSecrets } from '../lib/redact';
 import { normalizeDeviceLabel } from '../lib/devices';
 import { getAnnouncementsSession } from '../lib/sessions';
@@ -352,6 +352,20 @@ apiRoutes.post('/api/invites/redeem', async (c) => {
         403,
       );
     }
+    // An emailed invitation is redeemable only by an account whose address is
+    // that one and confirmed, and an account made here is never confirmed:
+    // the browser, which can take the code, is where it is accepted.
+    if (claimed.reason === 'wrong_address' || claimed.reason === 'unconfirmed') {
+      return c.json(
+        {
+          error:
+            claimed.reason === 'wrong_address'
+              ? 'this invitation was emailed to a different address'
+              : 'this invitation was emailed to one address: open it in a browser and confirm that address to accept it',
+        },
+        403,
+      );
+    }
     logLine({ evt: 'auth', a: 'redeem_fail', em: maskEmail(email), why: 'bad_code_race' });
     return c.json({ error: 'invite code is invalid, expired or used up' }, 404);
   }
@@ -359,6 +373,7 @@ apiRoutes.post('/api/invites/redeem', async (c) => {
     // Terminal onboarding: the agent got the token, but this is often the only
     // thing that tells the human their account now exists and where it lives.
     await notifyTeamJoined(db, env, { teamId: claimed.team.id, userId: claimed.userId });
+    await notifyMemberJoined(db, env, { teamId: claimed.team.id, userId: claimed.userId });
     await c.get('lifecycle').teamMemberCountChanged?.({ db, teamId: claimed.team.id });
   }
 

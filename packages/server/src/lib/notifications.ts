@@ -47,6 +47,7 @@ import {
 } from 'drizzle-orm';
 import type { Db } from '../db';
 import {
+  activity,
   debugSessions,
   memberships,
   messages,
@@ -57,7 +58,9 @@ import {
   users,
 } from '../db/schema';
 import type { Env } from '../env';
+import { effectiveLimits, planName, withEntitlements } from './entitlements';
 import { logLine } from './log';
+import { humanMembership } from './seats';
 import { activityEmail, type MailMessage, sendMail } from './mailer';
 import { deliverWebhook } from './notify';
 import { redactSecrets } from './redact';
@@ -69,6 +72,8 @@ export const NOTIFICATION_KINDS = [
   'session_reply',
   'session_resolved',
   'team_joined',
+  'member_joined',
+  'join_refused',
   'announcement',
 ] as const;
 export type NotificationKind = (typeof NOTIFICATION_KINDS)[number];
@@ -77,6 +82,8 @@ export interface NotificationPrefs {
   sessionReply: boolean;
   sessionResolved: boolean;
   teamJoined: boolean;
+  /** Somebody joined a workspace you own, or could not because it is full. */
+  memberJoined: boolean;
   announcements: boolean;
   /**
    * Personal Slack/Discord webhook. Not a switch — a second delivery route for
@@ -91,6 +98,7 @@ export const NOTIFICATION_DEFAULTS: NotificationPrefs = {
   sessionReply: true,
   sessionResolved: true,
   teamJoined: true,
+  memberJoined: true,
   // Announcements reach every member at once — opt in rather than drown people.
   announcements: false,
   webhookUrl: null,
@@ -100,6 +108,10 @@ const PREF_OF: Record<NotificationKind, keyof NotificationPrefs> = {
   session_reply: 'sessionReply',
   session_resolved: 'sessionResolved',
   team_joined: 'teamJoined',
+  // One switch for both: they are the same news to the same person, somebody
+  // arriving at a workspace they own, and one of them is only that it is full.
+  member_joined: 'memberJoined',
+  join_refused: 'memberJoined',
   announcement: 'announcements',
 };
 
@@ -122,6 +134,7 @@ export async function notificationPrefsForMany(
       sessionReply: r.sessionReply,
       sessionResolved: r.sessionResolved,
       teamJoined: r.teamJoined,
+      memberJoined: r.memberJoined,
       announcements: r.announcements,
       webhookUrl: r.webhookUrl,
     });
@@ -310,6 +323,76 @@ export async function notifyTeamJoined(
       },
     ]);
   });
+}
+
+/** The workspace's owners, minus whoever did it. */
+async function teamOwners(db: Db, teamId: string, actorId: string | null): Promise<string[]> {
+  const rows = await db
+    .select({ userId: memberships.userId })
+    .from(memberships)
+    .where(and(eq(memberships.teamId, teamId), eq(memberships.role, 'owner')));
+  return rows.map((r) => r.userId).filter((id) => id !== actorId);
+}
+
+/**
+ * The window a membership notification covers. A minute of slack, because the
+ * membership row is stamped by the database's clock and this by the process's,
+ * and the email lists everybody who arrived inside it.
+ */
+const JOIN_WINDOW_SLACK_MS = 60_000;
+
+async function queueOwnerEvent(
+  db: Db,
+  env: Env,
+  opts: { teamId: string; userId: string; kind: 'member_joined' | 'join_refused' },
+): Promise<void> {
+  const owners = await teamOwners(db, opts.teamId, opts.userId);
+  const prefs = await notificationPrefsForMany(db, owners);
+  const sinceAt = new Date(Date.now() - JOIN_WINDOW_SLACK_MS);
+  await enqueue(
+    db,
+    env,
+    owners
+      .filter((id) => prefs.get(id)?.memberJoined)
+      .map((userId) => ({
+        userId,
+        kind: opts.kind,
+        // A burst of people accepting on the same morning is one email.
+        coalesceKey: `${opts.kind === 'member_joined' ? 'members' : 'refused'}:${opts.teamId}`,
+        teamId: opts.teamId,
+        sessionId: null,
+        sinceAt,
+      })),
+  );
+}
+
+/**
+ * Somebody joined a workspace: its owners hear about it.
+ *
+ * Until 2026-09-24 the only email a join produced went to the person joining,
+ * so an owner learned who had come in from the activity feed, if they looked.
+ * On a paid Team every join is also a seat on their bill, and they are the one
+ * person who can undo a link that went further than they meant.
+ */
+export async function notifyMemberJoined(
+  db: Db,
+  env: Env,
+  opts: { teamId: string; userId: string },
+): Promise<void> {
+  await safely('enqueue', () => queueOwnerEvent(db, env, { ...opts, kind: 'member_joined' }));
+}
+
+/**
+ * Somebody accepted an invitation to a workspace that is at its plan's member
+ * limit. The refusal is on their screen, but they cannot fix it: the owner can,
+ * and before this the owner never found out it had happened.
+ */
+export async function notifyJoinRefused(
+  db: Db,
+  env: Env,
+  opts: { teamId: string; userId: string },
+): Promise<void> {
+  await safely('enqueue', () => queueOwnerEvent(db, env, { ...opts, kind: 'join_refused' }));
 }
 
 // -------------------------------------------------------------------- delivery
@@ -522,13 +605,124 @@ async function buildTeamJoinedEmail(db: Db, env: Env, row: QueueRow): Promise<Bu
   return {
     ok: true,
     mail: activityEmail({
-      subject: `You are on the ${team.name} team in STMA`,
-      lead: `Your account was added to ${team.name}. Your agent can now compare environments with your teammates' machines and answer their debug sessions — point it at the team and it will find the rest.`,
-      actionLabel: 'Open the team',
+      subject: `You joined ${team.name} in STMA`,
+      lead: `Your account was added to the workspace ${team.name}. Connect your own agents to it from Agent connections: each one gets its own connection, and your agents and machines never take a seat.`,
+      actionLabel: 'Open the workspace',
       actionUrl: `${env.baseUrl}/app/teams/${team.slug}`,
       manageUrl: `${env.baseUrl}/app/notifications`,
     }),
-    chat: `You were added to the ${team.name} team in STMA — ${env.baseUrl}/app/teams/${team.slug}`,
+    chat: `You were added to the workspace ${team.name} in STMA: ${env.baseUrl}/app/teams/${team.slug}`,
+  };
+}
+
+/** Still an owner of the workspace when the email goes out, or it goes to nobody. */
+async function stillOwner(db: Db, teamId: string, userId: string): Promise<boolean> {
+  const rows = await db
+    .select({ role: memberships.role })
+    .from(memberships)
+    .where(and(eq(memberships.teamId, teamId), eq(memberships.userId, userId)))
+    .limit(1);
+  return rows[0]?.role === 'owner';
+}
+
+/** "ada", "ada and bo", "ada, bo and cy". */
+function nameList(names: string[]): string {
+  if (names.length <= 1) return names[0] ?? '';
+  return `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
+}
+
+async function buildMemberJoinedEmail(db: Db, env: Env, row: QueueRow): Promise<Built> {
+  if (!row.teamId) return { ok: false, reason: 'no_team' };
+  const [team] = await db.select().from(teams).where(eq(teams.id, row.teamId)).limit(1);
+  if (!team) return { ok: false, reason: 'gone' };
+  if (!(await notificationAllowed(db, { userId: row.userId, teamId: team.id, projectId: null }))) {
+    return { ok: false, reason: 'scope_unavailable' };
+  }
+  if (!(await stillOwner(db, team.id, row.userId))) return { ok: false, reason: 'not_owner' };
+  // Who is in the workspace now and arrived inside the window: somebody who
+  // joined and left again before this went out is not news any more.
+  const arrived = await db
+    .select({ username: users.username, role: memberships.role })
+    .from(memberships)
+    .innerJoin(users, eq(memberships.userId, users.id))
+    .where(
+      and(
+        eq(memberships.teamId, team.id),
+        gte(memberships.createdAt, row.sinceAt),
+        ne(memberships.userId, row.userId),
+        humanMembership(),
+      ),
+    )
+    .orderBy(asc(memberships.createdAt))
+    .limit(MESSAGE_WINDOW);
+  if (arrived.length === 0) return { ok: false, reason: 'nothing_new' };
+  const url = `${env.baseUrl}/app/teams/${team.slug}?tab=people`;
+  const first = arrived[0]!;
+  const lead =
+    arrived.length === 1
+      ? `${first.username} joined your workspace ${team.name} as ${first.role === 'owner' ? 'an owner' : 'a member'}.`
+      : `${arrived.length} people joined your workspace ${team.name}: ${nameList(arrived.map((a) => a.username))}.`;
+  return {
+    ok: true,
+    mail: activityEmail({
+      subject:
+        arrived.length === 1 ? `${first.username} joined ${team.name}` : `${arrived.length} people joined ${team.name}`,
+      lead: `${lead} You can change a role or remove somebody from Members and invites.`,
+      actionLabel: 'Open Members and invites',
+      actionUrl: url,
+      manageUrl: `${env.baseUrl}/app/notifications`,
+    }),
+    chat: `${lead} ${url}`,
+  };
+}
+
+async function buildJoinRefusedEmail(db: Db, env: Env, row: QueueRow): Promise<Built> {
+  if (!row.teamId) return { ok: false, reason: 'no_team' };
+  const [team] = await db.select().from(teams).where(eq(teams.id, row.teamId)).limit(1);
+  if (!team) return { ok: false, reason: 'gone' };
+  if (!(await notificationAllowed(db, { userId: row.userId, teamId: team.id, projectId: null }))) {
+    return { ok: false, reason: 'scope_unavailable' };
+  }
+  if (!(await stillOwner(db, team.id, row.userId))) return { ok: false, reason: 'not_owner' };
+  // Read at send time: an owner who moved to a bigger plan inside the window
+  // has already answered this, and a mail saying the workspace is full would
+  // be wrong by the time it arrived. The sweep runs outside any request, so
+  // the metering this server was started with is passed in rather than read
+  // from a module value another server in the same process could have set.
+  const limit = (
+    await withEntitlements(undefined, () => effectiveLimits(db, team, env.hosted), env.hosted, env.betaUnmetered)
+  ).maxMembers;
+  const [held] = await db
+    .select({ n: count() })
+    .from(memberships)
+    .where(and(eq(memberships.teamId, team.id), humanMembership()));
+  if ((held?.n ?? 0) < limit) return { ok: false, reason: 'room_now' };
+  const tried = await db
+    .selectDistinct({ username: users.username })
+    .from(activity)
+    .innerJoin(users, eq(activity.userId, users.id))
+    .where(
+      and(
+        eq(activity.teamId, team.id),
+        eq(activity.action, 'join_refused'),
+        gte(activity.createdAt, row.sinceAt),
+      ),
+    )
+    .limit(MESSAGE_WINDOW);
+  const who = tried.length ? nameList(tried.map((t) => t.username)) : 'Somebody';
+  const people = limit === 1 ? '1 person' : `${limit} people`;
+  const lead = `${who} tried to join your workspace ${team.name} with an invitation, but it already has the ${people} its ${planName(team.plan)} plan allows. Nobody was added.`;
+  const url = `${env.baseUrl}/app/teams/${team.slug}?tab=people`;
+  return {
+    ok: true,
+    mail: activityEmail({
+      subject: `${team.name} is full`,
+      lead: `${lead} To let them in, move the workspace to a plan with room for more people, or remove somebody.`,
+      actionLabel: 'Open Members and invites',
+      actionUrl: url,
+      manageUrl: `${env.baseUrl}/app/notifications`,
+    }),
+    chat: `${lead} ${url}`,
   };
 }
 
@@ -630,7 +824,11 @@ export async function flushNotificationsOnce(
       const built =
         row.kind === 'team_joined'
           ? await buildTeamJoinedEmail(db, env, row)
-          : await buildSessionEmail(db, env, row, row.kind);
+          : row.kind === 'member_joined'
+            ? await buildMemberJoinedEmail(db, env, row)
+            : row.kind === 'join_refused'
+              ? await buildJoinRefusedEmail(db, env, row)
+              : await buildSessionEmail(db, env, row, row.kind);
       if (!built.ok) {
         await settle('skipped', built.reason);
         continue;

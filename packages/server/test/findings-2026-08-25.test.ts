@@ -583,7 +583,8 @@ it('does not claim a teammate\'s handoff was written by you', async () => {
   const memberPeople = await (
     await fetch(`${srv.url}/app/teams/${slug}?tab=people`, { headers: mate.header() })
   ).text();
-  expect(memberPeople).not.toContain('Generate link');
+  expect(memberPeople).not.toContain('Create link');
+  expect(memberPeople).not.toContain('Send invitations');
   expect(memberPeople).not.toContain('>Integrations</a>');
   expect(memberPeople).not.toContain(`/app/teams/${slug}/invites/`);
   expect((await form(mate, `${srv.url}/app/teams/${slug}/invites`, {})).status).toBe(404);

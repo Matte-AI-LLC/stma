@@ -426,7 +426,7 @@ export const Rail = ({ user, active }: { user: User; active?: RailKey }) => {
               active={active === 'delivery' || active === 'receipts'}
             />
             <span class="rail-group later">Workspace settings</span>
-            <RailLink href={teamHref(ws, '?tab=people')} label="Members" active={active === 'members'} />
+            <RailLink href={teamHref(ws, '?tab=people')} label="Members and invites" active={active === 'members'} />
             {owner ? (
               <RailLink
                 href={teamHref(ws, '?tab=integrations')}
@@ -816,6 +816,13 @@ export interface ConsoleProps {
    * rest keep the padded column they were written for.
    */
   bleed?: boolean;
+  /**
+   * False on a page that takes the address confirmation code itself, as the
+   * join page does for an emailed invitation: the band then keeps only its
+   * sentence, the way it does on Account, instead of offering a second code
+   * field that would answer somewhere else.
+   */
+  addressControls?: boolean;
   children?: Child;
 }
 
@@ -830,6 +837,7 @@ export const ConsoleShell = ({
   keys,
   keysNote,
   bleed,
+  addressControls = true,
   children,
 }: ConsoleProps) => (
   <div class="console">
@@ -843,7 +851,9 @@ export const ConsoleShell = ({
        * names ends when somebody enters a code, and a notice you can wave away
        * is one that stops being read the day it starts mattering.
        */}
-      {user.addressUnconfirmed ? <AddressBand user={user} onAccount={active === 'account'} /> : null}
+      {user.addressUnconfirmed ? (
+        <AddressBand user={user} onAccount={active === 'account' || !addressControls} />
+      ) : null}
       {strip || scope ? (
         <div class="strip">
           <div class="strip-l">{strip}</div>

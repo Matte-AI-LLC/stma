@@ -184,6 +184,15 @@ beforeAll(async () => {
   srv = await startServer(env);
 
   ada = await signup(ADA, 'adapassword1');
+  // Ada owns the workspace everybody else here joins, and since 2026-09-24 an
+  // owner is emailed when somebody does. These tests count the mail a thread
+  // produces, so she keeps every switch but that one; the owner's email has
+  // its own suite, workspace-invitations.test.ts.
+  await post(
+    '/app/notifications',
+    { session_reply: 'on', session_resolved: 'on', team_joined: 'on' },
+    ada.header(),
+  );
   const team = await post('/app/teams', { name: 'Notify Co' }, ada.header());
   teamPath = team.headers.get('location')!;
   await fetch(`${srv.url}${teamPath}/invites`, {
@@ -325,6 +334,7 @@ it('renders the current preferences and honours them', async () => {
   expect(box('session_reply')).toContain('checked');
   expect(box('session_resolved')).toContain('checked');
   expect(box('team_joined')).toContain('checked');
+  expect(box('member_joined')).toContain('checked');
   expect(box('announcements')).not.toContain('checked');
   // …and this instance admits it cannot send anything.
   expect(page).toContain('RESEND_API_KEY');

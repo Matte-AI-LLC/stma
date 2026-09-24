@@ -373,6 +373,13 @@ rosterRoutes.get('/app/teams/:slug/agents', async (c) => {
           sub="Who has which agent, where it can work, what it is doing now and what it last finished. A person's name opens everything they and their agents did."
           actions={
             <>
+              {/* The page somebody opens to add a person, so the way to do it
+                  starts here even though the invitations live on Members. */}
+              {access.role === 'owner' ? (
+                <a class="btn btn-sm" href={`/app/teams/${team.slug}?tab=people#invites`}>
+                  Invite people
+                </a>
+              ) : null}
               <a class="btn btn-sm" href={`/app/agents?team=${encodeURIComponent(team.slug)}`}>
                 Agent map
               </a>

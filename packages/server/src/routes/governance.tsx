@@ -246,10 +246,10 @@ const governancePage = async (c: Context<AppEnv>) => {
       <AppLayout user={user} active="governance" title="Not found">
         <div class="card card-pad joincard">
           <span class="tile tile-44 tile-gray">×</span>
-          <h2 class="title m0">Team not found</h2>
+          <h2 class="title m0">Workspace not found</h2>
           <p class="m0 sub">Either it does not exist or you are not a member.</p>
           <a class="btn" href="/app" style="align-self:flex-start">
-            Back to teams
+            Back to workspaces
           </a>
         </div>
       </AppLayout>,

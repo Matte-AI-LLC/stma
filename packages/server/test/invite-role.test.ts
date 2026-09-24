@@ -97,7 +97,7 @@ it('joins as a member by default, and as an owner when the link says so', async 
   const ownerPage = await (await fetch(`${srv.url}/join/${asOwner.code}`, { headers: ownerJar })).text();
   // "owner" on its own is a word, not an informed yes: the page says what the
   // authority is before it is accepted.
-  expect(ownerPage).toContain('publish the rules every agent on this team is given');
+  expect(ownerPage).toContain('publish the rules every agent in it is given');
   expect(ownerPage).toContain('remove people');
   expect((await post(`/join/${asOwner.code}`, {}, ownerJar)).status).toBe(302);
   expect(await roleOf('role-second-owner')).toBe('owner');
@@ -115,8 +115,8 @@ it('says so when an owner link lands on somebody who is already a member', async
   const res = await post(`/join/${link.code}`, {}, already);
   expect(res.status).toBe(302);
   const where = decodeURIComponent(res.headers.get('location') ?? '');
-  expect(where).toContain('already in this team');
-  expect(where).toContain('an owner can promote you');
+  expect(where).toContain('already in this workspace');
+  expect(where).toContain('An owner can promote you');
   expect(await roleOf('role-joiner')).toBe('member');
 
   // And the link is not spent by the attempt.

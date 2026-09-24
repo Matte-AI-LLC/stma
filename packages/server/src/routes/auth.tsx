@@ -36,6 +36,7 @@ import {
   signupFromAddress,
 } from '../auth/attempts';
 import { reservedUsername } from '../lib/admin';
+import { invitationFromNext, inviteCodeFromNext } from '../domain/invites';
 import { clientIp } from '../lib/ratelimit';
 import { burnPasswordCheck, hashPassword, randomCode, verifyPassword } from '../lib/crypto';
 import { emailIsFree, isEmail, maskEmail, normalizeEmail, usernameFromEmail } from '../lib/email';
@@ -48,6 +49,7 @@ import {
   passwordResetCodeEmail,
   sendMail,
 } from '../lib/mailer';
+import type { Env } from '../env';
 import type { AppEnv, User } from '../types';
 import { Head, Logo } from '../ui/Layout';
 import { Mail } from '../ui/Mail';
@@ -123,9 +125,9 @@ authRoutes.get('/login', (c) => {
                     {/* Rendered whenever signup is closed, which is a self-hosted
                         instance as often as a beta, so it names neither. */}
                     No account yet? This server is invite-only. Ask someone on
-                    your team — their agent can create one for you with{' '}
-                    <code>create_invite</code>, or they can send you the link from the workspace's
-                    People tab. Open that link in this browser and it does the rest. The{' '}
+                    your team to invite you from the workspace's Members and invites, or their
+                    agent can create an invitation with <code>create_invite</code>. Open it in
+                    this browser and it does the rest. The{' '}
                     <a href="/docs#terminal">guide</a> walks through it.
                   </p>
                 )}
@@ -221,13 +223,34 @@ authRoutes.get('/login', (c) => {
 
 // ---------------------------------------------------------------- local accounts
 
-authRoutes.get('/signup', (c) => {
+/**
+ * An invitation is a door of its own.
+ *
+ * Where signup is shut, or asks for an access code, the only way an invited
+ * person could create an account was the terminal API, while the sign-in page
+ * told them to open the link in the browser because "it does the rest" and the
+ * browser then sent them to a form that refused them. The browser now opens
+ * for exactly what the terminal door always did: somebody on their way to a
+ * live invitation. An emailed one opens it only for the address it was sent
+ * to. A server open to anyone needs none of this and applies none of it.
+ */
+function invitationDoor(
+  env: Pick<Env, 'signupsOpen' | 'signupAccessCodes'>,
+  invited: Awaited<ReturnType<typeof invitationFromNext>>,
+) {
+  const openToAnyone = env.signupsOpen && !accessCodeRequired(env);
+  return !openToAnyone && invited ? invited : undefined;
+}
+
+authRoutes.get('/signup', async (c) => {
   const env = c.get('env');
-  if (!env.localAuth || !env.signupsOpen) return c.redirect('/login');
-  if (c.get('user')) return c.redirect('/app');
   const next = sanitizeNext(c.req.query('next'));
+  const invited = env.localAuth ? await invitationFromNext(c.get('db'), next) : undefined;
+  const door = invitationDoor(env, invited);
+  if (!env.localAuth || (!env.signupsOpen && !door)) return c.redirect('/login');
+  if (c.get('user')) return c.redirect(invited ? next : '/app');
   const error = c.req.query('error');
-  const needsCode = accessCodeRequired(env);
+  const needsCode = accessCodeRequired(env) && !door;
   // A link can carry the code, so a cohort email is one click rather than a
   // copy-paste. It is not a secret the URL leaks — it is the thing the email
   // was sent to hand over.
@@ -244,7 +267,9 @@ authRoutes.get('/signup', (c) => {
             <div>
               <h1>Create your STMA account</h1>
               <p class="lede">
-                {needsCode
+                {invited
+                  ? `${invited.team.name} is waiting for you. Create your account, then accept the invitation on the next page.`
+                  : needsCode
                   ? 'STMA is in private beta. Your access code lets you create one account; teammates join you through invite links.'
                   : env.hosted && env.betaUnmetered
                     ? 'STMA is in public beta: every feature is on, there is nothing to pay and no card is asked for. Use it on your own or with a team; teammates join through invite links.'
@@ -286,6 +311,11 @@ authRoutes.get('/signup', (c) => {
                   name="email"
                   autocomplete="email"
                   placeholder="you@example.com"
+                  // An emailed invitation works only for the address it was
+                  // sent to, so the form starts there. Looked up from the
+                  // invitation the page is on its way to, never carried in
+                  // the URL.
+                  value={invited?.invite.email ?? ''}
                   required
                 />
                 {/* Any address will do: STMA is for one person as much as for a team,
@@ -342,19 +372,22 @@ authRoutes.get('/signup', (c) => {
 
 authRoutes.post('/auth/local/signup', async (c) => {
   const env = c.get('env');
-  if (!env.localAuth || !env.signupsOpen) return c.notFound();
+  if (!env.localAuth) return c.notFound();
   const body = await c.req.parseBody();
   const email = normalizeEmail(body.email);
   const password = typeof body.password === 'string' ? body.password : '';
   const next = sanitizeNext(typeof body.next === 'string' ? body.next : undefined);
+  const door = invitationDoor(env, await invitationFromNext(c.get('db'), next));
+  if (!env.signupsOpen && !door) return c.notFound();
   const back = (msg: string) =>
     c.redirect(`/signup?error=${encodeURIComponent(msg)}&next=${encodeURIComponent(next)}`);
 
   // Checked before anything else, and before the address is looked at: a beta
   // door that validates the email first would confirm whether an account exists
-  // to somebody who never had a code.
+  // to somebody who never had a code. An invitation stands in for the code,
+  // the way it always has at the terminal door.
   const submittedCode = typeof body.access_code === 'string' ? body.access_code : '';
-  const verdict = matchAccessCode(env, submittedCode);
+  const verdict = door ? { ok: true, matched: false } : matchAccessCode(env, submittedCode);
   if (!verdict.ok) {
     logLine({ evt: 'auth', a: 'signup_fail', why: 'access_code' });
     return back('That access code is not valid. Check the email that invited you to the beta.');
@@ -369,6 +402,11 @@ authRoutes.post('/auth/local/signup', async (c) => {
   }
 
   if (!isEmail(email)) return back('Enter a valid email address.');
+  // Compared with the invitation, never with the accounts table, so it tells
+  // nobody whether an address is registered.
+  if (door?.invite.email && email !== door.invite.email) {
+    return back('This invitation is for another address. Create the account with the address it was sent to.');
+  }
   if (password.length < 8 || password.length > 128) {
     return back('Password must be 8-128 characters.');
   }
@@ -1123,5 +1161,11 @@ authRoutes.get('/auth/github/callback', async (c) => {
 
 authRoutes.post('/logout', async (c) => {
   await destroySession(c);
-  return c.redirect('/');
+  // Signing out to open an invitation with another address lands back on the
+  // invitation, which is where that person was going; anywhere else is home.
+  let next: unknown;
+  try {
+    next = (await c.req.parseBody()).next;
+  } catch { /* the console's own sign-out button sends nothing */ }
+  return c.redirect(typeof next === 'string' && inviteCodeFromNext(next) ? next : '/');
 });

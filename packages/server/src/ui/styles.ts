@@ -407,9 +407,12 @@ form.inline { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 /* ---------- invites ---------- */
 .invrow { padding: 16px 18px; display: flex; flex-direction: column; gap: 10px; border-bottom: 1px solid var(--line-2); }
 .invrow:last-child { border-bottom: none; }
-.invrow-main { display: flex; align-items: center; gap: 10px; }
+/* Wraps rather than squeezes: an emailed invitation carries three buttons, and at
+   375px they left the address a few characters wide. The address keeps a floor
+   of 220px and the buttons move under it when there is not room for both. */
+.invrow-main { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .invurl {
-  flex: 1; min-width: 0; display: flex; align-items: center; height: 38px; padding: 0 12px;
+  flex: 1 1 220px; min-width: 0; display: flex; align-items: center; height: 38px; padding: 0 12px;
   border: 1px solid var(--line); border-radius: 7px; background: #fafaf8;
   font: 400 13px/1 var(--sans); color: #4b5055;
   overflow: hidden; white-space: nowrap; text-overflow: ellipsis;

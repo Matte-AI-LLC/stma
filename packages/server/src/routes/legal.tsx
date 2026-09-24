@@ -24,8 +24,13 @@ import { Mail } from '../ui/Mail';
  */
 export const legalRoutes = new Hono<AppEnv>();
 
-/** The day this version took effect. A new revision changes it. */
-const EFFECTIVE = '23 September 2026';
+/**
+ * The day each document's current version took effect. A new revision of one
+ * changes its own date and leaves the other's alone: the Privacy Policy gained
+ * emailed invitations on 24 September 2026 and the Terms did not change.
+ */
+const TERMS_EFFECTIVE = '23 September 2026';
+const PRIVACY_EFFECTIVE = '24 September 2026';
 const SUPPORT = 'support@matteai.com';
 const PRIVACY = 'gdpr@matteai.com';
 /**
@@ -94,12 +99,14 @@ const LegalDocument = ({
   site,
   title,
   description,
+  effective,
   intro,
   sections,
 }: {
   site: SiteInfo;
   title: string;
   description: string;
+  effective: string;
   intro: Child;
   sections: Section[];
 }) => (
@@ -110,7 +117,7 @@ const LegalDocument = ({
           {title}
         </h1>
         <p class="sub">
-          Effective {EFFECTIVE} · Last updated {EFFECTIVE}
+          Effective {effective} · Last updated {effective}
         </p>
       </div>
       {site.hosted ? null : <SelfHostNote />}
@@ -923,7 +930,8 @@ const privacySections = (): Section[] => [
             than the address.
           </li>
           <li>
-            <b>Workspace data:</b> workspace names, memberships and roles, invitations and who
+            <b>Workspace data:</b> workspace names, memberships and roles, invitations (with the
+            email address an owner sent one to, where it was sent by email) and who
             created them, the plan and its changes, and a record of who joined a workspace, changed
             role or lost access.
           </li>
@@ -1055,6 +1063,11 @@ const privacySections = (): Section[] => [
               'Contract, Art. 5(2)(c)',
             ],
             [
+              "Sending an invitation to an address an owner of a workspace gives us, on that owner's request, and keeping it until it is used, revoked or expires",
+              "Legitimate interests: the owner's in inviting the people they work with, Art. 6(1)(f)",
+              'Legitimate interests, Art. 5(2)(f)',
+            ],
+            [
               'Billing, and keeping tax and accounting records',
               'Contract and legal obligation, Art. 6(1)(b) and (c)',
               'Contract and legal obligation, Art. 5(2)(c) and (ç)',
@@ -1112,7 +1125,7 @@ const privacySections = (): Section[] => [
             ],
             [
               <b>Resend</b>,
-              "Sends the Service's email: sign-in codes, security notices and notifications. It delivers through Amazon Simple Email Service",
+              "Sends the Service's email: sign-in codes, security notices, invitations and notifications. It delivers through Amazon Simple Email Service",
               'United States',
             ],
             [
@@ -1468,6 +1481,7 @@ legalRoutes.get('/terms', (c) =>
       site={siteInfo(c)}
       title="Terms of Service"
       description={`The agreement between you and ${COMPANY} for STMA, the hosted service at stma.ai.`}
+      effective={TERMS_EFFECTIVE}
       intro={
         <>
           <P>
@@ -1494,6 +1508,7 @@ legalRoutes.get('/privacy', (c) =>
       site={siteInfo(c)}
       title="Privacy Policy"
       description="What personal data STMA, the hosted service at stma.ai, processes, why and for how long, and how to exercise your GDPR and KVKK rights."
+      effective={PRIVACY_EFFECTIVE}
       intro={
         <P>
           This policy explains how {COMPANY} ("we", "us") processes personal data in connection with

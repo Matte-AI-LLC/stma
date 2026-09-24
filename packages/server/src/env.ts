@@ -200,6 +200,17 @@ export interface Env {
   /** Hard ceiling on notification emails per user per rolling hour. */
   notifyMaxPerHour: number;
   /**
+   * Invitation emails this whole server sends in a UTC day (INVITE_EMAILS_PER_DAY,
+   * default 50), on top of twenty per account.
+   *
+   * An invitation goes to an address nobody here has proved anything about,
+   * through the same mail account that carries every sign-in code and password
+   * reset. A provider plan has a daily allowance, and invitations spending it
+   * would stop people signing in. Past the ceiling the invitation is still
+   * created and the owner copies its link instead, so nothing is lost.
+   */
+  inviteEmailsPerDay: number;
+  /**
    * Hosted Knowledge Hub engineering guardrails. These are configurable safety
    * ceilings, not commercial plan entitlements; self-hosted instances do not
    * apply them.
@@ -401,6 +412,7 @@ export function loadEnv(overrides: Partial<Env> = {}): Env {
     twoFactor: e.AUTH_2FA === '1' ? true : e.AUTH_2FA === '0' ? false : Boolean(resendApiKey),
     notifyDebounceSeconds: Number(e.NOTIFY_DEBOUNCE_SECONDS ?? 120),
     notifyMaxPerHour: Number(e.NOTIFY_MAX_PER_HOUR ?? 6),
+    inviteEmailsPerDay: positiveInteger('INVITE_EMAILS_PER_DAY', e.INVITE_EMAILS_PER_DAY, 50),
     // Conservative engineering defaults keep a not-yet-priced hosted corpus
     // bounded. M01 may later turn reviewed values into commercial entitlements.
     knowledgeHostedMaxBytes: positiveInteger(

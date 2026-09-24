@@ -344,6 +344,13 @@
       "when": 1790016359888,
       "tag": "0049_plan_grants",
       "breakpoints": true
+    },
+    {
+      "idx": 50,
+      "version": "7",
+      "when": 1790208180464,
+      "tag": "0050_workspace_invitations",
+      "breakpoints": true
     }
   ]
 }

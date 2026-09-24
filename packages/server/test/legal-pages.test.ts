@@ -55,7 +55,9 @@ it('serves both documents to a stranger, with the addresses a person writes to',
     for (const route of ['/terms', '/privacy']) {
       const html = await page(srv, route);
       expect(html).toContain('Matte AI LLC');
-      expect(html).toContain('23 September 2026');
+      // Each document carries its own date: the Privacy Policy was revised for
+      // emailed invitations on 24 September 2026 and the Terms were not.
+      expect(html).toContain(route === '/terms' ? 'Effective 23 September 2026' : 'Effective 24 September 2026');
       // Data protection and everything else go to different mailboxes, and both
       // are in both documents: somebody reading one must not have to find the
       // other to know where to write.

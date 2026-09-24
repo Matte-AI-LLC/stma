@@ -43,8 +43,14 @@ const SWITCHES: { field: PrefSwitch; name: string; label: string; note: string }
   {
     field: 'teamJoined',
     name: 'team_joined',
-    label: 'I am added to a team',
-    note: 'Confirms the invite landed, including when your agent redeemed it from a terminal.',
+    label: 'I am added to a workspace',
+    note: 'Confirms the invitation landed, including when your agent redeemed it from a terminal.',
+  },
+  {
+    field: 'memberJoined',
+    name: 'member_joined',
+    label: 'Somebody joins a workspace I own',
+    note: "Also when somebody could not join because the workspace is at its plan's member limit. Owners only.",
   },
   {
     field: 'announcements',
@@ -209,6 +215,7 @@ notificationsRoutes.post('/app/notifications', async (c) => {
     sessionReply: on('session_reply'),
     sessionResolved: on('session_resolved'),
     teamJoined: on('team_joined'),
+    memberJoined: on('member_joined'),
     announcements: on('announcements'),
     // This form does not contain the webhook field; carrying it through is what
     // stops "save preferences" from silently deleting a destination.

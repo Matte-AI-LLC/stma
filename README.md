@@ -521,8 +521,10 @@ a deployment until that build is released and its environment-specific gates pas
   which opens with a two-computer quick start and copyable first-message prompts, followed by
   a diagram of the whole system, MCP and control API side by side. Long
   lists page rather than truncate in silence. Self-serve account lifecycle: password change,
-  ownership transfer, owner-only invite links and member removal, leave team, delete team, delete account (a
-  content-preserving scrub, so teammates' threads stay readable).
+  ownership transfer, owner-only invitations by email (one address, once, confirmed) or as a
+  link with a use limit, the owners emailed when somebody joins, member removal, leave and
+  delete a workspace, delete account (a content-preserving scrub, so teammates' threads stay
+  readable).
 - **No silent failures**: an unknown tool argument is rejected with the accepted list instead
   of being dropped, a heartbeat keeps the scope it already declared alive, and environment
   preflight only escalates lockfiles the baseline actually records.
@@ -1045,10 +1047,14 @@ Agent connections page still shows its pending setup row, that row's Revoke acti
 enrollment to the newly bound installation and credential; the user never has to refresh and revoke
 a second row to stop server access.
 
-To add a person, an owner can ask their agent to call `create_invite`. The returned instruction
-block lets the invitee create/verify their account, join that one team and connect their own
-team-scoped agent in the same flow. It never shares the inviter's credential. The full walkthrough
-lives in the in-app guide at `/docs`, and the state/authorization map is in
+To add a person, an owner opens **Members and invites** in the workspace and sends an
+invitation by email, which works once and only for an account holding that address, confirmed,
+or creates a link and chooses how many people it is for. An owner can also ask their agent to
+call `create_invite`; the returned instruction block lets the invitee create/verify their
+account, join that one workspace and connect their own team-scoped agent in the same flow. It
+never shares the inviter's credential. An invitation opens signup even where `SIGNUPS_OPEN=0`
+or an access code is required, the way the terminal door always did. The full walkthrough lives
+in the in-app guide at `/docs`, and the state/authorization map is in
 [PRODUCT_FLOWS.md](PRODUCT_FLOWS.md).
 
 **Codex** (`~/.codex/config.toml`, user-level)
@@ -1155,7 +1161,7 @@ Three things are worth knowing before you turn the number up.
 | `AUTH_2FA` | no | `1` forces email sign-in codes on, `0` off. Default: on when `RESEND_API_KEY` is set. Also gates password-change confirmation and self-service reset |
 | `ADMIN_EMAILS` | no | Comma-separated operator addresses for `/admin`; works alongside `ADMIN_USERNAMES`. **Only a confirmed address counts**: signing up with a listed address is not being the operator. Needs a mail transport, since confirming means entering a code sent to it; without one, use `ADMIN_USERNAMES` |
 | `AUTH_LOCAL` | no | Local username+password accounts (default on; `0` disables) |
-| `SIGNUPS_OPEN` | no | `0` closes new local account registration |
+| `SIGNUPS_OPEN` | no | `0` closes new local account registration, except for somebody opening a live invitation |
 | `SIGNUP_ACCESS_CODES` | no | Codes signup asks for, comma separated, each `CODE` or `CODE:cohort-label`. Set, signup is invite-only without being closed; unset, signup behaves exactly as it always has and a self-hosted instance never sees a code field. A cohort code, not a one-use invite — an invite adds a human to an existing workspace, this is the door before that. Codes are compared as sha256 digests in constant time with no early exit, and checked **before** the address is looked at so the form cannot confirm who already has an account. The **label** is stored on the account that redeemed it (`users.signup_cohort`) and is what `/admin/beta` groups by; **the code itself is never stored, logged or rendered**. A code with no label is recorded as having come through the door without naming a wave |
 | `BETA_UNMETERED` | no | `1` lifts every ceiling but one on a hosted instance that is not charging yet. Deliberately separate from `STMA_HOSTED`: audit, identity composition and every operator surface keep behaving the way they will when billing turns on, and only the limits lift. It writes no plan onto any workspace, so unsetting it restores the matrix with nothing to unwind — `teams.plan` is `NOT NULL DEFAULT 'free'`, which is exactly where everybody lands. The one it leaves alone is the age limit on history: activity and the agent run trail keep the plan's retention throughout, so unsetting it deletes nothing either. `/admin/beta` is where you check what that costs each workspace before you do it |
 | `SITE_MODE` | no | `teaser` makes the **signed-out** site pre-launch: the landing page is the same page either way and says what the product is, but its call to action becomes the access code the private beta asks for, `/pricing` is not linked, and the guide and `/help` drop the sections about a console a visitor cannot reach — on `/help` that is connecting an agent and running one, since a stranger has neither. Their sign-in, self-hosting and known-limits halves are always there, which is the point of a troubleshooting page. Signed-in members get the full app, the full guide and the full help page — it is a statement about who the marketing is for, not a reduced build |
@@ -1174,6 +1180,7 @@ Three things are worth knowing before you turn the number up.
 | `AUTH_DEV_MODE` | no | `1` forces the dev login form. Auto-enabled outside production when OAuth is not configured |
 | `NOTIFY_DEBOUNCE_SECONDS` | no | Wait this long before emailing about a thread so a burst of replies becomes one message (default `120`) |
 | `NOTIFY_MAX_PER_HOUR` | no | Hard cap on notification emails per person per hour (default `6`) |
+| `INVITE_EMAILS_PER_DAY` | no | Invitation emails the whole server sends in a UTC day (default `50`), on top of twenty per owner. They leave through the same mail account as every sign-in code; past the ceiling the invitation is still created and the owner copies its link |
 | `ACTIVITY_RETENTION_DAYS` | no | Purge activity events, the agent run trail (`agent_events`) and announcements older than this (default `180`; `0` disables the age purge — a 20,000-row cap per team and 500 per run/channel still apply). **Ignored for the first two when `STMA_HOSTED=1`**: there the plan decides, because retention is one of the things a plan sells, and `BETA_UNMETERED` does not change that. The Activity page prints whichever number applies |
 | `ERROR_RETENTION_DAYS` | no | Purge operator error-log entries older than this (default `30`; `0` disables the age purge — a 2000-row cap still applies) |
 | `LOAD_RETENTION_DAYS` | no | How far back `/admin/ops` can look at load: five-minute rollups of request count, status mix, latency histogram, rate limiting, peak memory and peak event-loop lag, written every minute from the in-process counters (default `30`; `0` disables the age purge — a 20,000-row cap still applies). An instance fact, not a plan attribute: `STMA_HOSTED` does not change it |

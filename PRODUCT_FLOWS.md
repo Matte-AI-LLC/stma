@@ -53,10 +53,13 @@ The nouns are deliberately separate:
   and calls are never seats.
 - A **membership** grants a person access to one team. Its role is `owner` or `member`.
 - An **invite** adds a human membership. Only an owner may create or revoke one. It carries the
-  role its holder joins as, `member` or `owner`, chosen where the link is made rather than where
-  it is used: the person clicking it has no say in which one it is, so the join page states what an
-  owner invitation grants before it is accepted, and the owner's list labels every link. An agent
-  creating an invite over MCP can only create a member one.
+  role its holder joins as, `member` or `owner`, chosen where the invitation is made rather than
+  where it is used: the person opening it has no say in which one it is, so the join page states
+  what an owner invitation grants before it is accepted, and the owner's list labels every row.
+  An invitation is either **emailed**, when it names one address, works once and is redeemable
+  only by an account holding that address, confirmed, or a **link**, which works for as many
+  people as the owner chose (1, 5, 25 or anyone who has it). An agent creating an invite over MCP
+  can only create a member link.
 - An **OAuth authorization grant** is browser-approved client, installation and scope state. Its
   one-use code is bound to an exact client, callback, MCP resource and PKCE challenge.
 - An **agent enrollment** is the shared one-use server transition underneath OAuth and the legacy
@@ -127,7 +130,7 @@ local data only when the client deliberately includes it in a tool call.
 | --- | --- | --- | --- |
 | Create a workspace | `/app` | signed-in person | team overview |
 | Create a project | Projects or Agent connections → New project | exact workspace + repository identity | project page or selected project access |
-| Add a human | team → People or owner agent `create_invite` | exact team | joined team |
+| Add a human | workspace → Members and invites (also Invite people on Overview and People and agents), or owner agent `create_invite` | exact team; an emailed invitation also carries its one address | joined team; its owners emailed |
 | Connect an agent | Agent connections, team overview, or project page | client-specific native setup request with stable MCP URL; browser-selected team/project | OAuth installation |
 | First two-agent result | workspace → Connect & test | durable launch ID, exact scope, own account | server-observed send/reply |
 | See live work | Agent map | current team/project filters | selected run inspector |
@@ -309,11 +312,24 @@ membership.
 
 ### Browser path
 
-1. Owner opens Team → People and creates a revocable, expiring invitation.
-2. Invitee opens `/join/:code`, signs in or signs up, reviews the team and joins.
-3. One transaction checks expiry, use limit, hosted human limit and duplicate membership.
-4. The invitee lands on that team.
-5. The new member creates their own agent connection; the inviter's credential is never shared.
+1. Owner opens **Members and invites** and either types up to ten addresses and presses
+   **Send invitations**, or creates a link and chooses how many people it is for. Both are
+   revocable and last seven days. On a metered plan the card says how many places are left and,
+   on a paid Team, what each person beyond the included five costs, before anybody is invited; a
+   full workspace offers no form at all.
+2. Invitee opens `/join/:code`. Signed out, the page says whose workspace it is, what it grants and,
+   for an emailed invitation, which address it is for, and offers **Create an account** and
+   **I already have an account**; both come back to it. Signup opens for a live invitation even
+   where it is otherwise shut or asks for an access code, which is what the terminal door always
+   did; an emailed invitation opens it only for its own address, and the form starts with it.
+3. For an emailed invitation, an account with another address is told so and can sign out straight
+   back to the invitation; the right address, unconfirmed, is asked for the code on the invitation
+   page itself, and comes back to it.
+4. One transaction checks expiry, use limit, the invitation's address and confirmation, hosted
+   human limit and duplicate membership.
+5. The invitee lands on that workspace; the join is written to its activity feed and its owners
+   are emailed (their **Somebody joins a workspace I own** switch).
+6. The new member creates their own agent connection; the inviter's credential is never shared.
 
 ### Agent-assisted invitation
 
@@ -332,6 +348,17 @@ Guards and dead ends:
 
 - Web and MCP invite creation are owner-only.
 - An expired, revoked, exhausted or capacity-blocked invitation writes no partial membership.
+- **Accepting an emailed invitation never confirms the address.** The owner can copy the link from
+  the People tab, and anybody can sign up with an address they cannot read, so only a code that
+  reached the mailbox does; `email_verified_at` is what the operator gate and several recovery
+  doors trust. The terminal door therefore refuses an emailed invitation outright: an account it
+  creates is never confirmed.
+- Sending an invitation email needs a server that confirms addresses and a sender whose own address
+  is confirmed, because it goes, in their name, to somebody who may never have heard of STMA. There
+  is a daily ceiling per owner (20) and per server (`INVITE_EMAILS_PER_DAY`); past it the invitation
+  still exists and the owner copies its link.
+- A join refused by the member ceiling tells its owners, once an hour per person, and the
+  invitation keeps working for when they make room.
 - A losing concurrent redemption does not leave an empty account behind.
 - If terminal agent activation fails after membership commits, the invite may already be consumed;
   do not blindly retry. Sign in with that account, confirm membership and create a fresh scoped agent

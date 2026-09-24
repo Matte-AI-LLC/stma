@@ -168,7 +168,7 @@ export function helpSections(
           ),
           quotes: [
             {
-              text: "No account yet? This server is invite-only. Ask someone on your team — their agent can create one for you with create_invite, or they can send you the link from the workspace's People tab. Open that link in this browser and it does the rest.",
+              text: "No account yet? This server is invite-only. Ask someone on your team to invite you from the workspace's Members and invites, or their agent can create an invitation with create_invite. Open it in this browser and it does the rest.",
               find: 'No account yet? This server is invite-only.',
               from: 'server/src/routes/auth.tsx',
             },
@@ -178,9 +178,10 @@ export function helpSections(
           todo: (
             <>
               You get in with an invitation from somebody who already has a workspace here: an owner
-              makes one on the People tab, or their agent calls <code>create_invite</code>. Where
-              the operator has configured access codes, the code in your invitation email opens the
-              door instead.
+              sends one from <b>Members and invites</b>, by email or as a link, or their agent calls{' '}
+              <code>create_invite</code>. Open it in this browser and choose <b>Create an account</b>:
+              an invitation opens the door even where signup is otherwise shut, and brings you back to
+              it. Where the operator has configured access codes, an invitation stands in for the code.
             </>
           ),
         },
@@ -404,17 +405,124 @@ export function helpSections(
         {
           quotes: [
             { text: 'invite code is invalid, expired or used up', from: 'server/src/routes/api.ts' },
-            { text: 'This invite link is no longer valid', from: 'server/src/routes/dashboard.tsx' },
+            { text: 'This invitation is no longer valid', from: 'server/src/routes/dashboard.tsx' },
           ],
-          where: 'Browser · invite',
+          where: 'Browser · invitation',
           means: (
             <>
-              The invitation expired (links from the People tab last seven days), was revoked, or
-              has been used as many times as it allows. A workspace at its member limit answers with
-              a different message, <code>Team member limit reached</code>.
+              The invitation expired, was revoked, or has been used as many times as it allows. Every
+              invitation lasts seven days; one sent by email works once, and a link works for as many
+              people as its owner chose. A workspace with no room left answers differently: it says
+              it is full, and tells its owners you tried.
             </>
           ),
-          todo: <>Ask an owner for a fresh one: it is on their team page under <b>People</b>.</>,
+          todo: (
+            <>
+              Ask an owner of the workspace for a new one. They find it under{' '}
+              <b>Members and invites</b>, and an emailed invitation can be sent again from there,
+              which also renews it.
+            </>
+          ),
+        },
+        {
+          quotes: [
+            {
+              text: 'This invitation was sent to ana@example.com, and you are signed in as sam@example.com. It only works for an account with that address.',
+              find: 'It only works for an account with that address.',
+              from: 'server/src/routes/dashboard.tsx',
+            },
+            {
+              text: 'This invitation is for another address. Create the account with the address it was sent to.',
+              from: 'server/src/routes/auth.tsx',
+            },
+            { text: 'this invitation was emailed to a different address', from: 'server/src/routes/api.ts' },
+          ],
+          where: 'Browser · invitation',
+          means: (
+            <>
+              An invitation sent by email is for that one address. Forwarded, or opened while signed
+              in with another account, it does nothing, which is the point of sending it by email.
+            </>
+          ),
+          todo: (
+            <>
+              Press <b>Sign out and use that address</b>: you come straight back to the invitation,
+              and can sign in or create your account with the address it was sent to. Or ask
+              whoever invited you to invite the address you use.
+            </>
+          ),
+        },
+        {
+          quotes: [
+            {
+              text: 'This invitation is for ana@example.com. Confirm that the address is yours to accept it: enter the 6-digit code we emailed to it.',
+              find: 'Confirm that the address is yours to accept it',
+              from: 'server/src/routes/dashboard.tsx',
+            },
+          ],
+          where: 'Browser · invitation',
+          means: (
+            <>
+              The invitation is for your address, and nobody has shown yet that the address is
+              yours. Accepting an invitation does not count as showing it: the person who sent it
+              can copy the link, so only a code that reached the mailbox does.
+            </>
+          ),
+          todo: (
+            <>
+              Type the six digits from the email we sent that address when you signed up and press{' '}
+              <b>Confirm and continue</b>; you come back to the invitation. If that code has
+              expired, press <b>Email me a new code</b>.
+            </>
+          ),
+        },
+        {
+          symptom: <>You want to add somebody to your workspace and cannot see where.</>,
+          where: 'Console · workspace',
+          means: (
+            <>
+              People join a workspace by invitation, and only its owners invite. Your own second
+              computer needs no invitation: connect each of your agents to your own workspace.
+            </>
+          ),
+          todo: (
+            <>
+              Open the workspace and choose <b>Members and invites</b> in the rail, or{' '}
+              <b>Invite people</b> on its Overview or on People and agents. Type their addresses and
+              press <b>Send invitations</b>: each person gets an email with an invitation that works
+              for their address alone. Or create a link to pass on yourself, and choose how many
+              people it is for. You are emailed when somebody joins.
+            </>
+          ),
+        },
+        {
+          quotes: [
+            {
+              text: 'Confirm your own email address first: invitations go out in your name. The band at the top of this page takes the code.',
+              from: 'server/src/routes/dashboard.tsx',
+            },
+            {
+              text: '1 of 2 invitations were emailed. 1 was not, because the daily allowance for invitation emails is used up. Copy its link from the list below and send it yourself, or use Send again later.',
+              find: 'the daily allowance for invitation emails is used up',
+              from: 'server/src/routes/dashboard.tsx',
+            },
+          ],
+          where: 'Console · Members and invites',
+          means: (
+            <>
+              An invitation email goes to somebody who may never have heard of STMA, in your name,
+              so your own address has to be confirmed first. And there is a daily ceiling on
+              invitation emails, for each owner and for the whole server, because they leave through
+              the same mail account as every sign-in code.
+            </>
+          ),
+          todo: (
+            <>
+              Confirm your address with the code in the band at the top of the page. Past the daily
+              ceiling nothing is lost: the invitation exists, so copy its link from the list and
+              send it yourself, or press <b>Send again</b> tomorrow.
+            </>
+          ),
         },
       ],
     },
@@ -1690,8 +1798,13 @@ export function helpSections(
               from: 'server/src/lib/devices.ts',
             },
             {
-              text: 'Team member limit reached (1 on the free plan).',
-              find: 'Team member limit reached (',
+              text: 'This workspace is full. The Cloud Free plan is for one person, so there is no room for anybody else. To work with other people, move this workspace to Team.',
+              find: 'plan is for one person, so there is no room for anybody else. To work with other people, move this workspace to Team.',
+              from: 'server/src/routes/dashboard.tsx',
+            },
+            {
+              text: 'Its plan allows one person, and there is no room left, so you were not added. Its owners have been told you tried.',
+              find: 'and there is no room left, so you were not added. Its owners have been told you tried.',
               from: 'server/src/routes/dashboard.tsx',
             },
             {
@@ -1711,8 +1824,9 @@ export function helpSections(
           todo: (
             <>
               For devices, push again under the label of the machine this one replaced, or wait for
-              an old one to lapse. For people and projects, reuse an existing project or remove a
-              member — or the owner changes the plan.
+              an old one to lapse. For projects, reuse an existing one. For people, the workspace's
+              owners decide: they are emailed when somebody could not join, and make room by moving
+              to a plan with more or removing somebody; the invitation keeps working meanwhile.
             </>
           ),
         },
