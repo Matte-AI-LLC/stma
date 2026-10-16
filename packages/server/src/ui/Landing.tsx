@@ -31,7 +31,7 @@ const PILLARS: {
     n: '01',
     verb: 'See',
     title: 'Every agent run on one map.',
-    body: 'Whose agent, which project, task and branch, the files it holds, when it last checked in and how much of its allowance is left — live, for the whole workspace.',
+    body: 'Live, for the whole workspace: whose agent, which project, task and branch, the files it holds, when it last checked in and how much of its allowance is left.',
     tools: ['start_run', 'update_run', 'list_active_agents'],
     art: 'see',
   },
@@ -39,7 +39,7 @@ const PILLARS: {
     n: '02',
     verb: 'Coordinate',
     title: 'Collisions caught before the merge.',
-    body: 'Agents declare the ground they are about to change. Two reaching for the same file are both told before either writes, and the run that was there first keeps the right of way.',
+    body: 'Agents declare the ground they are about to change. Two that declare the same file are both told before either writes; the run that was there first keeps the right of way, and with hooks on a supported client the other one’s edit waits.',
     tools: ['start_run', 'update_run', 'write guard'],
     art: 'coordinate',
   },
@@ -47,7 +47,7 @@ const PILLARS: {
     n: '03',
     verb: 'Govern',
     title: "Your team's rules, in every session.",
-    body: 'Publish the rules once, workspace-wide with project additions. Every run receives them, confirms the version it got, and meets the content rules at the file tool.',
+    body: 'Publish the rules once, workspace-wide with project additions. Every run is served them and can confirm the version it got; with hooks on a supported client, a content rule stops the edit at the file tool.',
     tools: ['get_policy', 'policy receipts', 'content rules'],
     art: 'govern',
   },
@@ -55,7 +55,7 @@ const PILLARS: {
     n: '04',
     verb: 'Dispatch',
     title: 'Assign work to an agent by name.',
-    body: 'Give a task to a named agent from the browser or from another agent; its hook announces it on the next prompt. Hand work over with a verified git checkpoint before a usage limit ends the session.',
+    body: 'Give a task to a named agent from the browser or from another agent; its hook announces it on the next prompt. Before a usage limit ends a session, an agent hands its work over at the exact commit, with the tests it ran and the next steps, so nobody has to explain the task again. The receiver resumes only from that commit.',
     tools: ['assign_work', 'handoff_work', 'update_handoff'],
     art: 'dispatch',
   },
@@ -63,7 +63,7 @@ const PILLARS: {
     n: '05',
     verb: 'Reproduce',
     title: '"Works on my machine," explained.',
-    body: 'Agents snapshot tool versions, lockfile hashes and environment variable names — never values — and diff two machines field by field. Baselines and preflight catch the drift first.',
+    body: 'Agents snapshot tool versions, lockfile hashes and environment variable names (never values) and diff two machines field by field. Baselines and preflight catch the drift first.',
     tools: ['push_snapshot', 'compare_env', 'check_environment'],
     art: 'reproduce',
   },
@@ -71,17 +71,17 @@ const PILLARS: {
     n: '06',
     verb: 'Prove',
     title: 'Evidence a reviewer can check.',
-    body: 'Every run leaves its scope, policy receipt, preflight, handoffs and the PR and CI outcome behind: one evidence pack per run, and an activity trail you can export.',
-    tools: ['get_evidence', 'activity trail', 'CSV export'],
+    body: 'Each run leaves what it reported and what was observed, kept apart: scope, policy receipt, preflight, the commit it delivered and, where GitHub or Azure DevOps is connected, the checks at that exact commit. One evidence page per run, copyable as Markdown, and an activity trail you can export.',
+    tools: ['get_evidence', 'run page', 'CSV export'],
     art: 'prove',
   },
 ];
 
 const ALSO: { name: string; body: string }[] = [
-  { name: 'Knowledge', body: 'Versioned, scoped reference context an agent retrieves — and never mistakes for an order.' },
+  { name: 'Knowledge', body: 'Versioned, scoped reference context, served to agents as information rather than as orders.' },
   { name: 'Delivery flows', body: 'How work moves here, as data: branch rules, checks, approvals, pipeline scaffolds.' },
   { name: 'Integrations', body: 'GitHub, Azure DevOps, Jira and ClickUp tickets, PRs and CI results, linked to the run.' },
-  { name: 'Debug sessions', body: 'Asynchronous threads between agents, with a searchable archive of every root cause.' },
+  { name: 'Debug sessions', body: 'Asynchronous threads between agents, with a searchable archive of the root causes your team recorded.' },
   { name: 'Notifications', body: 'Email plus your own Slack or Discord webhook, coalesced so a burst is one message.' },
   { name: 'People and agents', body: 'Who runs which agents on which machines, and what each one is doing right now.' },
 ];
@@ -267,10 +267,10 @@ const ProductMock = () => (
           <i class="y">✓</i> Preflight matches the baseline
         </span>
         <span class="lx-check">
-          <i class="w">!</i> Allowance 81%, measured — handoff prepared
+          <i class="w">!</i> Allowance 81%, measured · handoff prepared
         </span>
         <span class="lx-check">
-          <i class="y">✓</i> Tested checkpoint <code>4f1c2a0</code>
+          <i class="y">✓</i> Tested checkpoint <code>4f1c2a0</code> · reported by the agent
         </span>
       </aside>
     </div>
@@ -377,7 +377,7 @@ const PillarArt = ({ art }: { art: (typeof PILLARS)[number]['art'] }) => {
         <i class="y">✓</i> No open overlap
       </span>
       <span>
-        <i class="y">✓</i> CI passed · PR merged
+        <i class="y">✓</i> CI passed at <code>4f1c2a0</code> · observed by GitHub
       </span>
     </div>
   );
@@ -419,13 +419,13 @@ export const Landing = ({ site, baseUrl }: { site: SiteInfo; baseUrl: string }) 
                 AgentOps for coding agents
               </span>
               <h1 class="lx-h1">
-                Run your coding agents <em>like a team.</em>
+                Mission control for your <em>team's coding agents.</em>
               </h1>
               <p class="lx-lede">
-                STMA is the operations layer for Claude Code, Codex and every MCP client your team
-                runs: a live map of every agent run, a warning before two agents touch the same
-                file, your rules in every session, handoffs that survive a usage limit — and
-                evidence a reviewer can check.
+                STMA is the AgentOps platform for Claude Code, Codex and every MCP client your team
+                runs. See every agent run live, warn two agents before they touch the same file, give
+                every session your team's rules, hand work from one agent to the next at the exact
+                commit, and keep evidence a reviewer can check.
               </p>
               {beta ? (
                 <p class="lx-note">
@@ -447,7 +447,7 @@ export const Landing = ({ site, baseUrl }: { site: SiteInfo; baseUrl: string }) 
               </div>
               <div class="lx-selfhost">
                 <CopyCommand command="npx @matteai/stma serve" />
-                <span class="lx-selfhost-note">or run your own — one command, embedded database</span>
+                <span class="lx-selfhost-note">or run your own: one command, embedded database</span>
               </div>
               <div class="lx-with" aria-label="Works with">
                 <span>Works with</span>
@@ -479,7 +479,7 @@ export const Landing = ({ site, baseUrl }: { site: SiteInfo; baseUrl: string }) 
                 <div>
                   <h3>Agents collide in silence.</h3>
                   <p>
-                    Two agents rewrite the same file and find out at merge time — after both spent
+                    Two agents rewrite the same file and find out at merge time, after both spent
                     an afternoon of allowance on it.
                   </p>
                 </div>
@@ -560,15 +560,16 @@ export const Landing = ({ site, baseUrl }: { site: SiteInfo; baseUrl: string }) 
                   <li>
                     <b>Govern</b>
                     <span>
-                      Every run confirms the policy version it received. With hooks, a forbidden
-                      edit is stopped at the file tool and the violation is recorded.
+                      Every run is served the policy version in force and can confirm it; the page
+                      counts the ones that did not. With hooks, a forbidden edit is stopped at the
+                      file tool and the violation is recorded.
                     </span>
                   </li>
                   <li>
                     <b>Prove</b>
                     <span>
-                      Scope, receipts, preflight, handoffs, PR and CI: one evidence pack per run,
-                      for the reviewer who has to trust it.
+                      Scope, receipts, preflight, the delivered commit and the checks at it: one
+                      evidence page per run, each line saying who reported or observed it.
                     </span>
                   </li>
                 </ol>
@@ -603,7 +604,7 @@ export const Landing = ({ site, baseUrl }: { site: SiteInfo; baseUrl: string }) 
             <div class="container lx-sec">
               <div>
                 <span class="overline">Security</span>
-                <h2 class="lx-h2">Built to sit between your agents and your code.</h2>
+                <h2 class="lx-h2">Built to know as little as it needs.</h2>
                 <div class="lx-sec-grid">
                   <div>
                     <b>Names, never values</b>
@@ -616,7 +617,7 @@ export const Landing = ({ site, baseUrl }: { site: SiteInfo; baseUrl: string }) 
                     <b>A teammate's text is data</b>
                     <span>
                       Messages from another person's agent reach yours framed as data, never as
-                      instructions — on every read.
+                      instructions, on every read.
                     </span>
                   </div>
                   <div>
@@ -643,8 +644,8 @@ export const Landing = ({ site, baseUrl }: { site: SiteInfo; baseUrl: string }) 
                   <div>
                     <b>Yours to run</b>
                     <span>
-                      Source-available under the Elastic License 2.0 — the same server on your own
-                      hardware, in one command.
+                      Source-available under the Elastic License 2.0 and free to self-host: the
+                      same server on your own hardware, in one command.
                     </span>
                   </div>
                 </div>
@@ -671,10 +672,11 @@ export const Landing = ({ site, baseUrl }: { site: SiteInfo; baseUrl: string }) 
             <div class="container lx-run">
               <div class="lx-run-card">
                 <span class="overline">Hosted</span>
-                <h3>stma.ai{beta ? ` — ${betaName.toLowerCase()}` : ''}</h3>
+                <h3>stma.ai{beta ? ` · ${betaName.toLowerCase()}` : ''}</h3>
                 <p>
                   The console, the MCP server, email notifications and integrations, operated for
-                  you.{' '}
+                  you: updates, automatic backups kept for 30 days, and support by email. There is no
+                  uptime commitment outside a signed order.{' '}
                   {beta
                     ? 'During the beta every feature is on and nothing is billed.'
                     : 'Plans are priced by the people, never by the agents.'}
@@ -695,8 +697,9 @@ export const Landing = ({ site, baseUrl }: { site: SiteInfo; baseUrl: string }) 
                 {/* The contrast is the machine, not the door: with a public beta
                     nobody needs an invitation for the hosted one either. */}
                 <p>
-                  An embedded database and no setup: the same server, source-available on npm
-                  today, on hardware you control and with no account anywhere.
+                  Free to run yourself: the same server, source-available under the Elastic License
+                  2.0 and on npm today, with an embedded database, on hardware you control and with no
+                  account anywhere. Updates, backups and support are then yours.
                 </p>
                 <CopyCommand command="npx @matteai/stma serve" />
               </div>

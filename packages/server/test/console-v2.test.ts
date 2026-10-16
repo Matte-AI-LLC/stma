@@ -137,9 +137,10 @@ it('creates a project before enrollment and still discovers projects from agent 
   expect(connectionLocation).toContain('/app/tokens?');
   expect(connectionLocation).toContain('team=v2-team');
   expect(connectionLocation).toContain('project=parcel-desk-agent-lab');
+  // The old address takes the reader to that project's own connections page.
   const selected = await page(connectionLocation);
   expect(selected.html).toMatch(
-    /<option value="project:[0-9a-f-]{36}" selected="">Project only — parcel-desk-agent-lab<\/option>/,
+    /<option value="project:[0-9a-f-]{36}" selected="">Project only · parcel-desk-agent-lab<\/option>/,
   );
 
   // Agent discovery remains valid and uses the same resolver as manual creation.

@@ -138,14 +138,20 @@ it('turns a new agent enrollment into one client-aware setup prompt', async () =
   await form(j, `${srv.url}/app/teams`, { name: 'Prompt Beta' });
 
   const overview = await fetch(`${srv.url}/app/teams/prompt-beta`, { headers: j.header() });
-  expect(await overview.text()).toContain('/app/tokens?team=prompt-beta');
+  expect(await overview.text()).toContain('href="/app/teams/prompt-beta/connections"');
 
+  // The old address still answers, by taking the reader to the workspace's own page.
   const picker = await fetch(`${srv.url}/app/tokens?team=prompt-beta`, { headers: j.header() });
+  expect(picker.url).toBe(`${srv.url}/app/teams/prompt-beta/connections`);
   const pickerHtml = await picker.text();
-  const selectedAccess = /<option value="(team:[0-9a-f-]{36})" selected="">Entire workspace — prompt-beta<\/option>/.exec(
+  const selectedAccess = /<option value="(team:[0-9a-f-]{36})" selected="">Entire workspace · Prompt Beta<\/option>/.exec(
     pickerHtml,
   )?.[1];
   expect(selectedAccess).toBeTruthy();
+  // A connection is made inside the workspace: the page offers this workspace and its
+  // projects, never another workspace and never a grant reaching all of them.
+  expect(pickerHtml.match(/value="team:/g)).toHaveLength(1);
+  expect(pickerHtml).not.toContain('value="personal"');
   expect(pickerHtml).toContain('Any client · OAuth');
   expect(pickerHtml).toContain(`${srv.url}/mcp`);
   expect(pickerHtml).toContain('Legacy setup prompt (compatibility)');
@@ -169,7 +175,7 @@ it('turns a new agent enrollment into one client-aware setup prompt', async () =
   expect(html).toContain('STMA_TARGET_TEAM&quot;: &quot;prompt-beta');
   expect(html).toContain('STMA_GRANT_SCOPE&quot;: &quot;team');
   expect(html).toContain('Copy prompt');
-  expect(html).toContain('one-time enrollment');
+  expect(html).toContain('can be used once');
   expect(/stma_enroll_[0-9a-f]{40}/.test(html)).toBe(true);
   expect(/stma_[0-9a-f]{40}/.test(html)).toBe(false);
 });

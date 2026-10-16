@@ -385,7 +385,7 @@ export function loadEnv(overrides: Partial<Env> = {}): Env {
     hosted: hostedInstance,
     trustedProxyHops: Math.max(0, Math.min(8, Number(e.TRUSTED_PROXY_HOPS ?? '0') || 0)),
     trustedProxyCidrs: parseProxyCidrs(e.TRUSTED_PROXY_CIDRS),
-    supportEmail: (e.SUPPORT_EMAIL ?? (hostedInstance ? 'support@matteai.com' : '')).trim(),
+    supportEmail: (e.SUPPORT_EMAIL ?? (hostedInstance ? 'support@stma.ai' : '')).trim(),
     privacyEmail: (e.PRIVACY_EMAIL ?? (hostedInstance ? 'gdpr@matteai.com' : '')).trim(),
     // Never on the hosted service, whatever the variable says. The panel exists
     // for a throwaway environment where hunting for the test credentials is the

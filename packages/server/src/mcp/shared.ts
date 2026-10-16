@@ -13,6 +13,20 @@ import type { AgentGrant } from '../lib/grants';
  * mean" answer, and an agent that gets two different phrasings of that question
  * has to learn the surface twice.
  */
+/**
+ * Where a tool is documented, for a tool that takes a free-form `body`.
+ *
+ * Claude's connector directory reads a caller-written body as a request to some
+ * API and asks the description to name that API's docs; its scan flagged the
+ * four tools with a `body` (2026-09-24). The target is STMA itself, and every
+ * tool has a row at `/docs#tool-<name>` (held by `layers.test.ts`), so the
+ * reference is that row on this server. `claude-connector.test.ts` requires it
+ * of every tool whose schema has a `body`.
+ */
+export function toolReference(baseUrl: string, name: string): string {
+  return ` STMA API reference: ${baseUrl}/docs#tool-${name}`;
+}
+
 export type ToolText = { content: Array<{ type: 'text'; text: string }>; isError?: boolean };
 
 export function text(payload: unknown): ToolText {

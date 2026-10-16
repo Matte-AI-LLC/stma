@@ -94,6 +94,7 @@ export async function exactProviderEvidence(
     .select({
       repositoryId: repositoryBindings.repositoryId,
       fullName: repositoryBindings.fullName,
+      provider: repositoryBindings.provider,
       fact: providerObservations,
     })
     .from(providerObservations)
@@ -108,4 +109,23 @@ export async function exactProviderEvidence(
     )
     .orderBy(desc(providerObservations.observedAt))
     .limit(100);
+}
+
+/**
+ * One current fact per exact provider subject. A provider may report several
+ * attempts for one workflow or PR; the rows arrive newest first, so the first
+ * one per subject is current and a superseded failure cannot sit beside the
+ * success that replaced it. Shared by the evidence pack and the handoff thread,
+ * so the two never disagree about what the provider said.
+ */
+export function currentProviderFacts<
+  T extends { fact: { bindingId: string; kind: string; subjectId: string } },
+>(rows: T[]): T[] {
+  const seen = new Set<string>();
+  return rows.filter((row) => {
+    const key = `${row.fact.bindingId}:${row.fact.kind}:${row.fact.subjectId}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }

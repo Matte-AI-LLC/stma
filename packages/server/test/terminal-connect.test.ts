@@ -103,8 +103,12 @@ it('refuses a command wider than one project, because the hooks belong to one ch
   const refused = await form('/app/tokens', {
     mode: 'terminal', name: 'claude-wide', device: 'windows-desktop', client: 'claude-code', access: `team:${team!.id}`,
   });
-  expect(refused.status).toBe(302);
-  expect(decodeURIComponent(refused.headers.get('location') ?? '')).toContain('one project');
+  // Answered on the workspace's page, with what was typed still in the form.
+  expect(refused.status).toBe(422);
+  const html = await refused.text();
+  expect(html).toContain('one project');
+  expect(html).toContain('value="claude-wide"');
+  expect(codeIn(html)).toBeFalsy();
 });
 
 it('says whose workspace a code joins without spending it', async () => {
@@ -176,8 +180,8 @@ it('issues a Codex command too, and refuses a client the command cannot configur
   const cursor = await form('/app/tokens', {
     mode: 'terminal', name: 'cursor-x', device: 'windows-desktop', client: 'cursor', access: `project:${projectId}`,
   });
-  expect(cursor.status).toBe(302);
-  expect(decodeURIComponent(cursor.headers.get('location') ?? '')).toContain('Claude Code and Codex');
+  expect(cursor.status).toBe(422);
+  expect(await cursor.text()).toContain('Claude Code and Codex');
 });
 
 it("appends a Codex entry without touching a byte of the owner's config, and removes only its own", () => {

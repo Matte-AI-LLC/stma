@@ -1,13 +1,6 @@
-import type { AgentClientType } from '@bridge/shared';
-import { Hono, type Context } from 'hono';
+import { Hono } from 'hono';
 import { loginRedirect } from '../auth/session';
-import { agentEnrollments } from '../db/schema';
 import { memberByUsername, projectForTeam, teamForUser } from '../domain/access';
-import {
-  connectCommandFor,
-  issueConnectCommand,
-  readConnectRequest,
-} from '../domain/connectRequests';
 import {
   agentRoster,
   rosterByPerson,
@@ -19,12 +12,11 @@ import { historyRetentionNote } from '../lib/cleanup';
 import { grantedOrOwnPlan } from '../lib/planGrants';
 import { fmtDate, timeAgo } from '../lib/format';
 import { pageWindow, slicePage } from '../lib/pagination';
-import { ensureRail } from '../lib/rail';
-import { personSessionsHref } from '../lib/scope';
+import { connectionsHref, personSessionsHref } from '../lib/scope';
 import type { AppEnv } from '../types';
-import { ConnectCheckoutForm, ConnectCommand } from '../ui/ConnectAgent';
 import { PageHead, teamTrail } from '../ui/Console';
 import { AppLayout } from '../ui/Layout';
+import { runHref } from './runs';
 import { Pager } from '../ui/Pager';
 import { noActivityFilters, readActivity } from './activity';
 import { readSessions } from './sessions';
@@ -33,14 +25,16 @@ import { readSessions } from './sessions';
  * Agents, where a person looks for them.
  *
  * Three pages over one reader (`domain/roster.ts`). Inside a project: the agents
- * that can work there, what each is doing, and the way to connect another one
- * without leaving the project — "Connect agent" used to land in personal
- * settings with no way back (the owner, 2026-09-20). In the workspace: the same
- * rows grouped by person, because the question there is who did what with which
+ * that can work there, what each is doing, and the way to connect another one,
+ * which is the project's own Agent connections page, so connecting never leaves
+ * the project ("Connect agent" used to land in personal settings with no way
+ * back, the owner, 2026-09-20; a copy of the connect form lived here until one
+ * page took over connecting, 2026-09-27). In the workspace: the same rows
+ * grouped by person, because the question there is who did what with which
  * agent. And one person at a time, because a name in that list was a link to a
- * filtered log and nothing else. None of them writes anything except the connect
- * form, and none re-derives a fact another page owns: a run's detail is the agent
- * map's inspector, a thread is its own page, the log is Activity.
+ * filtered log and nothing else. None of them writes anything, and none
+ * re-derives a fact another page owns: a run's detail is the agent map's
+ * inspector, a thread is its own page, the log is Activity.
  */
 export const rosterRoutes = new Hono<AppEnv>();
 
@@ -139,7 +133,7 @@ const Row = ({
       <td>
         {last ? (
           <>
-            <span>{last.name ?? 'untitled run'}</span>
+            <a href={runHref(team, last.runId)}>{last.name ?? 'untitled run'}</a>
             <div class="small muted">
               {!here && last.project ? `${last.project.name} · ` : ''}
               {ENDED[last.status] ?? last.status} {timeAgo(last.endedAt ?? new Date())}
@@ -167,70 +161,30 @@ const Head = ({ project }: { project: boolean }) => (
   </thead>
 );
 
-/** What a refused connect request hands back: the reason, and everything that was typed. */
-interface RefusedConnect {
-  error: string;
-  typed: Record<string, unknown>;
-}
-
-/** The command a successful request produced, shown once, on the page it was asked for. */
-interface IssuedConnect {
-  enrollment: typeof agentEnrollments.$inferSelect;
-  code: string;
-}
-
-rosterRoutes.get('/app/teams/:slug/projects/:project/agents', (c) => renderProjectAgents(c));
-
 /**
- * A project's agents, drawn for a GET or handed back by the connect form.
- *
- * Connecting used to be a link to the account's Agent connections page. Phase 4
- * made that page come back correctly, but the person still left the project to
- * fill in a form and read a command. The form is here now, and so is its answer —
- * whether that answer is a one-time command or a refusal with the fields still
- * in it (`renderPolicyEditor` and `renderKnowledge` set that contract).
+ * A project's agents. Connecting another one is the project's Agent connections
+ * page: the same page as the workspace's, inside this project, so the command it
+ * issues is for this project and the way back leads here.
  */
-async function renderProjectAgents(
-  c: Context<AppEnv>,
-  issued?: IssuedConnect,
-  refused?: RefusedConnect,
-) {
+rosterRoutes.get('/app/teams/:slug/projects/:project/agents', async (c) => {
   const user = c.get('user');
   if (!user) return loginRedirect(c);
   const db = c.get('db');
-  const access = await teamForUser(db, user.id, c.req.param('slug') ?? '');
+  const access = await teamForUser(db, user.id, c.req.param('slug'));
   if (!access) return c.notFound();
   const { team } = access;
-  const project = await projectForTeam(db, team.id, decodeURIComponent(c.req.param('project') ?? ''));
+  const project = await projectForTeam(db, team.id, decodeURIComponent(c.req.param('project')));
   if (!project) return c.notFound();
-  // A POST that answers with a page draws its own rail, in the scope it was posted for.
-  if (issued || refused) await ensureRail(db, user, team.slug, project.slug);
   const entries = await agentRoster(db, team.id, { projectId: project.id });
   const working = entries.filter((entry) => entry.live && entry.live.project?.id === project.id).length;
   const inScope = `?team=${encodeURIComponent(team.slug)}&project=${encodeURIComponent(project.slug)}`;
   const home = `/app/teams/${team.slug}/projects/${encodeURIComponent(project.slug)}`;
-  const connectAction = `${home}/agents/connect`;
-  const form = (
-    <ConnectCheckoutForm
-      action={connectAction}
-      here={{ team: { name: team.name }, project: { name: project.name } }}
-      typed={
-        refused
-          ? {
-              name: typeof refused.typed.name === 'string' ? refused.typed.name : undefined,
-              device: typeof refused.typed.device === 'string' ? refused.typed.device : undefined,
-              client: typeof refused.typed.client === 'string' ? refused.typed.client : undefined,
-            }
-          : undefined
-      }
-      idPrefix="pc"
-    />
-  );
+  const connect = connectionsHref(team.slug, project.slug);
   return c.html(
     <AppLayout
       user={user}
       active="agents"
-      title={`Agents — ${project.name}`}
+      title={`Agents · ${project.name}`}
       bleed
       head={
         <PageHead
@@ -250,14 +204,8 @@ async function renderProjectAgents(
               <a class="btn btn-sm" href={`${home}#assigned-work`}>
                 Assign work
               </a>
-              <a class="btn btn-sm" href={`/app/tokens${inScope}`}>
-                All my connections
-              </a>
-              {/* The form is on this page now, so this is a jump rather than a
-                  journey. The label stays what it was, because it is what
-                  somebody is looking for. */}
-              <a class="btn btn-sm btn-primary" href="#connect-agent">
-                Connect agent here
+              <a class="btn btn-sm btn-primary" href={connect}>
+                Connect agent
               </a>
             </>
           }
@@ -265,35 +213,17 @@ async function renderProjectAgents(
       }
       keysNote={`${entries.length} agent${entries.length === 1 ? '' : 's'} can work here · ${working} working now`}
     >
-      {/* The answer to the form is at the top, where the page's own padding does
-          not reach: this layout is `bleed`, so the cards carry their own margin. */}
-      {refused ? (
-        <div style="padding:16px 16px 0">
-          <div class="banner banner-error">
-            {refused.error} Nothing was created, and what you typed is still below.
-          </div>
-        </div>
-      ) : null}
-      {issued ? (
-        <div style="padding:16px 16px 0">
-          <ConnectCommand
-            command={connectCommandFor(issued.code, c.get('env').baseUrl)}
-            agent={issued.enrollment.name}
-            device={issued.enrollment.deviceLabel}
-            client={issued.enrollment.clientType as AgentClientType}
-            scope="project"
-            teamSlug={team.slug}
-            projectName={project.name}
-          />
-        </div>
-      ) : null}
-
       {entries.length === 0 ? (
         <div class="empty">
           <h2>No agent can work here yet</h2>
           <p>
             Connect one from the checkout of this project: it takes one command in that folder's
             terminal, and the agent appears here as soon as its client confirms.
+          </p>
+          <p class="m0">
+            <a class="btn btn-primary" href={connect}>
+              Connect agent
+            </a>
           </p>
         </div>
       ) : (
@@ -308,46 +238,8 @@ async function renderProjectAgents(
           </table>
         </div>
       )}
-
-      <div id="connect-agent" style="padding:0 16px 16px">
-        {form}
-      </div>
     </AppLayout>,
-    // A refused write answers with the page that still holds the work, not 200:
-    // the address did not change, and the submission did not succeed.
-    refused ? 422 : 200,
   );
-}
-
-/**
- * Issue the command for this project, and answer on this page.
- *
- * The scope is the address, not the form: the page already proved membership of
- * this workspace and resolved this project, so nothing a browser posts can move
- * the grant somewhere else. Everything a form can get wrong is checked by the
- * same `readConnectRequest` that `POST /app/tokens` calls.
- */
-rosterRoutes.post('/app/teams/:slug/projects/:project/agents/connect', async (c) => {
-  const user = c.get('user');
-  if (!user) return loginRedirect(c);
-  const db = c.get('db');
-  const access = await teamForUser(db, user.id, c.req.param('slug'));
-  if (!access) return c.notFound();
-  const project = await projectForTeam(db, access.team.id, decodeURIComponent(c.req.param('project')));
-  if (!project) return c.notFound();
-  const body = (await c.req.parseBody()) as Record<string, unknown>;
-  const asked = readConnectRequest(body, { terminal: true });
-  if ('error' in asked) return renderProjectAgents(c, undefined, { error: asked.error, typed: body });
-  const issued = await issueConnectCommand(db, {
-    userId: user.id,
-    name: asked.name,
-    device: asked.device,
-    client: asked.client,
-    role: asked.role,
-    teamId: access.team.id,
-    projectId: project.id,
-  });
-  return renderProjectAgents(c, issued);
 });
 
 rosterRoutes.get('/app/teams/:slug/agents', async (c) => {
@@ -364,7 +256,7 @@ rosterRoutes.get('/app/teams/:slug/agents', async (c) => {
     <AppLayout
       user={user}
       active="people"
-      title={`People and agents — ${team.name}`}
+      title={`People and agents · ${team.name}`}
       bleed
       head={
         <PageHead
@@ -383,7 +275,7 @@ rosterRoutes.get('/app/teams/:slug/agents', async (c) => {
               <a class="btn btn-sm" href={`/app/agents?team=${encodeURIComponent(team.slug)}`}>
                 Agent map
               </a>
-              <a class="btn btn-sm btn-primary" href={`/app/tokens?team=${encodeURIComponent(team.slug)}`}>
+              <a class="btn btn-sm btn-primary" href={connectionsHref(team.slug)}>
                 Connect agent
               </a>
             </>
@@ -400,7 +292,7 @@ rosterRoutes.get('/app/teams/:slug/agents', async (c) => {
             checkout's terminal.
           </p>
           <p class="m0">
-            <a class="btn btn-primary" href={`/app/tokens?team=${encodeURIComponent(team.slug)}`}>
+            <a class="btn btn-primary" href={connectionsHref(team.slug)}>
               Connect agent
             </a>
           </p>
@@ -502,7 +394,7 @@ rosterRoutes.get('/app/teams/:slug/people/:username', async (c) => {
     <AppLayout
       user={user}
       active="people"
-      title={`${person.username} — ${team.name}`}
+      title={`${person.username} · ${team.name}`}
       bleed
       head={
         <PageHead
@@ -590,8 +482,13 @@ rosterRoutes.get('/app/teams/:slug/people/:username', async (c) => {
               {runs.map((run) => (
                 <tr style={run.live ? '' : 'color:var(--mut-2)'}>
                   <td class="name">
+                    {/* A live run is on the map; an ended one keeps its evidence on its run page. */}
                     <a
-                      href={`/app/agents?run=${run.runId}&team=${encodeURIComponent(team.slug)}${run.project ? `&project=${encodeURIComponent(run.project.slug)}` : ''}`}
+                      href={
+                        run.live
+                          ? `/app/agents?run=${run.runId}&team=${encodeURIComponent(team.slug)}${run.project ? `&project=${encodeURIComponent(run.project.slug)}` : ''}`
+                          : runHref(team.slug, run.runId)
+                      }
                     >
                       {run.name ?? 'untitled run'}
                     </a>

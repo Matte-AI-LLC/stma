@@ -244,6 +244,14 @@ describe('the Claude app connects as a console, not an agent', () => {
       expect(typeof tool.annotations?.openWorldHint, tool.name).toBe('boolean');
       if (tool.annotations?.readOnlyHint === false) expect(tool.annotations?.destructiveHint, tool.name).toBe(true);
     }
+    // The directory's scan reads a free-form `body` as a request to an API and
+    // asks for that API's docs; the target is STMA, documented per tool.
+    const described = listed.body.result.tools as Array<{ name: string; description: string; inputSchema: { properties?: Record<string, unknown> } }>;
+    const withBody = described.filter((tool) => tool.inputSchema.properties?.body);
+    expect(withBody.map((tool) => tool.name).sort()).toEqual(['announce', 'open_session', 'post_message', 'propose_knowledge']);
+    for (const tool of withBody) expect(tool.description, tool.name).toContain(`/docs#tool-${tool.name}`);
+    const docs = await (await fetch(`${srv.url}/docs`)).text();
+    for (const tool of withBody) expect(docs, tool.name).toContain(`id="tool-${tool.name}"`);
     const byName = new Map(tools.map((tool) => [tool.name, tool.annotations]));
     expect(byName.get('whoami')).toMatchObject({ readOnlyHint: true, openWorldHint: false });
     expect(byName.get('list_issues')).toMatchObject({ readOnlyHint: true, openWorldHint: true });

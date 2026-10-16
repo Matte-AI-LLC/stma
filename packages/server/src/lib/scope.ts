@@ -63,6 +63,20 @@ export const sectionHref = (
     : WORKSPACE_FORM[key](team);
 
 /**
+ * Agent connections: where a person connects an agent, tests two of them
+ * together and manages their own connections.
+ *
+ * Not a `SectionKey`, because a project's rail does not list it: inside a
+ * project it is reached from the project's Agents page, and lights Agents. It
+ * still has both forms, and one handler answers both, so connecting from inside
+ * a project keeps the person inside it.
+ */
+export const connectionsHref = (team: string, project?: string | null): string =>
+  project
+    ? `/app/teams/${team}/projects/${encodeURIComponent(project)}/connections`
+    : `/app/teams/${team}/connections`;
+
+/**
  * The project this page is scoped to, spelled as the address spells it.
  *
  * The path wins. Inside `/projects/<project>/…` the project is part of the

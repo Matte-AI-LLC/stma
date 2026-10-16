@@ -99,7 +99,7 @@ afterAll(async () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-async function run(headSha: string) {
+async function run(headSha: string, status: 'completed' | 'failed' | 'stale' = 'completed') {
   return (
     await db
       .insert(agentRuns)
@@ -107,7 +107,7 @@ async function run(headSha: string) {
         installationId,
         teamId,
         projectId,
-        status: 'completed',
+        status,
         headSha,
         endedAt: new Date(),
       })
@@ -121,6 +121,7 @@ async function checkpoint(
   commitSha: string,
   createdAt: Date,
   repositoryIdentity = 'github.com/acme/api',
+  tests: Array<{ name: string; state: 'passed' | 'failed' | 'not_run'; detail?: string }> = [],
 ) {
   return (
     await db
@@ -134,7 +135,7 @@ async function checkpoint(
         repositoryIdentity,
         commitSha,
         worktreeClean: true,
-        tests: [],
+        tests,
         requestId: randomUUID(),
         requestHash: randomUUID(),
         createdAt,
@@ -237,4 +238,65 @@ it('fails closed when checkpoint repository identity differs from the project bi
   expect(pack.providerCoverage).toContain('does not match');
   expect(byKey(pack).checkpoint).toMatchObject({ state: 'attention' });
   expect(byKey(pack).outcome).toMatchObject({ state: 'unknown' });
+});
+
+it('never draws a checkpoint whose agent reported a failing test as fine', async () => {
+  const commit = sha('e');
+  const subject = await run(commit);
+  await checkpoint(subject.id, 'tested', commit, new Date(Date.now() - 2_000), 'github.com/acme/api', [
+    { name: 'npm test', state: 'failed', detail: '2 failed' },
+    { name: 'npm run lint', state: 'passed' },
+  ]);
+
+  const pack = await evidenceForRun(db, subject.id, userId);
+  if ('error' in pack) throw new Error(pack.error);
+  const found = byKey(pack).checkpoint;
+  expect(found).toMatchObject({ state: 'attention', source: 'client_report' });
+  expect(found.detail).toContain('reported failing tests');
+  expect(found.detail).toContain('npm test failed');
+  expect(pack.blocking).toContain('checkpoint');
+});
+
+it('names the reported tests, and a tested checkpoint with none passing is not called tested', async () => {
+  const passed = await run(sha('f'));
+  await checkpoint(passed.id, 'tested', sha('f'), new Date(Date.now() - 2_000), 'github.com/acme/api', [
+    { name: 'npm test', state: 'passed', detail: '41 passed' },
+  ]);
+  let pack = await evidenceForRun(db, passed.id, userId);
+  if ('error' in pack) throw new Error(pack.error);
+  expect(byKey(pack).checkpoint).toMatchObject({ state: 'ok', source: 'client_report' });
+  expect(byKey(pack).checkpoint.detail).toContain('Reported tests: npm test passed.');
+  expect(byKey(pack).checkpoint.detail).toContain('This remains a client report.');
+
+  const notRun = await run(sha('0'));
+  await checkpoint(notRun.id, 'tested', sha('0'), new Date(Date.now() - 2_000), 'github.com/acme/api', [
+    { name: 'npm test', state: 'not_run' },
+  ]);
+  pack = await evidenceForRun(db, notRun.id, userId);
+  if ('error' in pack) throw new Error(pack.error);
+  expect(byKey(pack).checkpoint).toMatchObject({ state: 'unknown' });
+  expect(byKey(pack).checkpoint.detail).toContain('no passing test was reported');
+
+  // A delivery checkpoint promises a commit, not a test run: no tests is fine there.
+  const delivered = await run(sha('1'));
+  await checkpoint(delivered.id, 'delivery', sha('1'), new Date(Date.now() - 2_000));
+  pack = await evidenceForRun(db, delivered.id, userId);
+  if ('error' in pack) throw new Error(pack.error);
+  expect(byKey(pack).checkpoint).toMatchObject({ state: 'ok' });
+  expect(byKey(pack).checkpoint.detail).toContain('No test result was reported with it.');
+});
+
+it("labels the run's own status as the agent's report and a stale run as STMA's", async () => {
+  const completed = await run(sha('2'));
+  let pack = await evidenceForRun(db, completed.id, userId);
+  if ('error' in pack) throw new Error(pack.error);
+  expect(byKey(pack).outcome).toMatchObject({ state: 'unknown', source: 'client_report' });
+  expect(byKey(pack).outcome.detail).toContain('Agent reported completion');
+
+  const stale = await run(sha('3'), 'stale');
+  pack = await evidenceForRun(db, stale.id, userId);
+  if ('error' in pack) throw new Error(pack.error);
+  expect(byKey(pack).outcome).toMatchObject({ state: 'unknown', source: 'stma_observation' });
+  expect(byKey(pack).outcome.detail).toContain('stopped hearing from this run');
+  expect(byKey(pack).outcome.detail).not.toContain('Still stale');
 });

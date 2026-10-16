@@ -1,7 +1,8 @@
 import type { Child } from 'hono/jsx';
 import { initials } from '../lib/format';
+import { reviewAccessLastDay } from '../lib/reviewAccess';
 import { EMPTY_RAIL, type RailCounts } from '../lib/rail';
-import { sectionHref } from '../lib/scope';
+import { connectionsHref, sectionHref } from '../lib/scope';
 import type { User } from '../types';
 
 /**
@@ -26,7 +27,6 @@ export type RailKey =
   | 'work'
   | 'members'
   | 'integrations'
-  | 'setup'
   | 'team'
   | 'agents'
   | 'projects'
@@ -197,12 +197,6 @@ export const ScopeBar = ({ user }: { user: User }) => {
           <a href="/app/account">Account</a>
           {user.plans ? <a href="/app/account#plan">Plan &amp; billing</a> : null}
           <a href="/app/notifications">Notifications</a>
-          {/* Keeps the workspace you are standing in. Without it this menu was
-              the one control on a workspace page that silently dropped you back
-              to the account scope, which is what the rail then drew. */}
-          <a href={rail.team ? `/app/tokens?team=${encodeURIComponent(rail.team)}` : '/app/tokens'}>
-            My agent connections
-          </a>
           <a href="/docs">Docs</a>
           {/* Beside Docs rather than in the rail: the rail lists the current
               scope's sections, and "what went wrong" belongs to no scope. */}
@@ -439,12 +433,13 @@ export const Rail = ({ user, active }: { user: User; active?: RailKey }) => {
               label="Repositories"
               active={active === 'repositories'}
             />
+            {/* One page connects, tests and lists (2026-09-27): it was two, and
+                the first was an account page reached through a `?team=` filter. */}
             <RailLink
-              href={`/app/tokens${scopeQuery(ws)}`}
+              href={connectionsHref(ws)}
               label="Agent connections"
               active={active === 'tokens'}
             />
-            <RailLink href={teamHref(ws, '/setup')} label="Connect & test" active={active === 'setup'} />
             {/* A plan is the workspace's, so its page is a workspace setting. Only
                 where the pages exist: a metered server without them has nothing
                 behind the link, and Account says which plan each workspace is on. */}
@@ -461,7 +456,13 @@ export const Rail = ({ user, active }: { user: User; active?: RailKey }) => {
               // The unscoped map, work and sessions lists left the rail (phase 4) but still
               // answer their addresses. They are the account-level view of everything, and a
               // page that lights nothing in the rail reads as a page that is lost.
-              active={active === 'teams' || active === 'agents' || active === 'work' || active === 'sessions'}
+              active={
+                active === 'teams' ||
+                active === 'agents' ||
+                active === 'work' ||
+                active === 'sessions' ||
+                active === 'tokens'
+              }
               badge={rail.teams > 1 ? rail.teams : undefined}
             />
             {rail.list.map((t) => (
@@ -474,7 +475,6 @@ export const Rail = ({ user, active }: { user: User; active?: RailKey }) => {
               label="Notifications"
               active={active === 'notifications'}
             />
-            <RailLink href="/app/tokens" label="My agent connections" active={active === 'tokens'} />
           </>
         )}
         <span class="rail-group later">Help</span>
@@ -844,6 +844,7 @@ export const ConsoleShell = ({
     <Rail user={user} active={active} />
     <div class="frame">
       <ScopeBar user={user} />
+      {user.isTest ? <div class="band2 band-warn" role="status" data-keep="true"><span class="tag">Test account</span><span>Use synthetic data only. Password-only access through {user.reviewAccessUntil ? reviewAccessLastDay(user.reviewAccessUntil) : '—'} (UTC). Managed by an operator.</span></div> : null}
       {/*
        * Above the page's own band, because it is about the account rather than
        * about this page, and because the page below it may be a redirect target

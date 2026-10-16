@@ -3,7 +3,8 @@ import { createHash } from 'node:crypto';
 import { and, eq, gt, inArray, isNull } from 'drizzle-orm';
 import { Hono } from 'hono';
 import type { Context } from 'hono';
-import { agentEnrollments, agentInstallations, memberships, oauthAuthorizationCodes, oauthClients, oauthRefreshTokens, projects, teams, tokens } from '../db/schema';
+import { agentEnrollments, agentInstallations, memberships, oauthAuthorizationCodes, oauthClients, oauthRefreshTokens, projects, teams, tokens, users } from '../db/schema';
+import { testAccountAvailable } from '../lib/testAccounts';
 import type { Db } from '../db';
 import { revokeAgentInstallation } from '../domain/agents';
 import { companionCandidates, isLocalAdapterClient, resolveCompanion } from '../domain/companions';
@@ -750,6 +751,8 @@ oauthRoutes.post('/oauth/token', async (c) => {
         .where(eq(oauthRefreshTokens.tokenHash, sha256hex(rawRefresh)))
         .limit(1);
       if (!row || row.refresh.clientId !== clientId || row.refresh.resource !== resource || row.refresh.revokedAt || row.token.revokedAt) return null;
+      const [owner] = await db.select().from(users).where(eq(users.id, row.token.userId)).limit(1).for('update');
+      if (!owner || !(await testAccountAvailable(db, owner))) return null;
       let replay = Boolean(row.refresh.usedAt) && Date.now() - row.refresh.usedAt!.getTime() <= REFRESH_REPLAY_GRACE_MS;
       if (replay) {
         // Only while the connection has not moved on. A refresh token spent after
@@ -843,7 +846,7 @@ oauthRoutes.post('/oauth/token', async (c) => {
       }
       const access = generatePat();
       const refreshToken = `stma_refresh_${randomHex(32)}`;
-      const expiresAt = new Date(Date.now() + ACCESS_TOKEN_TTL_MS);
+      const expiresAt = new Date(Math.min(Date.now() + ACCESS_TOKEN_TTL_MS, owner.isTest ? owner.reviewAccessUntil!.getTime() : Infinity));
       await db.update(tokens).set({ tokenHash: access.hash, prefix: access.prefix, expiresAt }).where(eq(tokens.id, row.token.id));
       await db.insert(oauthRefreshTokens).values({
         tokenHash: sha256hex(refreshToken),

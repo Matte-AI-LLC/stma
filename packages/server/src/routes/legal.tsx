@@ -26,20 +26,28 @@ export const legalRoutes = new Hono<AppEnv>();
 
 /**
  * The day each document's current version took effect. A new revision of one
- * changes its own date and leaves the other's alone: the Privacy Policy gained
- * emailed invitations on 24 September 2026 and the Terms did not change.
+ * changes its own date and leaves the other's alone. Both moved on 24 September
+ * 2026: the Privacy Policy gained emailed invitations, and the support address
+ * changed in both. An address is not a material change, so under each
+ * document's own clause it takes effect when published, and the date says so.
+ * The Terms moved again on 26 September 2026: "What STMA is" said a handoff
+ * carries a "verified git checkpoint", and a checkpoint is the sending agent's
+ * report; what STMA checks is the receiver's resume against it. A description
+ * that promised less is not a material change either.
  */
-const TERMS_EFFECTIVE = '23 September 2026';
+const TERMS_EFFECTIVE = '26 September 2026';
 const PRIVACY_EFFECTIVE = '24 September 2026';
-const SUPPORT = 'support@matteai.com';
+const SUPPORT = 'support@stma.ai';
 const PRIVACY = 'gdpr@matteai.com';
 /**
  * One technical mailbox, not two. `security@stma.ai` was written into these
  * documents before anybody checked whether it existed, and it does not: a
  * reported vulnerability would have bounced, which is worse than having no
  * address at all. Everything technical, a vulnerability report included, goes
- * to the address a person actually reads (owner's decision, 2026-09-23). Only
- * data-protection requests are separate, because the law names that route.
+ * to the address a person actually reads (owner's decision, 2026-09-23). That
+ * mailbox is `support@stma.ai` since 2026-09-24, on the product's own domain;
+ * `support@matteai.com` is retired. Only data-protection requests are
+ * separate, because the law names that route.
  */
 const SECURITY = SUPPORT;
 const COMPANY = 'Matte AI LLC';
@@ -160,9 +168,10 @@ const termsSections = (): Section[] => [
           (MCP). It shows every agent run on a live map; warns agents before two of them reach for
           the same files and says which run keeps the right of way; delivers the rules a team
           publishes to every run and records whether each run confirmed them; lets a person or an
-          agent assign work to a named agent, and lets an agent hand its work over with a verified
-          git checkpoint; records and compares the environments of different machines; and keeps
-          evidence of what each run did. It also includes Knowledge, delivery flows, integrations
+          agent assign work to a named agent, and lets an agent hand its work over at a git commit
+          it reports, which the receiving agent must match before it resumes; records and compares
+          the environments of different machines; and keeps evidence of what each run reported and
+          what was observed. It also includes Knowledge, delivery flows, integrations
           with GitHub, Azure DevOps, Jira and ClickUp, and email and webhook notifications.
         </P>
         <P>In these Terms:</P>
@@ -1135,7 +1144,7 @@ const privacySections = (): Section[] => [
             ],
             [
               <b>Google (Google Workspace)</b>,
-              'Our email at matteai.com, where support and data protection requests and other correspondence are handled',
+              'Our email at stma.ai and matteai.com, where support and data protection requests and other correspondence are handled',
               'United States and other countries',
             ],
           ]}

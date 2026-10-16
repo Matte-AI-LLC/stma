@@ -41,8 +41,8 @@ body.lx { background: #fbfbf9; }
 .lx-eyebrow .sep { color: var(--mut-2); }
 .lx-eyebrow .dot { background: var(--green-bright); box-shadow: 0 0 0 3px rgba(0,195,122,.18); }
 .lx-h1 {
-  margin: 24px auto 0; max-width: 15ch;
-  font: 680 72px/1.0 var(--sans); letter-spacing: -.048em; color: var(--ink); text-wrap: balance;
+  margin: 24px auto 0; max-width: 21ch;
+  font: 680 62px/1.02 var(--sans); letter-spacing: -.045em; color: var(--ink); text-wrap: balance;
 }
 .lx-h1 em {
   font-style: normal;
@@ -314,7 +314,7 @@ body.lx { background: #fbfbf9; }
   .lx-ins { display: none; }
 }
 @media (max-width: 960px) {
-  .lx-h1 { font-size: 56px; }
+  .lx-h1 { font-size: 50px; }
   .lx-why { grid-template-columns: 1fr; gap: 28px; }
   .lx-pillars { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .lx-how, .lx-sec { grid-template-columns: 1fr; gap: 40px; }
@@ -323,7 +323,7 @@ body.lx { background: #fbfbf9; }
 @media (max-width: 720px) {
   .lx-hero { padding-top: 56px; }
   .lx-eyebrow { font-size: 10.5px; letter-spacing: 0; gap: 6px; padding: 0 10px 0 9px; }
-  .lx-h1 { font-size: 42px; letter-spacing: -.04em; }
+  .lx-h1 { font-size: 36px; letter-spacing: -.035em; }
   .lx-lede { font-size: 17px; }
   .lx-h2 { font-size: 30px; }
   .lx-app { grid-template-columns: minmax(0, 1fr); min-height: 0; }

@@ -28,10 +28,13 @@ import { AppLayout } from '../ui/Layout';
 import { Pager } from '../ui/Pager';
 import { HandoffFlow } from '../ui/HandoffFlow';
 import { transitionHandoff } from '../domain/collaboration';
+import { handoverFor } from '../domain/evidence';
+import { runHref } from './runs';
 import { Band, Inspector, PageHead, scopedTrail, teamTrail, Trail } from '../ui/Console';
 import { ensureRail } from '../lib/rail';
 import { memberByUsername } from '../domain/access';
 import {
+  connectionsHref,
   projectInPath,
   scopedPersonParam,
   scopedProjectParam,
@@ -676,6 +679,20 @@ sessionsRoutes.get('/app/sessions/:id', async (c) => {
   await ensureRail(db, user, team.slug, home?.slug ?? null);
   const work = offer?.kind === 'assignment' ? 'assignment' : 'handoff';
   const ended = offer && ['cancelled', 'declined'].includes(offer.state) ? offer.state : undefined;
+  // What the handoff carried, beside the prose: the commit a receiver must be
+  // on to resume, the tests reported there and what a provider said about it.
+  // The branch lives in the brief's record, which is the thread's first
+  // `handoff` message whatever page of the thread is being drawn.
+  const handover = offer?.checkpointId ? await handoverFor(db, offer.checkpointId) : null;
+  const [brief] = offer
+    ? await db
+        .select({ payload: messages.payload })
+        .from(messages)
+        .where(and(eq(messages.sessionId, session.id), eq(messages.kind, 'handoff')))
+        .orderBy(messages.createdAt)
+        .limit(1)
+    : [];
+  const briefBranch = (brief?.payload as { branch?: string | null } | null)?.branch ?? null;
   const [assignedTo] = offer?.targetInstallationId
     ? await db
         .select({ name: agentInstallations.name, device: agentInstallations.deviceLabel })
@@ -773,6 +790,11 @@ sessionsRoutes.get('/app/sessions/:id', async (c) => {
               }
               unavailable={unavailable}
               assignedTo={assignedTo}
+              handover={
+                handover
+                  ? { ...handover, branch: briefBranch, href: runHref(team.slug, handover.runId) }
+                  : null
+              }
             />
           </Inspector>
         ) : undefined
@@ -1057,7 +1079,7 @@ const workPage = async (c: Context<AppEnv>) => {
                 console losing its place. */}
             <a
               class="btn btn-sm"
-              href={workTeam ? `/app/tokens?team=${encodeURIComponent(workTeam.slug)}` : '/app/tokens'}
+              href={workTeam ? connectionsHref(workTeam.slug) : '/app/tokens'}
             >
               Connect an agent
             </a>

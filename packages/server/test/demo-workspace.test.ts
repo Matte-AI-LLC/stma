@@ -239,11 +239,16 @@ describe('the demo workspace', () => {
   /**
    * The portal asks the submitter to confirm every tool was tried, and a
    * verified review calls each one: "every tool must return a successful
-   * response when called with valid parameters". Five cannot succeed from a
-   * chat on this demo by design, and each is held to answering with what is
-   * missing rather than a generic error: two read trackers the demo has not
-   * connected, two take ids only the console issues, and work named to another
-   * agent is that agent's to accept.
+   * response when called with valid parameters". So this follows the setup
+   * instructions the directory listing gives the reviewer, step for step. Two tools
+   * cannot succeed on this demo, because they read trackers it has not
+   * connected, and are held to naming the tracker rather than failing
+   * generically. Three answer once the reviewer has done what the instructions
+   * say, and before that each says what is missing: `launch_check` takes an id
+   * the Test on a workspace's Agent connections page issues, `record_delivery_receipt` a setup pack the
+   * Delivery page issues, and `update_handoff` accepts work only as the agent
+   * it is addressed to, while the reviewer can cancel an assignment of their
+   * own.
    */
   it('answers every tool from the reviewer\'s Claude, or says what is missing', async () => {
     const reviewer = await devLogin('demo-tools');
@@ -260,7 +265,8 @@ describe('the demo workspace', () => {
     const listed = await rpc(claude, 'tools/list');
     const names = (listed.result.tools as Array<{ name: string }>).map((tool) => tool.name).sort();
 
-    const answered = new Map<string, 'answered' | 'refused'>();
+    const answered = new Set<string>();
+    const refused = new Set<string>();
     const call = async (name: string, args: Record<string, unknown>) => {
       const body = await rpc(claude, 'tools/call', { name, arguments: args });
       const text = String(body.result?.content?.[0]?.text ?? body.error?.message ?? '');
@@ -269,7 +275,7 @@ describe('the demo workspace', () => {
     const works = async (name: string, args: Record<string, unknown> = {}) => {
       const answer = await call(name, args);
       expect(answer.ok, `${name}: ${answer.text.slice(0, 400)}`).toBe(true);
-      answered.set(name, 'answered');
+      answered.add(name);
       try {
         return JSON.parse(answer.text) as Record<string, any>;
       } catch {
@@ -281,7 +287,7 @@ describe('the demo workspace', () => {
       expect(answer.ok, `${name} answered: ${answer.text.slice(0, 200)}`).toBe(false);
       expect(answer.text, name).toMatch(because);
       expect(answer.text.length, `${name}: "${answer.text}"`).toBeGreaterThan(40);
-      answered.set(name, 'refused');
+      refused.add(name);
     };
 
     await works('whoami');
@@ -342,7 +348,7 @@ describe('the demo workspace', () => {
     await works('resolve_session', { session_id: thread.sessionId, root_cause: 'A question, not a defect.', fix: 'Answered in the thread.' });
     await works('announce', { team: t, body: 'Release 1.8 goes out at 16:00 UTC.' });
     await works('create_invite', { team: t });
-    await works('assign_work', {
+    const assignment = await works('assign_work', {
       team: t,
       project: 'parcel-desk',
       request_id: 'e4b1c2d3-1040-4a5b-8c6d-0e1f2a3b4c5d',
@@ -351,6 +357,8 @@ describe('the demo workspace', () => {
       task: 'PD-40 Show the carrier logo on each parcel row',
       brief: 'Each parcel row shows its carrier logo left of the tracking number, from public/carriers/.',
     });
+    // "Cancel that assignment." The sender may take back what it sent.
+    await works('update_handoff', { session_id: assignment.sessionId, action: 'cancel' });
     await works('handoff_work', {
       team: t,
       project: 'parcel-desk',
@@ -383,8 +391,41 @@ describe('the demo workspace', () => {
     );
     await refuses('update_handoff', { session_id: handedOver!.sessionId, action: 'accept' }, /claude-code/);
 
-    expect([...answered.keys()].sort()).toEqual(names);
-    expect([...answered.values()].filter((value) => value === 'refused')).toHaveLength(5);
+    // The instructions open /setup, which lands on the Test of the workspace's Agent
+    // connections page; "Launch my agents" there issues a launch, and the page that
+    // opens shows its id, and so does its address.
+    const setup = await fetch(`${srv.url}/app/teams/${t}/setup`, { headers: reviewer.header() });
+    expect(setup.url).toBe(`${srv.url}/app/teams/${t}/connections`);
+    const connections = await setup.text();
+    expect(connections).toContain('Launch my agents');
+    expect(connections).toContain('<option value="my_agents">My agents</option>');
+    const launched = await form(reviewer, '/app/launches', { team: t, intent: 'my_agents' });
+    expect(launched.status).toBe(303);
+    const launchId = /[?&]launch=([0-9a-f-]{36})/.exec(where(launched))?.[1];
+    expect(launchId, where(launched)).toBeTruthy();
+    const opened = await (await fetch(`${srv.url}${where(launched)}`, { headers: reviewer.header() })).text();
+    expect(opened).toContain(`Launch id: <code>${launchId}</code>`);
+    await works('launch_check', { launch_id: launchId, action: 'status' });
+
+    // The Delivery page's published flow, "Download agent setup .md" with the
+    // form as it opens (Propose then apply, no governance): the pack ends with
+    // the receipt to record, which Claude reads from the attached file.
+    const delivery = await (await fetch(`${srv.url}/app/teams/${t}/delivery`, { headers: reviewer.header() })).text();
+    const flowId = /\?flow=([0-9a-f-]{36})/.exec(delivery)?.[1];
+    expect(flowId, 'the demo publishes a delivery flow').toBeTruthy();
+    const pack = await fetch(
+      `${srv.url}/app/teams/${t}/delivery/agent-setup.md?flow=${flowId}&agentMode=propose-then-apply&agentGovernance=none&download=1`,
+      { headers: reviewer.header() },
+    );
+    expect(pack.status).toBe(200);
+    // The pack's first JSON block is its setup identity; the receipt is the
+    // one that reports a status.
+    const receipt = /```json\n(\{[^`]*"status": "planned"[^`]*\})\n```/.exec(await pack.text())?.[1];
+    expect(receipt, 'the pack carries its receipt').toBeTruthy();
+    await works('record_delivery_receipt', { receipt: JSON.parse(receipt!) });
+
+    expect([...new Set([...answered, ...refused])].sort()).toEqual(names);
+    expect(names.filter((name) => !answered.has(name))).toEqual(['list_clickup_tasks', 'list_issues']);
   }, 180_000);
 
   it('is only an account\'s first workspace, and only an operator builds it', async () => {

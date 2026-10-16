@@ -1,11 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { accountDeleted, membershipUser } from '../lib/securityHooks';
-import {
-  ACTIVE_AGENT_RUN_STATUSES,
-  AGENT_CLIENT_TYPES,
-  AGENT_ROLES,
-  type AgentClientType,
-} from '@bridge/shared';
+import { ACTIVE_AGENT_RUN_STATUSES } from '@bridge/shared';
 import { and, count, countDistinct, desc, eq, gt, inArray, isNull, lt, max, or } from 'drizzle-orm';
 import { Hono } from 'hono';
 import { deleteCookie, getCookie, setCookie } from 'hono/cookie';
@@ -13,7 +8,6 @@ import type { Context } from 'hono';
 import type { Db } from '../db';
 import {
   activity,
-  agentEnrollments,
   agentEvents,
   agentInstallations,
   agentRuns,
@@ -47,7 +41,6 @@ import {
   sessionsFor,
   type BrowserSession,
 } from '../auth/session';
-import { generatePat } from '../auth/pat';
 import { checkUserCode, CODE_TTL_MINUTES, issueAuthCode } from '../auth/codes';
 import { hashPassword, randomCode, randomHex, verifyPassword } from '../lib/crypto';
 import {
@@ -84,18 +77,6 @@ import {
   recordLoginFailure,
 } from '../auth/attempts';
  import { emailIsFree, isEmail, normalizeEmail } from '../lib/email';
-import { agentConnectPrompt } from '../lib/agentConnect';
-import { mcpConnectPrompt, mcpServerAlias } from '../lib/mcpConnectPrompt';
-import { FirstExchange } from '../ui/FirstExchange';
-import { ConnectCheckoutForm, ConnectCommand } from '../ui/ConnectAgent';
-import { connectCommandFor, readConnectRequest } from '../domain/connectRequests';
-import {
-  AGENT_ENROLLMENT_TTL_MINUTES,
-  TERMINAL_CONNECT_TTL_MINUTES,
-  createAgentEnrollment,
-  revokePendingEnrollment,
-} from '../domain/enrollments';
-import { grantLabel, type TokenScope } from '../lib/grants';
 import {
   githubForTeam,
   adoForTeam,
@@ -127,8 +108,6 @@ import {
   memberCapacity,
   type LinkUses,
 } from '../domain/invites';
-import { revokeAgentInstallation } from '../domain/agents';
-import { connectionPairings, setCompanion, type ConnectionPairing } from '../domain/companions';
 import { adoHealth, adoLocator, describeAdoFailure, parseAdoLocator } from '../lib/azureDevops';
 import { checkJiraConnection, describeJiraFailure, normalizeJiraSite } from '../lib/jira';
 import { AdoTokenHelp, JiraTokenHelp } from '../ui/TokenHelp';
@@ -145,7 +124,9 @@ import { isSafeWebhookUrl } from '../lib/notify';
 import { notifyJoinRefused, notifyMemberJoined, notifyTeamJoined } from '../lib/notifications';
 import { fmtDate, initials, timeAgo } from '../lib/format';
 import { REVIEW_ACCOUNT_LOCKED, reviewAccessActive } from '../lib/reviewAccess';
+import { TEST_ACCOUNT_LOCKED } from '../lib/testAccounts';
 import { ensureRail, workspaceCounters } from '../lib/rail';
+import { connectionsHref } from '../lib/scope';
 import { slugify } from '../lib/slug';
 import { track } from '../lib/track';
 import type { Env } from '../env';
@@ -159,6 +140,13 @@ import { Mail } from '../ui/Mail';
 
 export const dashboardRoutes = new Hono<AppEnv>();
 
+dashboardRoutes.use('/app/account/*', async (c, next) => {
+  if (c.req.method === 'POST' && c.get('user')?.isTest && /^\/app\/account\/(email|password|delete)(?:\/|$)/.test(c.req.path)) {
+    return c.redirect(`/app/account?error=${encodeURIComponent(TEST_ACCOUNT_LOCKED)}`);
+  }
+  await next();
+});
+
 const DAY = 24 * 60 * 60 * 1000;
 
 async function teamForMember(db: Db, slug: string, userId: string) {
@@ -169,55 +157,6 @@ async function teamForMember(db: Db, slug: string, userId: string) {
     .where(and(eq(teams.slug, slug), membershipUser(userId)))
     .limit(1);
   return rows[0];
-}
-
-type TokenProject = { id: string; name: string; slug: string };
-type TokenTeam = {
-  id: string;
-  name: string;
-  slug: string;
-  role: string;
-  projects: TokenProject[];
-};
-
-/** Teams a personal machine token may act in, also used by the setup prompt picker. */
-async function tokenTeamsFor(db: Db, userId: string): Promise<TokenTeam[]> {
-  const rows = await db
-    .select({ id: teams.id, name: teams.name, slug: teams.slug, role: memberships.role })
-    .from(teams)
-    .innerJoin(memberships, eq(memberships.teamId, teams.id))
-    .where(membershipUser(userId))
-    .orderBy(teams.name);
-  if (rows.length === 0) return [];
-  const projectRows = await db
-    .select({ id: projects.id, teamId: projects.teamId, name: projects.name, slug: projects.slug })
-    .from(projects)
-    .where(inArray(projects.teamId, rows.map((team) => team.id)))
-    .orderBy(projects.name);
-  return rows.map((team) => ({
-    ...team,
-    projects: projectRows
-      .filter((project) => project.teamId === team.id)
-      .map(({ id, name, slug }) => ({ id, name, slug })),
-  }));
-}
-
-async function enrollmentRowsFor(db: Db, userId: string) {
-  return db
-    .select({ enrollment: agentEnrollments, team: teams, project: projects })
-    .from(agentEnrollments)
-    .leftJoin(teams, eq(agentEnrollments.teamId, teams.id))
-    .leftJoin(projects, eq(agentEnrollments.projectId, projects.id))
-    .where(
-      and(
-        eq(agentEnrollments.userId, userId),
-        isNull(agentEnrollments.redeemedAt),
-        isNull(agentEnrollments.revokedAt),
-        gt(agentEnrollments.expiresAt, new Date()),
-      ),
-    )
-    .orderBy(desc(agentEnrollments.createdAt))
-    .limit(50);
 }
 
 /**
@@ -837,6 +776,7 @@ dashboardRoutes.get('/app', async (c) => {
 dashboardRoutes.post('/app/teams', async (c) => {
   const user = c.get('user');
   if (!user) return loginRedirect(c);
+  if (user.isTest) return c.redirect(`/app?error=${encodeURIComponent('Test accounts use their existing isolated workspace.')}`);
   const db = c.get('db');
   const env = c.get('env');
   const body = await c.req.parseBody();
@@ -1128,7 +1068,7 @@ async function renderTeamPage(c: Context<AppEnv>, refused?: InviteRefusal) {
           sub="Your workspace for agent connections, shared sessions and projects."
           actions={
             <>
-              <a class={`btn btn-sm${members.length === 1 ? ' btn-primary' : ''}`} href={`/app/tokens?team=${encodeURIComponent(team.slug)}`}>
+              <a class={`btn btn-sm${members.length === 1 ? ' btn-primary' : ''}`} href={connectionsHref(team.slug)}>
                 Connect agent
               </a>
               <a class="btn btn-sm" href={`/app/teams/${team.slug}/compare`}>
@@ -1165,7 +1105,7 @@ async function renderTeamPage(c: Context<AppEnv>, refused?: InviteRefusal) {
             the same workspace; no invitation, repository or paid Team subscription is needed
             for your first message.
           </p>
-          <a href={`/app/tokens?team=${encodeURIComponent(team.slug)}`}>Connect your agents</a>
+          <a href={connectionsHref(team.slug)}>Connect your agents</a>
           {' · '}<a href="/docs#quickstart">Follow the two-computer quick start</a>
           {role === 'owner' ? (
             <>
@@ -1367,7 +1307,7 @@ async function renderTeamPage(c: Context<AppEnv>, refused?: InviteRefusal) {
             </p>
             <a
               class="btn btn-white"
-              href={`/app/tokens?team=${encodeURIComponent(team.slug)}`}
+              href={connectionsHref(team.slug)}
               style="align-self:flex-start"
             >
               Open Agent connections
@@ -3513,680 +3453,6 @@ dashboardRoutes.post('/join/:code', async (c) => {
   );
 });
 
-// ---------------------------------------------------------------- tokens
-
-const TokensPage = (props: {
-  devices: Map<string, string>;
-  /** Which connection is a local adapter, and which agent it listens for — keyed by token. */
-  pairings: Map<string, ConnectionPairing>;
-  user: User;
-  list: (typeof tokens.$inferSelect)[];
-  enrollments: Array<{
-    enrollment: typeof agentEnrollments.$inferSelect;
-    team: typeof teams.$inferSelect | null;
-    project: typeof projects.$inferSelect | null;
-  }>;
-  teamChoices: TokenTeam[];
-  selectedTeam?: TokenTeam;
-  selectedProject?: TokenProject;
-  newEnrollment?: {
-    enrollment: typeof agentEnrollments.$inferSelect;
-    code: string;
-    team?: TokenTeam;
-    project?: TokenProject;
-    /** Issued for `stma connect`: shown as one terminal command, never as a prompt. */
-    terminal?: boolean;
-  };
-  /** Deprecated direct-POST compatibility; the current UI never submits this path. */
-  legacyToken?: string;
-  baseUrl: string;
-  error?: string;
-  notice?: string;
-  filterTeam?: string;
-  filterState?: string;
-  filterQuery?: string;
-}) => {
-  const {
-    user,
-    list,
-    devices,
-    pairings,
-    enrollments,
-    teamChoices,
-    selectedTeam,
-    selectedProject,
-    newEnrollment,
-    legacyToken,
-    baseUrl,
-    error,
-    notice,
-  } = props;
-  const terminalCommand = newEnrollment?.terminal
-    ? connectCommandFor(newEnrollment.code, baseUrl)
-    : undefined;
-  const setupPrompt = newEnrollment && !newEnrollment.terminal
-    ? agentConnectPrompt({
-        baseUrl,
-        enrollmentId: newEnrollment.enrollment.id,
-        enrollmentCode: newEnrollment.code,
-        enrollmentExpiresAt: newEnrollment.enrollment.expiresAt,
-        scope: newEnrollment.enrollment.scope as TokenScope,
-        agentName: newEnrollment.enrollment.name,
-        deviceLabel: newEnrollment.enrollment.deviceLabel,
-        clientType: newEnrollment.enrollment.clientType,
-        role: newEnrollment.enrollment.role ?? 'generalist',
-        teamSlug: newEnrollment.team?.slug,
-        projectName: newEnrollment.project?.name,
-      })
-    : undefined;
-  const preferredAccess = selectedProject
-    ? `project:${selectedProject.id}`
-    : selectedTeam
-      ? `team:${selectedTeam.id}`
-      : 'personal';
-  const promptScope = {
-    teamSlug: selectedTeam?.slug,
-    projectSlug: selectedProject?.slug,
-    projectName: selectedProject?.name,
-  };
-  const mcpAlias = mcpServerAlias(promptScope);
-  const shellQuote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
-  const codexConnectPrompt = mcpConnectPrompt({
-    baseUrl,
-    client: 'codex',
-    ...promptScope,
-  });
-  const claudeConnectPrompt = mcpConnectPrompt({
-    baseUrl,
-    client: 'claude-code',
-    ...promptScope,
-  });
-  const ownerTeams = teamChoices.filter((team) => team.role === 'owner');
-  const filterState = props.filterState ?? 'all';
-  const filterQuery = (props.filterQuery ?? '').slice(0, 100);
-  const FilterContext = () => <>
-    <input type="hidden" name="filter_team" value={props.filterTeam ?? ''} />
-    <input type="hidden" name="filter_project" value={selectedProject?.id ?? ''} />
-    <input type="hidden" name="filter_q" value={filterQuery} />
-  </>;
-  /**
-   * The second line of a connection's name cell: what it is paired with.
-   *
-   * An adapter gets the control, because which agent works in a checkout is
-   * something only its owner knows and an adapter activated before pairing
-   * existed has to be pairable without being activated again. An agent gets a
-   * sentence, because the pairing is edited from the adapter's side and the
-   * person looking at the agent still needs to know it has ears.
-   */
-  const PairingNote = ({ pairing }: { pairing?: ConnectionPairing }) => {
-    if (!pairing) return null;
-    if (!pairing.adapter) {
-      return pairing.adapters.length ? (
-        <div class="small muted" style="font-weight:400;margin-top:4px">
-          Adapter paired: {pairing.adapters.join(', ')} — its prompt hook announces work assigned
-          to this agent.
-        </div>
-      ) : null;
-    }
-    const current = pairing.companion?.live ? pairing.companion.installationId : '';
-    return (
-      <div style="font-weight:400;margin-top:6px;display:flex;flex-direction:column;gap:4px">
-        <form
-          class="inline m0"
-          method="post"
-          action={`/app/installations/${pairing.installationId}/companion`}
-          style="gap:6px"
-        >
-          <FilterContext />
-          <label class="small muted" for={`companion-${pairing.installationId}`}>
-            Local adapter · listens for
-          </label>
-          <select
-            class="in"
-            id={`companion-${pairing.installationId}`}
-            name="companion"
-            style="height:32px;font-size:13px;width:auto;max-width:300px"
-          >
-            <option value="none" selected={!current}>
-              Nobody — not paired
-            </option>
-            {pairing.choices.map((agent) => (
-              <option value={agent.installationId} selected={agent.installationId === current}>
-                {agent.name}
-                {agent.device ? ` · ${agent.device}` : ''} · {agent.access}
-              </option>
-            ))}
-          </select>
-          <button class="btn btn-sm" type="submit">
-            Save
-          </button>
-        </form>
-        {pairing.companion && !pairing.companion.live ? (
-          <div class="small" style="color:var(--red)">
-            Was paired with {pairing.companion.name}, which is revoked. Choose the agent that works
-            in this checkout now.
-          </div>
-        ) : !pairing.companion ? (
-          <div class="small muted">
-            Not paired: its hook is not told about work assigned to the agent beside it, and a
-            stopped edit is filed under this adapter's name.
-          </div>
-        ) : null}
-      </div>
-    );
-  };
-  const visibleEnrollments = enrollments.filter(({ enrollment: row, team }) =>
-    !row.redeemedAt && !row.revokedAt && row.expiresAt > new Date() &&
-    (!props.filterTeam || team?.slug === props.filterTeam) &&
-    (!selectedProject || row.projectId === selectedProject.id) &&
-    (!filterQuery || row.name.toLowerCase().includes(filterQuery.toLowerCase())) &&
-    ['all', 'incomplete'].includes(filterState),
-  );
-  const visibleTokens = list.filter((token) => {
-    if (props.filterTeam && token.teamId !== teamChoices.find((team) => team.slug === props.filterTeam)?.id) return false;
-    if (selectedProject && token.projectId !== selectedProject.id) return false;
-    if (filterQuery && !token.name.toLowerCase().includes(filterQuery.toLowerCase())) return false;
-    const pending = !!token.setupExpiresAt && !token.activatedAt;
-    if (filterState === 'active') return !token.revokedAt && !pending;
-    if (filterState === 'incomplete') return !token.revokedAt && pending;
-    if (filterState === 'revoked') return !!token.revokedAt;
-    return true;
-  });
-  const tokenScopeLabel = (token: (typeof tokens.$inferSelect)) => {
-    const team = teamChoices.find((choice) => choice.id === token.teamId);
-    const project = team?.projects.find((choice) => choice.id === token.projectId);
-    const scope = ['personal', 'team', 'project'].includes(token.scope)
-      ? (token.scope as TokenScope)
-      : 'personal';
-    return grantLabel({ scope, teamSlug: team?.slug ?? null, projectName: project?.name ?? null });
-  };
-  // Connecting is done from where the agent will work. Opened from a project, this
-  // page is inside that project — the scope bar and the rail already say so — and
-  // its trail is the way back to the project's agents; "Connect agent" used to be
-  // a walk into personal settings with no return (the owner, 2026-09-20).
-  const rail = user.rail;
-  const workspace = rail?.team ? { slug: rail.team, name: rail.list.find((t) => t.slug === rail.team)?.name } : null;
-  const agentsHome =
-    rail?.scope === 'project' && workspace && rail.project
-      ? `/app/teams/${workspace.slug}/projects/${encodeURIComponent(rail.project.slug)}/agents`
-      : null;
-  const trail =
-    rail?.scope === 'project' && workspace && rail.project && agentsHome
-      ? teamTrail(
-          workspace,
-          { label: 'Projects', href: `/app/teams/${workspace.slug}/projects` },
-          { label: rail.project.name, href: `/app/teams/${workspace.slug}/projects/${encodeURIComponent(rail.project.slug)}` },
-          { label: 'Agents', href: agentsHome },
-          { label: 'Connect' },
-        )
-      : rail?.scope === 'workspace' && workspace
-        ? teamTrail(workspace, { label: 'Agent connections' })
-        : [{ label: 'All workspaces', href: '/app' }, { label: 'My agent connections' }];
-  return (
-    <AppLayout user={user} active="tokens" title="Agent connections">
-      {error ? <Banner kind="error" text={error} /> : null}
-      {notice ? <Banner kind="success" text={notice} /> : null}
-      <PageHead
-        trail={trail}
-        actions={
-          agentsHome ? (
-            <a class="btn btn-sm" href={agentsHome}>
-              Back to {rail!.project!.name} agents
-            </a>
-          ) : undefined
-        }
-        title="Agent connections"
-        sub="Add one stable MCP address to each client. STMA creates a separate, revocable agent identity during browser authorization — no setup code or credential in a prompt."
-      />
-
-      {teamChoices.length === 0 ? (
-        <div class="card card-pad" style="display:flex;flex-direction:column;gap:12px">
-          <div class="card-title">Create or join a team first</div>
-          <div class="card-note">
-            A team is a workspace, even for one person. Create one named “My workspace”,
-            then return here. No invitation to yourself or repository setup is needed.
-          </div>
-          <a class="btn btn-primary" href="/app" style="align-self:flex-start">Go to teams</a>
-        </div>
-      ) : (
-      <>
-      {/* No "New project" here (2026-09-23, the owner's word). This page issues a
-          connection; a project is created on Projects, or by the first agent
-          that pushes a snapshot. A fold offering an unrelated form above the
-          thing somebody came for is furniture, and the connect form already
-          lists the projects that exist. */}
-
-      {terminalCommand && newEnrollment ? (
-        <ConnectCommand
-          command={terminalCommand}
-          agent={newEnrollment.enrollment.name}
-          device={newEnrollment.enrollment.deviceLabel}
-          client={newEnrollment.enrollment.clientType as AgentClientType}
-          scope={newEnrollment.enrollment.scope as TokenScope}
-          teamSlug={newEnrollment.team?.slug}
-          projectName={newEnrollment.project?.name}
-        />
-      ) : null}
-
-      <ConnectCheckoutForm
-        action="/app/tokens"
-        teams={teamChoices}
-        preferredAccess={preferredAccess}
-        context={<FilterContext />}
-      />
-
-      <div class="card card-pad" style="display:flex;flex-direction:column;gap:16px">
-        <div>
-          <span class="overline">Any client · OAuth</span>
-          <div class="card-title" style="margin-top:4px">Connect through your agent client</div>
-          <div class="card-note">
-            Paste one setup request into Codex or Claude Code, or add this same address yourself in
-            another OAuth-capable MCP client.
-            Your browser opens STMA, where you name the agent and machine and choose workspace or
-            project access. The client stores the credential; STMA puts no secret in a prompt,
-            terminal command, repository, or user-edited config file. After login, reload that
-            client once so its running task can load the new tools.
-          </div>
-        </div>
-        <div class="cmd">
-          <code>{baseUrl}/mcp</code>
-          <button class="copybtn solid" type="button" data-copy={`${baseUrl}/mcp`}>Copy MCP address</button>
-        </div>
-        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px">
-          <div style="border:1px solid var(--line);border-radius:12px;padding:14px">
-            <b>Codex</b>
-            <p class="small muted">Paste one transparent request into Codex. It uses one native OAuth flow; you approve it, then reload the task once.</p>
-            <button class="copybtn solid" type="button" data-copy={codexConnectPrompt}>Copy Codex setup request</button>
-            <details class="small" style="margin-top:10px"><summary>Manual fallback</summary>
-              <ol>
-                <li>Open Settings → MCP servers and add a Streamable HTTP server named <code>{mcpAlias}</code>.</li>
-                <li>Paste the MCP address above and save.</li>
-                <li>Select Authenticate; approve the exact project or workspace in STMA.</li>
-              </ol>
-              <div class="cmd" style="margin-top:8px"><code>{`codex mcp add ${mcpAlias} --url ${baseUrl}/mcp`}</code><button class="copybtn" type="button" data-copy={`codex mcp add ${mcpAlias} --url ${baseUrl}/mcp`}>Copy</button></div>
-              <p class="m0 muted">If Add did not start OAuth itself, run <code>{`codex mcp login ${mcpAlias}`}</code>. Never start a second login while one is open.</p>
-            </details>
-          </div>
-          <div style="border:1px solid var(--line);border-radius:12px;padding:14px">
-            <b>Claude Code</b>
-            <p class="small muted">Claude Code 2.1.186+ connects each Git checkout (clone or worktree) as its own agent: the request names the entry after that checkout, adds it at local scope and authenticates with the native login. Paste the same request into every Claude Code agent, including several on one machine. If the agent shell is non-interactive, you run the one login command in a regular terminal inside that checkout.</p>
-            <button class="copybtn solid" type="button" data-copy={claudeConnectPrompt}>Copy Claude setup request</button>
-            <details class="small" style="margin-top:10px"><summary>Manual fallback</summary>
-              <p class="m0 muted" style="margin-top:8px">In a terminal inside the checkout, pick a server name no other checkout on this machine uses, such as <code>stma-</code> plus the folder name. Claude Code keeps the login under that name, and logging in again under a name signs out its earlier login.</p>
-              <div class="cmd" style="margin-top:8px"><code>{`claude mcp add --transport http --scope local NAME ${baseUrl}/mcp`}</code><button class="copybtn" type="button" data-copy={`claude mcp add --transport http --scope local NAME ${baseUrl}/mcp`}>Copy</button></div>
-              <p class="m0 muted">Then run <code>claude mcp login NAME</code> in that checkout, approve in the browser and reload Claude Code there once. Remove an older machine-wide <code>{mcpAlias}</code> entry first, or every checkout also loads it. Local scope changes visibility only; STMA still enforces the approved project or workspace.</p>
-            </details>
-          </div>
-        </div>
-        <div class="banner banner-info">
-          <span class="ic">i</span>
-          <span>
-            Each browser approval creates a unique installation ID and short-lived, automatically
-            refreshed access. It grants STMA MCP access only. Local git hooks and file guards are a
-            separate optional adapter and are never silently installed by this connection.
-          </span>
-        </div>
-      </div>
-
-      <div class="card card-pad" style="display:flex;flex-direction:column;gap:12px">
-        <div>
-          <span class="overline">Separate opt-in · local coordination</span>
-          <div class="card-title" style="margin-top:4px">Automatically track work in this checkout</div>
-          <div class="card-note">
-            MCP login alone does not observe edits or start runs. The first-party STMA CLI can
-            install ignored, project-local hooks after you review the exact checkout and approve
-            a separate project-scoped browser connection. No existing Codex or Claude MCP credential
-            is read or copied. This creates a second, separately revocable installation for the
-            local adapter; it is not the same identity as the MCP connection. Its approval screen
-            asks which of your agents it listens for, so that agent's prompt hook hears work
-            assigned to it; an adapter you activated earlier is paired in the list below.
-          </div>
-        </div>
-        {selectedTeam && selectedProject ? (
-          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px">
-            {(['codex', 'claude-code'] as const).map((target) => {
-              const command = `stma adapter activate --target ${target} --team ${shellQuote(selectedTeam.slug)} --project ${shellQuote(selectedProject.name)} --server ${shellQuote(baseUrl)}`;
-              return <div class="cmd"><code>{command}</code><button class="copybtn solid" type="button" data-copy={command}>Copy {target} command</button></div>;
-            })}
-          </div>
-        ) : <p class="m0 muted">Select one project above to get its exact local activation command.</p>}
-        <p class="small muted m0">
-          Run this in a regular terminal at the Git checkout root after installing a STMA CLI version
-          that supports <code>adapter activate</code>. Review the browser consent yourself. Codex also
-          requires a separate <code>/hooks</code> trust review. File-tool guards do not cover shell,
-          operating-system or every external write path. A real run must be observed before claiming
-          coordination works.
-        </p>
-      </div>
-
-      <details class="card card-pad" open={!!setupPrompt}>
-        <summary class="card-title">Legacy setup prompt (compatibility)</summary>
-        <div class="card-note">
-          Use this only for an older MCP client that cannot complete OAuth. This path asks the agent
-          to install user-level configuration and may be refused by the client. The recommended flow
-          above avoids that model-mediated installation entirely.{' '}
-          The prompt carries a single-use {AGENT_ENROLLMENT_TTL_MINUTES}-minute enrollment code. Before any network or
-          user-level configuration change, the agent must show you the origin, persistent config
-          target, exact access boundary, credential lifetime, revocation path, replacement state and any
-          permission tightening, then wait for one explicit approval. After yes it uses the embedded
-          one-use code automatically; there is no second code-entry or setup-method step. The prompt
-          itself does not prove that its service is trusted; reject
-          an origin or grant you do not recognize. For two computers, use separate prompts and machine labels.{' '}
-          <a href="/docs#quickstart">Quick start</a>
-        </div>
-        <form class="authform" method="post" action="/app/tokens" style="margin-top:16px">
-          <FilterContext />
-          <div class="field">
-            <label for="agent-name">Agent name</label>
-            <input
-              class="in"
-              id="agent-name"
-              type="text"
-              name="name"
-              placeholder="codex-reviewer"
-              value={`agent-${list.length + enrollments.filter((row) => !row.enrollment.redeemedAt).length + 1}`}
-              maxlength={80}
-              required
-            />
-            <span class="help">The stable identity teammates see on runs and the agent map.</span>
-          </div>
-          <div class="field">
-            <label for="device-label">Machine</label>
-            <input
-              class="in"
-              id="device-label"
-              type="text"
-              name="device"
-              placeholder="macbook-pro"
-              value={`computer-${list.length + enrollments.filter((row) => !row.enrollment.redeemedAt).length + 1}`}
-              maxlength={60}
-              required
-            />
-            <span class="help">A short device label; another machine gets another prompt.</span>
-          </div>
-          <div class="field">
-            <label for="client-type">Client</label>
-            <select class="in" id="client-type" name="client">
-              {AGENT_CLIENT_TYPES.filter((client) => ['codex', 'claude-code', 'cursor'].includes(client)).map((client) => (
-                <option value={client}>{client}</option>
-              ))}
-            </select>
-          </div>
-          <details><summary>Agent role (optional)</summary>
-          <div class="field">
-            <label for="agent-role">Role</label>
-            <select class="in" id="agent-role" name="role">
-              {AGENT_ROLES.map((role) => (
-                <option value={role} selected={role === 'generalist'}>
-                  {role}
-                </option>
-              ))}
-            </select>
-            <span class="help">A visible label, not a permission.</span>
-          </div>
-          </details>
-          <div class="field">
-            <label for="agent-access">Access</label>
-            <select class="in" id="agent-access" name="access" required>
-              {teamChoices.map((team) => (
-                <optgroup label={team.name}>
-                  <option value={`team:${team.id}`} selected={preferredAccess === `team:${team.id}`}>
-                    Entire workspace — {team.slug}
-                  </option>
-                  {team.projects.map((project) => (
-                    <option
-                      value={`project:${project.id}`}
-                      selected={preferredAccess === `project:${project.id}`}
-                    >
-                      Project only — {project.name}
-                    </option>
-                  ))}
-                </optgroup>
-              ))}
-              <option value="personal" selected={preferredAccess === 'personal'}>
-                Personal — all current workspace memberships
-              </option>
-            </select>
-            <span class="help">
-              Project only is the least-privilege choice. Entire workspace includes every current
-              and later project in that workspace. Personal includes every membership this account
-              can reach; it does not mean “I work alone”.
-            </span>
-          </div>
-          <button class="btn btn-primary" type="submit" style="align-self:flex-start">
-            Create legacy one-time prompt
-          </button>
-        </form>
-      </details>
-      </>
-      )}
-
-      {setupPrompt ? (
-        <div class="reveal">
-          <div class="reveal-head">
-            <span class="ic">✓</span>
-            <div>
-              <div class="reveal-title">Setup prompt ready</div>
-              <div class="reveal-sub">
-                Legacy fallback: paste the whole block into exactly one agent on the named machine. Its enrollment code
-                is shown only now, expires in {AGENT_ENROLLMENT_TTL_MINUTES} minutes and can be used once.
-                The agent will present one redacted disclosure and ask once before connecting. After
-                yes, it consumes the embedded code automatically; you do not enter it again.
-              </div>
-            </div>
-          </div>
-          <div class="cmd setup-prompt">
-            <code>{setupPrompt}</code>
-            <button class="copybtn solid" type="button" data-copy={setupPrompt}>
-              Copy prompt
-            </button>
-          </div>
-          <div class="small" style="color:var(--green-ink)">
-            Enforced access:{' '}
-            <b>
-              {newEnrollment
-                ? grantLabel({
-                    scope: newEnrollment.enrollment.scope as TokenScope,
-                    teamSlug: newEnrollment.team?.slug ?? null,
-                    projectName: newEnrollment.project?.name ?? null,
-                  })
-                : ''}
-            </b>
-          </div>
-          <p class="small">
-            The MCP entry is persistent user-level configuration, so it is available to this client
-            across repositories; server access remains limited to the enforced grant above. Assume
-            the resulting credential has no automatic expiry unless redemption reports one. Revoke
-            server access here, then remove the local entry and reload the client to disconnect fully.
-            Activation uses a transient helper so the returned token does not pass through a command
-            argument, environment variable, tool output, clipboard or temporary response file. If the
-            client has no private input channel, it automatically uses a current-user-only OS-temp
-            handoff for the short-lived code without asking you to choose another method. If redemption
-            succeeds but validation or the local config write fails, the helper automatically revokes
-            that just-minted connection instead of leaving unused access active.
-          </p>
-          <p class="small">
-            Once the agent confirms <code>whoami</code>, open “Connect another agent” above for
-            your other computer. Already connected both? <a href="#first-message">Send your first message</a> below.
-          </p>
-        </div>
-      ) : null}
-
-      {teamChoices.length > 0 ? (
-        <FirstExchange
-          baseUrl={baseUrl}
-          teamSlug={newEnrollment ? newEnrollment.team?.slug : selectedTeam?.slug}
-          projectName={newEnrollment ? newEnrollment.project?.name : selectedProject?.name}
-        />
-      ) : null}
-
-      {legacyToken ? (
-        <div class="reveal">
-          <div class="reveal-head">
-            <span class="ic">!</span>
-            <div>
-              <div class="reveal-title">Legacy personal token created</div>
-              <div class="reveal-sub">
-                This backward-compatible token reaches all of your current memberships and is
-                shown once. New agent connections should use the scoped prompt form above.
-              </div>
-            </div>
-          </div>
-          <div class="cmd">
-            <code>{legacyToken}</code>
-            <button class="copybtn solid" type="button" data-copy={legacyToken}>Copy token</button>
-          </div>
-        </div>
-      ) : null}
-
-      {visibleEnrollments.length ? (
-        <div class="card scroll-x">
-          <div class="card-head">
-            <div>
-              <div class="card-title">Setup prompts not yet used</div>
-              <div class="card-note">Codes cannot be shown again. Revoke or let them expire, then create a fresh prompt.</div>
-            </div>
-          </div>
-          <table class="tbl">
-            <tr><th>Agent</th><th>Machine</th><th>Access</th><th>Expires</th><th></th></tr>
-            {visibleEnrollments
-              .map((row) => (
-                <tr>
-                  <td class="name">{row.enrollment.name}</td>
-                  <td class="mono muted">{row.enrollment.deviceLabel}</td>
-                  <td>{grantLabel({ scope: row.enrollment.scope as TokenScope, teamSlug: row.team?.slug ?? null, projectName: row.project?.name ?? null })}</td>
-                  <td class="muted">{row.enrollment.expiresAt.toISOString().slice(11, 16)} UTC</td>
-                  <td style="text-align:right">
-                    <form
-                      class="m0"
-                      method="post"
-                      action={`/app/enrollments/${row.enrollment.id}/revoke`}
-                      data-confirm="If the one-time code is still unused, this invalidates it immediately. If the agent activated while this page was open, the same action follows that enrollment and revokes its connected installation and credential."
-                      data-confirm-title="Revoke setup or connection?"
-                      data-confirm-action="Revoke access"
-                    >
-                      <FilterContext />
-                      <button class="linklike" type="submit">Revoke</button>
-                    </form>
-                  </td>
-                </tr>
-              ))}
-          </table>
-        </div>
-      ) : null}
-
-      <form method="get" action="/app/tokens" class="card card-pad" style="display:flex;gap:12px;flex-wrap:wrap;align-items:end">
-        {selectedProject ? <input type="hidden" name="project" value={selectedProject.id} /> : null}
-        <div class="field"><label for="connection-workspace">Workspace filter</label><select class="in" name="team" id="connection-workspace">
-          <option value="">All my connections</option>
-          {teamChoices.map((team) => <option value={team.slug} selected={props.filterTeam === team.slug}>{team.name}</option>)}
-        </select></div>
-        <div class="field"><label for="connection-state">Status</label><select class="in" name="state" id="connection-state">
-          {['all', 'active', 'incomplete', 'revoked'].map((state) => <option value={state} selected={filterState === state}>{state}</option>)}
-        </select></div>
-        <div class="field"><label for="connection-search">Agent name</label><input class="in" name="q" id="connection-search" value={filterQuery} placeholder="Search connections" /></div>
-        <button class="btn" type="submit">Filter</button><a class="btn" href="/app/tokens">Clear filters</a>
-        <p class="help" style="flex-basis:100%">Awaiting client: reload the named client and check its STMA connection within 15 minutes of setup. Setup expired: create a fresh prompt. Active confirms client identity, not repository readiness or completed work. Legacy credentials without verification remain unverified.</p>
-      </form>
-      {visibleTokens.length === 0 ? (
-        <div class="card">
-          <div class="empty">
-            <h2>{list.length ? 'No connections match these filters' : 'No connected agents yet'}</h2>
-            <p>
-              Create a prompt above. A token appears here only after that agent redeems its
-              one-time enrollment code.
-            </p>
-          </div>
-        </div>
-      ) : (
-        <div class="card scroll-x">
-          <table class="tbl">
-            <tr>
-              <th>Name</th>
-              <th>Access</th>
-              <th>Credential</th>
-              <th class="hide-sm">Machine it reports as</th>
-              <th>Created</th>
-              <th>Last used</th>
-              <th>Status</th>
-              <th></th>
-            </tr>
-            {visibleTokens.map((t) => (
-              <tr style={t.revokedAt ? 'color:var(--mut-2)' : ''}>
-                <td class="name">
-                  {t.name}
-                  {t.revokedAt ? null : <PairingNote pairing={pairings.get(t.id)} />}
-                </td>
-                <td>{tokenScopeLabel(t)}</td>
-                <td class="mono">{t.audience ? 'OAuth · client-managed' : `${t.prefix}••••••••`}</td>
-                <td class="mono muted hide-sm">
-                  {/* Not the token's name — the device label the snapshots it pushed
-                      carry. The two differ the moment somebody renames a token, and
-                      the one that matters for a diff is this one. */}
-                  {devices.get(t.id) ?? 'not yet'}
-                </td>
-                <td class="muted">{fmtDate(t.createdAt)}</td>
-                <td class="muted">{timeAgo(t.lastUsedAt) ?? '—'}</td>
-                <td>
-                  {t.revokedAt ? (
-                    <span class="pill pill-muted">
-                      <span class="dot gray" />
-                      revoked
-                    </span>
-                  ) : t.setupExpiresAt && !t.activatedAt ? (
-                    <span class="pill pill-muted"><span class="dot gray" />{t.setupExpiresAt <= new Date() ? 'setup expired' : 'awaiting client'}</span>
-                  ) : (
-                    <span class="pill pill-active">
-                      <span class="dot" />
-                      {t.activatedAt ? 'active' : 'legacy · unverified'}
-                    </span>
-                  )}
-                </td>
-                <td style="text-align:right">
-                  {t.revokedAt ? null : (
-                    <form
-                      class="m0"
-                      method="post"
-                      action={`/app/tokens/${t.id}/revoke`}
-                      data-confirm={`The agent using "${t.name}" loses server access immediately; active runs become stale and their claims are released. Existing snapshots, runs and sessions are kept. This does not remove the local MCP entry or stop the client — remove it there and reload separately.`}
-                      data-confirm-title={`Revoke "${t.name}"?`}
-                      data-confirm-action="Revoke token"
-                    >
-                      <FilterContext />
-                      <button class="linklike" type="submit">
-                        Revoke
-                      </button>
-                    </form>
-                  )}
-                </td>
-              </tr>
-            ))}
-          </table>
-        </div>
-      )}
-
-      <div class="card card-pad" style="display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap">
-        <div>
-          <div class="card-title">Everything else about you</div>
-          <div class="card-note">
-            This page is machines. Your password and the end of the road live on Account; what
-            STMA emails you lives on Notifications.
-          </div>
-        </div>
-        <div class="acts">
-          <a class="btn" href="/app/account">
-            Account
-          </a>
-          <a class="btn" href="/app/notifications">
-            Notifications
-          </a>
-        </div>
-      </div>
-    </AppLayout>
-  );
-};
-
-
 // ---------------------------------------------------------------- account
 
 /** A browser, as its own owner would recognise it. */
@@ -4372,7 +3638,7 @@ const AccountPage = (props: {
        * back into — and a typo at signup used to mean exactly that, with an
        * operator as the only way out.
        */}
-      {confirmByEmail && user.email ? (
+      {confirmByEmail && user.email && !user.isTest ? (
         <div class="card card-pad" style="display:flex;flex-direction:column;gap:14px">
           <div>
             <div class="card-title">
@@ -4496,7 +3762,7 @@ const AccountPage = (props: {
         </div>
       ) : null}
       {plans ? <PlanCard user={user} plans={plans} beta={beta} /> : null}
-      {user.passwordHash ? (
+      {user.passwordHash && !user.isTest ? (
         <div class="card card-pad" style="display:flex;flex-direction:column;gap:14px">
           <div>
             <div class="card-title">Account</div>
@@ -4635,7 +3901,9 @@ const AccountPage = (props: {
         </form>
       </div>
 
-      {support ? (
+      {user.isTest ? <div class="card card-pad"><div class="card-title">Operator-managed test identity</div><div class="card-note">{user.email} is a synthetic sign-in address, not a mailbox. Ask the operator to renew access or generate a new password. Email recovery and self-service identity changes are unavailable.</div></div> : null}
+
+      {support && !user.isTest ? (
         <div class="card card-pad">
           <div class="card-title">Get help</div>
           <div class="card-note">
@@ -4663,7 +3931,7 @@ const AccountPage = (props: {
           data-confirm-title="Delete your account?"
           data-confirm-action="Delete account"
         >
-          <button class="btn btn-danger" type="submit" style="align-self:flex-start">
+          <button class="btn btn-danger" type="submit" style="align-self:flex-start" disabled={user.isTest}>
             Delete account
           </button>
         </form>
@@ -4690,325 +3958,6 @@ dashboardRoutes.get('/app/account', async (c) => {
       error={c.req.query('error')}
       notice={c.req.query('ok')}
     />,
-  );
-});
-
-dashboardRoutes.get('/app/tokens', async (c) => {
-  const user = c.get('user');
-  if (!user) return loginRedirect(c);
-  const db = c.get('db');
-  const teamChoices = await tokenTeamsFor(db, user.id);
-  const selectedTeam =
-    teamChoices.find((team) => team.slug === c.req.query('team')) ?? teamChoices[0];
-  const requestedProject = c.req.query('project');
-  const selectedProject = selectedTeam?.projects.find(
-    (project) =>
-      project.id === requestedProject ||
-      project.slug === requestedProject ||
-      project.name === requestedProject,
-  );
-  await ensureRail(db, user, selectedTeam?.slug);
-  const list = await db
-    .select()
-    .from(tokens)
-    .where(eq(tokens.userId, user.id))
-    .orderBy(desc(tokens.createdAt));
-  // What each token reports as, from the snapshots it actually pushed. Bounded by
-  // this person's own tokens, and grouped rather than fetched row by row.
-  const devices = new Map<string, string>();
-  if (list.length > 0) {
-    for (const row of await db
-      .select({ tokenId: agentInstallations.tokenId, device: agentInstallations.deviceLabel })
-      .from(agentInstallations)
-      .where(
-        inArray(
-          agentInstallations.tokenId,
-          list.map((token) => token.id),
-        ),
-      )) {
-      if (row.tokenId && row.device) devices.set(row.tokenId, row.device);
-    }
-    for (const row of await db
-      .select({ tokenId: snapshots.tokenId, label: max(snapshots.deviceLabel) })
-      .from(snapshots)
-      .where(
-        inArray(
-          snapshots.tokenId,
-          list.map((t) => t.id),
-        ),
-      )
-      .groupBy(snapshots.tokenId)) {
-      // A real snapshot wins over enrollment metadata: this column answers
-      // what the connection actually reports as, while still avoiding "not yet"
-      // immediately after a successful activation.
-      if (row.tokenId && row.label) devices.set(row.tokenId, row.label);
-    }
-  }
-  return c.html(
-    <TokensPage
-      user={user}
-      list={list}
-      enrollments={await enrollmentRowsFor(db, user.id)}
-      devices={devices}
-      pairings={await connectionPairings(db, user.id)}
-      teamChoices={teamChoices}
-      selectedTeam={selectedTeam}
-      selectedProject={selectedProject}
-      baseUrl={c.get('env').baseUrl}
-      error={c.req.query('error')}
-      notice={c.req.query('ok')}
-      filterTeam={c.req.query('team') || undefined}
-      filterState={c.req.query('state')}
-      filterQuery={c.req.query('q')}
-    />,
-  );
-});
-
-dashboardRoutes.post('/app/tokens', async (c) => {
-  const user = c.get('user');
-  if (!user) return loginRedirect(c);
-  const db = c.get('db');
-  const body = await c.req.parseBody();
-  const name =
-    typeof body.name === 'string' && body.name.trim() ? body.name.trim().slice(0, 80) : '';
-  // Compatibility for pre-enrollment clients and the published CLI-era test
-  // contract. The current form always sends device+access, so no normal user
-  // falls into an all-memberships credential accidentally.
-  if (body.device === undefined && body.access === undefined && name) {
-    const pat = generatePat();
-    await db.insert(tokens).values({
-      userId: user.id,
-      name,
-      tokenHash: pat.hash,
-      prefix: pat.prefix,
-    });
-    const teamChoices = await tokenTeamsFor(db, user.id);
-    const list = await db
-      .select()
-      .from(tokens)
-      .where(eq(tokens.userId, user.id))
-      .orderBy(desc(tokens.createdAt));
-    await ensureRail(db, user, teamChoices[0]?.slug);
-    return c.html(
-      <TokensPage
-        user={user}
-        list={list}
-        enrollments={await enrollmentRowsFor(db, user.id)}
-        devices={new Map()}
-        pairings={await connectionPairings(db, user.id)}
-        teamChoices={teamChoices}
-        selectedTeam={teamChoices[0]}
-        legacyToken={pat.token}
-        baseUrl={c.get('env').baseUrl}
-      />,
-    );
-  }
-  // A connection started from a project's Agents page is refused back INTO that
-  // project: the person is one corrected field away from a command, and landing on
-  // the account's list took the project, the trail and the way back with it.
-  const refused = (message: string) => {
-    let query = `error=${encodeURIComponent(message)}`;
-    for (const [field, param] of [['filter_team', 'team'], ['filter_project', 'project']] as const) {
-      const held = body[field];
-      if (typeof held === 'string' && held) query += `&${param}=${encodeURIComponent(held.slice(0, 100))}`;
-    }
-    return c.redirect(`/app/tokens?${query}`);
-  };
-  const terminal = body.mode === 'terminal';
-  // The identity fields and the two clients a connect command can write hooks for
-  // are read by `domain/connectRequests.ts`, which a project's Agents page calls
-  // too: the same mistake must not get two different sentences depending on which
-  // door it was made at.
-  const asked = readConnectRequest(body, { terminal });
-  if ('error' in asked) return refused(asked.error);
-  const { device, client, role } = asked;
-  const teamChoices = await tokenTeamsFor(db, user.id);
-  if (teamChoices.length === 0) {
-    return refused('Create or join a team before connecting an agent.');
-  }
-  const access = typeof body.access === 'string' ? body.access : '';
-  let scope: TokenScope;
-  let selectedTeam: TokenTeam | undefined;
-  let selectedProject: TokenProject | undefined;
-  if (access === 'personal') {
-    scope = 'personal';
-  } else if (access.startsWith('team:')) {
-    scope = 'team';
-    selectedTeam = teamChoices.find((team) => team.id === access.slice('team:'.length));
-  } else if (access.startsWith('project:')) {
-    scope = 'project';
-    const projectId = access.slice('project:'.length);
-    selectedTeam = teamChoices.find((team) => team.projects.some((project) => project.id === projectId));
-    selectedProject = selectedTeam?.projects.find((project) => project.id === projectId);
-  } else {
-    return refused('Choose an access boundary for this agent.');
-  }
-  if (terminal && scope !== 'project') {
-    return refused('A connect command is for one project: its hooks belong to one checkout.');
-  }
-  if ((scope !== 'personal' && !selectedTeam) || (scope === 'project' && !selectedProject)) {
-    return refused('That team or project is no longer available to your account.');
-  }
-  const issued = await createAgentEnrollment(db, {
-    userId: user.id,
-    name,
-    deviceLabel: device,
-    clientType: client,
-    role,
-    scope,
-    teamId: selectedTeam?.id,
-    projectId: selectedProject?.id,
-    ...(terminal ? { ttlMinutes: TERMINAL_CONNECT_TTL_MINUTES } : {}),
-  });
-  const list = await db
-    .select()
-    .from(tokens)
-    .where(eq(tokens.userId, user.id))
-    .orderBy(desc(tokens.createdAt));
-  // The enrollment code is shown once, so this POST answers with a page rather
-  // than a redirect — and a page draws the rail.
-  // …in the scope the command is for. Without the project the rail fell back to the
-  // workspace at the one moment the person needs the way to the project's Agents,
-  // where the new agent is about to appear.
-  await ensureRail(db, user, selectedTeam?.slug, selectedProject?.slug);
-  return c.html(
-    <TokensPage
-      user={user}
-      list={list}
-      enrollments={await enrollmentRowsFor(db, user.id)}
-      devices={new Map()}
-      pairings={await connectionPairings(db, user.id)}
-      teamChoices={teamChoices}
-      selectedTeam={selectedTeam}
-      selectedProject={selectedProject}
-      newEnrollment={{
-        enrollment: issued.enrollment,
-        code: issued.code,
-        team: selectedTeam,
-        project: selectedProject,
-        terminal,
-      }}
-      baseUrl={c.get('env').baseUrl}
-    />,
-  );
-});
-
-async function connectionReturn(c: Context<AppEnv>, message: string, ok = true) {
-  const body = await c.req.parseBody();
-  const params = new URLSearchParams({ [ok ? 'ok' : 'error']: message });
-  for (const [field, name] of [['filter_team', 'team'], ['filter_project', 'project'], ['filter_q', 'q']] as const) {
-    if (typeof body[field] === 'string' && body[field]) params.set(name, body[field].slice(0, 100));
-  }
-  // Preserve identity filters, but show every state so the newly revoked row
-  // remains visible instead of disappearing from an "active" filter.
-  return c.redirect(`/app/tokens?${params}`);
-}
-
-dashboardRoutes.post('/app/enrollments/:id/revoke', async (c) => {
-  const user = c.get('user');
-  if (!user) return loginRedirect(c);
-  if (!UUID_RE.test(c.req.param('id'))) return c.notFound();
-  const db = c.get('db');
-  const enrollmentId = c.req.param('id');
-  const revoked = await revokePendingEnrollment(db, user.id, enrollmentId);
-  if (revoked[0]) {
-    return connectionReturn(c, 'Unused setup code revoked. No credential was created by it.');
-  }
-
-  // The page may still show the pending-code control when redemption wins in
-  // another process. Revoke must follow the user's selected enrollment to the
-  // installation it just created; making them find and click a second row
-  // leaves live access behind after an apparently successful revoke flow.
-  const [activated] = await db
-    .select({ installationId: agentEnrollments.installationId })
-    .from(agentEnrollments)
-    .where(and(eq(agentEnrollments.id, enrollmentId), eq(agentEnrollments.userId, user.id)))
-    .limit(1);
-  if (activated?.installationId) {
-    const result = await revokeAgentInstallation(db, user.id, activated.installationId);
-    logLine({
-      evt: 'agent_enrollment',
-      a: 'revoke_followed_activation',
-      enrollment: enrollmentId,
-      installation: activated.installationId,
-      alreadyInactive: 'error' in result,
-    });
-    return connectionReturn(c, 'Setup activated before this page refreshed. Its agent connection and server credential are revoked.');
-  }
-
-  return connectionReturn(c, 'That setup code was expired, already revoked, or was not yours. No active connection was found for it.', false);
-});
-
-dashboardRoutes.post('/app/tokens/:id/revoke', async (c) => {
-  const user = c.get('user');
-  if (!user) return loginRedirect(c);
-  if (!UUID_RE.test(c.req.param('id'))) return c.notFound();
-  const db = c.get('db');
-  const linked = await db
-    .select({ id: agentInstallations.id })
-    .from(agentInstallations)
-    .where(
-      and(
-        eq(agentInstallations.tokenId, c.req.param('id')),
-        eq(agentInstallations.userId, user.id),
-      ),
-    )
-    .limit(1);
-  if (linked[0]) {
-    const result = await revokeAgentInstallation(db, user.id, linked[0].id);
-    logLine({
-      evt: 'agent_connection',
-      a: 'revoked',
-      installation: linked[0].id,
-      alreadyInactive: 'error' in result,
-      via: 'connections_page',
-    });
-    return connectionReturn(c, 'Server access revoked. Remove the local MCP entry and reload that client to disconnect fully.');
-  }
-  await db
-    .update(tokens)
-    .set({ revokedAt: new Date() })
-    .where(and(eq(tokens.id, c.req.param('id')), eq(tokens.userId, user.id)));
-  return connectionReturn(c, 'Server access revoked. Remove the local MCP entry and reload that client to disconnect fully.');
-});
-
-/**
- * Pair one of your local adapters with the agent it sits beside, or unpair it.
- *
- * Its own route rather than a field on consent alone, because every adapter
- * activated before the pairing existed is already installed and working: the
- * only other way to pair one would be to activate it again, which mints a
- * second installation to deliver a label. Every rule — yours, live, an adapter,
- * a reachable agent — is `setCompanion`'s; this handler only carries the answer.
- */
-dashboardRoutes.post('/app/installations/:id/companion', async (c) => {
-  const user = c.get('user');
-  if (!user) return loginRedirect(c);
-  if (!UUID_RE.test(c.req.param('id'))) return c.notFound();
-  const body = await c.req.parseBody();
-  const requested = typeof body.companion === 'string' ? body.companion.trim() : '';
-  if (requested !== 'none' && !UUID_RE.test(requested)) {
-    return connectionReturn(c, 'Choose the agent this adapter listens for, or Nobody to unpair it.', false);
-  }
-  const result = await setCompanion(
-    c.get('db'),
-    user.id,
-    c.req.param('id'),
-    requested === 'none' ? null : requested,
-  );
-  if ('error' in result) return connectionReturn(c, result.error, false);
-  logLine({
-    evt: 'agent_connection',
-    a: result.companion ? 'paired' : 'unpaired',
-    installation: result.adapter.id,
-    companionOf: result.companion?.installationId,
-    via: 'connections_page',
-  });
-  return connectionReturn(
-    c,
-    result.companion
-      ? `${result.adapter.name} now listens for ${result.companion.name}: its prompt hook announces work assigned to ${result.companion.name}, an edit its guard stops is filed under ${result.companion.name}, and ${result.companion.name} may update, finish and hand off the runs these hooks start. It still cannot accept work itself or touch that agent's own runs.`
-      : `${result.adapter.name} is no longer paired. Its hooks keep guarding the checkout; the agent beside it hears about assigned work only when somebody asks it to read its inbox, and is refused from its next call on the runs these hooks start.`,
   );
 });
 

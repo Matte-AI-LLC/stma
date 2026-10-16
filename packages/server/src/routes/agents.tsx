@@ -9,10 +9,10 @@ import {
   type ConflictClaim,
   type ConflictSeverity,
 } from '@bridge/shared';
-import { eq, inArray } from 'drizzle-orm';
+import { and, eq, inArray } from 'drizzle-orm';
 import { Hono } from 'hono';
 import { loginRedirect } from '../auth/session';
-import { policyReceipts } from '../db/schema';
+import { agentRuns, memberships, policyReceipts, teams as teamRows } from '../db/schema';
 import { activeRunsForMember, claimsForRuns, revokeAgentInstallation } from '../domain/agents';
 import {
   pastGroundForRuns,
@@ -22,6 +22,10 @@ import {
   installationsForMember,
 } from '../domain/fleetReaders';
 import { evidenceForRun } from '../domain/evidence';
+import { membershipUser } from '../lib/securityHooks';
+import { isCanonicalUuid } from '../lib/ids';
+import { runHref } from './runs';
+import { EvidenceChecks, EvidenceNext } from '../ui/Evidence';
 import { cheapestWith, effectiveLimits } from '../lib/entitlements';
 import { teamsOf } from '../mcp/shared';
 import { initials, timeAgo } from '../lib/format';
@@ -367,6 +371,21 @@ agentsRoutes.get('/app/agents', async (c) => {
       : // Default to the run that most needs attention, then to the newest.
         visibleRows.find((row) => severityByRun.get(row.run.id) === 'critical') ?? visibleRows[0];
   const missingWantedRun = Boolean(wanted && !wantedRun);
+  // The map is presence and forgets a run after a day; its run page does not.
+  // Only a run in one of this person's workspaces is named, so the banner says
+  // nothing about a run somebody else holds.
+  const missingRunTeam =
+    missingWantedRun && isCanonicalUuid(wanted)
+      ? (
+          await db
+            .select({ slug: teamRows.slug })
+            .from(agentRuns)
+            .innerJoin(teamRows, eq(teamRows.id, agentRuns.teamId))
+            .innerJoin(memberships, and(eq(memberships.teamId, teamRows.id), membershipUser(user.id)))
+            .where(eq(agentRuns.id, wanted!.toLowerCase()))
+            .limit(1)
+        )[0]?.slug
+      : undefined;
   const selection: GraphSelection = selectedScope
     ? { type: 'scope', id: selectedScope.id }
     : selected
@@ -838,22 +857,11 @@ agentsRoutes.get('/app/agents', async (c) => {
           {pack && !('error' in pack) ? (
             <div class="ins-sec">
               <span class="ins-label">Merge readiness</span>
-              {pack.checks.map((check) => (
-                <div class="check">
-                  <span class={check.state === 'ok' ? 'y' : check.state === 'attention' ? 'n' : 'w'}>
-                    {check.state === 'ok' ? '✓' : check.state === 'attention' ? '!' : '?'}
-                  </span>
-                  <span>{check.detail}<small class="muted" style="display:block">{check.source} · {check.coverage} · {check.observedAt ?? 'observation time unknown'}{check.limitations?.map((limit) => <span style="display:block">{limit}</span>)}</small></span>
-                </div>
-              ))}
-              <span class="muted small">
-                {pack.blocking.length > 0
-                  ? `Fix first: ${pack.blocking.join(', ')}.`
-                  : pack.unconfirmed.length > 0
-                    ? `Nothing failing, but unconfirmed: ${pack.unconfirmed.join(', ')}. Unconfirmed is not the same as fine.`
-                    : 'No recorded failure in the checks shown. Missing evidence is not approval.'}
-              </span>
-              <details><summary>Exact-commit provider observations ({pack.providerFacts.length})</summary><p class="small muted">{pack.providerCoverage}</p>{pack.providerFacts.map((row) => <p>{row.fullName} · {row.fact.commitSha.slice(0, 12)} · {row.fact.subjectId} attempt {row.fact.attempt}: {row.fact.state}</p>)}</details>
+              <EvidenceChecks pack={pack} />
+              <EvidenceNext pack={pack} />
+              <a class="small" href={runHref(selected.team.slug, selected.run.id)}>
+                Open the run page: evidence that stays after the run ends, with Copy as Markdown
+              </a>
             </div>
           ) : null}
 
@@ -911,8 +919,15 @@ agentsRoutes.get('/app/agents', async (c) => {
         <div class="banner banner-warn">
           <span class="ic">!</span>
           <span>
-            That exact run is no longer active. STMA did not substitute another agent. Its
-            retained history remains in the workspace Activity and Governance pages.
+            That exact run is no longer active. STMA did not substitute another agent.{' '}
+            {missingRunTeam ? (
+              <>
+                Its evidence stays on{' '}
+                <a href={runHref(missingRunTeam, wanted!.toLowerCase())}>its run page</a>.
+              </>
+            ) : (
+              'Its retained history remains in the workspace Activity and Governance pages.'
+            )}
           </span>
         </div>
       ) : null}

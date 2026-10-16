@@ -92,7 +92,7 @@ import { SNAPSHOT_CHECKLIST } from '../mcp/checklist';
 import { requireAnnotations } from '../mcp/annotations';
 import { registerFleetTools, FLEET_TOOL_PARAMS } from '../mcp/fleet';
 import { registerKnowledgeTools, KNOWLEDGE_TOOL_PARAMS } from '../mcp/knowledge';
-import { err, resolveTeam, teamsOf, text } from '../mcp/shared';
+import { err, resolveTeam, teamsOf, text, toolReference } from '../mcp/shared';
 import { buildOnboardFiles } from '../mcp/onboard';
 import { teammateJoinPrompt } from '../lib/agentConnect';
 import type { AppEnv, Token, User } from '../types';
@@ -194,14 +194,13 @@ const KEEP_SNAPSHOTS_PER_DEVICE = 20;
 // they get two paragraphs.
 //
 // A coding agent in a checkout gets the paragraph every agent-lab round was
-// measured with. A descriptive rewrite (2026-09-24) carried every rule as a fact,
-// and the agents did not act on it the same way: across its two lab runs b2 never
-// closed a run, where it closed two in each run on this paragraph, and one run
-// failed the policy stage because b1's edit was refused for stale ground before
-// the content rule was reached. Two runs a side cannot prove the paragraph caused
-// that failure rather than timing; they are why the paragraph that was green in
-// every round before, and twice after, is the one an agent gets. For an agent the
-// order of the calls is the point, so it stays a sequence.
+// measured with. A descriptive rewrite (2026-09-24) carried every rule as a fact;
+// on it the round went red once in two runs, and on this paragraph it was green in
+// all four runs after, with the agents keeping to the order of calls more often.
+// The per-agent counts live in the evidence ledger (docs/genel-test-durumu-
+// 2026-09-13.md, "24 Eylül akşamı") and not here, because a count written here
+// was contradicted by the next run. For an agent the order of the calls is the
+// point, so it stays a sequence.
 //
 // The Claude app gets the descriptive one. It reaches Claude in a chat with a
 // person, where "never look for it on disk" means nothing, and it is what
@@ -922,7 +921,8 @@ export function buildMcpServer(
     {
       title: 'Announce to the team',
       description:
-        "Broadcast a short announcement that lands in every teammate's inbox (breaking changes, big merges, rebases, deploys, migration changes). Not for debugging — use open_session for that.",
+        "Broadcast a short announcement that lands in every teammate's inbox (breaking changes, big merges, rebases, deploys, migration changes). Not for debugging — use open_session for that." +
+        toolReference(env.baseUrl, 'announce'),
       inputSchema: {
         team: z
           .string()
@@ -998,7 +998,8 @@ export function buildMcpServer(
     {
       title: 'Open a debug session',
       description:
-        'Start a topic-based debug session that teammates\' agents can join asynchronously (e.g. "migrations fail locally"). Include a first message with the error output, repro steps and what you already ruled out. Never include secret values.',
+        'Start a topic-based debug session that teammates\' agents can join asynchronously (e.g. "migrations fail locally"). Include a first message with the error output, repro steps and what you already ruled out. Never include secret values.' +
+        toolReference(env.baseUrl, 'open_session'),
       inputSchema: {
         title: z.string().trim().min(3).max(200).describe('Short problem statement.'),
         team: z
@@ -1217,7 +1218,8 @@ export function buildMcpServer(
     {
       title: 'Post to a debug session',
       description:
-        'Post a typed message to a debug session. Use kind to help the other agent: question, answer, hypothesis, info-request, resolution, note. Attach log excerpts as attachments instead of pasting huge blobs. Never include secret values.',
+        'Post a typed message to a debug session. Use kind to help the other agent: question, answer, hypothesis, info-request, resolution, note. Attach log excerpts as attachments instead of pasting huge blobs. Never include secret values.' +
+        toolReference(env.baseUrl, 'post_message'),
       inputSchema: {
         session_id: z.string(),
         body: z.string().min(1).max(20_000),

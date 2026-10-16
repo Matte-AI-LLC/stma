@@ -239,6 +239,19 @@ h1.title, h2.title { margin: 0; font: 600 26px/1.2 var(--sans); letter-spacing: 
 }
 .section-jump a:hover { border-color: var(--green); color: var(--green-strong); text-decoration: none; }
 .section-jump span { color: var(--mut); font: 400 11px/1 var(--sans); }
+/* Agent connections: one page, three numbered sections (connect, test, yours). */
+.conn-head { display: flex; gap: 12px; align-items: flex-start; margin-top: 12px; scroll-margin-top: 16px; }
+.conn-head h2 { margin: 0; font: 600 18px/1.3 var(--sans); letter-spacing: -.01em; color: var(--ink); }
+.conn-head p { margin: 4px 0 0; font: 400 13px/1.55 var(--sans); color: var(--txt-2); }
+.conn-n {
+  width: 26px; height: 26px; border-radius: 99px; flex: none; margin-top: 1px;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: var(--ink); color: #fff; font: 600 12px/1 var(--sans);
+}
+/* A test has four steps: one row where there is room, never three and a straggler. */
+.xchg .flow-steps { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+@media(max-width:900px) { .xchg .flow-steps { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media(max-width:600px) { .xchg .flow-steps { grid-template-columns: 1fr; } }
 .activity-filters {
   display: grid; grid-template-columns: repeat(4, minmax(140px, 1fr));
   gap: 12px; align-items: end;

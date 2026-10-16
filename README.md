@@ -1,12 +1,21 @@
-# STMA — Speak to my Agent
+# STMA · Speak to my Agent
 
-**AgentOps for teams that build with coding agents.**
+**Mission control for your team's coding agents.**
 
-STMA is the operations layer between the coding agents your team runs — Claude Code, Codex, Cursor,
-any MCP client — and the people responsible for what they do: a live map of every agent run, a
-warning before two agents touch the same file, the team's rules delivered to every run, work
-assigned to a named agent or handed over before a usage limit ends a session, environment snapshots
-that carry names and never values, and an evidence pack a reviewer can check.
+STMA is the AgentOps platform between the coding agents your team runs (Claude Code, Codex, Cursor,
+any MCP client) and the people responsible for what they do:
+
+- **See** every agent run on a live map: whose agent, which project, task and branch, the files it
+  holds.
+- **Coordinate**: two agents that declare the same file are warned before either writes, and the
+  run that was there first keeps the right of way.
+- **Govern**: the team's rules reach every run, and the console shows which runs confirmed them.
+- **Dispatch**: assign work to a named agent, or let an agent hand its work over at the exact
+  commit with the tests it ran and the next steps, so nobody has to explain the task again.
+- **Reproduce**: environment snapshots that carry variable names and never values, and a diff
+  between two machines.
+- **Prove**: an evidence page per run that keeps what the agent reported apart from what STMA and a
+  connected provider observed, copyable as Markdown for a pull request.
 
 It works the same for one person with a laptop and a desktop as for several people on a project.
 
@@ -16,18 +25,18 @@ It works the same for one person with a laptop and a desktop as for several peop
    choose **New workspace** and name it **My workspace**, or use the workspace you already have.
    A “team” is a workspace — it can contain just you. Only its name is required.
 2. **Connect your first agent.** For a Claude Code or Codex checkout the fastest way is one terminal
-   command: on the project's own **Agents** page (or on **Agent connections**, where you choose the
-   project yourself), fill in **Fastest · one terminal command**,
+   command: open the workspace's **Agent connections** (in its menu, or **Connect agent** on a
+   project's **Agents** page, which opens the same page inside that project), fill in
+   **Fastest · one terminal command**,
    press **Create connect command** and paste the result into a terminal opened in that checkout
    (`npx -y @matteai/stma connect CODE --server …`). It shows the workspace and project, asks
    `y/N`, then adds the checkout's MCP entry and its local hooks as **one** identity: no browser
    consent, no login step, nothing to pair. Paste it into a terminal, not into the agent: the
    code is a one-use, ten-minute secret, and a careful agent refuses to redeem one. Codex gets one
-   STMA identity per machine, because it loads its user configuration in every checkout. For
-   any other client use OAuth (published: `@matteai/stma@0.14.0`). If Claude Code already has
-   another STMA entry at user scope, the command says so and the hook names the entry its calls
-   belong to; remove or scope the other one so the agent cannot mix identities. For
-   any other client use OAuth: open **Agent connections**, choose the client and copy its setup
+   STMA identity per machine, because it loads its user configuration in every checkout. If
+   Claude Code already has another STMA entry at user scope, the command says so and the hook
+   names the entry its calls belong to; remove or scope the other one so the agent cannot mix
+   identities. For any other client use OAuth: open **Agent connections**, choose the client and copy its setup
    request into that agent. The request tells the agent to use only Codex or Claude Code's built-in
    MCP command for the displayed address; it contains no credential or installer. Complete the one
    native OAuth flow the client starts. STMA opens in your browser; sign in,
@@ -84,7 +93,8 @@ keeps its MCP entry (Codex user configuration, a Claude Code checkout) decides w
 load it, never the server-side project grant. Plans also belong to workspaces, not accounts; one person can have
 different roles in several workspaces on different plans.
 **Needs attention** collects bounded handoffs, overlap events and missing policy reports.
-Management tools live under **Manage workspace**. A handoff needs explicit `update_handoff`
+Management tools live under **Rules set here** and **Workspace settings** in the workspace rail.
+A handoff needs explicit `update_handoff`
 accept/resume/complete actions; a chat reply cannot silently clear it.
 
 Evidence distinguishes agent reports from provider observations. Policy hash matching does not
@@ -115,7 +125,8 @@ snapshot collector's omission of values is not a guarantee about all submitted c
 STMA (Speak to my Agent) is a vendor-neutral control plane for a company's coding agents. MCP is
 one transport surface; the product layer answers the operational questions MCP does not: which
 human owns an agent, what project and task it is working on, which files/contracts it may touch,
-which global rules it actually received, and whether its environment is safe to work in.
+which global rules it actually received, and whether its environment matches the project's
+baseline.
 
 The identity, onboarding, scope, governance, delivery and offboarding state machines are mapped in
 [PRODUCT_FLOWS.md](PRODUCT_FLOWS.md). It is the change checklist for avoiding dead ends and
@@ -147,7 +158,7 @@ cross-scope drift.
 
 ## What's here today
 
-Private beta. This section documents the current source contract; a capability is not available on
+Public beta. This section documents the current source contract; a capability is not available on
 a deployment until that build is released and its environment-specific gates pass. Highlights:
 
 - **37 MCP tools** over a stateless Streamable HTTP endpoint: identity & onboarding (`whoami`,
@@ -156,9 +167,10 @@ a deployment until that build is released and its environment-specific gates pas
   (`open_session`, `list_sessions`, `get_session`, `post_message`, `resolve_session`, `inbox`,
   `search_past_issues`), team-wide `announce`, and the **fleet group** (`start_run`, `update_run`,
   `finish_run`, `list_active_agents`, `get_policy`, `get_workflow`, `check_environment`,
-  `handoff_work`, `assign_work`, `list_issues`, `get_evidence`, `launch_check`, `update_handoff`,
-  `record_delivery_receipt`). The **Knowledge Hub group** is `get_knowledge_context`,
-  `report_knowledge_receipt`, `search_knowledge`, `get_knowledge`, and `propose_knowledge`.
+  `handoff_work`, `assign_work`, `list_issues`, `list_clickup_tasks`, `get_evidence`,
+  `launch_check`, `update_handoff`, `record_delivery_receipt`). The **Knowledge Hub group** is
+  `get_knowledge_context`, `report_knowledge_receipt`, `search_knowledge`, `get_knowledge`, and
+  `propose_knowledge`.
 - **The fleet layer is reachable from MCP alone.** Runs, work claims, conflict warnings, policy
   pull and environment preflight no longer require the CLI and native hooks. A current connection
   binds one scoped credential to one durable agent installation; legacy PATs retain their
@@ -169,9 +181,11 @@ a deployment until that build is released and its environment-specific gates pas
   client's supported HTTP-MCP settings. Standards-based OAuth discovery, dynamic client
   registration, exact callback matching and PKCE S256 move identity/scope approval into STMA's
   browser UI. Access tokens are short-lived; refresh tokens rotate; reuse revokes the linked
-  installation. Each approval still creates a unique installation and enforced project/workspace
-  grant. A copied setup request can ask the agent to invoke the client's native MCP command, but
-  the model never handles the credential or hand-edits raw user configuration. The OAuth client
+  installation — except the same token presented again within two minutes, before a later one is
+  spent, which is treated as a retry after a lost answer and answered again. Each approval still
+  creates a unique installation and enforced project/workspace grant. A copied setup request can
+  ask the agent to invoke the client's native MCP command, but the model never handles the
+  credential or hand-edits raw user configuration. The OAuth client
   type shown on consent is fixed from that client's registration, and a successful authenticated
   MCP initialize marks the installation active; `whoami` then verifies the visible identity/scope.
 - **Legacy setup remains bounded, but is no longer the default.** For a client without OAuth,
@@ -377,14 +391,16 @@ a deployment until that build is released and its environment-specific gates pas
   ClickUp — beside **Disconnect**, which removes both. A comment is **one attempt** after STMA's
   own durable event: ClickUp's comment endpoint takes no idempotency key, so a failure is reported
   on that card rather than retried, and a tracker never fails a run.
-- **Terminal-first onboarding**: an owner's agent returns one invite instruction block. The
-  invitee's agent can redeem it with `{code, email, password, agent_name, device, client, role}`
-  and receive an account, team membership and a team-scoped credential bound to that installation
-  — no browser required. Passwordless accounts fall back to the browser. Browser and terminal
-  claims share one atomic path: max-use and plan limits cannot be oversubscribed by simultaneous
-  requests, and a losing terminal claim does not leave an empty account behind.
-- **Projects** can be created by a workspace owner from **Projects** or the inline **New project**
-  bar on **Agent connections**, and are still born automatically from the repo identifier agents
+- **Agent-assisted invitations**: an owner's agent returns one invitation block from
+  `create_invite`. The invitee's agent explains it, asks once and opens the link in the browser,
+  where the person signs in or creates their account and joins; it never collects a password, and
+  joining installs no MCP connection. The older terminal redemption API still accepts
+  `{code, email, password, agent_name, device, client, role}` for existing integrations, never for
+  an emailed invitation. Browser and terminal claims share one atomic path: max-use and plan
+  limits cannot be oversubscribed by simultaneous requests, and a losing terminal claim does not
+  leave an empty account behind.
+- **Projects** can be created by a workspace owner from **Projects**, and are still born
+  automatically from the repo identifier agents
   send. Both paths use the same canonical repository resolver. Repository identity keeps
   host/owner/repository distinct from the display basename, so two different owners' `api`
   repositories do not silently share history. Once a project-scoped credential is issued, every
@@ -413,7 +429,7 @@ a deployment until that build is released and its environment-specific gates pas
   including control-plane actions (runs, policy publishes, baselines, drift, critical preflights).
   URL-backed filters narrow by project, action, person, agent, free text and date; pagination and
   CSV preserve the same filter set.
-- **Notification settings** (`/app/notifications`, under **Settings**): a reply in a thread you are part of, its
+- **Notification settings** (`/app/notifications`, in the account menu): a reply in a thread you are part of, its
   resolution, or being added to a team reaches you by email. Never your own actions, never a
   thread you have already read, coalesced per thread and capped per person per hour;
   announcements are opt-in. Needs `RESEND_API_KEY` to leave the box. Add your **own** Slack or
@@ -444,13 +460,13 @@ a deployment until that build is released and its environment-specific gates pas
   section links; following a section URL opens the exact group instead of burying baselines below
   policy rows.
 - **Agent control plane** (`/app/agents`): live ownership, task/branch presence, work claims and
-  critical conflict radar across humans and agent clients. Drawn as a card per person — their
-  agents, declared scope and heartbeat — with colliding claims marked in place and an overlap
-  panel naming the two runs pulling at the same resource; the dense table stays below it. A
-  durable inventory keeps idle and stale identities visible after live work ends, with owner,
-  client, role, last context and last seen. Active identities sort first, then newest last-seen
-  within each state. Exact run links never fall through to an unrelated live run when their target
-  has finished. You can disable only your own run identity; active
+  critical conflict radar across humans and agent clients. Drawn as a scope graph — runs on one
+  side, the ground they hold on the other, contested claims in red — above a ledger of live runs
+  and an inspector that names the run on the other side of every collision. A durable inventory
+  (the map's **Identities** tab) keeps idle and stale identities visible after live work ends,
+  with owner, client, role, last context and last seen. Active identities sort first, then
+  newest last-seen within each state. Exact run links never fall through to an unrelated live
+  run when their target has finished. You can disable only your own run identity; active
   scope is ended and the agent cannot silently re-register it. Token revocation remains a separate
   control for an exposed credential.
 - **A project has a page**: every repository an agent names becomes a project, and its page puts
@@ -480,9 +496,16 @@ a deployment until that build is released and its environment-specific gates pas
   verdict, overlaps, declared scope, newest immutable delivery/test checkpoint and trail in one
   pack, with what nobody confirmed named as unconfirmed rather than passed. Provider status is
   exact only for that checkpoint's repository and commit; legacy branch-linked CI stays labelled
-  legacy. Same pack in the agent map, so the reviewer and the agent that asked for review read one
-  answer.
-- **Work reaches the agent without being asked.** The lifecycle hook already fires immediately
+  legacy. A checkpoint whose agent reported a failing test needs attention, never a tick. Same pack
+  in the agent map and on the run's own page (`/app/teams/<workspace>/runs/<run>`), which keeps it
+  after the run leaves the map and says where each line came from (reported by the agent, observed
+  by STMA, observed by the provider), with **Copy as Markdown** for a pull request. Nothing posts
+  it anywhere, and it is evidence, not permission to merge.
+- **The receiver sees what was handed over.** A handoff's thread shows the commit the receiver
+  must be on, the tests the sender reported there and what a connected provider observed at that
+  exact commit, each labelled with whose word it is, and links to the evidence of the run the work
+  came from.
+- **Work reaches the agent on its next prompt.** The lifecycle hook already fires immediately
   before your agent reads your next message, and whatever it prints becomes context — so it now
   carries what is waiting: a handoff, with the branch to check out and the exact `start_run` that
   re-claims the same scope. It offers; it does not act. Checked whenever you type and at most once a minute
@@ -505,8 +528,9 @@ a deployment until that build is released and its environment-specific gates pas
   it. Leases still expire without heartbeats. Hook events retain identity and bounded quota metadata,
   not raw prompts, tool contents or transcripts. Each credential and the human browser has its own
   inbox read cursor; one agent reading a thread does not clear it for the rest of the fleet.
-- **Command console** (server-rendered, no client framework): a dark rail that separates the
-  current team's controls from cross-team and personal destinations, with live counts; a status
+- **Command console** (server-rendered, no client framework): a scope bar naming the workspace and
+  project, a dark rail that lists the sections of the scope a page is in — the account, a
+  workspace or one of its projects — with live counts; a status
   strip that says what is true right now (runs, claims, criticals, drift,
   connection state), a ledger, and an inspector carrying the detail and the trail for whatever is
   selected. Selection is a query parameter, so it survives a refresh and can be linked to;
@@ -518,8 +542,8 @@ a deployment until that build is released and its environment-specific gates pas
   dropped stream costs latency and never correctness.
 - **Web dashboard** (server-rendered, design system from Claude Design): teams, invites, tokens,
   sessions with typed messages, environment-compare view, in-app usage guide at `/docs` —
-  which opens with a two-computer quick start and copyable first-message prompts, followed by
-  a diagram of the whole system, MCP and control API side by side. Long
+  which opens with the six jobs STMA does, then a two-computer quick start with copyable
+  first-message prompts and a diagram of the whole system, MCP and control API side by side. Long
   lists page rather than truncate in silence. Self-serve account lifecycle: password change,
   ownership transfer, owner-only invitations by email (one address, once, confirmed) or as a
   link with a use limit, the owners emailed when somebody joins, member removal, leave and
@@ -576,13 +600,15 @@ Two commands and one endpoint make version skew answerable rather than mysteriou
 
 ```bash
 stma version --server     # this CLI, and the instance it is pointed at
-curl -s https://stma.ai/health   # {"ok":true,"version":"0.11.0"}
+curl -s https://stma.ai/health   # {"ok":true,"version":"0.19.1","buildSha":"…"}
 ```
 
 ## Self-hosting (n8n-style)
 
-STMA is open-core: run it yourself for free, or use the hosted cloud (paid tiers fund the
-project). **Self-hosting is not a reduced product**: plan limits only apply when
+STMA's core is source-available under the Elastic License 2.0: run it yourself for free, or use
+the hosted cloud, where we run the server, its updates, automatic backups kept for 30 days and
+email support (paid tiers fund the project). **Self-hosting is not a reduced product**: plan limits
+only apply when
 `STMA_HOSTED=1`, and an instance nobody configured is unmetered — every feature, no
 ceilings. Self-host with Docker Compose:
 
@@ -701,17 +727,17 @@ Stripe can apply the relevant product rules; applicable taxes remain separate fr
 
 ## Authentication
 
-For the fastest start, add the single MCP address from **Agent connections** to each client and
-complete a separate STMA browser authorization for each agent/machine. Then choose **Connect & test**
-in the workspace and give the connected agents its secret-free sender/reply checks. Progress survives
-refresh. No repository, governance setup or second human is needed. A connection proves an
+For the fastest start, add the single MCP address from the workspace's **Agent connections** to
+each client and complete a separate STMA browser authorization for each agent/machine. Then start
+the **Test** on the same page and give the connected agents its secret-free sender/reply checks.
+Progress survives refresh. No repository, governance setup or second human is needed. A connection proves an
 authenticated identity, not a running process or two physical machines. Each teammate uses their own
 account and each agent its own credential family.
 
-**Handoffs** separates the next owner from unread chat. **Repositories** separates credentials,
-project bindings and exact provider observations. Blueprint packs expose scope/version/hash and
-plan-only versus approval-gated apply; returned **Delivery receipts** remain agent reports beside
-provider facts, never a fabricated approval. See [Product flows](PRODUCT_FLOWS.md).
+**Work** separates the next owner of assignments and handoffs from unread chat. **Repositories**
+separates credentials, project bindings and exact provider observations. Blueprint packs expose
+scope/version/hash and plan-only versus approval-gated apply; returned **Delivery receipts**
+remain agent reports beside provider facts, never a fabricated approval. See [Product flows](PRODUCT_FLOWS.md).
 
 - **Local accounts** (default): **email + password**, hashed with scrypt. The username is a
   derived display name used for attribution, compare labels (`alice@macbook`) and URLs.
@@ -753,14 +779,26 @@ provider facts, never a fabricated approval. See [Product flows](PRODUCT_FLOWS.m
   or workspace and filtered by workspace plan, membership and authentication state. A user detail
   manages independent workspace roles and memberships while preventing last-owner removal and plan
   over-capacity; organization-managed memberships remain controlled by their identity administrator.
+  The same page can give one account **review access** — password sign-in without the emailed
+  code, for at most 60 days, each use mailed to the account — for a reviewer who holds its
+  password but not its mailbox, and can build a **demo workspace** for an account that has none.
+  For recordings that must not depend on a mailbox, **Create an isolated test account** on
+  `/admin/users` creates a distinct test identity with a generated password, a synthetic
+  `@demo.stma.invalid` sign-in address and one empty workspace. No email is sent and no address
+  is marked verified. Access is password-only for at most 60 days, with normal sign-in throttling;
+  the account can never be an operator or join another workspace. The operator can renew, disable
+  or rotate its password; each action revokes its old browser sessions, agent credentials and
+  unused connection codes. Expiry also blocks existing browser/API access and OAuth refresh.
+  Save the once-shown password privately, never in a repository. Use synthetic data only.
 - **Operator history** — the same console also answers *what happened*, not only what is happening.
   **Load history** on `/admin/ops` is a persisted five-minute rollup (requests, status mix, latency
   histogram, rate limiting, peak memory and event-loop lag) over 24 hours, 7 days or 30 days,
   drawn beside — and clearly apart from — the live in-process counters that a restart erases.
   Percentiles are recomputed from the stored histograms, because a p95 cannot be averaged across
   windows. A missing bucket means the process was not running, not that nobody called it.
-  **Ceiling history** records every time a workspace's limits moved — an operator's plan switch, a
-  workspace owner starting an evaluation, or a Stripe reconciliation nobody was watching — with
+  **Ceiling history** records every time a workspace's limits moved — an operator's plan switch or
+  complimentary plan, a workspace owner starting an evaluation, or a Stripe reconciliation nobody
+  was watching — with
   what it moved from, what to, by which route and, when a person did it, who. It is on the
   workspace's own page and as a recent list on `/admin`.
   **Beta reach** (`/admin/beta`) answers the other half: which access-code cohort every workspace
@@ -824,9 +862,13 @@ approval, then carry code through git and the structured brief through STMA.
 
 ## Local agent control plane
 
-Start the app, create a team and use **Agent connections** to mint a scoped credential for this
-installation. Expose the returned token only to the shell that launches your coding agent. The CLI
-never writes the token to disk.
+Start the app, create a workspace and a project, and connect the checkout: **Agent connections**
+issues a one-time code as one command, `stma connect CODE --server ORIGIN`, which you run in a
+terminal inside that checkout (never paste it into an agent). It stores that installation's
+credential in your OS user's private store, and the commands below then run as that installation
+(pass `--profile` when a checkout has more than one). A token minted before browser connections
+still works from `STMA_TOKEN` with `STMA_URL`, exposed only to the shell that launches the agent;
+the CLI never writes `STMA_TOKEN` to disk, and the console no longer issues new ones.
 
 Install the CLI (published as `@matteai/stma`; the command it installs is `stma`):
 
@@ -835,6 +877,7 @@ npm install -g @matteai/stma      # or: npx @matteai/stma --help
 ```
 
 ```bash
+# Only with a legacy token; a checkout connected with `stma connect` needs neither line
 export STMA_URL=http://localhost:3000
 export STMA_TOKEN=stma_...
 
@@ -957,6 +1000,12 @@ Codex requires the new project hooks to be reviewed in `/hooks` before first use
 
 ## Connect an agent
 
+A connection is made inside the workspace it will work in. **Agent connections** is one page per
+workspace (`/app/teams/<workspace>/connections`): connect an agent, test two of them together, and
+manage your own connections that can work there. Opened from a project's **Agents** page it is the
+same page inside that project, and every choice on it is that project. `/app/tokens`, which older
+messages and the CLI print, takes you to it.
+
 Open **Agent connections**. Select Codex or Claude Code and copy the setup request into that agent.
 It checks only whether the exact generated name already exists, with configuration output hidden,
 uses only the client's built-in MCP add/login path, and stops rather than replacing it. Differently
@@ -1060,12 +1109,12 @@ a second row to stop server access.
 To add a person, an owner opens **Members and invites** in the workspace and sends an
 invitation by email, which works once and only for an account holding that address, confirmed,
 or creates a link and chooses how many people it is for. An owner can also ask their agent to
-call `create_invite`; the returned instruction block lets the invitee create/verify their
-account, join that one workspace and connect their own team-scoped agent in the same flow. It
-never shares the inviter's credential. An invitation opens signup even where `SIGNUPS_OPEN=0`
-or an access code is required, the way the terminal door always did. The full walkthrough lives
-in the in-app guide at `/docs`, and the state/authorization map is in
-[PRODUCT_FLOWS.md](PRODUCT_FLOWS.md).
+call `create_invite`; the returned instruction block has the invitee's agent open the invitation
+in the browser, where they sign in or create their account and join that one workspace, then
+connect their own agent from Agent connections. It never shares the inviter's credential. An
+invitation opens signup even where `SIGNUPS_OPEN=0` or an access code is required, the way the
+terminal door always did. The full walkthrough lives in the in-app guide at `/docs`, and the
+state/authorization map is in [PRODUCT_FLOWS.md](PRODUCT_FLOWS.md).
 
 **Codex** (`~/.codex/config.toml`, user-level)
 
@@ -1164,8 +1213,9 @@ Three things are worth knowing before you turn the number up.
 | `DATABASE_URL` | prod* | Postgres connection string. Unset → embedded PGlite (dev, or prod with `EMBEDDED_DB=1`) |
 | `DATABASE_POOL_MAX` | no | Connections this instance's pool may open (default `10`, clamped to 1–100). The live channel's listener and the boot-time migration lock are **extra**, one each. Lower it when you run several instances: the ceiling is `max_connections` on your server, and a rolling deploy can have the old and new sets open at once |
 | `EMBEDDED_DB` | no | `1` allows production on the embedded database — **one instance only**, persist `packages/server/.data`. On `DATABASE_URL` you may run several: rate limits, the loop guard and the live `/app/stream` channel are all shared through Postgres (the last over `LISTEN`/`NOTIFY`). See [Running more than one instance](#running-more-than-one-instance) |
+| `MIGRATIONS_DIR` | no | Where the SQL migrations are read from, on boot and by `--upgrade-data` (default: the `drizzle/` directory that ships with the server package). Only for a build that moves them |
 | `STMA_UPGRADE_ENGINE` | no | Only read by `--upgrade-data`: the module entry (`dist/index.js`) of a PGlite copy that can open the *older* data directory. Set it to run the upgrade with no registry access; unset, the pinned engine is fetched into a fresh private temp directory and checked against the digest this build pins before it is loaded. Never read on a normal boot |
-| `RESEND_API_KEY` | no | Resend API key for account emails (sign-in codes, password reset). Without it codes are only logged and email 2FA defaults off |
+| `RESEND_API_KEY` | no | Resend API key for account emails (sign-in codes, password reset). Without it nothing is sent: mail stays in an in-process outbox, the log names only its kind and never a code, and email 2FA defaults off |
 | `MAIL_FROM` | no | Sender address (default `STMA <noreply@stma.ai>`). **Its domain must be verified with your mail provider**, or every message is refused and nothing says so on a page: sign-in codes and password resets simply stop arriving. A configured key proves an account, never a verified domain, so the server prints this address at boot and `/admin/ops` carries a Mail card with the provider's own refusal |
 | `ADMIN_USERNAMES` / `ADMIN_EMAILS` | no | Comma-separated operator lists. Unset → `/admin` (incl. `/admin/usage`) is a plain 404. An address counts only once the account has **confirmed** it (Account → Send me a code), and a new account can never take a listed username — so list a username the operator already holds, or an address they can read |
 | `AUTH_2FA` | no | `1` forces email sign-in codes on, `0` off. Default: on when `RESEND_API_KEY` is set. Also gates password-change confirmation and self-service reset |
@@ -1174,12 +1224,12 @@ Three things are worth knowing before you turn the number up.
 | `SIGNUPS_OPEN` | no | `0` closes new local account registration, except for somebody opening a live invitation |
 | `SIGNUP_ACCESS_CODES` | no | Codes signup asks for, comma separated, each `CODE` or `CODE:cohort-label`. Set, signup is invite-only without being closed; unset, signup behaves exactly as it always has and a self-hosted instance never sees a code field. A cohort code, not a one-use invite — an invite adds a human to an existing workspace, this is the door before that. Codes are compared as sha256 digests in constant time with no early exit, and checked **before** the address is looked at so the form cannot confirm who already has an account. The **label** is stored on the account that redeemed it (`users.signup_cohort`) and is what `/admin/beta` groups by; **the code itself is never stored, logged or rendered**. A code with no label is recorded as having come through the door without naming a wave |
 | `BETA_UNMETERED` | no | `1` lifts every ceiling but one on a hosted instance that is not charging yet. Deliberately separate from `STMA_HOSTED`: audit, identity composition and every operator surface keep behaving the way they will when billing turns on, and only the limits lift. It writes no plan onto any workspace, so unsetting it restores the matrix with nothing to unwind — `teams.plan` is `NOT NULL DEFAULT 'free'`, which is exactly where everybody lands. The one it leaves alone is the age limit on history: activity and the agent run trail keep the plan's retention throughout, so unsetting it deletes nothing either. `/admin/beta` is where you check what that costs each workspace before you do it |
-| `SITE_MODE` | no | `teaser` makes the **signed-out** site pre-launch: the landing page is the same page either way and says what the product is, but its call to action becomes the access code the private beta asks for, `/pricing` is not linked, and the guide and `/help` drop the sections about a console a visitor cannot reach — on `/help` that is connecting an agent and running one, since a stranger has neither. Their sign-in, self-hosting and known-limits halves are always there, which is the point of a troubleshooting page. Signed-in members get the full app, the full guide and the full help page — it is a statement about who the marketing is for, not a reduced build |
+| `SITE_MODE` | no | `teaser` makes the **signed-out** site pre-launch: the landing page is the same page either way and says what the product is, but its call to action becomes the access code where `SIGNUP_ACCESS_CODES` asks for one and the guide otherwise, `/pricing` is not linked, and the guide and `/help` drop the sections about a console a visitor cannot reach — on `/help` that is connecting an agent and running one, since a stranger has neither. Their sign-in, self-hosting and known-limits halves are always there, which is the point of a troubleshooting page. Signed-in members get the full app, the full guide and the full help page — it is a statement about who the marketing is for, not a reduced build |
 | `DEMO_LOGINS` | no | Credentials printed on the sign-in page of a throwaway environment: `email:password[:label]`, comma separated, up to 8. Only ever shows the literal you set — the page reads nothing from the database, so this can never expose a real account. **Never set it on a production app** |
 | `STMA_HOSTED` | no | `1` makes plan limits apply. **Unset means this is your instance and nothing is metered** — the fleet, governance, evidence, retention and every cap are open. Only the hosted service sets it |
 | `TRUSTED_PROXY_HOPS` | no | How many proxies of your own stand in front of this instance. `X-Forwarded-For` is a list each proxy appends to, so its leftmost entry is whatever the client sent; every per-IP rate limit counts this many entries in from the **right**, which is the part a client cannot choose. `0`, the default, trusts only what the nearest proxy appended and is right for a direct-to-origin deployment. Behind a CDN in front of a platform ingress the chain ends `…, client, edge`, so `1` is the real client. Too high groups a whole proxy's traffic together; too low is coarser still. Neither direction is forgeable |
 | `TRUSTED_PROXY_CIDRS` | no | Which addresses may be one of those hops: comma-separated CIDR ranges, or `cloudflare` for Cloudflare's published edge ranges. Set, a hop is stepped over only when the address that appended it is on the list, so a client that skips the proxy and connects to the origin directly is counted against the address it connected from rather than one it typed — a count alone cannot tell the two apart. A value that does not parse stops the server at boot |
-| `SUPPORT_EMAIL` | no | Where a person writes when the product goes wrong. Shown in the signed-out footer, on the account page, at the end of `/help`, on the sign-in, signup, forgot and reset pages, and in the password-changed email. Defaults to `support@matteai.com` **only** when `STMA_HOSTED=1`: an instance you run yourself gets no address unless you set one, because telling your users to mail us sends us what we cannot act on and sends you none. Empty means nothing offers a support door |
+| `SUPPORT_EMAIL` | no | Where a person writes when the product goes wrong. Shown in the signed-out footer, on the account page, at the end of `/help`, on the sign-in, signup, forgot and reset pages, and in the password-changed email. Defaults to `support@stma.ai` **only** when `STMA_HOSTED=1`: an instance you run yourself gets no address unless you set one, because telling your users to mail us sends us what we cannot act on and sends you none. Empty means nothing offers a support door |
 | `PRIVACY_EMAIL` | no | Where a data-protection request goes: access, correction, deletion, portability, objection — the GDPR and KVKK doors. Shown in the signed-out footer as **Data protection**, beside the **GDPR & KVKK requests** link to `/privacy#rights`. Defaults to `gdpr@matteai.com` **only** when `STMA_HOSTED=1`, for the reason `SUPPORT_EMAIL` has: on an instance you run, you are the controller of the data it holds and our address would take requests we cannot answer. Empty means no such door. The addresses printed inside `/terms` and `/privacy` are Matte AI's own and do not follow this variable — those documents describe the hosted service whichever server renders them, and say so |
 | `KNOWLEDGE_HOSTED_MAX_BYTES` | no | Hosted-only Knowledge Hub content-byte guardrail per workspace (default `10485760`, 10 MiB). An over-cap write fails with capacity detail; history is not deleted. Not a plan entitlement; ignored when self-hosted |
 | `KNOWLEDGE_HOSTED_MAX_DRAFTS` | no | Hosted-only draft-record guardrail per workspace (default `250`); ignored when self-hosted |
@@ -1187,7 +1237,7 @@ Three things are worth knowing before you turn the number up.
 | `KNOWLEDGE_HOSTED_MAX_VERSIONS` | no | Hosted-only stored-version guardrail per workspace (default `1000`); ignored when self-hosted |
 | `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | no | Optional GitHub OAuth; callback URL is `{BASE_URL}/auth/github/callback` |
 | `CLICKUP_CLIENT_ID` / `CLICKUP_CLIENT_SECRET` | no | Optional customer-facing ClickUp OAuth app; callback URL is `{BASE_URL}/auth/clickup/callback`. Users authorize in ClickUp and never paste personal API tokens into STMA |
-| `AUTH_DEV_MODE` | no | `1` forces the dev login form. Auto-enabled outside production when OAuth is not configured |
+| `AUTH_DEV_MODE` | no | `1` forces the dev login form. Auto-enabled outside production when GitHub OAuth is not configured |
 | `NOTIFY_DEBOUNCE_SECONDS` | no | Wait this long before emailing about a thread so a burst of replies becomes one message (default `120`) |
 | `NOTIFY_MAX_PER_HOUR` | no | Hard cap on notification emails per person per hour (default `6`) |
 | `INVITE_EMAILS_PER_DAY` | no | Invitation emails the whole server sends in a UTC day (default `50`), on top of twenty per owner. They leave through the same mail account as every sign-in code; past the ceiling the invitation is still created and the owner copies its link |
@@ -1205,7 +1255,7 @@ Three things are worth knowing before you turn the number up.
 ## Deploy
 
 Every push and pull request runs typecheck, the e2e suite and the build in CI
-(`.github/workflows/ci.yml`); ghcr image publishing and the Azure demo deploy are gated on
+(`.github/workflows/ci.yml`); ghcr image publishing and the hosted service's Azure deploy are gated on
 the same tests (`docker.yml`, `deploy-azure.yml`). Azure authentication is **OIDC** — the
 workflows exchange a short-lived GitHub token for Azure access, so no Azure password is stored
 in the repository.
@@ -1239,16 +1289,16 @@ packages/
 
 ## License
 
-STMA is open-core under the [Elastic License 2.0](LICENSE) (ELv2), © 2026 Matte AI LLC:
-free to use, modify and self-host; you may not offer it to third parties as a competing
-hosted or managed service. Commercial-only hosted components live under the private `ee/`
+STMA is source-available under the [Elastic License 2.0](LICENSE) (ELv2), © 2026 Matte AI LLC:
+free to use, modify and self-host; you may not provide it to third parties as a hosted or managed
+service. It is not open source in the OSI sense, because ELv2 limits that one use. Commercial-only hosted components live under the private `ee/`
 package with an `UNLICENSED` manifest and separate proprietary notice; they never enter the public
 mirror, npm tarballs or public image.
 
 ## Legal and security
 
 Terms of service and the privacy policy are served at `/terms` and `/privacy`, linked from
-every public footer. Vulnerability reports go to **support@matteai.com** — see
+every public footer. Vulnerability reports go to **support@stma.ai** — see
 [SECURITY.md](SECURITY.md). Contribution setup and the rules this repo actually enforces are
 in [CONTRIBUTING.md](CONTRIBUTING.md).
 

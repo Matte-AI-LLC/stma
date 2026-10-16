@@ -5,6 +5,7 @@ import type { Context, MiddlewareHandler } from 'hono';
 import type { Db } from '../db';
 import {
   activity,
+  agentEnrollments,
   agentInstallations,
   agentRuns,
   crmContacts,
@@ -28,8 +29,11 @@ import {
   cohortSummaries,
   nearestTheLine,
 } from '../domain/betaCohorts';
-import { adminConfigured, isAdminEmail, isAdminUser, isAdminUsername } from '../lib/admin';
+import { adminConfigured, isAdminEmail, isAdminUser, isAdminUsername, reservedUsername } from '../lib/admin';
+import { hashPassword, randomHex } from '../lib/crypto';
+import { TEST_EMAIL_DOMAIN, TEST_ACCOUNT_LOCKED } from '../lib/testAccounts';
 import { DEMO_WORKSPACE, seedDemoWorkspace } from '../domain/demoWorkspace';
+import { PILOT_NOT_RECORDED, pilotSheet, pilotSheetMarkdown, pilotWindow } from '../domain/pilotSheet';
 import {
   REVIEW_ACCESS_MAX_DAYS,
   parseReviewLastDay,
@@ -960,7 +964,7 @@ adminRoutes.get('/admin/usage', async (c) => {
           <Stat
             label="Repeat handoff workspaces"
             value={nfmt(economics.handoffs.repeatTeams)}
-            note={`${nfmt(economics.handoffs.resumed)} resumed · ${nfmt(economics.handoffs.completed)} completed`}
+            note={`${nfmt(economics.handoffs.resumed)} resumed · ${nfmt(economics.handoffs.completed)} completed · assignments apart: ${nfmt(economics.assignments.offered)}`}
             metric="repeat-handoff-teams"
           />
           <Stat
@@ -2446,6 +2450,7 @@ adminRoutes.get('/admin/teams/:id', async (c) => {
           <h1 class="title">{workspace.name}</h1>
           <p class="sub">Workspace → projects → scoped agent connections. Membership and plan live at the workspace boundary.</p>
         </div>
+        <a class="btn" href={`/admin/teams/${workspace.id}/pilot`}>Pilot sheet</a>
         <form class="inline m0" method="post" action={`/admin/teams/${workspace.id}/plan`}>
           <input type="hidden" name="return_to" value="detail" />
           <select class="in" name="plan">
@@ -2556,7 +2561,389 @@ adminRoutes.get('/admin/teams/:id', async (c) => {
   );
 });
 
+// ---------------------------------------------------------------- pilot sheet
+
+/** The plan as the workspace page states it: a running grant first, then its own plan. */
+async function planLine(db: Db, workspace: { id: string; plan: string }) {
+  const grant = await planGrantFor(db, workspace.id);
+  return grant && isGrantActive(grant)
+    ? `${grant.plan}, given ${grant.endsAt ? `through ${grantLastDay(grant.endsAt)}` : 'with no end date'} (own plan ${workspace.plan})`
+    : workspace.plan;
+}
+
+/**
+ * One workspace read the way a pilot is judged (`domain/pilotSheet.ts`). The
+ * window starts at `?since=` — the pilot's first day — and the export is the
+ * weekly report's first half; the second half is what only people know, and
+ * both the page and the export name it.
+ */
+adminRoutes.get('/admin/teams/:id/pilot', async (c) => {
+  const user = c.get('user')!;
+  const db = c.get('db');
+  const id = c.req.param('id');
+  if (!UUID_RE.test(id)) return c.notFound();
+  const [workspace] = await db.select({ plan: teams.plan }).from(teams).where(eq(teams.id, id)).limit(1);
+  if (!workspace) return c.notFound();
+  const sheet = await pilotSheet(db, c.get('env'), id, pilotWindow(c.req.query('since')));
+  if (!sheet) return c.notFound();
+  const plan = await planLine(db, { id, plan: workspace.plan });
+  const sinceParam = sheet.window.since.toISOString().slice(0, 10);
+  const t = sheet.workTotals;
+  const w = sheet.warnings;
+  return c.html(
+    <AppLayout user={user} active="admin" title={`Pilot sheet: ${sheet.team.name}`}>
+      <div class="page-head">
+        <div>
+          <div class="overline">
+            <a href="/admin/teams">Workspaces</a> / <a href={`/admin/teams/${id}`}>{sheet.team.slug}</a> / pilot
+          </div>
+          <h1 class="title">Pilot sheet: {sheet.team.name}</h1>
+          <p class="sub">
+            What STMA recorded in this workspace since {fmtDate(sheet.window.since)} ({sheet.window.days} days), read
+            from runs, handoffs and checkpoints, which are never swept. The operator's own accounts are marked, so a
+            use the operator prompted is not read as the participant's. Plan: {plan}.
+          </p>
+        </div>
+        <div class="row" style="gap:8px">
+          <form class="inline m0" method="get" action={`/admin/teams/${id}/pilot`}>
+            <label class="small muted" for="pilot-since">
+              Pilot started
+            </label>{' '}
+            <input class="in" id="pilot-since" type="date" name="since" value={sinceParam} />
+            <button class="btn" type="submit">
+              Show
+            </button>
+          </form>
+          <a class="btn btn-primary" href={`/admin/teams/${id}/pilot.md?since=${sinceParam}`}>
+            Download .md
+          </a>
+        </div>
+      </div>
+      <AdminTabs active="teams" />
+
+      <div style={statGrid}>
+        <Stat label="Handoffs" value={t.handoffs} note={`${t.verifiedResumes} resumed on the handed-over commit`} />
+        <Stat label="Assignments" value={t.assignments} note={`${t.byOperator} of the ${t.handoffs + t.assignments} dispatched by the operator`} />
+        <Stat label="Reported complete" value={t.completed} note="The agent's report, not a provider verdict" />
+        <Stat label="Warnings confirmed" value={w.confirmed} note={`of ${w.answered} answered · ${w.minutesSaved} min reported`} />
+      </div>
+
+      <div class="card scroll-x" style="margin-top:14px">
+        <div class="card-head">
+          <div>
+            <div class="card-title">Weekly</div>
+            <div class="card-note">
+              Seven-day steps from the pilot's first day. Runs and people exclude the operator's own agents.
+            </div>
+          </div>
+        </div>
+        <table class="tbl">
+          <tr>
+            <th>Week of</th>
+            <th>Runs</th>
+            <th>Operator runs</th>
+            <th>People</th>
+            <th>Agents</th>
+            <th>Handoffs</th>
+            <th>Assignments</th>
+            <th>Resumed (on commit)</th>
+            <th>Completed</th>
+          </tr>
+          {sheet.weeks.map((week) => (
+            <tr>
+              <td class="muted">{fmtDate(week.from)}</td>
+              <td>{week.runs}</td>
+              <td class="muted">{week.operatorRuns}</td>
+              <td>{week.people}</td>
+              <td>{week.agents}</td>
+              <td>{week.handoffs}</td>
+              <td>{week.assignments}</td>
+              <td>
+                {week.resumed} ({week.verifiedResumes})
+              </td>
+              <td>{week.completed}</td>
+            </tr>
+          ))}
+        </table>
+        {sheet.runsTruncated ? (
+          <div class="card-pad muted small">
+            Only the newest {sheet.runsScanned} runs were read; older weeks may be undercounted.
+          </div>
+        ) : null}
+      </div>
+
+      <div class="card scroll-x" style="margin-top:14px">
+        <div class="card-head">
+          <div>
+            <div class="card-title">Work handed over and assigned</div>
+            <div class="card-note">
+              A resume marked "on commit" carried a checkpoint, and STMA refuses any resume that is not on it.
+              Browser replies are messages a person typed on the thread: help given in the product.
+            </div>
+          </div>
+        </div>
+        {sheet.work.length === 0 ? (
+          <div class="card-pad muted">No handoff or assignment in the window.</div>
+        ) : (
+          <table class="tbl">
+            <tr>
+              <th>Created</th>
+              <th>Kind</th>
+              <th>Title</th>
+              <th>From → to</th>
+              <th>Commit</th>
+              <th>State</th>
+              <th>Resumed</th>
+              <th>Completed</th>
+              <th>Browser replies</th>
+            </tr>
+            {sheet.work.map((row) => (
+              <tr>
+                <td class="muted">{timeAgo(row.createdAt)}</td>
+                <td>
+                  <span class={`pill ${row.kind === 'handoff' ? 'pill-active' : 'pill-member'}`}>{row.kind}</span>
+                </td>
+                <td class="name">{row.title}</td>
+                <td class="small">
+                  {row.from}
+                  {row.fromOperator ? (
+                    <span class="pill pill-owner" style="margin-left:6px">
+                      operator
+                    </span>
+                  ) : null}{' '}
+                  → {row.to ?? 'anyone'}
+                </td>
+                <td class="mono small">
+                  {row.checkpoint ? row.checkpoint.sha.slice(0, 12) : '-'}
+                  {row.checkpoint?.failed.length ? (
+                    <div class="small" style="color:var(--red)">
+                      failing: {row.checkpoint.failed.join(', ')}
+                    </div>
+                  ) : null}
+                </td>
+                <td>{row.state.replace('_', ' ')}</td>
+                <td class="muted">
+                  {row.resumedAt ? `${timeAgo(row.resumedAt)}${row.verifiedResume ? ' · on commit' : ''}` : '-'}
+                </td>
+                <td class="muted">{timeAgo(row.completedAt) ?? '-'}</td>
+                <td>{row.browserReplies}</td>
+              </tr>
+            ))}
+          </table>
+        )}
+      </div>
+
+      <div class="card scroll-x" style="margin-top:14px">
+        <div class="card-head">
+          <div>
+            <div class="card-title">Deliveries</div>
+            <div class="card-note">
+              The newest delivery or tested checkpoint of each run in the window. Tests are the agent's report;
+              provider lines are the provider's observation at that exact commit.
+            </div>
+          </div>
+        </div>
+        {sheet.deliveries.length === 0 ? (
+          <div class="card-pad muted">No delivery or tested checkpoint in the window.</div>
+        ) : (
+          <table class="tbl">
+            <tr>
+              <th>When</th>
+              <th>Run</th>
+              <th>Agent</th>
+              <th>Commit</th>
+              <th>Tests (reported)</th>
+              <th>Provider</th>
+            </tr>
+            {sheet.deliveries.map((row) => (
+              <tr>
+                <td class="muted">{timeAgo(row.at)}</td>
+                <td class="name">{row.task ?? 'untitled run'}</td>
+                <td class="small">
+                  {row.agent} · {row.owner}
+                  {row.operator ? ' (operator)' : ''}
+                </td>
+                <td class="mono small">
+                  {row.commitSha.slice(0, 12)} · {row.kind}
+                  {row.clean ? '' : ' · dirty'}
+                </td>
+                <td class="small">
+                  {row.failed.length ? (
+                    <span style="color:var(--red)">failing: {row.failed.join(', ')}</span>
+                  ) : (
+                    `${row.passed} passed`
+                  )}
+                </td>
+                <td class="small">
+                  {row.provider.length
+                    ? row.provider.join(', ')
+                    : row.repositoryMatches
+                      ? 'no observation of this commit'
+                      : 'repository does not match the project'}
+                </td>
+              </tr>
+            ))}
+          </table>
+        )}
+      </div>
+
+      <div class="grid2" style="margin-top:14px">
+        <div class="card card-pad">
+          <div class="card-title">Connections and first results</div>
+          {sheet.connections.map((row) => (
+            <p class="small m0">
+              {row.name} · {row.client}
+              {row.device ? ` · ${row.device}` : ''} · {row.owner}
+              {row.operator ? ' (operator)' : ''} · connected {fmtDate(row.createdAt)} · last used{' '}
+              {timeAgo(row.lastUsedAt) ?? 'never'}
+              {row.revoked ? ' · revoked' : ''}
+            </p>
+          ))}
+          {sheet.launches.map((row) => (
+            <p class="small m0 muted">
+              Connection test by {row.by}: opened {fmtDate(row.createdAt)}, exchange{' '}
+              {row.exchangeConfirmedAt ? fmtDate(row.exchangeConfirmedAt) : 'not yet'}, first real result{' '}
+              {row.firstRealResultAt ? fmtDate(row.firstRealResultAt) : 'not reported'}
+            </p>
+          ))}
+          {sheet.connections.length === 0 && sheet.launches.length === 0 ? (
+            <p class="small muted m0">No workspace-scoped connection yet.</p>
+          ) : null}
+        </div>
+        <div class="card card-pad">
+          <div class="card-title">New people and projects</div>
+          {sheet.expansion.access.length === 0 && sheet.expansion.projects.length === 0 ? (
+            <p class="small muted m0">None in the window.</p>
+          ) : null}
+          {sheet.expansion.access.map((row) => (
+            <p class="small m0">
+              {fmtDate(row.at)} · {row.action.replaceAll('_', ' ')} · {row.who}
+              {row.role ? ` (${row.role})` : ''} · {row.source}
+            </p>
+          ))}
+          {sheet.expansion.projects.map((row) => (
+            <p class="small m0">
+              {fmtDate(row.createdAt)} · project {row.name} created
+            </p>
+          ))}
+        </div>
+      </div>
+
+      <div class="card card-pad" style="margin-top:14px">
+        <div class="card-title">Not recorded here: write these in the pilot record</div>
+        <ul class="small">
+          {PILOT_NOT_RECORDED.map((item) => (
+            <li>{item}</li>
+          ))}
+        </ul>
+      </div>
+    </AppLayout>,
+  );
+});
+
+adminRoutes.get('/admin/teams/:id/pilot.md', async (c) => {
+  const db = c.get('db');
+  const id = c.req.param('id');
+  if (!UUID_RE.test(id)) return c.notFound();
+  const [workspace] = await db.select({ plan: teams.plan }).from(teams).where(eq(teams.id, id)).limit(1);
+  if (!workspace) return c.notFound();
+  const sheet = await pilotSheet(db, c.get('env'), id, pilotWindow(c.req.query('since')));
+  if (!sheet) return c.notFound();
+  const markdown = pilotSheetMarkdown(sheet, await planLine(db, { id, plan: workspace.plan }));
+  c.header('content-type', 'text/markdown; charset=utf-8');
+  c.header(
+    'content-disposition',
+    `attachment; filename="pilot-${sheet.team.slug}-${sheet.window.until.toISOString().slice(0, 10)}.md"`,
+  );
+  c.header('cache-control', 'private, no-store');
+  return c.body(markdown);
+});
+
 // ---------------------------------------------------------------- users
+
+adminRoutes.post('/admin/test-accounts', async (c) => {
+  const actor = c.get('user')!;
+  const env = c.get('env');
+  const db = c.get('db');
+  const body = await c.req.parseBody();
+  const name = typeof body.name === 'string' ? body.name.trim().toLowerCase() : '';
+  const displayName = typeof body.display_name === 'string' ? body.display_name.replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, 80) : '';
+  const back = (message: string) => c.redirect(`/admin/users?error=${encodeURIComponent(message)}`);
+  if (!env.localAuth) return back('Password sign-in must be enabled before creating a test account.');
+  if (!/^[a-z][a-z0-9-]{2,23}$/.test(name)) return back('Choose a demo name of 3–24 lowercase letters, numbers or hyphens.');
+  const username = `demo-${name}`;
+  const email = `${username}@${TEST_EMAIL_DOMAIN}`;
+  if (reservedUsername(env, username) || isAdminEmail(env, email)) return back('Choose a name not reserved for an operator.');
+  const parsed = parseReviewLastDay(body.last_day);
+  if ('error' in parsed) return back(parsed.error);
+  const taken = await db.select({ id: users.id }).from(users).where(sql`lower(${users.username}) = ${username} or ${users.email} = ${email}`).limit(1);
+  if (taken.length) return back('That test account already exists. Open it to manage its access.');
+  const password = randomHex(20);
+  const passwordHash = await hashPassword(password);
+  let account: { id: string; username: string; email: string | null };
+  try {
+    account = await db.transaction(async (tx) => {
+      const [created] = await tx.insert(users).values({ username, email, displayName: displayName || 'Demo Showcase', passwordHash, isTest: true, reviewAccessUntil: parsed.until }).returning();
+      const [workspace] = await tx.insert(teams).values({ name: `${displayName || 'Demo Showcase'} · Test`, slug: `${username}-${randomHex(3)}` }).returning();
+      await tx.update(users).set({ testWorkspaceId: workspace!.id }).where(eq(users.id, created!.id));
+      await tx.insert(memberships).values({ teamId: workspace!.id, userId: created!.id, role: 'owner' });
+      await appendMembershipChange(tx as unknown as Db, { teamId: workspace!.id, teamSlug: workspace!.slug, action: 'added', subjectId: created!.id, subjectLabel: username, previousRole: null, nextRole: 'owner', source: 'operator', route: 'POST /admin/test-accounts', actorId: actor.id, actorLabel: actor.username, detail: 'created an isolated test workspace' });
+      await criticalAudit(tx as unknown as Db, { teamId: workspace!.id, actorId: actor.id, action: 'test_account_created', subjectId: created!.id });
+      return created!;
+    });
+  } catch (error) {
+    if (error instanceof SecurityRefusal) return back(error.message);
+    return back('The test account could not be created. No partial account or workspace was kept.');
+  }
+  logLine({ evt: 'admin', a: 'test_account_created', u: actor.username, target: username, until: parsed.until.toISOString() });
+  c.header('Cache-Control', 'private, no-store');
+  return c.html(<AppLayout user={actor} active="admin" title="Test account created">
+    <h1 class="title">Test account created</h1>
+    <p class="sub">Save this password in a private local note. It is shown once and is never emailed or logged.</p>
+    <div class="card card-pad"><dl class="kv"><dt>Sign-in</dt><dd>{email}</dd><dt>Password</dt><dd><code id="test-account-password">{password}</code></dd><dt>Last day (UTC)</dt><dd>{reviewAccessLastDay(parsed.until)}</dd></dl></div>
+    <p class="sub">Test identity only. No mailbox, no email verification claim, no operator access. Its workspace starts empty for a real onboarding recording.</p>
+    <a class="btn btn-primary" href={`/admin/users/${account.id}`}>Manage test account</a>
+  </AppLayout>);
+});
+
+adminRoutes.post('/admin/users/:id/test-access', async (c) => {
+  const actor = c.get('user')!;
+  const db = c.get('db');
+  const id = c.req.param('id');
+  if (!UUID_RE.test(id)) return c.notFound();
+  const [account] = await db.select().from(users).where(eq(users.id, id)).limit(1);
+  if (!account?.isTest || !account.testWorkspaceId) return c.notFound();
+  const body = await c.req.parseBody();
+  const back = (message: string, ok = false) => c.redirect(`/admin/users/${id}?${ok ? 'ok' : 'error'}=${encodeURIComponent(message)}`);
+  if (body.action !== 'renew' && body.action !== 'disable' && body.action !== 'rotate') return back('Choose renew, disable or rotate.');
+  const parsed = body.action === 'renew' ? parseReviewLastDay(body.last_day) : null;
+  if (parsed && 'error' in parsed) return back(parsed.error);
+  const password = body.action === 'rotate' ? randomHex(20) : null;
+  const passwordHash = password ? await hashPassword(password) : null;
+  try {
+    await db.transaction(async (tx) => {
+      await tx.update(users).set({
+        ...(body.action === 'disable' ? { reviewAccessUntil: null } : {}),
+        ...(parsed && 'until' in parsed ? { reviewAccessUntil: parsed.until } : {}),
+        ...(passwordHash ? { passwordHash } : {}),
+      }).where(eq(users.id, id));
+      await tx.delete(webSessions).where(eq(webSessions.userId, id));
+      // Reopening a test account must not revive old credentials. Renewal is an
+      // explicit new setup boundary, as disabling or rotating already is.
+      await tx.update(tokens).set({ revokedAt: new Date() }).where(and(eq(tokens.userId, id), isNull(tokens.revokedAt)));
+      await tx.update(agentEnrollments).set({ revokedAt: new Date() }).where(and(eq(agentEnrollments.userId, id), isNull(agentEnrollments.revokedAt)));
+      await tx.update(agentInstallations).set({ revokedAt: new Date() }).where(and(eq(agentInstallations.userId, id), isNull(agentInstallations.revokedAt)));
+      await criticalAudit(tx as unknown as Db, { teamId: account.testWorkspaceId!, actorId: actor.id, action: 'test_account_access_changed', subjectId: id });
+    });
+  } catch (error) {
+    if (error instanceof SecurityRefusal) return back(error.message);
+    throw error;
+  }
+  logLine({ evt: 'admin', a: `test_access_${body.action}`, u: actor.username, target: account.username });
+  if (!password) return back('Test access updated. All browser sessions and agent credentials were revoked; reconnect explicitly.', true);
+  c.header('Cache-Control', 'private, no-store');
+  return c.html(<AppLayout user={actor} active="admin" title="Test password rotated"><h1 class="title">New test password</h1><p>Shown once. Save it privately. Previous browser sessions and agent credentials were revoked.</p><div class="card card-pad"><code id="test-account-password">{password}</code></div><a href={`/admin/users/${id}`}>Back to test account</a></AppLayout>);
+});
 
 adminRoutes.get('/admin/users', async (c) => {
   const user = c.get('user')!;
@@ -2588,7 +2975,7 @@ adminRoutes.get('/admin/users', async (c) => {
   const membership = ['has', 'none'].includes(c.req.query('membership') ?? '')
     ? c.req.query('membership')!
     : '';
-  const auth = ['password', 'github', 'admin', 'blocked'].includes(c.req.query('auth') ?? '')
+  const auth = ['password', 'github', 'admin', 'blocked', 'test'].includes(c.req.query('auth') ?? '')
     ? c.req.query('auth')!
     : '';
   const list = all.filter((account) => {
@@ -2607,6 +2994,7 @@ adminRoutes.get('/admin/users', async (c) => {
         (auth === 'password' && Boolean(account.passwordHash)) ||
         (auth === 'github' && account.githubId != null) ||
         (auth === 'admin' && isAdminUser(env, account)) ||
+        (auth === 'test' && account.isTest) ||
         (auth === 'blocked' && !account.passwordHash && account.githubId == null))
     );
   });
@@ -2626,6 +3014,16 @@ adminRoutes.get('/admin/users', async (c) => {
       {c.req.query('error') ? <Banner kind="error" text={c.req.query('error')!} /> : null}
       {c.req.query('ok') ? <Banner kind="success" text={c.req.query('ok')!} /> : null}
 
+      <details class="card card-pad" style="margin-bottom:14px"><summary>Create an isolated test account</summary>
+        <p class="small muted">No mailbox or emailed codes. Only its own new workspace, no operator access, at most 60 days. Keep synthetic data only; never use a customer identity.</p>
+        <form method="post" action="/admin/test-accounts" data-confirm="Create a password-only test identity and its isolated workspace? It has no email recovery and cannot be an operator.">
+          <label class="field"><span>Demo name</span><input class="in" name="name" placeholder="showcase" pattern="[a-z][a-z0-9-]{2,23}" required /></label>
+          <label class="field"><span>Display name</span><input class="in" name="display_name" placeholder="Demo Showcase" maxlength={80} /></label>
+          <label class="field"><span>Last day (UTC)</span><input class="in" name="last_day" type="date" value={new Date(Date.now() + 30 * DAY).toISOString().slice(0, 10)} max={new Date(Date.now() + REVIEW_ACCESS_MAX_DAYS * DAY).toISOString().slice(0, 10)} required /></label>
+          <button class="btn btn-primary" type="submit">Create test account</button>
+        </form>
+      </details>
+
       <form class="card card-pad" method="get" action="/admin/users" style="margin-bottom:14px">
         <div class="row" style="gap:10px;align-items:flex-end;flex-wrap:wrap">
           <label class="field" style="margin:0;min-width:260px;flex:1">
@@ -2634,7 +3032,7 @@ adminRoutes.get('/admin/users', async (c) => {
           </label>
           <label class="field" style="margin:0;min-width:160px"><span>Workspace plan</span><select class="in" name="plan"><option value="">Any plan</option>{planIds.map((id) => <option value={id} selected={plan === id}>{id}</option>)}</select></label>
           <label class="field" style="margin:0;min-width:150px"><span>Membership</span><select class="in" name="membership"><option value="">Any</option><option value="has" selected={membership === 'has'}>Has workspace</option><option value="none" selected={membership === 'none'}>No workspace</option></select></label>
-          <label class="field" style="margin:0;min-width:150px"><span>Authentication</span><select class="in" name="auth"><option value="">Any</option><option value="password" selected={auth === 'password'}>Password</option><option value="github" selected={auth === 'github'}>GitHub</option><option value="admin" selected={auth === 'admin'}>Admin</option><option value="blocked" selected={auth === 'blocked'}>No sign-in</option></select></label>
+          <label class="field" style="margin:0;min-width:150px"><span>Authentication</span><select class="in" name="auth"><option value="">Any</option><option value="password" selected={auth === 'password'}>Password</option><option value="github" selected={auth === 'github'}>GitHub</option><option value="admin" selected={auth === 'admin'}>Admin</option><option value="test" selected={auth === 'test'}>Test account</option><option value="blocked" selected={auth === 'blocked'}>No sign-in</option></select></label>
           <button class="btn btn-primary" type="submit">Filter</button>
           <a class="btn" href="/admin/users">Clear</a>
           <span class="muted small">{list.length} of {all.length}</span>
@@ -2672,6 +3070,7 @@ adminRoutes.get('/admin/users', async (c) => {
                 </td>
                 <td>
                   <div class="row" style="gap:6px;flex-wrap:wrap">
+                    {u.isTest ? <span class="pill pill-open">test account</span> : null}
                     {u.passwordHash ? <span class="pill pill-member">password</span> : null}
                     {u.githubId != null ? <span class="pill pill-member">github</span> : null}
                     {isAdminUser(env, u) ? <span class="pill pill-owner">admin</span> : null}
@@ -2745,7 +3144,7 @@ adminRoutes.get('/admin/users/:id', async (c) => {
             <dt>Authentication</dt><dd>{authentication}</dd>
           </dl>
           <form method="post" action={`/admin/users/${account.id}/email`} style="margin-top:14px">
-            <label class="field"><span>Email (sign-in)</span><div class="inline"><input class="in" type="email" name="email" value={account.email ?? ''} placeholder="none — sign-in blocked" required /><button class="btn" type="submit">Save email</button></div></label>
+            <label class="field"><span>Email (sign-in)</span><div class="inline"><input class="in" type="email" name="email" value={account.email ?? ''} placeholder="none — sign-in blocked" disabled={account.isTest} required /><button class="btn" type="submit" disabled={account.isTest}>Save email</button></div></label>
           </form>
         </div>
         <div class="card card-pad">
@@ -2761,7 +3160,17 @@ adminRoutes.get('/admin/users/:id', async (c) => {
         </div>
       </div>
 
-      <div class="card card-pad" style="margin-top:14px" id="review-access">
+      {account.isTest ? <div class="card card-pad" style="margin-top:14px" id="test-access">
+        <div class="card-title">Test account · no mailbox</div>
+        <p class="small muted">Operator-created identity, confined to its own demo workspace. Email is deliberately unverified, not a recovery channel. It can never be an operator. Access: {reviewing ? `through ${reviewAccessLastDay(account.reviewAccessUntil!)} UTC` : 'disabled or expired'}.</p>
+        <form class="inline" method="post" action={`/admin/users/${account.id}/test-access`} data-confirm="Renew test access? Every existing browser session and agent credential is revoked; reconnect explicitly.">
+          <input type="hidden" name="action" value="renew" /><input class="in" type="date" aria-label="Test access last day UTC" name="last_day" value={suggestedLastDay} max={latestLastDay} required /><button class="btn" type="submit">Renew test access</button>
+        </form>
+        <form class="inline" method="post" action={`/admin/users/${account.id}/test-access`} data-confirm="Disable this test account and revoke every browser session and agent credential?"><input type="hidden" name="action" value="disable" /><button class="btn btn-danger" type="submit">Disable test account</button></form>
+        <form class="inline" method="post" action={`/admin/users/${account.id}/test-access`} data-confirm="Generate a new password? The current password stops working; every browser session and agent credential is revoked."><input type="hidden" name="action" value="rotate" /><button class="btn" type="submit">Generate new test password</button></form>
+      </div> : null}
+
+      {!account.isTest ? <div class="card card-pad" style="margin-top:14px" id="review-access">
         <div class="card-title">Review access</div>
         <p class="small muted">
           For a reviewer who is given this account's password and cannot read its mailbox, such as
@@ -2786,8 +3195,7 @@ adminRoutes.get('/admin/users/:id', async (c) => {
             <button class="btn btn-primary" type="submit">Turn on review access</button>
           </form>
         )}
-      </div>
-
+      </div> : null}
       <div class="card card-pad" style="margin-top:14px" id="demo-workspace">
         <div class="card-title">Demo workspace</div>
         <p class="small muted">
@@ -2859,6 +3267,7 @@ adminRoutes.post('/admin/users/:id/memberships', async (c) => {
   const account = (await db.select().from(users).where(eq(users.id, userId)).limit(1))[0];
   const workspace = (await db.select().from(teams).where(eq(teams.id, teamId)).limit(1))[0];
   if (!account || !workspace) return c.redirect(userAdminBack(userId, 'User or workspace not found.'));
+  if (account.isTest && account.testWorkspaceId !== teamId) return c.redirect(userAdminBack(userId, 'A test account is confined to its own demo workspace.'));
   const allowed = await adminMembershipAllowed(c, teamId, 'add');
   if (!allowed.ok) return c.redirect(userAdminBack(userId, allowed.message));
   try {
@@ -3075,6 +3484,7 @@ adminRoutes.post('/admin/users/:id/review-access', async (c) => {
   const account = (await db.select().from(users).where(eq(users.id, id)).limit(1))[0];
   if (!account) return c.notFound();
   const refused = reviewAccessRefusal(account, { operator: listedOperator(env, account), twoFactor: env.twoFactor });
+  if (account.isTest) return back('Use the Test account controls, not review access.');
   if (refused) return back(refused);
   const parsed = parseReviewLastDay((await c.req.parseBody()).last_day);
   if ('error' in parsed) return back(parsed.error);
@@ -3103,6 +3513,7 @@ adminRoutes.post('/admin/users/:id/review-access/off', async (c) => {
   if (!account) return c.notFound();
   // Ending access ends the sessions it opened. Which of them came through the
   // review door is not recorded, so every browser goes: this is a demo account.
+  if (account.isTest) return back('Use the Test account controls, not review access.');
   await db.update(users).set({ reviewAccessUntil: null }).where(eq(users.id, id));
   await db.delete(webSessions).where(eq(webSessions.userId, id));
   logLine({ evt: 'admin', a: 'review_access_off', u: actor.username, target: account.username });
@@ -3160,6 +3571,7 @@ adminRoutes.post('/admin/users/:id/email', async (c) => {
   const rows = await db.select().from(users).where(eq(users.id, id)).limit(1);
   const target = rows[0];
   if (!target) return back('That account no longer exists.');
+  if (target.isTest) return back(TEST_ACCOUNT_LOCKED);
   if (target.email === email) return back(`${target.username} already signs in with ${email}.`, true);
   if (!(await emailIsFree(db, email, id))) {
     return back('Another account already uses that email.');

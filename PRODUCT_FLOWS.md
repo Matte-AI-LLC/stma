@@ -10,7 +10,7 @@ The goal is not to describe every screen. It is to make dead ends, ambiguous own
 leaks visible before code ships.
 
 The returned flow design is implemented using the existing console, not a separate demo runtime.
-Canonical paths: workspace **Connect & test**, **Handoffs**, **Repositories**, **Delivery receipts**,
+Canonical paths: workspace **Agent connections** (connect, test, manage), **Work**, **Repositories**, **Delivery receipts**,
 **Knowledge**, and the hosted **Evaluation** / **Organizations** surfaces. State labels describe
 evidence, not optimism.
 
@@ -129,10 +129,10 @@ local data only when the client deliberately includes it in a tool call.
 | User intent | Primary entry | Context carried forward | Successful destination |
 | --- | --- | --- | --- |
 | Create a workspace | `/app` | signed-in person | team overview |
-| Create a project | Projects or Agent connections → New project | exact workspace + repository identity | project page or selected project access |
+| Create a project | Projects | exact workspace + repository identity | project page or selected project access |
 | Add a human | workspace → Members and invites (also Invite people on Overview and People and agents), or owner agent `create_invite` | exact team; an emailed invitation also carries its one address | joined team; its owners emailed |
-| Connect an agent | Agent connections, team overview, or project page | client-specific native setup request with stable MCP URL; browser-selected team/project | OAuth installation |
-| First two-agent result | workspace → Connect & test | durable launch ID, exact scope, own account | server-observed send/reply |
+| Connect an agent | workspace → Agent connections (also Connect agent on the overview, a project page or a project's Agents, which open it in that scope) | the workspace or project in the address; client-specific native setup request with stable MCP URL; browser-selected team/project | OAuth installation or connect command |
+| First two-agent result | workspace → Agent connections → Test | durable launch ID, exact scope, own account | server-observed send/reply |
 | See live work | Agent map | current team/project filters | selected run inspector |
 | Discuss or hand off | Sessions / `inbox` | team/project/run | durable thread or handoff queue |
 | Recover a handoff | Work (`/app/handoffs`, or the project's `…/projects/<project>/work`) → session inspector | named human + accepting installation | explicit next action, no browser impersonation |
@@ -188,8 +188,8 @@ Success means the person has at least one membership and can name where an agent
 
 Guards and dead ends:
 
-- Agent connections with zero memberships do not create a credential that can reach nothing. The
-  page sends the person back to teams.
+- A connection is made inside a workspace. With zero memberships nothing can be connected and
+  `/app/tokens` sends the person to create a workspace; with several it asks which one.
 - Closed signup and invite-only states must explain which invitation or owner action is needed.
 - **The hosted signup form says that creating an account accepts the Terms**, and links them and
   the Privacy Policy. An instance somebody else runs shows neither line and neither do its
@@ -198,6 +198,12 @@ Guards and dead ends:
   controller and its own terms apply.
 - A sole owner cannot leave/delete their account while the team would be orphaned; ownership must
   be transferred or the team deleted.
+- An operator can build a **demo workspace** as an account's first workspace, from that account's
+  admin page (a directory reviewer is the case); an account that already has one gets none. It is
+  written the way the product writes it — the owner's part through the console's own functions,
+  three connected agents' part through `/mcp` under their own credentials — and those credentials
+  are discarded once it is built: the installations stay, so work can be assigned to them, and
+  nobody holds a token for them.
 
 ## F0a — Account recovery
 
@@ -237,7 +243,7 @@ Authorization invariants:
   address. The last two matter although they sit behind a session, because `/app/*` carries no
   per-IP limit at all and what the password still buys there is permanence — lock the owner out,
   or redirect every future reset.
-- **Review access is the one exception to the second factor, and it is narrow.** An operator can
+- **Review access is a narrow exception to the second factor for verified accounts.** An operator can
   mark a single account, with a last day at most 60 days away, so that a reviewer who holds its
   password but not its mailbox can sign in (a directory review is the case). Until that day its
   password sign-in skips the emailed code; nothing else about the account loosens. The throttle
@@ -245,6 +251,18 @@ Authorization invariants:
   session lasts a day, the account cannot move its address or delete itself, and it can never be
   an operator. A listed operator, an account without a password and one whose address was never
   confirmed cannot be given it. It lapses by the clock; ending it early signs every browser out.
+- **Mailbox-free test accounts are a separate operator-created identity, not a signup option.**
+  On `/admin/users`, choose a demo name and a last day (at most 60 days away). STMA generates a
+  password and a reserved `@demo.stma.invalid` address, marks the identity as test, and creates one
+  empty workspace atomically. The password appears once, with a no-store response; keep it in a
+  private local note. No inbox is required, no email is sent, and `emailVerifiedAt` stays empty.
+  The test identity remains non-operator permanently, cannot create or join other workspaces,
+  and cannot self-change its sign-in identity or use email recovery. Its short browser session,
+  MCP/API calls, enrollment redemption and OAuth refresh all enforce its expiry. Renew, disable
+  and password rotation invalidate old sessions, tokens, installations and pending connection
+  codes; renewing never revives old credentials. The console labels it as a test account. Its
+  workspace is deliberately not pre-seeded: record real onboarding and real agent behavior with
+  synthetic project data. Revocation ends STMA access, not local agent processes.
 - **An emailed code never reaches the operator log.** Each code email puts its six digits in the
   subject on purpose, so the log line carries a stable `kind` (`login_code`, `password_reset_code`,
   …) and never the subject. A second factor readable by whoever can read the logs is not one, and
@@ -346,7 +364,7 @@ membership.
 3. Sign-in and membership consent happen in the browser. The agent never collects a password or
    MFA code, generates a credential helper or installs MCP as a side effect of human membership.
 4. After observed membership confirmation, the new member creates their own project-scoped
-   connection through the versioned Connector flow above.
+   connection from Agent connections through F2 below.
 
 Success means one confirmed human membership. Agent installation and client confirmation remain
 separate outcomes. The backwards-compatible terminal redemption API remains available for existing
@@ -380,8 +398,8 @@ Guards and dead ends:
 
 **Actor:** a signed-in member at a terminal inside one Git checkout. No model takes part.
 
-1. On Agent connections the member names the agent and machine, picks **one project** and
-   creates a connect command. The enrollment code is shown once, stored hash-only, single-use and
+1. On the workspace's Agent connections the member names the agent and machine, picks **one
+   project** (inside a project, that project) and creates a connect command. The enrollment code is shown once, stored hash-only, single-use and
    expires after ten minutes. A workspace-wide or personal choice is refused: the hooks belong to
    one checkout.
 2. `stma connect CODE --server ORIGIN` refuses, before anything is spent, a directory that is not
@@ -422,9 +440,9 @@ skipping OAuth, bounded by project-only scope and one-click revocation.
 
 **Actor:** a signed-in team member and one coding-agent client.
 
-1. The person opens Agent connections directly or follows a team/project “Connect agent” link.
-2. If the project does not exist, a workspace owner creates it from the inline New project bar;
-   successful creation returns with that project available for authorization.
+1. The person opens the workspace's Agent connections, or follows a team/project “Connect agent”
+   link to the same page in that scope.
+2. If the project does not exist, a workspace owner creates it on Projects.
 3. They add the fixed `{BASE_URL}/mcp` Streamable HTTP endpoint in their coding client. There is no
    per-agent URL, setup envelope, bearer value or model-executed installer.
 4. The client discovers protected-resource and authorization-server metadata, dynamically registers
@@ -527,7 +545,8 @@ Guards and dead ends:
 ### Minimum activation path: two computers, one reply
 
 1. One reachable server URL, one account, one workspace. **New workspace** needs only a name.
-2. Open **Connect & test** and start/resume a durable launch for this human, exact scope and intent.
+2. Open the workspace's **Agent connections** and, in its **Test** section, start/resume a durable
+   launch for this human, exact scope and intent.
    Its ID survives reloads and is not a credential.
 3. Each client is separately authorized against the same `/mcp` address through F2. Use distinct
    names/device labels and the same scope; no invitation to oneself or duplicated account.
@@ -590,7 +609,7 @@ pushed snapshots under in the last 30 days, at most two. A `push_snapshot` from 
 before anything is stored or a project is created, and the reply names the two that count. A device
 that already counts is never refused by the ceiling. A device stops counting 30 days after its last snapshot, so a
 replaced machine frees its slot on its own; nothing needs to be deleted. Connections are never limited
-by machine, and self-hosted instances, paid plans, an active Team evaluation and the private beta
+by machine, and self-hosted instances, paid plans, an active Team evaluation and the beta
 count nothing. A count that would add a device is taken again under the workspace lock, so two new
 machines cannot both take the last slot.
 
@@ -603,9 +622,9 @@ two agents in the same worktree still collide. Lease expiry means coverage is lo
 **Actor:** a workspace owner through the console, or a member's agent through a repository-aware
 tool call.
 
-1. Before connecting a project-scoped agent, an owner may create the project from **Projects** or
-   the inline **New project** bar on **Agent connections**. A repository URL or owner/repository
-   identifier is preferred; successful creation returns to the calling page and selects the project.
+1. Before connecting a project-scoped agent, an owner may create the project from **Projects**. A
+   repository URL or owner/repository identifier is preferred; successful creation returns to the
+   calling page and selects the project.
 2. Alternatively, the agent obtains the canonical repository identifier from the origin remote.
 3. Manual creation and `push_snapshot`, `open_session` or `start_run` call the same resolver.
 4. Equivalent URL, case and `.git` variants collapse to one host/owner/repository identity. Two
@@ -701,9 +720,11 @@ under is not the same act as installing them in the repository's rules file. Age
 drive measured automation.
 
 The console has three scopes and the chrome says which one a page is in. The **scope bar** above
-every page names the workspace and, inside one, the project; both are pickers, and the person's own
-pages sit behind their name at its right. The **rail** lists the sections of that scope and nothing
-else: an account page (the workspace list, account, notifications, the person's own connections,
+every page names the workspace and, inside one, the project; the project is a picker and the
+workspace a link, because switching workspace is the rail's job, and the person's own pages sit
+behind their name at its right. The **rail** names the workspace under its brand, a switcher where
+there is another to go to, and otherwise lists the sections of that scope and nothing else: an
+account page (the workspace list, account, notifications, the person's own connections,
 the guide) lists the workspaces and what still spans them; a workspace page lists the workspace's
 sections, its rules for every project and its settings; inside a project the rail is that
 project's — Overview, Agents, Work, Sessions, Activity, and the rules in effect there — and its
@@ -715,13 +736,12 @@ what their link opens. Integrations is offered in the rail to owners only, as on
 **Agents are found where they work.** Inside a project, **Agents** lists the agents whose
 credential can work there — bound to that project, or reaching the whole workspace; one bound to
 another project is not listed, because the server would refuse it — with what each is doing now,
-the unfinished work given to it and what it last finished there. **Connecting happens on that
-page**: the same form the account's Agent connections page carries, with the project taken from
-the address rather than offered as a choice, and its one-time command is shown on that page. A
-refused request comes back to it with everything that was typed still in the fields. The project
-and the workspace come from the address and the member's own proved membership, so nothing a
-browser posts can move the grant to another project. The account's connections page is unchanged
-and still lists, revokes and pairs every connection.
+the unfinished work given to it and what it last finished there. **Connect agent** opens the
+workspace's Agent connections inside that project (`…/projects/<project>/connections`): every
+choice there is that project, its one-time command is shown on that page, a refused request comes
+back to it with everything that was typed still in the fields, and the way back is the project's
+Agents. The server re-checks the member's own membership and that the project belongs to one of
+their workspaces, so nothing a browser posts can reach a workspace they are not in.
 
 In the workspace, **People and agents** groups the same rows by person, and a person's name opens
 their own page: their role and when they joined, their agents and what each is doing, their live
@@ -839,6 +859,11 @@ completion/handoff should close its own run without closing another installation
   continues on that branch: switching the checkout to that existing branch is part of the handoff,
   not a new branch, and the commands are the receiving agent's own, never copied from the brief.
   The "commit only on the branch this checkout is already on" rule belongs to assignments.
+- The handoff's thread shows the person on the receiving side what was handed over: the
+  checkpoint's repository, commit and worktree state, the tests the sender reported there (labelled
+  as the sender's report), what a connected provider observed at that exact commit, and a link to
+  the source run's page. A branchless handoff says it carries no commit. The timeline's *Resumed*
+  step says, for a handoff with a checkpoint, that STMA accepted the resume only from that commit.
 - `handoff_work` writes a structured resume block derived from the run, releases its claims and
   closes it. A branch handoff must reference an immutable delivery/tested checkpoint recorded on
   that run, either earlier or atomically in the handoff call; otherwise it is refused and the run
@@ -1089,6 +1114,19 @@ fresh observations.
 Evidence schema v2 preserves `ok/attention/unknown`, adding provenance, subject, coverage, observation
 time and limitations. A matching reported policy hash is not compliance; a completed run is not
 verified delivery. Unknown history is never turned green. MCP and the inspector share one evaluator.
+A checkpoint whose agent reported a failing test is `attention`, and one called `tested` with no
+passing test reported is `unknown`; the tests stay the agent's report either way. Without a provider
+fact the outcome line is the agent's own status report (`client_report`), except a run closed as
+`stale`, which STMA observed.
+
+Every run has a page, `/app/teams/<workspace>/runs/<run>`, that serves the same evaluator for as
+long as the run exists (the agent map draws only live runs and each agent's newest ended one for a
+day). It names each line's source in words (reported by the agent, observed by STMA, observed by the
+provider), shows the delivered commit, the tests reported there, the provider's observations at that
+exact commit and where the run's checkpoints were handed over, and offers the same content as
+Markdown to copy or download. It is read by workspace members only (the address is under the
+workspace, so an organization-managed workspace's role check applies), posts nothing anywhere and
+is not a merge approval. Only the canonical spelling of the run id is answered.
 
 The Needs attention page composes bounded handoffs, recorded overlaps and missing/hash-drift receipts;
 its review links do not approve anything. New launch cohorts are durable and sequential. Historical
@@ -1217,10 +1255,11 @@ SCIM Groups, data-residency promises and HA/SLA are not supplied by this foundat
 
 ## Returned-design recovery contracts
 
-- Connect & test resumes the same launch. Its primary first/second-agent prompts contain only the
-  durable launch ID and exactly one `launch_check` send/reply action. Existing connected agents use
-  them directly. A closed legacy fallback may combine an enrollment with that same bounded action;
-  reissue revokes the old unused code and reload never reveals its secret again.
+- The Test section of Agent connections resumes the same launch. Its first/second-agent prompts
+  contain only the durable launch ID and exactly one `launch_check` send/reply action. Existing
+  connected agents use them directly. A client that cannot use OAuth connects through the legacy
+  prompt in the Connect section first and then runs the same check; reload never reveals a code's
+  secret again.
 - A browser may cancel its sender's handoff or decline an offer addressed to its human. It cannot
   accept/resume/complete as an installation. A resolved chat is not a completed handoff.
 - Repository connection, exact project binding and provider evidence are separate. Moving a
@@ -1248,6 +1287,9 @@ SCIM Groups, data-residency promises and HA/SLA are not supplied by this foundat
 | browser sign-up/team/invite/token/MCP | `packages/server/test/e2e.test.ts` |
 | one-use enrollment + project/team enforcement | `packages/server/test/scoped-enrollment.test.ts` |
 | terminal connect: ten-minute project-only command, non-consuming preview, initialize confirms, legacy path unchanged | `packages/server/test/terminal-connect.test.ts` |
+| MCP OAuth and the Claude app: discovery, exact callbacks, PKCE, rotation, the two-minute refresh replay and reuse revocation; consent without a machine, Personal proposed, a first workspace made on the consent page, tool hints | `packages/server/test/mcp-oauth.test.ts`, `packages/server/test/claude-connector.test.ts` |
+| emailed invitations and link limits; review access; mailbox-free test accounts; the operator-built demo workspace | `packages/server/test/workspace-invitations.test.ts`, `packages/server/test/review-access.test.ts`, `packages/server/test/test-accounts.test.ts`, `packages/server/test/demo-workspace.test.ts` |
+| what a handoff carried on its thread; the run page and its Markdown; the operator's per-workspace pilot sheet; reported tests and sources in the evidence pack | `packages/server/test/pilot-readiness.test.ts`, `packages/server/test/evidence-checkpoints.test.ts` |
 | one human, two enrollments, first reply on Cloud Free + quick-start entry points | `packages/server/test/quick-start.test.ts` |
 | persistent launch replay, lifecycle acceptance, exact provider facts, receipt scope, encryption rotation and concurrent project/policy writes | `packages/server/test/product-readiness.test.ts` |
 | generated setup prompt and URL correctness | `packages/server/test/findings-2026-08-25.test.ts` |

@@ -55,16 +55,19 @@ it('serves both documents to a stranger, with the addresses a person writes to',
     for (const route of ['/terms', '/privacy']) {
       const html = await page(srv, route);
       expect(html).toContain('Matte AI LLC');
-      // Each document carries its own date: the Privacy Policy was revised for
-      // emailed invitations on 24 September 2026 and the Terms were not.
-      expect(html).toContain(route === '/terms' ? 'Effective 23 September 2026' : 'Effective 24 September 2026');
+      // Each document carries its own date. Both were revised on 24 September
+      // 2026: the Privacy Policy for emailed invitations, and both for the
+      // support address moving to support@stma.ai. The Terms again on 26
+      // September, for a description that no longer calls a checkpoint verified.
+      expect(html).toContain(route === '/terms' ? 'Effective 26 September 2026' : 'Effective 24 September 2026');
+      expect(html).not.toContain('verified git checkpoint');
       // Data protection and everything else go to different mailboxes, and both
       // are in both documents: somebody reading one must not have to find the
       // other to know where to write.
       expect(html, `${route} must offer the data protection address`).toContain(
         'gdpr@matteai.com',
       );
-      expect(html, `${route} must offer the support address`).toContain('support@matteai.com');
+      expect(html, `${route} must offer the support address`).toContain('support@stma.ai');
       // A vulnerability report goes to the same mailbox as everything else
       // technical (2026-09-23): security@stma.ai was written into these
       // documents before anybody checked whether it existed, and it does not,
@@ -84,6 +87,9 @@ it('no longer says it is a draft, and no longer names the retired addresses', as
       expect(html).not.toContain('privacy@stma.ai');
       expect(html).not.toContain('legal@stma.ai');
       expect(html).not.toContain('security@stma.ai');
+      // Support moved to the product's own domain on 2026-09-24 (owner's
+      // decision); the old mailbox is not where anybody is told to write.
+      expect(html).not.toContain('support@matteai.com');
     }
   }
 });

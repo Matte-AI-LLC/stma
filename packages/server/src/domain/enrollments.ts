@@ -12,6 +12,7 @@ import {
   users,
 } from '../db/schema';
 import { randomHex, sha256hex } from '../lib/crypto';
+import { testAccountAvailable } from '../lib/testAccounts';
 import type { TokenScope } from '../lib/grants';
 import { beforeEnrollmentRedeem, enrollmentIssued, enrollmentRedeemed } from '../lib/securityHooks';
 import { LOCAL_ADAPTER_CAPABILITY, resolveCompanion, type CompanionCandidate } from './companions';
@@ -121,6 +122,10 @@ export async function redeemAgentEnrollmentByIdInTransaction(
   }
   await beforeEnrollmentRedeem(tx, found.enrollment.id);
 
+  // Codes issued before an expiry must not become a second sign-in door.
+  const [owner] = await tx.select().from(users).where(eq(users.id, userId)).limit(1).for('update');
+  if (!owner || !(await testAccountAvailable(tx, owner))) return { ok: false } as const;
+
   const scope = found.enrollment.scope as TokenScope;
   if (
     !['personal', 'team', 'project'].includes(scope) ||
@@ -175,7 +180,7 @@ export async function redeemAgentEnrollmentByIdInTransaction(
     .returning();
   let token = tokenRows[0]!;
   const credential = await enrollmentRedeemed(tx, found.enrollment.id, token.id);
-  const expiries = [credential.expiresAt, oauth?.accessExpiresAt].filter(
+  const expiries = [credential.expiresAt, oauth?.accessExpiresAt, owner.isTest ? owner.reviewAccessUntil : null].filter(
     (value): value is Date => value instanceof Date,
   );
   const effectiveExpiry = expiries.length

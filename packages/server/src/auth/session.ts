@@ -4,6 +4,7 @@ import { deleteCookie, getCookie, setCookie } from 'hono/cookie';
 import type { Db } from '../db';
 import { users, webSessions } from '../db/schema';
 import { isAdminUser } from '../lib/admin';
+import { testAccountAvailable } from '../lib/testAccounts';
 import { liveCodeExpiry } from './codes';
 import { railFor } from '../lib/rail';
 import { randomHex, sha256hex } from '../lib/crypto';
@@ -23,12 +24,13 @@ export async function createSession(
   c: Context<AppEnv>,
   userId: string,
   ttlDays?: number,
+  db: Db = c.get('db'),
 ): Promise<string> {
-  const db = c.get('db');
   const env = c.get('env');
   const sid = randomHex(32);
   const days = ttlDays ?? env.sessionTtlDays;
-  const expiresAt = new Date(Date.now() + days * 24 * 60 * 60 * 1000);
+  const ttlSeconds = Math.max(0, Math.floor(days * 24 * 60 * 60));
+  const expiresAt = new Date(Date.now() + ttlSeconds * 1000);
   await db.insert(webSessions).values({
     id: sid,
     userId,
@@ -42,7 +44,7 @@ export async function createSession(
     sameSite: 'Lax',
     path: '/',
     secure: env.baseUrl.startsWith('https://'),
-    maxAge: days * 24 * 60 * 60,
+    maxAge: ttlSeconds,
   });
   return sid;
 }
@@ -164,6 +166,11 @@ export const sessionUser: MiddlewareHandler<AppEnv> = async (c, next) => {
       .limit(1);
     if (rows[0]) {
       const user: User = rows[0].user;
+      if (!(await testAccountAvailable(db, user))) {
+        deleteCookie(c, COOKIE_NAME, { path: '/' });
+        await next();
+        return;
+      }
       // "Last seen" has to be roughly true to be worth reading, and a write on
       // every request would make every page load pay for a column nobody reads
       // most of the time. Once every SEEN_EVERY_MS is close enough to tell a
@@ -185,7 +192,7 @@ export const sessionUser: MiddlewareHandler<AppEnv> = async (c, next) => {
       // nothing ever sets `email_verified_at`, and a permanent warning about a
       // state the server cannot leave is noise, not a notice.
       user.addressUnconfirmed =
-        c.get('env').twoFactor && Boolean(user.email) && !user.emailVerifiedAt;
+        !user.isTest && c.get('env').twoFactor && Boolean(user.email) && !user.emailVerifiedAt;
       // One indexed read, and only for the few accounts the band is drawn for.
       if (user.addressUnconfirmed) {
         user.verifyCodeExpiresAt = await liveCodeExpiry(db, user.id, 'email_verify');

@@ -1,6 +1,6 @@
 import { and, desc, eq, gte, inArray, isNull, lte } from 'drizzle-orm';
 import type { Db } from '../db';
-import { exactProviderEvidence } from './providerEvidence';
+import { currentProviderFacts, exactProviderEvidence } from './providerEvidence';
 import {
   agentEvents,
   agentInstallations,
@@ -50,6 +50,77 @@ export interface EvidenceCheck {
 
 const TRAIL_LIMIT = 20;
 
+/**
+ * What the provider said about the commit a checkpoint names — and only when
+ * the checkpoint is of the project's own repository. `exactProviderEvidence`
+ * requires both sides of the immutable observation to retain this project id
+ * and comes through an explicit verified binding. That is the repository join:
+ * provider-specific locators (GitHub owner/name and Azure org/project/repo) must
+ * not be guessed into one URL spelling here. One current fact per provider
+ * subject (`currentProviderFacts`). Used by the evidence pack and by the handoff
+ * thread's "what was handed over", so a reviewer and a receiver read one answer.
+ */
+export async function providerFactsForCheckpoint(
+  db: Db,
+  run: { teamId: string; projectId: string | null },
+  projectRepositoryIdentity: string | null,
+  checkpoint: { repositoryIdentity: string; commitSha: string } | undefined,
+) {
+  const project = projectRepositoryIdentity
+    ? canonicalRepositoryIdentity(projectRepositoryIdentity)
+    : null;
+  const reported = checkpoint ? canonicalRepositoryIdentity(checkpoint.repositoryIdentity) : null;
+  const repositoryMatches = Boolean(checkpoint && project && reported === project);
+  const facts = repositoryMatches
+    ? currentProviderFacts(
+        await exactProviderEvidence(db, run.teamId, run.projectId, checkpoint!.commitSha),
+      )
+    : [];
+  return {
+    projectRepositoryIdentity: project,
+    checkpointRepositoryIdentity: reported,
+    repositoryMatches,
+    facts,
+  };
+}
+
+/**
+ * What a handoff carried, for the person on the receiving end.
+ *
+ * The thread used to render the brief's prose and nothing else, so the commit
+ * a receiver must be on to resume, the tests the sender reported there and
+ * anything a provider said about that commit were in the database and on no
+ * screen. This is the checkpoint the handoff names, who reported it, and the
+ * provider's word on that exact commit through the same rule the evidence pack
+ * uses — so a receiver and a reviewer read one answer.
+ */
+export async function handoverFor(db: Db, checkpointId: string) {
+  const [row] = await db
+    .select({
+      checkpoint: runCheckpoints,
+      run: { id: agentRuns.id, teamId: agentRuns.teamId, projectId: agentRuns.projectId },
+      reportedBy: agentInstallations.name,
+      projectRepositoryIdentity: projects.repositoryIdentity,
+    })
+    .from(runCheckpoints)
+    .innerJoin(agentRuns, eq(agentRuns.id, runCheckpoints.runId))
+    .innerJoin(agentInstallations, eq(agentInstallations.id, runCheckpoints.installationId))
+    .leftJoin(projects, eq(projects.id, agentRuns.projectId))
+    .where(eq(runCheckpoints.id, checkpointId))
+    .limit(1);
+  if (!row) return null;
+  const provider = await providerFactsForCheckpoint(db, row.run, row.projectRepositoryIdentity, row.checkpoint);
+  return {
+    checkpoint: row.checkpoint,
+    runId: row.run.id,
+    reportedBy: row.reportedBy,
+    repositoryMatchesProject: provider.repositoryMatches,
+    providerFacts: provider.facts,
+  };
+}
+
+export type Handover = NonNullable<Awaited<ReturnType<typeof handoverFor>>>;
+
 export async function evidenceForRun(db: Db, runId: string, viewerId: string) {
   const rows = await db
     .select({
@@ -87,39 +158,17 @@ export async function evidenceForRun(db: Db, runId: string, viewerId: string) {
       .orderBy(desc(runCheckpoints.createdAt), desc(runCheckpoints.id))
       .limit(1)
   )[0];
-  const projectRepositoryIdentity = found.projectRepositoryIdentity
-    ? canonicalRepositoryIdentity(found.projectRepositoryIdentity)
-    : null;
-  const checkpointRepositoryIdentity = checkpoint
-    ? canonicalRepositoryIdentity(checkpoint.repositoryIdentity)
-    : null;
-  const checkpointRepositoryMatches = Boolean(
-    checkpoint &&
-      projectRepositoryIdentity &&
-      checkpointRepositoryIdentity === projectRepositoryIdentity,
+  const {
+    projectRepositoryIdentity,
+    checkpointRepositoryIdentity,
+    repositoryMatches: checkpointRepositoryMatches,
+    facts: currentProviderFacts,
+  } = await providerFactsForCheckpoint(
+    db,
+    found.run,
+    found.projectRepositoryIdentity,
+    checkpoint,
   );
-  const providerFacts = checkpointRepositoryMatches
-    ? await exactProviderEvidence(
-        db,
-        found.run.teamId,
-        found.run.projectId,
-        checkpoint!.commitSha,
-      )
-    : [];
-  // `exactProviderEvidence` requires both sides of the immutable observation
-  // to retain this project id and comes through an explicit verified binding.
-  // That is the repository join: provider-specific locators (GitHub owner/name
-  // and Azure org/project/repo) must not be guessed into one URL spelling here.
-  // A provider may report several attempts for one workflow/PR. The query is
-  // newest first, so retain one current fact per exact provider subject rather
-  // than letting a superseded failure and success decide the state together.
-  const seenProviderSubjects = new Set<string>();
-  const currentProviderFacts = providerFacts.filter((row) => {
-    const key = `${row.fact.bindingId}:${row.fact.kind}:${row.fact.subjectId}`;
-    if (seenProviderSubjects.has(key)) return false;
-    seenProviderSubjects.add(key);
-    return true;
-  });
   const providerFailures = currentProviderFacts.filter((row) =>
     ['failure', 'closed'].includes(row.fact.state),
   );
@@ -235,6 +284,20 @@ export async function evidenceForRun(db: Db, runId: string, viewerId: string) {
   ).length;
   const collisions = trail.filter((event) => event.type === 'conflicts_detected');
   const overlaps = collisions.length + namedElsewhere;
+  // The tests a checkpoint carries are the agent's own words about that commit.
+  // They were passed through and never read, so a checkpoint whose agent said
+  // "npm test failed" was drawn as a green tick beside it — the one place a
+  // reviewer looks to learn what was tested (found 2026-09-26). They stay a
+  // client report either way; what changes is that a reported failure is never
+  // shown as fine, and a checkpoint called `tested` with no passing test in it
+  // is not shown as tested.
+  const reportedTests = checkpoint?.tests ?? [];
+  const failedTests = reportedTests.filter((test) => test.state === 'failed');
+  const passedTests = reportedTests.filter((test) => test.state === 'passed');
+  const testsLine =
+    reportedTests.length === 0
+      ? 'No test result was reported with it.'
+      : `Reported tests: ${reportedTests.map((test) => `${test.name} ${test.state.replace('_', ' ')}`).join(', ')}.`;
 
   const checks: EvidenceCheck[] = [
     {
@@ -280,16 +343,22 @@ export async function evidenceForRun(db: Db, runId: string, viewerId: string) {
       key: 'checkpoint',
       state: !checkpoint
         ? 'unknown'
-        : !checkpointRepositoryMatches || !checkpoint.worktreeClean
+        : !checkpointRepositoryMatches || !checkpoint.worktreeClean || failedTests.length > 0
           ? 'attention'
-          : 'ok',
+          : checkpoint.kind === 'tested' && passedTests.length === 0
+            ? 'unknown'
+            : 'ok',
       detail: !checkpoint
         ? 'No immutable delivery/test checkpoint was reported. Run head and branch state cannot identify the delivered commit.'
         : !checkpointRepositoryMatches
           ? `Checkpoint repository ${checkpointRepositoryIdentity ?? 'unknown'} does not match the project's bound repository ${projectRepositoryIdentity ?? 'unknown'}.`
           : !checkpoint.worktreeClean
             ? `Latest ${checkpoint.kind} checkpoint ${checkpoint.commitSha.slice(0, 12)} reported a dirty worktree; uncommitted work is outside that commit.`
-            : `Latest ${checkpoint.kind} checkpoint records clean commit ${checkpoint.commitSha.slice(0, 12)} in ${checkpointRepositoryIdentity}. This remains a client report.`,
+            : failedTests.length > 0
+              ? `The agent reported failing tests at ${checkpoint.kind} checkpoint ${checkpoint.commitSha.slice(0, 12)}: ${failedTests.map((test) => test.name).join(', ')}. ${testsLine}`
+              : checkpoint.kind === 'tested' && passedTests.length === 0
+                ? `Checkpoint ${checkpoint.commitSha.slice(0, 12)} is marked tested, but no passing test was reported with it. ${testsLine}`
+                : `Latest ${checkpoint.kind} checkpoint records clean commit ${checkpoint.commitSha.slice(0, 12)} in ${checkpointRepositoryIdentity}. ${testsLine} This remains a client report.`,
     },
     {
       key: 'knowledge',
@@ -333,8 +402,10 @@ export async function evidenceForRun(db: Db, runId: string, viewerId: string) {
         found.run.status === 'completed'
           ? 'Agent reported completion and released its scope; completion is not provider verification.'
           : found.run.status === 'failed'
-            ? 'Finished as failed.'
-            : `Still ${found.run.status} — this pack describes work in progress.`,
+            ? 'The agent reported this run as failed.'
+            : found.run.status === 'stale'
+              ? 'STMA stopped hearing from this run and closed it as stale; no completion was reported.'
+              : `Still ${found.run.status}: this pack describes work in progress.`,
         !checkpoint
           ? 'Provider result is unverified: no immutable delivery/test checkpoint identifies the current commit.'
           : !checkpointRepositoryMatches
@@ -402,6 +473,17 @@ export async function evidenceForRun(db: Db, runId: string, viewerId: string) {
       item.limitations = [
         'Legacy branch association is not exact repository/commit verification.',
         'A merged PR is not proof that all required checks or human approvals passed.',
+      ];
+    } else if (item.key === 'outcome') {
+      // With no provider fact, what is left is the run's own status, and every
+      // status but `stale` is one the agent declared (start, update, finish).
+      // Calling that an STMA observation put the agent's "done" under the same
+      // label as a collision STMA computed — the one distinction this pack sells.
+      item.source = found.run.status === 'stale' ? 'stma_observation' : 'client_report';
+      item.limitations = [
+        found.run.status === 'stale'
+          ? 'A stale run is one whose lease ran out; it says nothing about whether the work was finished.'
+          : 'Run status is what the agent reported; no provider observed this outcome.',
       ];
     }
   }

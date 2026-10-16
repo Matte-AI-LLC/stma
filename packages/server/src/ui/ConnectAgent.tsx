@@ -3,17 +3,17 @@ import { TERMINAL_CONNECT_TTL_MINUTES } from '../domain/enrollments';
 import { grantLabel, type TokenScope } from '../lib/grants';
 
 /**
- * Connecting a checkout, wherever the person happens to be standing.
+ * Connecting a checkout from a workspace's Agent connections page.
  *
- * There are two doors onto the same act now — the account's Agent connections
- * page and a project's Agents page — and a second copy of this markup would
- * drift inside a release: the two would disagree about what the command does,
- * how long the code lives, or which clients it supports. So the form and the
- * one-time command are one component each, parameterised by the only thing that
- * differs: whether the address has already decided the project.
+ * One page connects agents (2026-09-27, the owner's word: two connect screens
+ * and a connections page outside every workspace were one too many). It is drawn
+ * for a GET and again for the POST that answers with a one-time command, so the
+ * form and the command are components rather than markup in two handlers that
+ * would drift apart inside a release: what the command does, how long the code
+ * lives, which clients it supports.
  *
  * Nothing here touches the database. The rules behind the form live in
- * `domain/connectRequests.ts`, which both POST handlers call.
+ * `domain/connectRequests.ts`, which the POST handler calls.
  */
 
 export interface ConnectTeam {
@@ -23,13 +23,16 @@ export interface ConnectTeam {
 }
 
 /**
- * The workspace and project the command will be scoped to, when the page already
- * knows them. Names only: the ids travel in the address this posts to, never in
- * a field, so there is nothing here for a browser to change.
+ * The project the command will be scoped to, when the page is inside one.
+ *
+ * The id travels as a hidden field because the form posts to the one door that
+ * issues connections. That door re-checks the caller's membership and that the
+ * project belongs to one of their workspaces, so the field can only choose what
+ * the person could have chosen on the page anyway.
  */
 export interface ConnectHere {
   team: { name: string };
-  project: { name: string };
+  project: { id: string; name: string };
 }
 
 /** What was typed into a refused submission, so the page can hand it back. */
@@ -37,12 +40,14 @@ export interface ConnectTyped {
   name?: string;
   device?: string;
   client?: string;
+  access?: string;
 }
 
 /**
- * The form. `here` fixes the project — on a project's Agents page the address
- * already chose it, and a picker there would offer to connect an agent to some
- * other project. Without it the caller passes every workspace and the person picks.
+ * The form. `here` fixes the project: inside a project the address already chose
+ * it, and a picker there would offer to connect an agent to some other project.
+ * Without it the caller passes the workspace and the person picks one of its
+ * projects.
  */
 export const ConnectCheckoutForm = ({
   action,
@@ -51,6 +56,7 @@ export const ConnectCheckoutForm = ({
   preferredAccess,
   typed,
   context,
+  projectsHref,
   idPrefix = 'tc',
 }: {
   action: string;
@@ -61,113 +67,126 @@ export const ConnectCheckoutForm = ({
   typed?: ConnectTyped;
   /** Hidden fields the answering page needs to come back to where this was posted. */
   context?: unknown;
+  /** Where a project is created, for a workspace that has none yet. */
+  projectsHref?: string;
   /** Two forms can share a page, so ids must not collide. */
   idPrefix?: string;
-}) => (
-  <div class="card card-pad" style="display:flex;flex-direction:column;gap:16px">
-    <div>
-      <span class="overline">Fastest · one terminal command</span>
-      <div class="card-title" style="margin-top:4px">Connect a Claude Code or Codex checkout</div>
-      <div class="card-note">
-        Choose the access here, where you are already signed in, and get one command. You run
-        it in a terminal inside the checkout; no browser consent, no login step and no model
-        handles the code. It adds the MCP entry for that checkout, installs the ignored local
-        hooks and file guard, and gives the agent and its hooks <b>one</b> identity, so
-        assigned work reaches the prompt hook with nothing to pair. The credential is stored in
-        the client's own configuration (Claude Code: that checkout's local entry; Codex: its
-        user <code>config.toml</code>) and, protected for your OS user, in <code>~/.stma</code>;
-        it is scoped to {here ? <b>{here.project.name}</b> : 'what you choose below'} and
-        revocable from Agent connections. Other clients use the OAuth path there.
-      </div>
-    </div>
-    <form class="authform" method="post" action={action}>
-      {context}
-      <input type="hidden" name="mode" value="terminal" />
-      <div class="field">
-        <label for={`${idPrefix}-name`}>Agent name</label>
-        <input
-          class="in"
-          id={`${idPrefix}-name`}
-          type="text"
-          name="name"
-          placeholder="claude-backend"
-          value={typed?.name}
-          maxlength={80}
-          required
-        />
-        <span class="help">What teammates see on runs, and the name a lead assigns work to.</span>
-      </div>
-      <div class="field">
-        <label for={`${idPrefix}-device`}>Machine</label>
-        <input
-          class="in"
-          id={`${idPrefix}-device`}
-          type="text"
-          name="device"
-          placeholder="windows-desktop"
-          value={typed?.device}
-          maxlength={60}
-          required
-        />
-      </div>
-      <div class="field">
-        <label for={`${idPrefix}-client`}>Client</label>
-        <select class="in" id={`${idPrefix}-client`} name="client" required>
-          <option value="claude-code" selected={typed?.client !== 'codex'}>
-            Claude Code — one agent per checkout
-          </option>
-          <option value="codex" selected={typed?.client === 'codex'}>
-            Codex — one agent per machine
-          </option>
-        </select>
-        <span class="help">
-          Claude Code keeps the entry with the checkout. Codex loads its user configuration in
-          every checkout, so it gets one STMA identity per machine and the command refuses a
-          second one; its hooks also need your trust in <code>/hooks</code>.
-        </span>
-      </div>
-      {here ? (
-        <div class="field">
-          <span class="help m0">
-            Access: <b>project only — {here.project.name}</b>, in <b>{here.team.name}</b>. The
-            command is issued for this project because its hooks belong to this checkout.
-          </span>
+}) => {
+  const choices = (teams ?? []).filter((team) => team.projects.length > 0);
+  return (
+    <div class="card card-pad" style="display:flex;flex-direction:column;gap:16px">
+      <div>
+        <span class="overline">Fastest · one terminal command</span>
+        <div class="card-title" style="margin-top:4px">Connect a Claude Code or Codex checkout</div>
+        <div class="card-note">
+          Choose the {here ? 'agent' : 'project'} here, where you are already signed in, and get one
+          command. You run it in a terminal inside the checkout; no browser consent, no login step
+          and no model handles the code. It adds the MCP entry for that checkout, installs the
+          ignored local hooks and file guard, and gives the agent and its hooks <b>one</b> identity,
+          so assigned work reaches the prompt hook with nothing to pair. The credential is stored in
+          the client's own configuration (Claude Code: that checkout's local entry; Codex: its user{' '}
+          <code>config.toml</code>) and, protected for your OS user, in <code>~/.stma</code>. It is
+          scoped to {here ? <b>{here.project.name}</b> : 'the project you choose'} and you can revoke
+          it below. Other clients use the OAuth path.
         </div>
+      </div>
+      {!here && choices.length === 0 ? (
+        <p class="m0 muted">
+          This workspace has no project yet, and a command is issued for one project because its
+          hooks belong to one checkout.{' '}
+          {projectsHref ? <a href={projectsHref}>Create the project</a> : 'Create the project'} first,
+          or connect through OAuth below; the first agent that reports a snapshot also creates it.
+        </p>
       ) : (
-        <div class="field">
-          <label for={`${idPrefix}-access`}>Access</label>
-          <select class="in" id={`${idPrefix}-access`} name="access" required>
-            {(teams ?? []).map((team) => (
-              <optgroup label={team.name}>
-                {team.projects.map((project) => (
-                  <option
-                    value={`project:${project.id}`}
-                    selected={preferredAccess === `project:${project.id}`}
-                  >
-                    Project only — {project.name}
-                  </option>
-                ))}
-              </optgroup>
-            ))}
-          </select>
-          <span class="help">
-            One project, because the hooks belong to one checkout. Create the project first if it
-            is not listed.
-          </span>
-        </div>
+        <form class="authform" method="post" action={action}>
+          {context}
+          <input type="hidden" name="mode" value="terminal" />
+          {here ? <input type="hidden" name="access" value={`project:${here.project.id}`} /> : null}
+          <div class="field">
+            <label for={`${idPrefix}-name`}>Agent name</label>
+            <input
+              class="in"
+              id={`${idPrefix}-name`}
+              type="text"
+              name="name"
+              placeholder="claude-backend"
+              value={typed?.name}
+              maxlength={80}
+              required
+            />
+            <span class="help">What teammates see on runs, and the name a lead assigns work to.</span>
+          </div>
+          <div class="field">
+            <label for={`${idPrefix}-device`}>Machine</label>
+            <input
+              class="in"
+              id={`${idPrefix}-device`}
+              type="text"
+              name="device"
+              placeholder="windows-desktop"
+              value={typed?.device}
+              maxlength={60}
+              required
+            />
+          </div>
+          <div class="field">
+            <label for={`${idPrefix}-client`}>Client</label>
+            <select class="in" id={`${idPrefix}-client`} name="client" required>
+              <option value="claude-code" selected={typed?.client !== 'codex'}>
+                Claude Code · one agent per checkout
+              </option>
+              <option value="codex" selected={typed?.client === 'codex'}>
+                Codex · one agent per machine
+              </option>
+            </select>
+            <span class="help">
+              Claude Code keeps the entry with the checkout. Codex loads its user configuration in
+              every checkout, so it gets one STMA identity per machine and the command refuses a
+              second one; its hooks also need your trust in <code>/hooks</code>.
+            </span>
+          </div>
+          {here ? (
+            <div class="field">
+              <span class="help m0">
+                Access: <b>project only, {here.project.name}</b>, in <b>{here.team.name}</b>. The
+                command is issued for this project because its hooks belong to this checkout.
+              </span>
+            </div>
+          ) : (
+            <div class="field">
+              <label for={`${idPrefix}-access`}>Project</label>
+              <select class="in" id={`${idPrefix}-access`} name="access" required>
+                {choices.map((team) =>
+                  team.projects.map((project) => (
+                    <option
+                      value={`project:${project.id}`}
+                      selected={(typed?.access ?? preferredAccess) === `project:${project.id}`}
+                    >
+                      {project.name}
+                    </option>
+                  )),
+                )}
+              </select>
+              <span class="help">
+                One project, because the hooks belong to one checkout. Create the project first if
+                it is not listed.
+              </span>
+            </div>
+          )}
+          <button class="btn btn-primary" type="submit" style="align-self:flex-start">
+            Create connect command
+          </button>
+        </form>
       )}
-      <button class="btn btn-primary" type="submit" style="align-self:flex-start">
-        Create connect command
-      </button>
-    </form>
-  </div>
-);
+    </div>
+  );
+};
 
 /**
- * The one-time command, shown once, wherever it was asked for.
+ * The one-time command, shown once, on the page that asked for it.
  *
- * It is the reason both POST handlers answer with a page instead of a redirect:
- * nothing stores the code, so a redirect would lose it.
+ * It is the reason the POST answers with a page instead of a redirect: nothing
+ * stores the code, so a redirect would lose it.
  */
 export const ConnectCommand = ({
   command,

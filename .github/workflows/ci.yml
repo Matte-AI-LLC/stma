@@ -39,6 +39,12 @@ jobs:
       # real-agent lab still loads and still types the guide's own sentences.
       - if: hashFiles('acceptance/owed.test.mjs') != ''
         run: node --test acceptance/owed.test.mjs acceptance/agent-lab/lab.test.mjs
+      # The public mirror's allowlist and scan, on every change rather than first
+      # at the tag: v0.19.1's mirror was refused for one test comment after npm and
+      # production had already shipped. The script is not in the public tree, so
+      # the public repository skips this step.
+      - if: hashFiles('scripts/public-tree.mjs') != ''
+        run: node scripts/public-tree.mjs "$RUNNER_TEMP/public-tree"
       - if: hashFiles('ee/package-lock.json') != ''
         run: npm test --prefix ee
       - run: npm run build

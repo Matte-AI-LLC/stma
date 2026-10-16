@@ -260,7 +260,7 @@ it('redeems one project enrollment once and enforces it at the MCP boundary', as
   expect(pickerHtml).toMatch(/class="scope-at"[^>]*>\s*Scope Alpha/);
   expect(pickerHtml).toMatch(/class="scope-at in"[^>]*>\s*payments-api/);
   expect(pickerHtml).toContain('single-use 30-minute enrollment code');
-  const access = /<option value="(project:[0-9a-f-]{36})" selected="">Project only — payments-api<\/option>/.exec(
+  const access = /<option value="(project:[0-9a-f-]{36})" selected="">Project only · payments-api<\/option>/.exec(
     pickerHtml,
   )?.[1];
   expect(access).toBeTruthy();
@@ -393,7 +393,7 @@ it('pins project-scoped writes to a project created from a repository URL', asyn
     { headers: owner.header() },
   );
   const access = new RegExp(
-    `<option value="(project:${original!.id})" selected="">Project only — parcel-desk-agent-lab</option>`,
+    `<option value="(project:${original!.id})" selected="">Project only · parcel-desk-agent-lab</option>`,
   ).exec(await picker.text())?.[1];
   expect(access).toBeTruthy();
   const enrollment = await createEnrollment(owner, {
@@ -630,7 +630,8 @@ it('follows a stale enrollment Revoke to the connection when redemption won the 
 
   const staleRevoke = await form(owner, `/app/enrollments/${redeemedId}/revoke`, { filter_team: 'enrollment-revoke-lab', filter_q: 'redeemed-agent' });
   const staleLocation = new URL(staleRevoke.headers.get('location')!, srv.url);
-  expect(staleLocation.searchParams.get('team')).toBe('enrollment-revoke-lab');
+  // Back on the workspace's own connections page, with the search it was pressed from.
+  expect(staleLocation.pathname).toBe('/app/teams/enrollment-revoke-lab/connections');
   expect(staleLocation.searchParams.get('q')).toBe('redeemed-agent');
   expect(staleLocation.searchParams.get('error')).toBeNull();
   expect(staleLocation.searchParams.get('ok')).toContain('activated before this page refreshed');
@@ -741,7 +742,7 @@ it('lets a teammate connect their own scoped agent but keeps invitations owner-o
     headers: member.header(),
   });
   const pickerHtml = await picker.text();
-  const teamAccess = /<option value="(team:[0-9a-f-]{36})" selected="">Entire workspace — membership-lab<\/option>/.exec(
+  const teamAccess = /<option value="(team:[0-9a-f-]{36})" selected="">Entire workspace · Membership Lab<\/option>/.exec(
     pickerHtml,
   )?.[1];
   expect(teamAccess).toBeTruthy();

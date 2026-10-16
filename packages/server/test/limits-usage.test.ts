@@ -324,6 +324,7 @@ it('reports retained value signals and keeps measured, estimated and missing run
     .values([
       { teamId: team.id, openedBy: owner.id, title: 'Economic handoff one' },
       { teamId: team.id, openedBy: owner.id, title: 'Economic handoff two' },
+      { teamId: team.id, openedBy: owner.id, title: 'An assignment, not a handoff' },
     ])
     .returning();
   await db.insert(handoffs).values([
@@ -342,12 +343,24 @@ it('reports retained value signals and keeps measured, estimated and missing run
       resumedAt: now,
       updatedAt: now,
     },
+    // A lead starting somebody is not work moving between agents, and must not
+    // make a workspace that only ever assigns look like a repeat handoff one.
+    {
+      sessionId: sessions[2]!.id,
+      offeredBy: owner.id,
+      kind: 'assignment',
+      state: 'completed',
+      resumedAt: now,
+      completedAt: now,
+      updatedAt: now,
+    },
   ]);
 
   const report = await economicObservation(db, 400);
   expect(report.days, 'operator windows are bounded').toBe(90);
   expect(report.firstRealResults).toMatchObject({ reports: 1, teams: 1 });
   expect(report.handoffs).toMatchObject({ offered: 2, resumed: 2, completed: 1, repeatTeams: 1 });
+  expect(report.assignments).toEqual({ offered: 1, completed: 1 });
   expect(report.reviewSignals).toMatchObject({ runs: 2, mergedRuns: 1, ciRuns: 1, repeatTeams: 1 });
   expect(report.runCosts).toEqual({
     measuredRuns: 1,

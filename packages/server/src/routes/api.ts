@@ -25,6 +25,7 @@ import {
 } from '../domain/enrollments';
 import { burnPasswordCheck, hashPassword, verifyPassword } from '../lib/crypto';
 import { reservedUsername } from '../lib/admin';
+import { isTestEmail, testAccountAvailable, TEST_ACCOUNT_UNAVAILABLE } from '../lib/testAccounts';
 import { emailIsFree, isEmail, maskEmail, normalizeEmail, usernameFromEmail } from '../lib/email';
 import { logLine } from '../lib/log';
 import { notifyTeam } from '../lib/notify';
@@ -320,8 +321,10 @@ apiRoutes.post('/api/invites/redeem', async (c) => {
       );
     }
     await clearLoginFailures(db, email);
+    if (!(await testAccountAvailable(db, existingUser))) return c.json({ error: TEST_ACCOUNT_UNAVAILABLE }, 403);
     username = existingUser.username;
   } else {
+    if (isTestEmail(email)) return c.json({ error: 'That email domain is reserved for operator-created test accounts.' }, 400);
     if (!(await emailIsFree(db, email))) {
       return c.json({ error: 'that email is already registered' }, 409);
     }

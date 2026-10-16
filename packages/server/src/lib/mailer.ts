@@ -11,6 +11,7 @@
 import type { Env } from '../env';
 import { maskEmail } from './email';
 import { logLine } from './log';
+import { isTestEmail } from './testAccounts';
 
 /**
  * What a message is for — a stable label, so the operator log never has to
@@ -53,7 +54,7 @@ export interface SentMail extends MailMessage {
   transport: MailTransport;
 }
 
-export type MailTransport = 'resend' | 'memory';
+export type MailTransport = 'resend' | 'memory' | 'suppressed';
 
 export type MailResult =
   | { ok: true; transport: MailTransport }
@@ -153,6 +154,9 @@ function recordFailure(msg: MailMessage, to: string, reason: string): void {
  * request path where a mail provider hiccup must not become a 500.
  */
 export async function sendMail(env: Env, msg: MailMessage): Promise<MailResult> {
+  // A reserved demo identity has no inbox. Never hand its mail to a provider or
+  // count a suppressed notification as delivered or failed.
+  if (isTestEmail(msg.to)) return { ok: true, transport: 'suppressed' };
   const transport = mailTransport(env);
   const to = maskEmail(msg.to);
   // `kind`, never `subject`: the subject of every code email contains the code.

@@ -759,7 +759,7 @@ it('masks inbound hook tokens in the access log', async () => {
 // ----------------------------------------------- the mail a locked-out reader gets
 
 it('sends somebody whose password just changed to the door that still opens', () => {
-  const mail = passwordChangedEmail('https://stma.ai', 'support@matteai.com');
+  const mail = passwordChangedEmail('https://stma.ai', 'support@stma.ai');
   const both = `${mail.text}\n${mail.html}`;
 
   // `/login` is a wall for the one reader this mail is written for: if somebody
@@ -773,8 +773,8 @@ it('sends somebody whose password just changed to the door that still opens', ()
   expect(mail.html).toContain('reset your password now');
   expect(both).not.toContain('sign in at');
 
-  expect(mail.text).toContain('support@matteai.com');
-  expect(mail.html).toContain('mailto:support@matteai.com');
+  expect(mail.text).toContain('support@stma.ai');
+  expect(mail.html).toContain('mailto:support@stma.ai');
 });
 
 it('offers no support address when the instance has none', () => {

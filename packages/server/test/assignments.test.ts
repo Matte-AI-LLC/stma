@@ -2121,13 +2121,16 @@ it('shows a project its agents, and a workspace who has which agent and what eac
   // A local adapter is a checkout's ears, not an agent.
   expect(inProject).not.toContain('<div class="name">lead-codex-local</div>');
 
-  // Connecting starts here and comes back here.
-  const connect = '/app/tokens?team=parcel-desk&amp;project=parcel-desk-api';
+  // Connecting starts here, on the workspace's one connections page opened inside
+  // this project, and comes back here.
+  const connect = '/app/teams/parcel-desk/projects/parcel-desk-api/connections';
   expect(inProject).toContain(`href="${connect}"`);
-  const connections = await (await page('/app/tokens?team=parcel-desk&project=parcel-desk-api')).text();
+  const connections = await (await page(connect)).text();
   expect(lit(connections)).toEqual(['Agents']);
   expect(connections).toContain('Back to parcel-desk-api agents');
   expect(connections).toContain('<a href="/app/teams/parcel-desk/projects/parcel-desk-api/agents">Agents</a>');
+  // The old address lands on the same page.
+  expect((await page('/app/tokens?team=parcel-desk&project=parcel-desk-api')).url).toBe(`${srv.url}${connect}`);
 
   // The workspace groups the same rows by person, and every name opens that person.
   const people = await (await page('/app/teams/parcel-desk/agents')).text();
@@ -2147,13 +2150,12 @@ it('shows a project its agents, and a workspace who has which agent and what eac
 });
 
 it('keeps a connection started inside a project inside it, whether it is issued or refused', async () => {
-  // Phase 4 of the console plan: every action returns where it started. Connecting
-  // opened in the project's scope (phase 2) and then lost it at the two moments that
-  // matter: the page that shows the command fell back to the workspace, and a
-  // refused request landed on the account's list with the project gone.
+  // Phase 4 of the console plan: every action returns where it started. The one
+  // door that issues connections answers on the page it was posted from, and the
+  // page says where that was.
   const lit = (html: string) =>
     [...html.matchAll(/class="rail-link active"[^>]*>([^<]*)/g)].map((m) => m[1]!.trim());
-  const scope = { filter_team: 'parcel-desk', filter_project: apiProjectId };
+  const scope = { back_team: 'parcel-desk', back_project: 'parcel-desk-api' };
 
   const issued = await form(
     `${srv.url}/app/tokens`,
@@ -2168,67 +2170,76 @@ it('keeps a connection started inside a project inside it, whether it is issued 
   expect(page).toContain('Back to parcel-desk-api agents');
   expect(page).toContain('<a href="/app/teams/parcel-desk/projects/parcel-desk-api/agents">Agents</a>');
 
-  // A refusal comes back to the same scope, one corrected field away from a command.
+  // A refusal comes back to the same scope, one corrected field away from a command,
+  // with what was typed still in it.
   const refused = await form(
     `${srv.url}/app/tokens`,
     { ...scope, name: '', device: 'mac', access: `project:${apiProjectId}`, client: 'codex', role: 'generalist' },
     leadCookie,
   );
-  expect(refused.status).toBe(302);
-  const where = new URL(refused.headers.get('location') ?? '', srv.url);
-  expect(where.pathname).toBe('/app/tokens');
-  expect(where.searchParams.get('team')).toBe('parcel-desk');
-  expect(where.searchParams.get('project')).toBe(apiProjectId);
-  expect(where.searchParams.get('error')).toContain('Name one agent');
-  const back = await (await fetch(where, { headers: leadCookie })).text();
+  expect(refused.status).toBe(422);
+  const back = await refused.text();
+  expect(back).toContain('Name one agent');
+  expect(back).toContain('value="mac"');
+  expect(back).not.toContain('stma_enroll_');
   expect(lit(back)).toEqual(['Agents']);
   expect(back).toContain('Back to parcel-desk-api agents');
 
-  // Opened from the account, a refusal stays at the account: there is no scope to keep.
+  // A tab opened before the page moved still sends the old fields, and still comes back.
+  const older = await form(
+    `${srv.url}/app/tokens`,
+    { filter_team: 'parcel-desk', filter_project: apiProjectId, name: '', device: 'mac', access: `project:${apiProjectId}` },
+    leadCookie,
+  );
+  expect(older.status).toBe(422);
+  expect(lit(await older.text())).toEqual(['Agents']);
+
+  // With no page to return to, the answer is the workspace the access names.
   const plain = await form(`${srv.url}/app/tokens`, { name: '', device: 'mac', access: `team:${teamId}` }, leadCookie);
-  const plainWhere = new URL(plain.headers.get('location') ?? '', srv.url);
-  expect(plainWhere.searchParams.get('team')).toBeNull();
-  expect(plainWhere.searchParams.get('project')).toBeNull();
+  expect(plain.status).toBe(422);
+  expect(lit(await plain.text())).toEqual(['Agent connections']);
 });
 
-it('creates the connect command on a project Agents page, and refuses there too', async () => {
-  // Phase 2 left "connect the agent for this project" as a link to the account's
-  // Agent connections page: the person left the project to fill in a form and
-  // read a command. The form is on the page now, and so is its answer.
+it('connects from inside a project on the one connections page, and refuses there too', async () => {
+  // A copy of the connect form lived on the project's Agents page until one page
+  // took over connecting (2026-09-27). The button there opens that page inside
+  // the project, where every choice is the project and the answer stays put.
   const agentsPage = `${srv.url}/app/teams/parcel-desk/projects/parcel-desk-api/agents`;
+  const connectPage = `${srv.url}/app/teams/parcel-desk/projects/parcel-desk-api/connections`;
   const lit = (html: string) =>
     [...html.matchAll(/class="rail-link active"[^>]*>([^<]*)/g)].map((m) => m[1]!.trim());
 
-  const empty = await (await fetch(agentsPage, { headers: leadCookie })).text();
-  // One component with /app/tokens, so the form is the same form; only the
-  // project differs, and here the address already decided it.
-  expect(empty).toContain('action="/app/teams/parcel-desk/projects/parcel-desk-api/agents/connect"');
-  expect(empty).toContain('Create connect command');
-  expect(empty).toContain('project only — parcel-desk-api');
-  // No access picker: the project is the address, not a field a browser can move.
-  expect(empty).not.toContain('id="pc-access"');
-  expect(empty).toContain('href="#connect-agent"');
+  const agents = await (await fetch(agentsPage, { headers: leadCookie })).text();
+  expect(agents).not.toContain('Create connect command');
+  expect(agents).toContain('href="/app/teams/parcel-desk/projects/parcel-desk-api/connections"');
 
+  const empty = await (await fetch(connectPage, { headers: leadCookie })).text();
+  expect(empty).toContain('action="/app/tokens"');
+  expect(empty).toContain('Create connect command');
+  expect(empty).toContain('project only, parcel-desk-api');
+  expect(empty).toContain(`<input type="hidden" name="access" value="project:${apiProjectId}"/>`);
+  // No project picker: inside a project the page does not offer another one.
+  expect(empty).not.toContain('id="tc-access"');
+  expect(lit(empty)).toEqual(['Agents']);
+
+  const back = { back_team: 'parcel-desk', back_project: 'parcel-desk-api' };
   const issued = await form(
-    `${agentsPage}/connect`,
-    { mode: 'terminal', name: 'In Place', device: 'mac-mini', client: 'claude-code' },
+    `${srv.url}/app/tokens`,
+    { ...back, mode: 'terminal', name: 'In Place', device: 'mac-mini', client: 'claude-code', access: `project:${apiProjectId}` },
     leadCookie,
   );
   expect(issued.status).toBe(200);
   const shown = await issued.text();
-  // The one-time command, in the same shape /app/tokens shows it, on this page.
   expect(shown).toContain('npx -y @matteai/stma connect stma_enroll_');
   expect(shown).toContain('Run this in a terminal, inside the checkout');
   expect(shown).toContain('<b>In Place</b>');
   expect(shown).toContain('<b>parcel-desk / parcel-desk-api</b>');
-  // Still the project's page: the rail, the trail and the roster are all here.
   expect(lit(shown)).toEqual(['Agents']);
-  expect(shown).toContain('<h1>Agents</h1>');
+  expect(shown).toContain('<h1>Agent connections</h1>');
 
-  // A refusal comes back here too, with what was typed still in it.
   const refused = await form(
-    `${agentsPage}/connect`,
-    { mode: 'terminal', name: '', device: 'mac-mini', client: 'codex' },
+    `${srv.url}/app/tokens`,
+    { ...back, mode: 'terminal', name: '', device: 'mac-mini', client: 'codex', access: `project:${apiProjectId}` },
     leadCookie,
   );
   expect(refused.status).toBe(422);
@@ -2241,22 +2252,27 @@ it('creates the connect command on a project Agents page, and refuses there too'
 
   // A client whose hooks this command cannot write is answered, not silently downgraded.
   const wrongClient = await form(
-    `${agentsPage}/connect`,
-    { mode: 'terminal', name: 'Cursor Here', device: 'mac-mini', client: 'cursor' },
+    `${srv.url}/app/tokens`,
+    { ...back, mode: 'terminal', name: 'Cursor Here', device: 'mac-mini', client: 'cursor', access: `project:${apiProjectId}` },
     leadCookie,
   );
   expect(wrongClient.status).toBe(422);
   expect(await wrongClient.text()).toContain('supports Claude Code and Codex');
 
-  // A stranger cannot post it, and is told nothing about the project either.
+  // The form the Agents page used to carry has no door any more.
+  const retired = await form(`${agentsPage}/connect`, { mode: 'terminal', name: 'Old', device: 'mac-mini', client: 'codex' }, leadCookie);
+  expect(retired.status).toBe(404);
+
+  // A stranger is told nothing about the project, and cannot connect into it.
   const outsider = jar();
   outsider.store(await form(`${srv.url}/auth/dev`, { username: 'stranger-connect' }));
+  expect((await fetch(connectPage, { headers: outsider.header() })).status).toBe(404);
   const denied = await form(
-    `${agentsPage}/connect`,
-    { mode: 'terminal', name: 'Sneaky', device: 'mac-mini', client: 'codex' },
+    `${srv.url}/app/tokens`,
+    { mode: 'terminal', name: 'Sneaky', device: 'mac-mini', client: 'codex', access: `project:${apiProjectId}` },
     outsider.header(),
   );
-  expect(denied.status).toBe(404);
+  expect(await denied.text()).not.toContain('stma_enroll_');
 });
 
 it('gives a person their own page: their agents, runs, work and trail', async () => {

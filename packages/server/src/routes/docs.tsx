@@ -86,7 +86,7 @@ docsRoutes.get('/docs', (c) => {
       tag: 'collisions and right of way',
       text: (
         <>
-          Agents declare the ground before they edit. Two reaching for the same file are warned
+          Agents declare the ground before they edit. Two that declare the same file are warned
           before either writes, the run that was there first keeps the right of way, and ground
           that moved under a live run is named. With the hooks <code>stma connect</code> installs,
           the write guard stops a file-tool edit on ground another run holds.
@@ -102,8 +102,9 @@ docsRoutes.get('/docs', (c) => {
       text: (
         <>
           The team publishes its rules once — workspace rules, project additions — and every run
-          receives them and files a receipt, so drift is visible. Content rules are checked at the
-          file tool and again when a run ends; approval rules and change budgets are warnings on{' '}
+          is served them and can file a receipt, so drift and silence are both visible. With hooks
+          on a supported client, content rules are checked at the file tool and again when a run
+          ends; approval rules and change budgets are warnings on{' '}
           <code>start_run</code>. Environment baselines and preflight belong here too.
         </>
       ),
@@ -118,8 +119,9 @@ docsRoutes.get('/docs', (c) => {
         <>
           A lead assigns work to a named agent from the browser or from another agent, and that
           agent's hook announces it on the next prompt. An agent near the end of its allowance
-          hands its branch over with a verified git checkpoint; the receiver accepts, resumes and
-          completes.
+          hands its branch over at an exact Git commit it reports; the receiver accepts, resumes
+          only from that commit in a clean checkout, and completes. The thread shows the commit, the
+          tests the sender reported and what a provider observed there.
         </>
       ),
       tools: ['assign_work', 'handoff_work', 'update_handoff', 'inbox'],
@@ -146,12 +148,15 @@ docsRoutes.get('/docs', (c) => {
       tag: 'evidence and audit',
       text: (
         <>
-          A merge-readiness evidence pack per run, the activity trail with CSV export, policy
-          violations, and pull-request and CI outcomes linked back to the run that produced them.
+          An evidence page per run that keeps what the agent reported apart from what STMA and a
+          provider observed, copyable as Markdown for a pull request; the activity trail with CSV
+          export, policy violations, and pull-request and CI outcomes linked back to the run that
+          produced them.
         </>
       ),
       tools: ['get_evidence', 'report_knowledge_receipt'],
       console: [
+        { href: '#console-run', label: 'Run page' },
         { href: '#console-activity', label: 'Activity' },
         { href: '#console-governance', label: 'Governance' },
       ],
@@ -188,9 +193,9 @@ docsRoutes.get('/docs', (c) => {
               How to use STMA
             </h1>
             <p class="sub" style="max-width:68ch">
-              STMA is AgentOps for teams that build with coding agents: the operations layer between
-              your agents — Claude Code, Codex, Cursor or any MCP client — and the people responsible
-              for them. Connect one agent first; each of the six jobs below is here when you need it.
+              STMA is mission control for your team's coding agents: the AgentOps layer between your
+              agents (Claude Code, Codex, Cursor or any MCP client) and the people responsible for
+              them. Connect one agent first; each of the six jobs below is here when you need it.
             </p>
             <p class="m0 small muted" style="margin-top:8px">
               Looking at a message the product printed? <a href="/help">/help</a> quotes each one and
@@ -270,9 +275,11 @@ docsRoutes.get('/docs', (c) => {
                 <span class="num">2</span>
                 <div>
                   <b>Connect the first computer.</b> For a Claude Code or Codex checkout, the fastest way is
-                  the <b>one terminal command</b> card (Claude Code or Codex) on{' '}
-                  <a href="/app/tokens">Agent connections</a>: pick the project, create the command and
-                  paste it into a terminal opened in that checkout. It shows the workspace and
+                  the <b>one terminal command</b> card (Claude Code or Codex) on your workspace's{' '}
+                  <a href="/app/tokens">Agent connections</a> (under <b>Workspace settings</b> in its
+                  menu): pick the project, create the command and
+                  paste it into a terminal opened in that checkout. A new workspace has no project
+                  yet, so create one first with <b>New project</b> on its <b>Projects</b> page. It shows the workspace and
                   project, asks <code>y/N</code>, and connects the agent and its local hooks as one
                   identity with no browser consent. Paste it into a terminal, never into the agent:
                   the code is a one-use, ten-minute secret. For another client, open{' '}
@@ -306,7 +313,7 @@ docsRoutes.get('/docs', (c) => {
               deployment; do not expose a development server or send credentials over public HTTP.
             </p>
             <FirstExchange baseUrl={base} expanded />
-            <div class="card card-pad" id="dispatch"><h3>Connected is the start, not the result</h3><p>For real work, ask the sender to call <code>handoff_work</code>. The receiving enrolled agent calls <code>update_handoff</code> with <code>accept</code>, then resumes only from the checkpoint's exact repository and commit in a clean worktree, and finally uses <code>complete</code>. A mismatch stays visible. A question or chat reply does not accept or complete the job. Local file access and external changes still need your authorization.</p><p>A handoff can name its receiver: <code>handoff_work</code> with <code>to_agent</code> addresses one agent, as <code>list_teammates</code> shows it; only that agent can accept it and its prompt hook announces it. Without it the work is offered to a person or the team.</p><p>To start an agent rather than stop one, a lead calls <code>assign_work</code> or uses <b>Assign work</b> on the project page: the task is addressed to one agent by name, only that agent can accept it, and its own <code>start_run</code> records the ground it takes.</p><p><b>Any member of a workspace may dispatch work, and may see every person and agent in it.</b> That is deliberate: a lead is a role people hold, not one STMA enforces, and requiring ownership to hand work out would put a human back in the middle of the thing this removes. It is worth knowing before you invite somebody, because it is not where the neighbouring boundaries sit — publishing policy, editing the delivery flow, recording a baseline and creating a project are all owner-only.</p><p>Source-only credentials stay on the source machine. For a branch handoff, STMA refuses peer-authored next steps that tell the receiver to provision, copy or use a credential; the allowed pattern is to ask the source machine for a non-secret result. Branchless operator runbooks can still describe future credential administration.</p><p>Use <b>Needs attention</b> for bounded review items, and <b>Manage workspace</b> for Governance, Delivery, Repositories and receipts. These screens do not imply that STMA observed every action your agents took.</p><p>Delivery downloads bind scope, content, mode and optional policy in a schema-v2 manifest. Submit compact JSON with <code>record_delivery_receipt</code>. A run checkpoint or Knowledge receipt remains a client report. Provider evidence must match the newest delivery/test checkpoint's repository and commit; even then, one successful workflow is not all required checks or human approval.</p></div>
+            <div class="card card-pad" id="dispatch"><h3>Connected is the start, not the result</h3><p>For real work, ask the sender to call <code>handoff_work</code>. The receiving enrolled agent calls <code>update_handoff</code> with <code>accept</code>, then resumes only from the checkpoint's exact repository and commit in a clean worktree, and finally uses <code>complete</code>. A mismatch stays visible. A question or chat reply does not accept or complete the job. Local file access and external changes still need your authorization.</p><p>On the handoff's thread, <b>What was handed over</b> shows the commit the receiver must be on, the tests the sender reported there and what a connected provider observed at that exact commit, each labelled with whose word it is. The run the work came from keeps its evidence on its own page.</p><p>A handoff can name its receiver: <code>handoff_work</code> with <code>to_agent</code> addresses one agent, as <code>list_teammates</code> shows it; only that agent can accept it and its prompt hook announces it. Without it the work is offered to a person or the team.</p><p>To start an agent rather than stop one, a lead calls <code>assign_work</code> or uses <b>Assign work</b> on the project page: the task is addressed to one agent by name, only that agent can accept it, and its own <code>start_run</code> records the ground it takes.</p><p><b>Any member of a workspace may dispatch work, and may see every person and agent in it.</b> That is deliberate: a lead is a role people hold, not one STMA enforces, and requiring ownership to hand work out would put a human back in the middle of the thing this removes. It is worth knowing before you invite somebody, because it is not where the neighbouring boundaries sit — publishing policy, editing the delivery flow, recording a baseline and creating a project are all owner-only.</p><p>Source-only credentials stay on the source machine. For a branch handoff and for every assignment, STMA refuses a next step that mentions a credential, a warning not to copy one included (the brief STMA writes already carries that warning), unless the step asks the source machine or agent for a non-secret result; the refusal names the steps by position. Branchless operator runbooks can still describe future credential administration.</p><p>Use <b>Needs attention</b> for bounded review items. In the workspace rail, Governance and Delivery, which links its receipts, are under <b>Rules set here</b>, and Repositories under <b>Workspace settings</b>. These screens do not imply that STMA observed every action your agents took.</p><p>Delivery downloads bind scope, content, mode and optional policy in a schema-v2 manifest. Submit compact JSON with <code>record_delivery_receipt</code>. A run checkpoint or Knowledge receipt remains a client report. Provider evidence must match the newest delivery/test checkpoint's repository and commit; even then, one successful workflow is not all required checks or human approval.</p></div>
             <p class="small muted">
               The other computer does not need another account; it does need its own browser approval
               and installation. Already using project-only connections? Keep both agents on that same
@@ -419,7 +426,8 @@ docsRoutes.get('/docs', (c) => {
                 OAuth discovery and PKCE; STMA opens in your browser and asks you to name the agent
                 and machine and choose project, workspace or explicit personal access. The client
                 type is fixed from its OAuth registration instead of being editable. If the project
-                is missing, a workspace owner can create it from <b>New project</b> before approval.
+                is missing, a workspace owner can create it from <b>New project</b> on the workspace's
+                Projects page before approval.
                 Project-only connections remain pinned to that exact project.
                 The client stores one-hour access and rotating refresh credentials. No bearer value,
                 setup code, downloaded installer or hand-edited config passes through the agent
@@ -557,8 +565,9 @@ docsRoutes.get('/docs', (c) => {
           <section class="doc-section" id="control-plane">
             <h2>Local agent control plane</h2>
             <p class="m0 sub" style="max-width:68ch">
-              MCP offers an agent the tools; the local hooks are what make the fleet map complete
-              and a claim enforceable. They open a run on every prompt whether or not the model
+              MCP offers an agent the tools; the local hooks are what fill in the fleet map and let
+              a supported client's edit wait for the right of way. They open a run on every prompt
+              whether or not the model
               remembers to, announce work assigned to the agent, and stop a file-tool edit on ground
               another run holds. The local <code>stma</code> CLI adds lifecycle, ownership,
               conflict, policy and preflight data without requiring GitHub, Jira, Slack, billing, or
@@ -568,8 +577,8 @@ docsRoutes.get('/docs', (c) => {
               <b>For a Claude Code or Codex checkout, start with <code>stma connect</code>.</b>{' '}
               {showConsole ? (
                 <>
-                  <a href="/app/tokens">Agent connections</a> (or a project's <b>Agents</b> page)
-                  issues
+                  The workspace's <a href="/app/tokens">Agent connections</a> (also reached with{' '}
+                  <b>Connect agent</b> on a project's <b>Agents</b> page) issues
                 </>
               ) : (
                 <>The console issues</>
@@ -577,7 +586,7 @@ docsRoutes.get('/docs', (c) => {
               a ten-minute, project-only command; run it in a terminal at the root of the checkout,
               never inside the agent. It previews the workspace, project, agent and device, asks{' '}
               <code>y/N</code>, then adds the MCP entry and the pinned hooks as one installation, so
-              there is nothing to pair. The steps below are the longer routes: an environment
+              there is nothing to pair. The steps below are the longer routes: a legacy environment
               credential, a published policy file, and <code>stma adapter activate</code> for an
               agent that is already connected through the browser.
             </p>
@@ -585,9 +594,11 @@ docsRoutes.get('/docs', (c) => {
               <div class="step-row">
                 <span class="num">1</span>
                 <div>
-                  <b>Launch with credentials in the environment.</b> Set <code>STMA_URL</code> and
-                  <code> STMA_TOKEN</code> in the shell that launches the coding agent. The token is
-                  never stored by the CLI.
+                  <b>Or launch with a legacy credential in the environment.</b> A token minted before
+                  browser connections still works: set <code>STMA_URL</code> and
+                  <code> STMA_TOKEN</code> in the shell that launches the coding agent, and the CLI
+                  never stores it. The console no longer issues new ones; a checkout connected with{' '}
+                  <code>stma connect</code> needs neither.
                 </div>
               </div>
               <div class="step-row">
@@ -839,7 +850,7 @@ docsRoutes.get('/docs', (c) => {
                 </tr>
                 <tr id="tool-post_message">
                   <td class="mono">post_message</td>
-                  <td>Typed reply: question · answer · hypothesis · info-request · resolution.</td>
+                  <td>Typed reply: question · answer · hypothesis · info-request · resolution · note (the default).</td>
                 </tr>
                 <tr id="tool-resolve_session">
                   <td class="mono">resolve_session</td>
@@ -1359,15 +1370,16 @@ docsRoutes.get('/docs', (c) => {
                 <tr>
                   <td class="name">Projects</td>
                   <td>
-                    A project per repository, born the first time an agent names one — nothing to
-                    create. The list carries runs now, open sessions, whether a baseline exists,
+                    A project per repository. A workspace owner creates one with <b>New project</b>,
+                    which a project-only connection needs first; an agent's first run, snapshot or
+                    session that names a repository creates one too. The list carries runs now, open sessions, whether a baseline exists,
                     the policy version and the delivery flow; opening one puts that project's live
                     runs, threads, run trail, policy and environment on a single page, each next to
                     the control that changes it. <b>Open a session</b> carries the team and project
                     into the form, whose project field selects an existing record rather than
                     creating one from a typo. Inside a project the rail is that project's:
-                    Agents, Work, Sessions, Activity, and the rules in effect there — Knowledge,
-                    Governance, Delivery and Environments — each at the project's own address.
+                    Agents, Work, Sessions, Activity and Environments, then the rules in effect
+                    there — Knowledge, Governance and Delivery — each at the project's own address.
                   </td>
                 </tr>
                 <tr>
@@ -1384,8 +1396,8 @@ docsRoutes.get('/docs', (c) => {
                   <td class="name">Account</td>
                   <td>
                     Your password and account deletion, behind your own name at the foot of the
-                    rail. Agent connections have their own page, and what STMA emails you lives on
-                    Notifications.
+                    rail. Agent connections live inside each workspace, and what STMA emails you
+                    lives on Notifications.
                   </td>
                 </tr>
                 <tr>
@@ -1396,21 +1408,23 @@ docsRoutes.get('/docs', (c) => {
                     marked as such. Owners invite people by email or with a link and revoke either;
                     members see the roster but never receive those access-bearing URLs. A team's own
                     page is four tabs for owners: <b>Overview</b> (projects, team
-                    health, what agents share), <b>People</b> (members, invitations waiting and, on a
-                    metered plan, how many places are left),
+                    health, what agents share), <b>People</b> (members, where an owner changes a role
+                    or removes somebody, invitations waiting and, on a metered plan, how many places
+                    are left),{' '}
                     <b>Integrations</b> (Slack/Discord, inbound CI and GitHub hooks, GitHub, Azure
-                    DevOps, Jira and OAuth-based ClickUp project/List connections — owners) and <b>Settings</b> (leave, remove a
-                    member, delete the team). Members do not see the empty owner-only Integrations
+                    DevOps, Jira and OAuth-based ClickUp project/List connections — owners) and <b>Settings</b> (leave, or
+                    delete the workspace). Members do not see the empty owner-only Integrations
                     tab. The tab is in the URL, so a link to one is a link to what you were looking at.
                   </td>
                 </tr>
                 <tr>
                   <td class="name">Notifications</td>
                   <td>
-                    Under <b>Settings</b>, choose what reaches you and where. This is delivery
-                    configuration, not a notification inbox. A reply in a thread you are part of, its
-                    resolution, or being added to a team — never your own actions, never a thread
-                    you have already read. Replies landing together become one message, there is a
+                    Beside <b>Account</b>, behind your name, choose what reaches you and where. This
+                    is delivery configuration, not a notification inbox. A reply in a thread you are
+                    part of, its resolution, being added to a team, or, for an owner, somebody
+                    joining the team or being turned away because it is full — never your own
+                    actions, never a thread you have already read. Replies landing together become one message, there is a
                     cap per hour, and announcements are opt-in. Add your own Slack or Discord
                     webhook and the same events reach your chat client; "Send a test" proves the URL
                     before you rely on it. Multiple workers claim deliveries through short database
@@ -1487,14 +1501,30 @@ docsRoutes.get('/docs', (c) => {
                     URL and are preserved in pagination and CSV export.
                   </td>
                 </tr>
+                <tr id="console-run">
+                  <td class="name">Run page</td>
+                  <td>
+                    One run's evidence for as long as the run exists, at{' '}
+                    <code>/app/teams/&lt;workspace&gt;/runs/&lt;run&gt;</code>: the commit it delivered and
+                    who reported it, the tests the agent reported there, what a connected GitHub or
+                    Azure DevOps observed at that exact commit, every check with its source in words
+                    (reported by the agent, observed by STMA, observed by the provider), where its work
+                    was handed over, its scope and its trail. <b>Copy as Markdown</b> and{' '}
+                    <b>Download .md</b> give the same page as text for a pull request; nothing is
+                    posted anywhere, and the page says it is evidence, not permission to merge. The
+                    map's inspector, a handoff thread, a person's page and a project's recent activity
+                    link to it. Members of the workspace only.
+                  </td>
+                </tr>
                 <tr id="console-agent-map">
                   <td class="name">Agent map</td>
                   <td>
                     Live human/client ownership, team and project, task, branch, leased work claims,
-                    heartbeat state and conflict severity across all teams you belong to. A card per
-                    person shows each agent's declared scope with colliding claims marked in red, and
-                    an overlap panel names the two runs pulling at the same resource; the table below
-                    carries the same data densely. It also shows what a run said about its own
+                    heartbeat state and conflict severity across all teams you belong to. The ledger
+                    lists each run with the ground it holds, and selecting one opens the inspector:
+                    its scope with colliding claims marked in red, the run it overlaps, and its
+                    trail. A red band names both runs when a collision is critical: two runs writing
+                    the same migration, contract, lockfile, schema or infrastructure file. It also shows what a run said about its own
                     vendor allowance — "96% used" and a banner when one is about to stop — and marks
                     parallel attempts at one task as "attempt 2 of 3" rather than as a collision.
                     A <b>scope graph</b> above the ledger draws the same claims as lines: runs on
@@ -1561,19 +1591,21 @@ docsRoutes.get('/docs', (c) => {
                     the first thing a reader checks and the first thing that discredits the rest.
                   </td>
                 </tr>
-                <tr>
+                <tr id="console-connections">
                   <td class="name">Agent connections</td>
                   <td>
-                    <b>Agent connections:</b> owners can create a missing project in the inline New
-                    project bar and return with it available. Add the one `/mcp` address to each
-                    client; STMA's browser page creates a unique agent/machine installation with
-                    explicit project/team/personal access. OAuth credentials remain client-managed.
-                    A closed legacy prompt remains for older clients and its pending one-use
-                    enrollments can still be revoked.
-                    Connected credentials and their bound installations can also be disabled
-                    immediately if a laptop is lost. Password and account deletion live on Account.
-                    For a Claude Code or Codex checkout the same terminal-command form is on that
-                    project's own <b>Agents</b> page, and the command comes back there.
+                    One page per workspace, under <b>Workspace settings</b>; <b>Connect agent</b> on a
+                    project's <b>Agents</b> page opens the same page inside that project, where every
+                    choice is that project. Three sections. <b>Connect an agent</b>: the one terminal
+                    command for a Claude Code or Codex checkout, or the one <code>/mcp</code> address
+                    and a browser approval for any client, with the workspace or one of its projects
+                    as its access. <b>Test two agents together</b>: a sender check and a reply check
+                    that carry a launch id, confirmed on the page. <b>Your connections here</b>: every
+                    connection of yours that can work in the workspace, to revoke or pair. Projects
+                    are created on Projects, or by the first agent that names its repository. OAuth
+                    credentials remain client-managed. A closed legacy prompt remains for older
+                    clients and its pending one-use enrollments can still be revoked. Password and
+                    account deletion live on Account.
                   </td>
                 </tr>
                 <tr id="console-people">
@@ -1605,9 +1637,10 @@ docsRoutes.get('/docs', (c) => {
                   </td>
                 </tr>
                 <tr>
-                  <td class="name">Compare</td>
+                  <td class="name">Environments</td>
                   <td>
-                    The same env diff agents get, as a visual side-by-side report. If the newest
+                    Which projects have a baseline, who recorded it and when, and the same env diff
+                    agents get, as a visual side-by-side report. If the newest
                     snapshots belong to different projects, choose one project before comparing.
                   </td>
                 </tr>
@@ -1656,7 +1689,9 @@ docsRoutes.get('/docs', (c) => {
                 <span class="y">✓</span>
                 <span>
                   Credentials are stored hashed, returned once, scoped and revocable per
-                  agent/machine. Setup prompts contain only a short-lived one-use code.
+                  agent/machine. The default setup request carries no code or credential at all;
+                  the terminal connect command and the legacy setup prompt carry only a short-lived
+                  one-use code.
                 </span>
               </div>
               <div class="factrow">
@@ -1690,8 +1725,11 @@ docsRoutes.get('/docs', (c) => {
               <div class="factrow">
                 <span class="y">✓</span>
                 <span>
-                  Native adapter installation is a dry run by default and preserves unrelated
-                  hooks. Local hook and outbox files contain no personal access token.
+                  Installing the local hooks shows what will change and waits for your yes —{' '}
+                  <code>stma connect</code> asks <code>y/N</code>, <code>adapter activate</code> waits
+                  for the browser approval, the older <code>adapter install</code> is a dry run until{' '}
+                  <code>--apply</code> — and preserves unrelated hooks. Local hook and outbox files
+                  contain no personal access token.
                 </span>
               </div>
             </div>
@@ -1708,6 +1746,16 @@ docsRoutes.get('/docs', (c) => {
                 Cloud Free takes environment snapshots from two devices per person, counted over
                 the last 30 days; connecting agents is never limited by machine.
               </p>
+              {env.betaUnmetered ? (
+                // The rest of this section describes buying, which the beta does not
+                // do: /help's "Nothing to pay yet" entry says the same thing.
+                <p class="m0" style="max-width:72ch">
+                  <b>Nothing is for sale while STMA is in beta.</b> Every workspace has every
+                  feature and none of the plan limits except the one on how long history is kept,
+                  and its Plan &amp; billing page says so. The rest of this section is how billing
+                  works once pricing starts.
+                </p>
+              ) : null}
               <div class="card card-pad">
                 <p class="m0 small">
                   <b>Account</b> lists the plan of every workspace you are in, and each workspace has a{' '}
@@ -1855,14 +1903,23 @@ docsRoutes.get('/docs', (c) => {
             </div>
             <h2>Find your next action</h2>
             <p>
-              <b>Connect &amp; test</b> resumes your first-agent → second-agent → confirmed exchange.
-              First authorize each client from Agent connections using the same MCP address and a
-              separate browser approval. Then paste the launch's secret-free sender/reply check into
-              the matching connected agents. Refresh keeps progress; the checks contain no token or
+              Recording a demo without an inbox? An operator can create an <b>isolated test account</b>
+              {' '}from Admin → Users. It has a synthetic sign-in address, a once-shown generated
+              password and an empty workspace. No mailbox or email code is needed; no address is
+              marked verified. Use synthetic data only. Access lasts at most 60 days, the account
+              cannot be an operator or join another workspace, and expiry stops browser and agent
+              access. Ask the operator to renew access or rotate the password; either action
+              revokes old sessions and agent credentials. Save the password privately, never in Git.
+            </p>
+            <p>
+              The <b>Test</b> on your workspace's Agent connections page resumes your first-agent →
+              second-agent → confirmed exchange. First connect each client on the same page, with
+              the same MCP address and a separate browser approval each. Then paste the test's
+              secret-free sender/reply check into the matching connected agents. Refresh keeps progress; the checks contain no token or
               setup code. Never share credentials or client configuration with a teammate.
             </p>
             <p>
-              <a href="/app/handoffs">Handoffs</a> shows who owns the next action. Browser controls
+              <a href="/app/handoffs">Work</a> lists assignments and handoffs and who owns the next action. Browser controls
               cancel or decline; acceptance, resumption and completion identify the actual agent.
               Resolving a chat does not complete its handoff. Repositories separates connections,
               project bindings and exact evidence. Moving a binding never relabels old observations.
@@ -1870,7 +1927,9 @@ docsRoutes.get('/docs', (c) => {
             </p>
             <p>
               Hosted evaluation is 14 days, up to 3 humans and 1 project, once per account. It never
-              charges automatically. An organization member uses Organizations for sign-in and
+              charges automatically
+              {env.betaUnmetered ? ', and it is closed while the beta runs, which already lifts every limit it would' : ''}
+              . An organization member uses Organizations for sign-in and
               assigned-project browser authorizations; personal workspaces remain separate. Revocation
               ends STMA access and leases, not local processes.
             </p>
@@ -1880,7 +1939,7 @@ docsRoutes.get('/docs', (c) => {
               <code>npm i -g @matteai/stma-server</code> runs the same build with no container at
               all — see the README. An instance you run yourself is <b>not metered</b>: plan limits
               only apply to the hosted service, so the fleet, governance, evidence and retention
-              are all open.
+              are all included, with no meter.
             </p>
             <p class="m0 small muted">
               {/* In the page body rather than only the marketing footer: signed in, the console

@@ -242,6 +242,16 @@ export interface EconomicObservation {
     repeatTeams: number;
     latestAt: Date | null;
   };
+  /**
+   * Work a lead gave an agent by name. Counted apart from handoffs since
+   * 2026-09-26: an assignment carries no commit and starts somebody, a handoff
+   * moves work between agents, and a workspace that only ever assigned was
+   * reported as a repeat handoff workspace.
+   */
+  assignments: {
+    offered: number;
+    completed: number;
+  };
   reviewSignals: {
     /** Distinct runs with a retained PR or CI event, never event-row count. */
     runs: number;
@@ -289,9 +299,11 @@ export async function economicObservation(
     db
       .select({
         teamId: debugSessions.teamId,
-        offered: count(),
-        resumed: sql<number>`count(*) filter (where ${handoffs.resumedAt} is not null)::int`,
-        completed: sql<number>`count(*) filter (where ${handoffs.completedAt} is not null)::int`,
+        offered: sql<number>`count(*) filter (where ${handoffs.kind} = 'handoff')::int`,
+        resumed: sql<number>`count(*) filter (where ${handoffs.kind} = 'handoff' and ${handoffs.resumedAt} is not null)::int`,
+        completed: sql<number>`count(*) filter (where ${handoffs.kind} = 'handoff' and ${handoffs.completedAt} is not null)::int`,
+        assigned: sql<number>`count(*) filter (where ${handoffs.kind} = 'assignment')::int`,
+        assignedCompleted: sql<number>`count(*) filter (where ${handoffs.kind} = 'assignment' and ${handoffs.completedAt} is not null)::int`,
         latestAt: max(handoffs.updatedAt),
       })
       .from(handoffs)
@@ -351,6 +363,10 @@ export async function economicObservation(
       completed: handoffRows.reduce((sum, row) => sum + Number(row.completed), 0),
       repeatTeams: handoffRows.filter((row) => Number(row.resumed) >= 2).length,
       latestAt: latest(handoffRows.map((row) => (row.latestAt ? new Date(row.latestAt) : null))),
+    },
+    assignments: {
+      offered: handoffRows.reduce((sum, row) => sum + Number(row.assigned), 0),
+      completed: handoffRows.reduce((sum, row) => sum + Number(row.assignedCompleted), 0),
     },
     reviewSignals: {
       runs: reviewRows.reduce((sum, row) => sum + Number(row.runs), 0),

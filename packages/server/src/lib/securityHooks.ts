@@ -29,6 +29,8 @@ export interface SecurityPrincipal {
  */
 export const CRITICAL_AUDIT_ACTIONS = [
   'membership_joined',
+  'test_account_created',
+  'test_account_access_changed',
   'policy_published',
   'knowledge_published',
   'knowledge_archived',

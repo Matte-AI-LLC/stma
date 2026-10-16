@@ -1,6 +1,6 @@
 {
   "name": "@matteai/stma-server",
-  "version": "0.19.0",
+  "version": "0.20.0",
   "type": "module",
   "scripts": {
     "build:connector": "tsup --config tsup.connector.config.ts",
@@ -15,23 +15,23 @@
     "seed:demo": "tsx scripts/seed-demo.ts"
   },
   "dependencies": {
-    "@electric-sql/pglite": "^0.5.8",
-    "@hono/node-server": "^2.1.1",
-    "@modelcontextprotocol/sdk": "^1.13.0",
-    "dotenv": "^18.0.3",
-    "drizzle-orm": "^0.45.2",
-    "hono": "^4.7.0",
+    "@electric-sql/pglite": "^0.5.9",
+    "@hono/node-server": "^2.1.4",
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "dotenv": "^18.0.7",
+    "drizzle-orm": "^0.45.4",
+    "hono": "^4.13.13",
     "postgres": "^3.4.5",
-    "zod": "^4.6.5"
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@bridge/shared": "*",
-    "@types/node": "^22.20.2",
-    "drizzle-kit": "^0.31.1",
+    "@types/node": "^22.20.5",
+    "drizzle-kit": "^0.31.11",
     "pglite-pg17": "npm:@electric-sql/pglite@0.3.16",
-    "smol-toml": "1.8.0",
+    "smol-toml": "1.9.1",
     "tsup": "^8.3.5",
-    "tsx": "^4.23.13",
+    "tsx": "^4.23.15",
     "typescript": "^7.0.2",
     "vitest": "^4.1.11"
   },

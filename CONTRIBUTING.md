@@ -1,15 +1,15 @@
 # Contributing
 
-Thanks for looking. STMA is open-core under the [Elastic License 2.0](LICENSE):
-you can run it, modify it and self-host it; you cannot offer it to third parties
-as a competing hosted service.
+Thanks for looking. STMA is source-available under the [Elastic License 2.0](LICENSE):
+you can run it, modify it and self-host it for free; you cannot provide it to third
+parties as a hosted or managed service.
 
 ## Getting it running
 
 ```bash
 npm install
 npm run dev      # embedded PGlite, dev login, http://localhost:3000
-npm test         # the whole suite, ~30s, no external services
+npm test         # the whole suite, 5–7 min on CI, no external services
 ```
 
 There is no database to install and no account to create — dev mode signs you in.
@@ -25,7 +25,7 @@ SEED_PASSWORD=... npm run seed:demo -w @matteai/stma-server -- --url http://loca
 ## The rules that matter here
 
 1. **Docs move with the code, in the same change.** If behaviour changes, update
-   whichever of these it touches: `README.md`, `ROADMAP.md`, the in-app guide
+   whichever of these it touches: `README.md`, `PRODUCT_FLOWS.md`, `ROADMAP.md`, the in-app guide
    (`packages/server/src/routes/docs.tsx`), `docs/deploy-azure.md`, `CLAUDE.md`.
    Documentation that lags the code is worse than none.
 2. **Tests before deploy.** `npm run typecheck` and `npm test` must be green. A bug
@@ -42,8 +42,8 @@ SEED_PASSWORD=... npm run seed:demo -w @matteai/stma-server -- --url http://loca
 6. **Everything in this repository is written to be read publicly.** Company-internal
    material — pricing work, cost models, competitive reads, infrastructure
    runbooks — lives in a separate private repository and never lands here, not even
-   as a path in a comment. The public tree is built from an explicit allowlist
-   (`scripts/public-tree.mjs`) and a scan refuses identifiers that must not ship.
+   as a path in a comment. The public tree is built at release from an explicit
+   allowlist, and a scan refuses identifiers that must not ship.
 
 ## Things worth knowing before you change agent-facing code
 
@@ -62,5 +62,5 @@ tests and the build on every push; a nightly job runs the same suite on Linux,
 Windows and macOS, plus a lab that drives three real machines against a live
 instance.
 
-Security issues go to **support@matteai.com**, not to a public issue — see
+Security issues go to **support@stma.ai**, not to a public issue — see
 [SECURITY.md](SECURITY.md).

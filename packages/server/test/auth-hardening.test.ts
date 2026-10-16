@@ -422,7 +422,7 @@ it('A8: the recovery pages carry a way out when no mail arrives', async () => {
     ).toContain('on its way');
     // Fix: print env.supportEmail on /forgot, /reset and /login.
     for (const page of ['/forgot', '/reset', '/login']) {
-      expect(await (await fetch(down.url + page)).text(), page).toContain('support@matteai.com');
+      expect(await (await fetch(down.url + page)).text(), page).toContain('support@stma.ai');
     }
   } finally {
     globalThis.fetch = real;

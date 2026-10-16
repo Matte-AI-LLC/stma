@@ -4,6 +4,7 @@ import { Hono } from 'hono';
 import type { Context } from 'hono';
 import { deleteCookie, getCookie, setCookie } from 'hono/cookie';
 import { users } from '../db/schema';
+import type { Db } from '../db';
 import {
   exchangeGithubCode,
   fetchGithubProfile,
@@ -51,6 +52,7 @@ import {
   sendMail,
 } from '../lib/mailer';
 import { REVIEW_SESSION_DAYS, reviewAccessActive, reviewAccessLastDay } from '../lib/reviewAccess';
+import { isTestEmail, testAccountAvailable, TEST_ACCOUNT_UNAVAILABLE } from '../lib/testAccounts';
 import type { Env } from '../env';
 import type { AppEnv, User } from '../types';
 import { Head, Logo } from '../ui/Layout';
@@ -404,6 +406,7 @@ authRoutes.post('/auth/local/signup', async (c) => {
   }
 
   if (!isEmail(email)) return back('Enter a valid email address.');
+  if (isTestEmail(email)) return back('Test accounts are created by an operator, not through signup.');
   // Compared with the invitation, never with the accounts table, so it tells
   // nobody whether an address is registered.
   if (door?.invite.email && email !== door.invite.email) {
@@ -573,6 +576,20 @@ authRoutes.post('/auth/local/login', async (c) => {
     return fail(failed.locked ? lockedMessage(failed.resetAt) : undefined);
   }
   await clearLoginFailures(db, email);
+  if (user.isTest) {
+    const signedIn = await db.transaction(async (tx) => {
+      // Serialize with an operator rotating/disabling the identity while its
+      // password was being checked. An old password must not open a new session.
+      const [current] = await tx.select().from(users).where(eq(users.id, user.id)).limit(1).for('update');
+      if (!current?.isTest || current.passwordHash !== user.passwordHash || !(await testAccountAvailable(tx as unknown as Db, current))) return false;
+      const remainingDays = (current.reviewAccessUntil!.getTime() - Date.now()) / 86_400_000;
+      await createSession(c, current.id, Math.min(REVIEW_SESSION_DAYS, remainingDays), tx as unknown as Db);
+      return true;
+    });
+    if (!signedIn) return fail(TEST_ACCOUNT_UNAVAILABLE);
+    logLine({ evt: 'auth', a: 'test_login', u: user.username });
+    return c.redirect(next);
+  }
   // An account an operator opened for a directory reviewer, who has the
   // password and not the mailbox (`lib/reviewAccess.ts`). Everything above
   // still ran, the throttle included; the address is told instead of asked.
@@ -915,8 +932,9 @@ const ResetPage = ({
 
 authRoutes.get('/forgot', (c) => {
   const env = c.get('env');
-  // Self-service reset needs a mailbox to deliver to; without the email switch
-  // the operator escape hatch (/admin/users) is the recovery path.
+  // Self-service reset needs a mailbox to deliver to. Without the email switch
+  // there is no reset at all: the admin console can change an address but never
+  // sets a password, which /help#signin says to the person locked out.
   if (!env.localAuth || !env.twoFactor) return c.notFound();
   if (c.get('user')) return c.redirect('/app');
   return c.html(<ForgotPage error={c.req.query('error')} support={env.supportEmail} />);
@@ -924,8 +942,9 @@ authRoutes.get('/forgot', (c) => {
 
 authRoutes.get('/reset', (c) => {
   const env = c.get('env');
-  // Self-service reset needs a mailbox to deliver to; without the email switch
-  // the operator escape hatch (/admin/users) is the recovery path.
+  // Self-service reset needs a mailbox to deliver to. Without the email switch
+  // there is no reset at all: the admin console can change an address but never
+  // sets a password, which /help#signin says to the person locked out.
   if (!env.localAuth || !env.twoFactor) return c.notFound();
   if (c.get('user')) return c.redirect('/app');
   /**
@@ -951,8 +970,9 @@ authRoutes.get('/reset', (c) => {
 
 authRoutes.post('/auth/local/forgot', async (c) => {
   const env = c.get('env');
-  // Self-service reset needs a mailbox to deliver to; without the email switch
-  // the operator escape hatch (/admin/users) is the recovery path.
+  // Self-service reset needs a mailbox to deliver to. Without the email switch
+  // there is no reset at all: the admin console can change an address but never
+  // sets a password, which /help#signin says to the person locked out.
   if (!env.localAuth || !env.twoFactor) return c.notFound();
   const body = await c.req.parseBody();
   const email = normalizeEmail(body.email);
@@ -982,7 +1002,7 @@ authRoutes.post('/auth/local/forgot', async (c) => {
     .where(and(eq(users.email, email), isNotNull(users.passwordHash)))
     .limit(1);
   const user = rows[0];
-  if (!user) {
+  if (!user || user.isTest) {
     logLine({ evt: 'auth', a: 'reset_request', hit: false, em: maskEmail(email) });
     return done();
   }
@@ -1025,8 +1045,9 @@ authRoutes.post('/auth/local/forgot', async (c) => {
 
 authRoutes.post('/auth/local/reset', async (c) => {
   const env = c.get('env');
-  // Self-service reset needs a mailbox to deliver to; without the email switch
-  // the operator escape hatch (/admin/users) is the recovery path.
+  // Self-service reset needs a mailbox to deliver to. Without the email switch
+  // there is no reset at all: the admin console can change an address but never
+  // sets a password, which /help#signin says to the person locked out.
   if (!env.localAuth || !env.twoFactor) return c.notFound();
   const body = await c.req.parseBody();
   const code = typeof body.code === 'string' ? body.code.trim() : '';

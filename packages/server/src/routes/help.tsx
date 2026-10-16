@@ -363,10 +363,11 @@ export function helpSections(
           ),
           todo: (
             <>
-              On a server somebody you know runs, ask them — the operator can reset an account from
-              the admin console. If the server is yours, configure email (<code>RESEND_API_KEY</code>
-              ) before you invite anyone; until then, that console is the only way back into an
-              account.
+              On a server somebody you know runs, ask them to switch email on, which brings these
+              pages back. The admin console can change an account's address but cannot set a
+              password, so until email works a forgotten password cannot be reset from inside STMA.
+              If the server is yours, configure email (<code>RESEND_API_KEY</code>) before you invite
+              anyone.
             </>
           ),
         },
@@ -410,9 +411,10 @@ export function helpSections(
           where: 'Browser · invitation',
           means: (
             <>
-              The invitation expired, was revoked, or has been used as many times as it allows. Every
-              invitation lasts seven days; one sent by email works once, and a link works for as many
-              people as its owner chose. A workspace with no room left answers differently: it says
+              The invitation expired, was revoked, or has been used as many times as it allows. An
+              invitation lasts seven days, unless an agent made it with <code>create_invite</code> and
+              asked for another length, up to thirty; one sent by email works once, and a link works
+              for as many people as its owner chose. A workspace with no room left answers differently: it says
               it is full, and tells its owners you tried.
             </>
           ),
@@ -601,10 +603,11 @@ export function helpSections(
           ),
           todo: (
             <>
-              Make a new command on <a href="/app/tokens">Agent connections</a> or the project's{' '}
-              <b>Agents</b> page — for Claude Code or Codex, with <b>Project only</b> access — and
-              run it within ten minutes, with the <code>--server</code> it was printed with. Any
-              other client, or wider access, connects through the browser instead.
+              Make a new command on your workspace's <a href="/app/tokens">Agent connections</a>{' '}
+              (or <b>Connect agent</b> on the project's <b>Agents</b> page), for Claude Code or
+              Codex and one project, and run it within ten minutes, with the <code>--server</code>{' '}
+              it was printed with. Any other client, or wider access, connects through the browser
+              instead.
             </>
           ),
         },
@@ -1525,7 +1528,7 @@ export function helpSections(
               from: 'server/src/routes/compare.tsx',
             },
           ],
-          where: 'Agent · Compare',
+          where: 'Agent · Environments',
           means: (
             <>
               A diff compares one project on two machines. The two newest snapshots were pushed from
@@ -1534,8 +1537,8 @@ export function helpSections(
           ),
           todo: (
             <>
-              Pass <code>repo</code> to <code>compare_env</code>, or pick the project on the Compare
-              page, so both sides come from the same project.
+              Pass <code>repo</code> to <code>compare_env</code>, or pick the project on the
+              Environments page, so both sides come from the same project.
             </>
           ),
         },

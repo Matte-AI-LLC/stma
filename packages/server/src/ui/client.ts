@@ -24,7 +24,14 @@ export const clientJs = `(function () {
         var response = await fetch(launchStatus.getAttribute('data-launch-status'), { credentials: 'same-origin', cache: 'no-store', signal: AbortSignal.timeout(4000) });
         if (!response.ok) { launchStatus.textContent = 'Access or connection changed. Refresh or sign in again.'; return; }
         var status = await response.json();
-        if (status.exchanged || (launchStatus.hasAttribute('data-launch-first') && String(status.first) !== launchStatus.getAttribute('data-launch-first'))) { window.location.assign(launchStatus.getAttribute('data-launch-refresh') || window.location.href); return; }
+        if (status.exchanged || (launchStatus.hasAttribute('data-launch-first') && String(status.first) !== launchStatus.getAttribute('data-launch-first'))) {
+          // The test is a section of a longer page: keep the reader on it. Assigning
+          // an address that differs only by its fragment would scroll, not reload.
+          var next = new URL(launchStatus.getAttribute('data-launch-refresh') || window.location.href, window.location.href);
+          next.hash = window.location.hash;
+          if (next.href === window.location.href) window.location.reload(); else window.location.assign(next.href);
+          return;
+        }
         launchStatus.textContent = status.first ? 'Sender observed. Waiting for the second agent to reply.' : 'Waiting for the sender prompt to run.';
       } catch (_) { launchStatus.textContent = 'Could not refresh. Check the server connection; your launch is saved.'; }
       setTimeout(checkLaunch, 5000);

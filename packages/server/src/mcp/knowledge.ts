@@ -13,7 +13,7 @@ import {
 import type { Env } from '../env';
 import type { AgentGrant } from '../lib/grants';
 import type { Token, User } from '../types';
-import { err, resolveTeam, text } from './shared';
+import { err, resolveTeam, text, toolReference } from './shared';
 
 /** Five additive tools: bounded context, its receipt, search/read, or a draft proposal. */
 export function registerKnowledgeTools(
@@ -154,7 +154,8 @@ export function registerKnowledgeTools(
     {
       title: 'Propose a Knowledge Hub draft',
       description:
-        'Create an immutable native/import draft for owner review. This never publishes. Project targets must already exist; imports carry uploaded UTF-8 text and never cause STMA to fetch a path or URL.',
+        'Create an immutable native/import draft for owner review. This never publishes. Project targets must already exist; imports carry uploaded UTF-8 text and never cause STMA to fetch a path or URL.' +
+        toolReference(env.baseUrl, 'propose_knowledge'),
       inputSchema: {
         team: teamParam,
         stable_key: z

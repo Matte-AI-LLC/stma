@@ -34,6 +34,7 @@ export interface OperatorCandidate {
   emailVerifiedAt: Date | null;
   /** While it runs the account signs in with a password alone, so it is never an operator. */
   reviewAccessUntil?: Date | null;
+  isTest?: boolean;
 }
 
 /** Whether a username is listed in ADMIN_USERNAMES (trimmed + case-insensitive). */
@@ -59,7 +60,7 @@ export function isAdminEmail(env: Pick<Env, 'adminEmails'>, email: string | null
 export function isAdminUser(env: Pick<Env, 'adminUsernames' | 'adminEmails'>, user: OperatorCandidate): boolean {
   // Review access skips the second factor; the admin page refuses to give it to
   // a listed account, and this holds if the lists change while it runs.
-  if (reviewAccessActive(user)) return false;
+  if (user.isTest || reviewAccessActive(user)) return false;
   return (
     isAdminUsername(env, user.username) ||
     (Boolean(user.emailVerifiedAt) && isAdminEmail(env, user.email))

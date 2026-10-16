@@ -149,8 +149,9 @@ export const SiteFooter = ({ site }: { site: SiteInfo }) => (
             Speak to my Agent
           </a>
           <p>
-            AgentOps for teams that build with coding agents: see every run, keep agents off each
-            other's ground, give them the team's rules and prove what they did.
+            Mission control for your team's coding agents: see every run, warn agents before they
+            share ground, give them the team's rules, hand work over at the exact commit, and keep
+            the record of what each one reported and what was observed.
           </p>
         </div>
         <nav class="foot-col" aria-label="Product">

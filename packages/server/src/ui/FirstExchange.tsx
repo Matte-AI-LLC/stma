@@ -1,15 +1,16 @@
 /**
- * The guide and connection page share one persistent, server-observed launch.
+ * The test before a first launch exists: two agents, one server-observed exchange.
  *
- * It used to be a heading, a paragraph and a bare select beside a button — the
- * one place in the console that still looked like a form nobody designed. The
- * three things a launch observes are drawn as the steps they are, and the
- * choice is a labelled field like every other form here.
+ * Drawn in the Test section of a workspace's Agent connections page, where it
+ * starts the test in that page's scope, and on the guide, where it can only say
+ * where that page is. The three things a test observes are drawn as the steps
+ * they are, and the choice is a labelled field like every other form here.
  */
 export function FirstExchange(props: {
   baseUrl: string;
   teamSlug?: string;
-  projectName?: string;
+  /** The project's slug when the page is inside one. */
+  project?: string;
   expanded?: boolean;
 }) {
   return (
@@ -18,15 +19,15 @@ export function FirstExchange(props: {
         <span class="overline">First result</span>
         <h3>Two agents, one result</h3>
         <p>
-          Start or resume a persistent launch. Authorize each client through the same MCP address,
+          Start or resume a persistent launch. Connect each agent through the same MCP address,
           then give the two connected agents short sender/reply checks with no credentials or setup
-          instructions. STMA confirms the exchange on the launch page.
+          instructions. STMA confirms the exchange on the workspace's Agent connections page.
         </p>
       </div>
       <ol class="xchg-steps">
         <li>
-          <b>Authorize</b>
-          <span>Each client approves once in the browser, through the one MCP address.</span>
+          <b>Connect</b>
+          <span>Each agent gets its own connection, with its own name and machine.</span>
         </li>
         <li>
           <b>Send</b>
@@ -34,14 +35,14 @@ export function FirstExchange(props: {
         </li>
         <li>
           <b>Reply</b>
-          <span>The second answers it, and the launch page confirms the round trip.</span>
+          <span>The second answers it, and the page confirms the round trip.</span>
         </li>
       </ol>
       <div class="xchg-foot">
         {props.teamSlug ? (
           <form class="xchg-form" method="post" action="/app/launches">
             <input type="hidden" name="team" value={props.teamSlug} />
-            {props.projectName && <input type="hidden" name="project" value={props.projectName} />}
+            {props.project && <input type="hidden" name="project" value={props.project} />}
             <div class="field">
               <label for="launch-intent">Who is connecting?</label>
               <select class="in" id="launch-intent" name="intent">
@@ -54,14 +55,14 @@ export function FirstExchange(props: {
             </button>
           </form>
         ) : (
-          <a class="btn btn-primary" href="/app/tokens">
+          <a class="btn btn-primary" href="/app/tokens#test">
             Choose workspace and launch my agents
           </a>
         )}
         <p class="card-note">
           {props.teamSlug && (
             <>
-              Scope: {props.teamSlug} / {props.projectName ?? 'workspace'}.{' '}
+              Scope: {props.teamSlug} / {props.project ?? 'workspace'}.{' '}
             </>
           )}
           A teammate signs in with their own account. Your credential is never shared. STMA does

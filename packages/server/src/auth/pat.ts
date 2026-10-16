@@ -7,6 +7,7 @@ import { isTokenScope, type AgentGrant } from '../lib/grants';
 import type { AppEnv } from '../types';
 import { authorizeSecurity, setSecurityPrincipal } from '../lib/securityHooks';
 import { logLine } from '../lib/log';
+import { testAccountAvailable, TEST_ACCOUNT_UNAVAILABLE } from '../lib/testAccounts';
 
 export function generatePat(): { token: string; hash: string; prefix: string } {
   const token = PAT_PREFIX + randomHex(20);
@@ -83,6 +84,7 @@ export const mcpAuth: MiddlewareHandler<AppEnv> = async (c, next) => {
     );
   }
   if (!row) return unauthorized(c, undefined, 'invalid_token');
+  if (!(await testAccountAvailable(db, row.user))) return unauthorized(c, TEST_ACCOUNT_UNAVAILABLE, 'invalid_token');
   if (row.token.expiresAt && row.token.expiresAt <= new Date()) {
     logLine({ evt: 'credential', a: 'rejected', why: 'token_expired', installation: row.installationId });
     return unauthorized(c, 'The OAuth access token expired. The MCP client should refresh it.', 'invalid_token');

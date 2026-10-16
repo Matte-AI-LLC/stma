@@ -86,8 +86,15 @@ export async function launchCheck(
       .where(eq(launchAttempts.id, id))
       .for('update');
     const row = locked[0];
+    // Not found, somebody else's own-agents launch and outside this credential's
+    // reach answer alike, so the reply cannot be used to learn which ids exist.
     if (!row || !(await launchForViewer(tx as unknown as Db, id, userId, grant)))
-      return { error: 'Launch unavailable in this credential scope.' };
+      return {
+        error:
+          'No launch with this id is visible to this connection. A launch is started on a workspace\'s ' +
+          'Connect & test page, which shows its id; only connections within that workspace (and, for ' +
+          'a launch between your own agents, only yours) can send, reply to or read it.',
+      };
     if (action === 'status')
       return {
         launch: row,

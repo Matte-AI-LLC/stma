@@ -388,7 +388,9 @@ it('draws the same console chrome on every signed-in page', async () => {
     // on one of them. These are account pages: they offer the workspaces and the
     // person's own pages, and no longer a map or a sessions list that mixes every
     // workspace (phase 4 of the console plan) — those numbers are on /app, per workspace.
-    for (const link of ['/app', '/app/teams/pictures', '/app/tokens', '/docs']) {
+    // Agent connections left the account too (2026-09-27): a connection is made inside
+    // a workspace, and /app/tokens takes a person with one workspace straight to it.
+    for (const link of ['/app', '/app/teams/pictures', '/app/account', '/docs']) {
       expect(html, `${path} lost the ${link} link`).toContain(`href="${link}"`);
     }
     // The old top nav must be gone, not merely hidden.
@@ -510,6 +512,13 @@ it('says what the product is now, and offers no door that is not there', async (
   expect(html).toContain('npx @matteai/stma serve');
   // This instance has no managed billing composed, so it sells nothing.
   expect(html).not.toContain('href="/pricing"');
+  // The headline is the platform, not one of its features (owner's decision,
+  // 2026-09-27): handing work over is described under Dispatch.
+  expect(html).toContain('Mission control for your <em>team&#39;s coding agents.</em>');
+  expect(html).not.toContain('without explaining it again.</em>');
+  expect(html).toContain('so nobody has to explain the task again');
+  // No em dash anywhere on the page a stranger reads first (owner's word, same day).
+  expect(html, 'the landing page must not carry an em dash').not.toContain('—');
 });
 
 it('serves the stylesheet from a URL that changes when the stylesheet does', async () => {
@@ -545,7 +554,9 @@ it('highlights the rail item you are actually on', async () => {
     ['/app/teams/pictures', 'Overview'],
     // Unscoped, the map and the lists are the account-level view of everything.
     ['/app/agents', 'All workspaces'],
-    ['/app/tokens', 'My agent connections'],
+    // One workspace: the old address is the door to that workspace's page.
+    ['/app/tokens', 'Agent connections'],
+    ['/app/teams/pictures/connections', 'Agent connections'],
     ['/app/tokens?team=pictures', 'Agent connections'],
     ['/app/agents?team=pictures', 'Agent map'],
     ['/app/sessions?team=pictures', 'Sessions'],

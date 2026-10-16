@@ -5,7 +5,6 @@ import { afterAll, beforeAll, expect, it } from 'vitest';
 import { eq } from 'drizzle-orm';
 import {
   agentInstallations,
-  agentEnrollments,
   agentRuns,
   invites,
   memberships,
@@ -128,20 +127,25 @@ it('leads with the first result and handles closed registration without a dead s
 
 it('connects two scoped agents and exchanges a reply with one human on Cloud Free', async () => {
   expect(await page('/app')).toContain('Start with one workspace');
+  // A connection belongs to a workspace, so with none there is nothing to connect to yet.
   const emptyConnections = await page('/app/tokens');
-  expect(emptyConnections).toContain('Create or join a team first');
+  expect(emptyConnections).toContain('Create a workspace first');
   expect(emptyConnections).not.toContain('id="first-message"');
   const created = await form('/app/teams', { name: 'My workspace' });
   expect(created.headers.get('location')).toBe('/app/teams/my-workspace');
   const overview = await page('/app/teams/my-workspace');
   expect(overview).toContain('Just you, two computers?');
-  expect(overview).toContain('class="btn btn-sm btn-primary" href="/app/tokens?team=my-workspace"');
+  expect(overview).toContain('class="btn btn-sm btn-primary" href="/app/teams/my-workspace/connections"');
   expect(overview).toContain('/docs#quickstart');
 
   const connections = await page('/app/tokens?team=my-workspace');
   const access = /<option value="(team:[0-9a-f-]{36})" selected="">/.exec(connections)?.[1];
   expect(access).toBeTruthy();
-  expect(connections).toContain('Personal includes every membership this account can reach');
+  // Connecting and testing are one page now, inside the workspace.
+  expect(connections).toContain('<h2>Connect an agent</h2>');
+  expect(connections).toContain('<h2>Test two agents together</h2>');
+  expect(connections).toContain('id="first-message"');
+  expect(connections).not.toContain('value="personal"');
   expect(connections).toContain('Copy Codex setup request');
   expect(connections).toContain('Copy Claude setup request');
   expect(connections).toContain('codex mcp add stma-my-workspace --url');
@@ -165,9 +169,9 @@ it('connects two scoped agents and exchanges a reply with one human on Cloud Fre
     const html = await response.text();
     expect(html).toContain('Setup prompt ready');
     expect(html).toContain('agent on the named machine');
-    expect(html).toContain(
-      '<details class="card card-pad" open=""><summary class="card-title">Legacy setup prompt (compatibility)',
-    );
+    // Shown once, at the top of the workspace's page that asked for it.
+    expect(html).toContain('<div class="reveal" id="setup-prompt">');
+    expect(html).toContain('<h1>Agent connections</h1>');
     expect(html).not.toMatch(/stma_[0-9a-f]{40}/);
     const code = promptJsonValue(html, 'STMA_ENROLLMENT_CODE');
     expect(code).toMatch(/^stma_enroll_[0-9a-f]{40}$/);
@@ -194,15 +198,24 @@ it('connects two scoped agents and exchanges a reply with one human on Cloud Fre
   // exercising an unmetered server and calling it a Free-plan check.
   expect((await rpc(first.token, 'get_policy')).isError).toBe(true);
 
+  // The test is the page's second section: starting one lands on it, with its id.
   const launchCreated = await form('/app/launches', { team: 'my-workspace', intent: 'my_agents' });
   const launchUrl = launchCreated.headers.get('location')!;
-  const launchId = launchUrl.split('/').at(-1)!;
+  const launchId = new URL(launchUrl, srv.url).searchParams.get('launch')!;
+  expect(launchUrl).toBe(`/app/teams/my-workspace/connections?launch=${launchId}#test`);
   expect(
     (await form('/app/launches', { team: 'my-workspace', intent: 'my_agents' })).headers.get(
       'location',
     ),
   ).toBe(launchUrl);
-  expect(await page(launchUrl)).toContain('Waiting for sender');
+  const waiting = await page(launchUrl);
+  expect(waiting).toContain('Waiting for sender');
+  expect(waiting).toContain(`Launch id: <code>${launchId}</code>`);
+  // Its old addresses land on the same section.
+  const old = await fetch(`${srv.url}/app/launches/${launchId}`, { headers: { cookie }, redirect: 'manual' });
+  expect(old.headers.get('location')).toBe(launchUrl);
+  const setup = await fetch(`${srv.url}/app/teams/my-workspace/setup`, { headers: { cookie }, redirect: 'manual' });
+  expect(setup.headers.get('location')).toBe('/app/teams/my-workspace/connections#test');
   await call(first.token, 'launch_check', { launch_id: launchId, action: 'send' });
   expect(
     (await rpc(first.token, 'launch_check', { launch_id: launchId, action: 'reply' })).isError,
@@ -217,7 +230,7 @@ it('connects two scoped agents and exchanges a reply with one human on Cloud Fre
   ).toHaveLength(2);
   expect(await page(launchUrl)).toContain('Your agents exchanged a message');
   const exchangeOnly = await page(launchUrl);
-  expect(exchangeOnly).toContain('Exchange confirmed · real task pending');
+  expect(exchangeOnly).toContain('Test <span>exchange confirmed</span>');
   expect(exchangeOnly).toContain('no real task is complete yet');
   expect(exchangeOnly).toContain('Connection doctor');
   // The first agent's read must not clear the second agent's independent inbox.
@@ -287,74 +300,45 @@ it('keeps launch scope explicit and delegates proof to authenticated server obse
   }
 });
 
-it('launches with two combined prompts, preserves form recovery and never replays a displayed secret', async () => {
-  const launch = await form('/app/launches', {
-    team: 'my-workspace',
-    intent: 'my_agents',
-    fresh: 'yes',
-  });
-  const url = launch.headers.get('location')!;
-  const id = url.split('/').at(-1)!;
-  const invalid = await form(url + '/enroll', { name: 'kept-name', device: '', client: 'generic' });
+it('keeps a refused prompt on its page, shows a code once and keeps the test free of secrets', async () => {
+  // One legacy form now: the test used to carry a second one that combined the
+  // enrollment with its check. A client without OAuth connects here first and then
+  // pastes the same bounded check every other client gets.
+  const connections = await page('/app/teams/my-workspace/connections');
+  const access = /<option value="(team:[0-9a-f-]{36})" selected="">/.exec(connections)?.[1]!;
+  const back = { back_team: 'my-workspace', back_project: '' };
+  const invalid = await form('/app/tokens', { ...back, name: 'kept-name', device: '', client: 'generic', access });
+  expect(invalid.status).toBe(422);
   const invalidHtml = await invalid.text();
-  expect(invalidHtml).toContain('Your input is preserved');
+  expect(invalidHtml).toContain('Name one agent and one machine');
   expect(invalidHtml).toContain('value="kept-name"');
+  expect(invalidHtml).toContain('<details class="card fold-card" id="legacy-prompt" open="">');
   expect(invalidHtml).not.toContain('STMA_ENROLLMENT_CODE');
-  const first = await form(url + '/enroll', {
-    name: 'one-prompt-first',
-    device: 'laptop',
-    client: 'generic',
-  });
-  const html = await first.text();
-  const firstCode = promptJsonValue(html, 'STMA_ENROLLMENT_CODE');
+  expect(invalidHtml).not.toContain('no workspace yet');
+
+  const issued = await form('/app/tokens', { ...back, name: 'one-prompt-first', device: 'laptop', client: 'generic', access });
+  expect(issued.status).toBe(200);
+  const html = await issued.text();
+  const code = promptJsonValue(html, 'STMA_ENROLLMENT_CODE');
   const enrollmentId = promptJsonValue(html, 'STMA_ENROLLMENT_ID');
-  expect(html).toContain('Connect &amp; test');
-  expect(html).not.toContain('no workspace yet');
-  expect(html).toContain('launch_check');
-  expect(html).toContain('only additional authorized write');
-  expect(await page(url + '?enrollment=' + enrollmentId)).not.toContain(firstCode);
-  const replacement = await form(url + '/enroll', {
-    name: 'one-prompt-first',
-    device: 'laptop',
-    client: 'generic',
-    replace: enrollmentId,
+  // Reload never shows the code again; the pending row can still be revoked.
+  const again = await page('/app/teams/my-workspace/connections');
+  expect(again).not.toContain(code);
+  expect(again).toContain(`/app/enrollments/${enrollmentId}/revoke`);
+  const revoked = await form(`/app/enrollments/${enrollmentId}/revoke`, back);
+  expect(revoked.headers.get('location')).toContain('/app/teams/my-workspace/connections?');
+  const redeem = await fetch(srv.url + '/api/agent-enrollments/redeem', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ code }),
   });
-  const replacementCode = promptJsonValue(
-    await replacement.text(),
-    'STMA_ENROLLMENT_CODE',
-  );
-  expect(replacementCode).not.toBe(firstCode);
-  expect(
-    (await srv.db.select().from(agentEnrollments).where(eq(agentEnrollments.id, enrollmentId)))[0]!
-      .revokedAt,
-  ).not.toBeNull();
-  const redeem = (code: string) =>
-    fetch(srv.url + '/api/agent-enrollments/redeem', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ code }),
-    });
-  expect((await redeem(firstCode)).status).not.toBe(200);
-  const sender = (await (await redeem(replacementCode)).json()) as any;
-  expect(sender.grant.scope).toBe('team');
-  expect(sender.installation.role).toBe('generalist');
-  await call(sender.token, 'whoami', {});
-  await call(sender.token, 'launch_check', { launch_id: id, action: 'send' });
-  expect(await page(url)).toContain('Connect another agent');
-  const second = await form(url + '/enroll', {
-    name: 'one-prompt-second',
-    device: 'desktop',
-    client: 'generic',
-  });
-  const secondHtml = await second.text();
-  expect(secondHtml).toContain('&quot;action&quot;:&quot;reply&quot;');
-  const receiver = (await (
-    await redeem(promptJsonValue(secondHtml, 'STMA_ENROLLMENT_CODE'))
-  ).json()) as any;
-  expect(receiver.installation.role).toBe('generalist');
-  await call(receiver.token, 'whoami', {});
-  await call(receiver.token, 'launch_check', { launch_id: id, action: 'reply' });
-  expect(await page(url)).toContain('Your agents exchanged a message');
+  expect(redeem.status).not.toBe(200);
+
+  const launch = await form('/app/launches', { team: 'my-workspace', intent: 'my_agents', fresh: 'yes' });
+  const testPage = await page(launch.headers.get('location')!);
+  expect(testPage).toContain('1 · Copy sender check');
+  expect(testPage).toContain('launch_check');
+  expect(testPage).not.toContain('STMA_ENROLLMENT_CODE');
   expect(await srv.db.select().from(agentRuns)).toHaveLength(0);
 });
 
@@ -374,5 +358,5 @@ it('keeps error recovery on the owning screen with input and navigation intact',
   expect(repo.status).toBe(400);
   const repoHtml = await repo.text();
   expect(repoHtml).toContain('Your input is preserved');
-  expect(repoHtml).toContain('Connect &amp; test');
+  expect(repoHtml).toContain('href="/app/teams/my-workspace/connections"');
 });

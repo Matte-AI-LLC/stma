@@ -1,7 +1,7 @@
 # stma
 
 CLI for **STMA (Speak to my Agent)** — a vendor-neutral control plane for a team's coding
-agents. It makes agent work attributable and safe across humans, repositories and client
+agents. It makes agent work attributable and coordinated across humans, repositories and client
 vendors: run lifecycle, leased work claims with a deterministic conflict radar, canonical
 team/project policy with drift receipts, and environment preflight.
 
@@ -12,9 +12,11 @@ this machine with an embedded database and no configuration. Documentation:
 ## Just want my two agents to talk?
 
 You do not need the CLI for this. On your STMA server, sign in once and create a workspace with
-**Workspaces → New workspace** (a workspace can be just you). Open **Connect & test** and start
-a launch. Paste the first setup prompt into the first agent; it connects and sends. Create and
-paste a new prompt into the second agent; it connects and replies. Do not copy tokens or MCP
+**Workspaces → New workspace** (a workspace can be just you). Connect each agent from that
+workspace's **Agent connections**: add the server's `/mcp` address in that client and approve it in
+the browser, or, for a Claude Code or Codex checkout, run the `stma connect` command it issues
+(below). Then start the **Test** on the same page and paste its sender check into the first agent
+and its reply check into the second; they carry a launch ID, not a credential. Do not copy tokens or MCP
 config between computers. The saved page confirms the exchange; no third prompt.
 
 No self-invitation, repository setup, governance or paid Team subscription is needed for the
@@ -40,7 +42,7 @@ similarity check — the installed command is still `stma`.
 
 ## Configure
 
-The CLI reads two environment variables and never writes your token to disk:
+The CLI reads two environment variables and never writes `STMA_TOKEN` to disk:
 
 ```bash
 export STMA_URL=https://your-deployment.example.com
@@ -49,8 +51,9 @@ export STMA_TOKEN=stma_...      # placeholder: your own agent credential, never 
 
 PowerShell uses `$env:STMA_URL=...` / `$env:STMA_TOKEN=...`.
 The token is a secret: the example is a placeholder, not a command to paste with a real key into
-chat or shell history. Use private environment injection. Current agent setup prompts deliver a
-scoped token privately during redemption; the CLI does not redeem enrollment codes itself.
+chat or shell history. Use private environment injection. The legacy setup prompt delivers a
+scoped token privately during redemption; the CLI redeems a code only in `stma connect`, which a
+person runs in a terminal.
 
 ## Common commands
 
@@ -88,7 +91,10 @@ have verified that the earlier request should be abandoned and you deliberately 
 
 ## Native lifecycle adapters
 
-For Codex or Claude Code, activate project-local tracking separately from MCP login. In a
+For a Claude Code or Codex checkout, `stma connect CODE --server ORIGIN` — the ten-minute, one-use
+command **Agent connections** issues, run in a terminal at the checkout root and never inside the
+agent — adds the MCP entry and these hooks as one installation. For an agent already connected
+through the browser, activate project-local tracking separately from MCP login. In a
 regular terminal at the Git checkout root, review the disclosed changes, then approve the
 exact project in STMA's browser page. This creates a second, revocable OAuth installation
 for the local adapter; the CLI never reads your MCP client's private OAuth credential.
@@ -127,7 +133,8 @@ local outbox when the server is unreachable.
 
 Environment snapshots carry tool versions, lockfile hashes and environment variable
 **names** — never values, never file contents. Device identity is a one-way hash; your
-hostname and username are not sent.
+hostname is not sent, and your username only as the default agent name `<username>-<target>`
+of `adapter install` when you pass no `--name`.
 
 ## License
 

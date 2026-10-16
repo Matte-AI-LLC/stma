@@ -56,9 +56,10 @@ import { findOrCreateProject } from '../lib/projects';
 import { authorizeSecurity } from '../lib/securityHooks';
 import { track } from '../lib/track';
 import type { AppEnv } from '../types';
-import { sectionHref, type SectionKey } from '../lib/scope';
+import { connectionsHref, sectionHref, type SectionKey } from '../lib/scope';
 import { Band, Field, Lead, PageHead, teamTrail, Vr } from '../ui/Console';
 import { AppLayout } from '../ui/Layout';
+import { runHref } from './runs';
 import { ProjectCreateBar } from '../ui/ProjectCreate';
 
 /**
@@ -697,7 +698,7 @@ projectsRoutes.get('/app/teams/:slug/projects/:project', async (c) => {
             <>
               <a
                 class="btn btn-sm"
-                href={`/app/tokens?team=${encodeURIComponent(team.slug)}&project=${encodeURIComponent(project.slug)}`}
+                href={connectionsHref(team.slug, project.slug)}
               >
                 Connect agent
               </a>
@@ -956,7 +957,9 @@ projectsRoutes.get('/app/teams/:slug/projects/:project', async (c) => {
                     <td>
                       <span class="pill pill-member">{row.event.type.replaceAll('_', ' ')}</span>
                     </td>
-                    <td class="mono">{row.run.taskKey ?? '—'}</td>
+                    <td class="mono">
+                      <a href={runHref(team.slug, row.run.id)}>{row.run.taskKey ?? 'run'}</a>
+                    </td>
                     <td>{row.owner}</td>
                   </tr>
                 ))}
@@ -1155,7 +1158,7 @@ projectsRoutes.get('/app/teams/:slug/projects/:project', async (c) => {
             <div class="dialog-actions">
               <a
                 class="btn"
-                href={`/app/tokens?team=${encodeURIComponent(team.slug)}&project=${encodeURIComponent(project.slug)}`}
+                href={connectionsHref(team.slug, project.slug)}
               >
                 Connect agent
               </a>

@@ -376,7 +376,7 @@ it('leaves an unconfigured instance exactly as it was', async () => {
 
 it('puts a support address on the hosted landing page, and none on a self-hosted one', async () => {
   const landing = await (await fetch(beta.url)).text();
-  expect(landing).toContain('mailto:support@matteai.com');
+  expect(landing).toContain('mailto:support@stma.ai');
   expect(landing).toContain('>Support<');
 
   // The troubleshooting page has one job the footer link does not: it must not
@@ -384,7 +384,7 @@ it('puts a support address on the hosted landing page, and none on a self-hosted
   // the address is where the page ends — with the data-protection address beside
   // it, because "delete my data" is not a support ticket.
   const help = await (await fetch(`${beta.url}/help`)).text();
-  expect(help).toContain('mailto:support@matteai.com');
+  expect(help).toContain('mailto:support@stma.ai');
   expect(help).not.toContain('publishes no support address');
   expect(help).toContain('mailto:gdpr@matteai.com');
 
@@ -393,7 +393,9 @@ it('puts a support address on the hosted landing page, and none on a self-hosted
   const signup = await (await fetch(`${beta.url}/signup`)).text();
   expect(signup).toContain('Access code refused');
   expect(signup).toContain('/help#signin');
-  expect(signup).toContain('mailto:support@matteai.com');
+  expect(signup).toContain('mailto:support@stma.ai');
+  // The support mailbox moved to the product's own domain on 2026-09-24.
+  for (const html of [landing, help, signup]) expect(html).not.toContain('support@matteai.com');
 
   // Same rule the access-code call to action follows: a page must not offer a
   // door that is not there. A self-hosted instance telling its users to write to
@@ -402,7 +404,7 @@ it('puts a support address on the hosted landing page, and none on a self-hosted
   expect(own.supportEmail).toBe('');
   expect(own.privacyEmail).toBe('');
   const ours = loadEnv({ ...BASE, pgliteDir: betaDir, hosted: true });
-  expect(ours.supportEmail).toBe('support@matteai.com');
+  expect(ours.supportEmail).toBe('support@stma.ai');
   expect(ours.privacyEmail).toBe('gdpr@matteai.com');
 });
 

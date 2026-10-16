@@ -6,6 +6,7 @@ import { randomCode } from '../lib/crypto';
 import { effectiveLimits, type PlanLimits } from '../lib/entitlements';
 import { appendMembershipChange } from '../lib/memberships';
 import { criticalAudit } from '../lib/securityHooks';
+import { testAccountAvailable } from '../lib/testAccounts';
 
 const DAY = 24 * 60 * 60 * 1000;
 
@@ -234,6 +235,8 @@ export async function claimInviteMembership(
       }
 
       if ('userId' in input) {
+        const [identity] = await tx.select().from(users).where(eq(users.id, input.userId)).limit(1);
+        if (identity?.isTest && (identity.testWorkspaceId !== row.team.id || !(await testAccountAvailable(tx as unknown as Db, identity)))) return { ok: false, reason: 'invalid' } as const;
         const existing = await tx
           .select({ userId: memberships.userId })
           .from(memberships)
