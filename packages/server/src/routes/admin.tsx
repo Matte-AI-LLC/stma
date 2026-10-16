@@ -2906,6 +2906,59 @@ adminRoutes.post('/admin/test-accounts', async (c) => {
   </AppLayout>);
 });
 
+adminRoutes.post('/admin/users/:id/test-presentation', async (c) => {
+  const actor = c.get('user')!;
+  const db = c.get('db');
+  const id = c.req.param('id');
+  if (!UUID_RE.test(id)) return c.notFound();
+  const [account] = await db.select().from(users).where(eq(users.id, id)).limit(1);
+  if (!account?.isTest || !account.testWorkspaceId) return c.notFound();
+  const [workspace] = await db.select().from(teams).where(eq(teams.id, account.testWorkspaceId)).limit(1);
+  if (!workspace) return c.notFound();
+  const body = await c.req.parseBody();
+  const back = (message: string, ok = false) => c.redirect(`/admin/users/${id}?${ok ? 'ok' : 'error'}=${encodeURIComponent(message)}`);
+  const label = (value: unknown): string | null => {
+    if (typeof value !== 'string' || /[\u0000-\u001f\u007f]/.test(value)) return null;
+    const trimmed = value.trim();
+    return trimmed.length > 0 && trimmed.length <= 80 ? trimmed : null;
+  };
+  const username = typeof body.username === 'string' ? body.username.trim().toLowerCase() : '';
+  const displayName = label(body.display_name);
+  const workspaceName = label(body.workspace_name);
+  if (!/^[a-z][a-z0-9-]{2,31}$/.test(username)) return back('Choose a username of 3–32 lowercase letters, numbers or hyphens.');
+  if (reservedUsername(c.get('env'), username)) return back('Choose a name not reserved for an operator.');
+  if (!displayName || !workspaceName) return back('Account and workspace names must be 1–80 characters, without control characters.');
+  const ownedProjects = await db.select({ id: projects.id }).from(projects).where(eq(projects.teamId, workspace.id));
+  const projectNames: { id: string; name: string }[] = [];
+  for (const [key, value] of Object.entries(body)) {
+    if (!key.startsWith('project_name_')) continue;
+    const projectId = key.slice('project_name_'.length);
+    if (!ownedProjects.some((project) => project.id === projectId)) return back('Project labels must belong to this account’s workspace.');
+    const name = label(value);
+    if (!name) return back('Project names must be 1–80 characters, without control characters.');
+    projectNames.push({ id: projectId, name });
+  }
+  try {
+    await db.transaction(async (tx) => {
+      const taken = await tx.select({ id: users.id }).from(users)
+        .where(sql`lower(${users.username}) = ${username} and ${users.id} <> ${id}`).limit(1);
+      if (taken.length) throw new SecurityRefusal('That username is already in use.');
+      await tx.update(users).set({ username, displayName }).where(eq(users.id, id));
+      await tx.update(teams).set({ name: workspaceName }).where(eq(teams.id, workspace.id));
+      for (const project of projectNames) {
+        await tx.update(projects).set({ name: project.name })
+          .where(and(eq(projects.id, project.id), eq(projects.teamId, workspace.id)));
+      }
+      await criticalAudit(tx as unknown as Db, { teamId: workspace.id, actorId: actor.id, action: 'test_account_presentation_changed', subjectId: id });
+    });
+  } catch (error) {
+    if (error instanceof SecurityRefusal) return back(error.message);
+    return back('The names could not be saved. No partial changes were kept.');
+  }
+  logLine({ evt: 'admin', a: 'test_account_presentation_changed', u: actor.username, target: username });
+  return back('Names saved. Sign-in, access, workspace links and agent connections are unchanged.', true);
+});
+
 adminRoutes.post('/admin/users/:id/test-access', async (c) => {
   const actor = c.get('user')!;
   const db = c.get('db');
@@ -3120,6 +3173,10 @@ adminRoutes.get('/admin/users/:id', async (c) => {
     : reviewAccessRefusal(account, { operator: listedOperator(env, account), twoFactor: env.twoFactor });
   const suggestedLastDay = new Date(Date.now() + 29 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
   const latestLastDay = new Date(Date.now() + REVIEW_ACCESS_MAX_DAYS * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const testWorkspace = workspaceRows.find((row) => row.team.id === account.testWorkspaceId)?.team;
+  const testProjects = account.isTest && testWorkspace
+    ? await db.select().from(projects).where(eq(projects.teamId, testWorkspace.id)).orderBy(projects.name)
+    : [];
 
   return c.html(
     <AppLayout user={actor} active="admin" title={`Admin — ${account.username}`}>
@@ -3168,6 +3225,15 @@ adminRoutes.get('/admin/users/:id', async (c) => {
         </form>
         <form class="inline" method="post" action={`/admin/users/${account.id}/test-access`} data-confirm="Disable this test account and revoke every browser session and agent credential?"><input type="hidden" name="action" value="disable" /><button class="btn btn-danger" type="submit">Disable test account</button></form>
         <form class="inline" method="post" action={`/admin/users/${account.id}/test-access`} data-confirm="Generate a new password? The current password stops working; every browser session and agent credential is revoked."><input type="hidden" name="action" value="rotate" /><button class="btn" type="submit">Generate new test password</button></form>
+        {testWorkspace ? <form method="post" action={`/admin/users/${account.id}/test-presentation`} style="margin-top:20px">
+          <div class="card-title">Presentation names</div>
+          <p class="small muted">Name the person, workspace and projects independently. This changes their visible names, not sign-in, access, expiry, stable links or existing connections.</p>
+          <label class="field"><span>Username</span><input class="in" name="username" value={account.username} minLength={3} maxLength={32} pattern="[a-z][a-z0-9-]{2,31}" required /></label>
+          <label class="field"><span>Account display name</span><input class="in" name="display_name" value={account.displayName ?? account.username} maxLength={80} required /></label>
+          <label class="field"><span>Workspace name</span><input class="in" name="workspace_name" value={testWorkspace.name} maxLength={80} required /></label>
+          {testProjects.map((project) => <label class="field"><span>Project name · {project.slug}</span><input class="in" name={`project_name_${project.id}`} value={project.name} maxLength={80} required /></label>)}
+          <button class="btn" type="submit">Save presentation names</button>
+        </form> : null}
       </div> : null}
 
       {!account.isTest ? <div class="card card-pad" style="margin-top:14px" id="review-access">

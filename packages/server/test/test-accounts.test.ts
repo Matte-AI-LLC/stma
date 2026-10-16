@@ -104,6 +104,41 @@ it('cannot be created by a visitor or ordinary user, nor through ordinary signup
   expect((await post('/admin/test-accounts', { name: 'cross-origin', last_day: day(1) }, operatorCookie, { origin: 'https://untrusted.example' })).status).toBe(403);
 });
 
+it('keeps test identity details on Account and operator pages, not the working console', async () => {
+  const account = await create('quiet-console');
+  const sid = cookie(await login(account.email!, account.password));
+  const [workspace] = await srv.db.select().from(teams).where(eq(teams.id, account.testWorkspaceId!));
+  expect(workspace).toBeTruthy();
+  for (const path of [
+    '/app',
+    `/app/teams/${workspace!.slug}`,
+    `/app/agents?team=${workspace!.slug}`,
+    `/app/teams/${workspace!.slug}/connections`,
+    '/app/notifications',
+  ]) {
+    const res = await get(path, sid);
+    expect(res.status, path).toBe(200);
+    const page = await res.text();
+    expect(page, path).not.toContain('>Test account<');
+    expect(page, path).not.toContain('Password-only access through');
+    expect(page, path).not.toContain('Use synthetic data only.');
+  }
+  const settings = await (await get('/app/account', sid)).text();
+  expect(settings).toContain('<div class="card-title">Test account</div>');
+  expect(settings).toContain(`through ${day(7)} (UTC)`);
+  expect(settings).toContain('Use synthetic data only.');
+  expect(settings).toContain('synthetic sign-in address, not a mailbox');
+  const operator = await (await get(`/admin/users/${account.id}`, operatorCookie)).text();
+  expect(operator).toContain('Test account · no mailbox');
+  expect(operator).toContain(`through ${day(7)} UTC`);
+  expect(operator).toContain('Disable test account');
+  const [unchanged] = await srv.db.select().from(users).where(eq(users.id, account.id));
+  expect(unchanged!.isTest).toBe(true);
+  expect(unchanged!.emailVerifiedAt).toBeNull();
+  expect(unchanged!.testWorkspaceId).toBe(account.testWorkspaceId);
+  expect(unchanged!.reviewAccessUntil).toEqual(account.reviewAccessUntil);
+});
+
 it('rolls back account/workspace creation and credential changes when the audit refuses', async () => {
   const account = await create('atomic');
   const sid = cookie(await login(account.email!, account.password, '9'));
@@ -118,6 +153,81 @@ it('rolls back account/workspace creation and credential changes when the audit 
     expect((await get('/app/account', sid)).status).toBe(200);
     expect((await mcp(active.token)).status).toBe(200);
   } finally { refuseAudit = false; }
+});
+
+it('lets the operator name the person, workspace and project independently without reconnecting', async () => {
+  const account = await create('presentation');
+  const sid = cookie(await login(account.email!, account.password, '10'));
+  const active = await connection(account);
+  const [workspace] = await srv.db.select().from(teams).where(eq(teams.id, account.testWorkspaceId!));
+  const [project] = await srv.db.insert(projects).values({ teamId: workspace!.id, name: 'parcel-desk-demo', slug: 'parcel-desk-demo', repositoryIdentity: 'github.com/example/parcel-desk' }).returning();
+  const fields = { username: 'alex-morgan', display_name: 'Alex Morgan', workspace_name: 'Northstar', [`project_name_${project!.id}`]: 'Parcel Desk', email: 'ignored@example.com', is_test: 'false' };
+  const response = await post(`/admin/users/${account.id}/test-presentation`, fields, operatorCookie);
+  expect(where(response)).toContain('ok=Names saved');
+  const { password: _password, ...stored } = account;
+  const [after] = await srv.db.select().from(users).where(eq(users.id, account.id));
+  expect(after).toEqual({ ...stored, username: 'alex-morgan', displayName: 'Alex Morgan' });
+  expect(await srv.db.select().from(teams).where(eq(teams.id, workspace!.id))).toEqual([{ ...workspace!, name: 'Northstar' }]);
+  expect(await srv.db.select().from(projects).where(eq(projects.id, project!.id))).toEqual([{ ...project!, name: 'Parcel Desk' }]);
+  const page = await (await get(`/app/teams/${workspace!.slug}/projects/${project!.slug}`, sid)).text();
+  expect(page).toContain('Alex Morgan');
+  expect(page).toContain('owner · Northstar');
+  expect(page).toContain('Parcel Desk');
+  expect(page).not.toContain('>Test account<');
+  expect(page).not.toContain('>demo-presentation<');
+  expect((await get('/app/account', sid)).status).toBe(200);
+  expect((await mcp(active.token)).status).toBe(200);
+  expect(where(await login(account.email!, account.password, '10'))).toBe('/app');
+  expect(await testAccountAvailable(srv.db, after!)).toBe(true);
+  const operator = await (await get(`/admin/users/${account.id}`, operatorCookie)).text();
+  expect(operator).toContain('Save presentation names');
+  expect(operator).toContain(`name="project_name_${project!.id}"`);
+});
+
+it('keeps presentation changes operator-only, same-origin and limited to test identities', async () => {
+  const account = await create('presentation-gate');
+  const sid = cookie(await login(account.email!, account.password, '11'));
+  const ordinary = await post('/auth/dev', { username: 'ordinary-presentation' });
+  const fields = { username: 'new-person', display_name: 'New Person', workspace_name: 'New Workspace' };
+  const route = `/admin/users/${account.id}/test-presentation`;
+  for (const session of ['', sid, cookie(ordinary)]) expect((await post(route, fields, session)).status).toBe(404);
+  expect((await post(route, fields, operatorCookie, { origin: 'https://untrusted.example' })).status).toBe(403);
+  const [normal] = await srv.db.select().from(users).where(eq(users.username, 'ordinary-presentation'));
+  expect((await post(`/admin/users/${normal!.id}/test-presentation`, fields, operatorCookie)).status).toBe(404);
+  expect((await post('/admin/users/not-an-id/test-presentation', fields, operatorCookie)).status).toBe(404);
+  expect((await srv.db.select().from(users).where(eq(users.id, account.id)))[0]!.username).toBe(account.username);
+});
+
+it('rejects reserved, duplicate, malformed and foreign presentation names atomically', async () => {
+  const account = await create('presentation-validation');
+  const [workspace] = await srv.db.select().from(teams).where(eq(teams.id, account.testWorkspaceId!));
+  const [foreign] = await srv.db.insert(teams).values({ name: 'Other', slug: 'presentation-other' }).returning();
+  const [foreignProject] = await srv.db.insert(projects).values({ teamId: foreign!.id, name: 'Other project', slug: 'other-project' }).returning();
+  await post('/auth/dev', { username: 'TakenName' });
+  const route = `/admin/users/${account.id}/test-presentation`;
+  const fields = { username: 'presentation-person', display_name: 'Person', workspace_name: 'Company' };
+  for (const invalid of [
+    { username: 'ops' }, { username: 'TAKENNAME' }, { username: '../invalid' },
+    { display_name: '' }, { workspace_name: 'x'.repeat(81) }, { display_name: 'line\nbreak' },
+    { [`project_name_${foreignProject!.id}`]: 'Hijacked' },
+  ]) expect(where(await post(route, { ...fields, ...invalid }, operatorCookie))).toContain('error=');
+  expect((await srv.db.select().from(users).where(eq(users.id, account.id)))[0]!.username).toBe(account.username);
+  expect((await srv.db.select().from(teams).where(eq(teams.id, workspace!.id)))[0]).toEqual(workspace);
+  expect((await srv.db.select().from(projects).where(eq(projects.id, foreignProject!.id)))[0]).toEqual(foreignProject);
+});
+
+it('rolls back all presentation names if the critical audit refuses', async () => {
+  const account = await create('presentation-atomic');
+  const [workspace] = await srv.db.select().from(teams).where(eq(teams.id, account.testWorkspaceId!));
+  const [project] = await srv.db.insert(projects).values({ teamId: workspace!.id, name: 'Before', slug: 'before' }).returning();
+  refuseAudit = true;
+  try {
+    const fields = { username: 'after-person', display_name: 'After Person', workspace_name: 'After Workspace', [`project_name_${project!.id}`]: 'After project' };
+    expect(where(await post(`/admin/users/${account.id}/test-presentation`, fields, operatorCookie))).toContain('Test audit refused');
+  } finally { refuseAudit = false; }
+  expect((await srv.db.select().from(users).where(eq(users.id, account.id)))[0]!.username).toBe(account.username);
+  expect((await srv.db.select().from(teams).where(eq(teams.id, workspace!.id)))[0]).toEqual(workspace);
+  expect((await srv.db.select().from(projects).where(eq(projects.id, project!.id)))[0]).toEqual(project);
 });
 
 it('validates the expiry, reserved names and duplicates without leaving partial workspaces', async () => {

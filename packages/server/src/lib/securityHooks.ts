@@ -31,6 +31,7 @@ export const CRITICAL_AUDIT_ACTIONS = [
   'membership_joined',
   'test_account_created',
   'test_account_access_changed',
+  'test_account_presentation_changed',
   'policy_published',
   'knowledge_published',
   'knowledge_archived',

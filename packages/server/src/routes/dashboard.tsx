@@ -123,7 +123,7 @@ import {
 import { isSafeWebhookUrl } from '../lib/notify';
 import { notifyJoinRefused, notifyMemberJoined, notifyTeamJoined } from '../lib/notifications';
 import { fmtDate, initials, timeAgo } from '../lib/format';
-import { REVIEW_ACCOUNT_LOCKED, reviewAccessActive } from '../lib/reviewAccess';
+import { REVIEW_ACCOUNT_LOCKED, reviewAccessActive, reviewAccessLastDay } from '../lib/reviewAccess';
 import { TEST_ACCOUNT_LOCKED } from '../lib/testAccounts';
 import { ensureRail, workspaceCounters } from '../lib/rail';
 import { connectionsHref } from '../lib/scope';
@@ -3901,7 +3901,21 @@ const AccountPage = (props: {
         </form>
       </div>
 
-      {user.isTest ? <div class="card card-pad"><div class="card-title">Operator-managed test identity</div><div class="card-note">{user.email} is a synthetic sign-in address, not a mailbox. Ask the operator to renew access or generate a new password. Email recovery and self-service identity changes are unavailable.</div></div> : null}
+      {user.isTest ? (
+        <div class="card card-pad">
+          <div class="card-title">Test account</div>
+          <p class="card-note">
+            Operator-managed test identity. Password-only access through{' '}
+            {user.reviewAccessUntil ? reviewAccessLastDay(user.reviewAccessUntil) : '—'} (UTC).
+            {' '}Use synthetic data only.
+          </p>
+          <div class="card-note">
+            {user.email} is a synthetic sign-in address, not a mailbox. Ask the operator to renew
+            access or generate a new password. Email recovery and self-service identity changes
+            are unavailable.
+          </div>
+        </div>
+      ) : null}
 
       {support && !user.isTest ? (
         <div class="card card-pad">

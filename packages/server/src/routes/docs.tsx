@@ -1910,6 +1910,10 @@ docsRoutes.get('/docs', (c) => {
               cannot be an operator or join another workspace, and expiry stops browser and agent
               access. Ask the operator to renew access or rotate the password; either action
               revokes old sessions and agent credentials. Save the password privately, never in Git.
+              {' '}Test status and the access end date remain in Account settings and the
+              operator's user page, not in a banner across workspace or agent-map screens.
+              {' '}The operator can use <b>Presentation names</b> to name the person, workspace
+              and projects separately without changing sign-in, stable links or agent connections.
             </p>
             <p>
               The <b>Test</b> on your workspace's Agent connections page resumes your first-agent →

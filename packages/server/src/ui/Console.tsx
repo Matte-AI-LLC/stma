@@ -1,6 +1,5 @@
 import type { Child } from 'hono/jsx';
 import { initials } from '../lib/format';
-import { reviewAccessLastDay } from '../lib/reviewAccess';
 import { EMPTY_RAIL, type RailCounts } from '../lib/rail';
 import { connectionsHref, sectionHref } from '../lib/scope';
 import type { User } from '../types';
@@ -189,8 +188,8 @@ export const ScopeBar = ({ user }: { user: User }) => {
           fleet lives: its pages sit behind the name, not in the rail. */}
       <details class="scope-pick scope-me">
         <summary class="scope-at" title="Your account">
-          <span class="avatar light">{initials(user.username)}</span>
-          {user.username}
+          <span class="avatar light">{initials(user.displayName || user.username)}</span>
+          {user.displayName || user.username}
           <span class="caret">▾</span>
         </summary>
         <div class="scope-menu right">
@@ -491,15 +490,15 @@ export const Rail = ({ user, active }: { user: User; active?: RailKey }) => {
             place the fleet lives. The role under it is where you check your own
             authority in the workspace on screen. */}
         <a class="railme" href="/app/account" title="Account">
-          <span class="avatar">{initials(user.username)}</span>
+          <span class="avatar">{initials(user.displayName || user.username)}</span>
           <div class="rail-who">
-            <div class="n">{user.username}</div>
+            <div class="n">{user.displayName || user.username}</div>
             <div class="r">
               {rail.scope === 'account'
                 ? rail.teams > 0
                   ? `${rail.teams} workspace${rail.teams === 1 ? '' : 's'}`
                   : 'no workspace yet'
-                : `${rail.role ? `${rail.role} · ` : ''}${rail.team ?? 'no workspace yet'}`}
+                : `${rail.role ? `${rail.role} · ` : ''}${rail.list.find((team) => team.slug === rail.team)?.name ?? rail.team ?? 'no workspace yet'}`}
             </div>
           </div>
         </a>
@@ -844,7 +843,6 @@ export const ConsoleShell = ({
     <Rail user={user} active={active} />
     <div class="frame">
       <ScopeBar user={user} />
-      {user.isTest ? <div class="band2 band-warn" role="status" data-keep="true"><span class="tag">Test account</span><span>Use synthetic data only. Password-only access through {user.reviewAccessUntil ? reviewAccessLastDay(user.reviewAccessUntil) : '—'} (UTC). Managed by an operator.</span></div> : null}
       {/*
        * Above the page's own band, because it is about the account rather than
        * about this page, and because the page below it may be a redirect target

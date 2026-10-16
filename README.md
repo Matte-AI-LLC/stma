@@ -789,6 +789,11 @@ remain agent reports beside provider facts, never a fabricated approval. See [Pr
   the account can never be an operator or join another workspace. The operator can renew, disable
   or rotate its password; each action revokes its old browser sessions, agent credentials and
   unused connection codes. Expiry also blocks existing browser/API access and OAuth refresh.
+  Account settings and the operator's user page show its test status and access end date;
+  working screens, including the agent map, have no test-account banner.
+  The operator can separately name the person, workspace and projects under **Presentation
+  names**. This preserves sign-in, expiry, stable URLs and existing agent connections; account
+  menus use the person's display name and the workspace's readable name.
   Save the once-shown password privately, never in a repository. Use synthetic data only.
 - **Operator history** — the same console also answers *what happened*, not only what is happening.
   **Load history** on `/admin/ops` is a persisted five-minute rollup (requests, status mix, latency

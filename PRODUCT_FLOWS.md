@@ -260,7 +260,14 @@ Authorization invariants:
   and cannot self-change its sign-in identity or use email recovery. Its short browser session,
   MCP/API calls, enrollment redemption and OAuth refresh all enforce its expiry. Renew, disable
   and password rotation invalidate old sessions, tokens, installations and pending connection
-  codes; renewing never revives old credentials. The console labels it as a test account. Its
+  codes; renewing never revives old credentials. Account settings and the operator's user page
+  identify it as a test account and show its access end date; workspace, map and other working
+  screens use the normal console without an account-wide test banner. **Presentation names** on
+  the operator's user page independently updates the username, display name, dedicated workspace
+  name and that workspace's project names in one audited transaction. Reserved or duplicate
+  usernames and foreign projects are refused. Email, password, test flag, expiry, IDs, slugs,
+  repository identities and active connections do not change. The console uses display names
+  with username fallback and readable workspace names. Its
   workspace is deliberately not pre-seeded: record real onboarding and real agent behavior with
   synthetic project data. Revocation ends STMA access, not local agent processes.
 - **An emailed code never reaches the operator log.** Each code email puts its six digits in the
