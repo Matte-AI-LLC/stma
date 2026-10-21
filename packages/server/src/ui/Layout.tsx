@@ -11,7 +11,16 @@ export { Logo };
 export const SITE_DESCRIPTION =
   'STMA is mission control for your team\'s coding agents: a live map of every agent run, a warning before two agents touch the same file, your rules in every session, work handed over at the exact commit, and evidence a reviewer can check.';
 
-export const Head = ({ title, description }: { title?: string; description?: string }) => (
+export const Head = ({
+  title,
+  description,
+  themeColor = '#fbfbf9',
+}: {
+  title?: string;
+  description?: string;
+  /** The browser chrome's colour; a dark page says so, or the address bar stays pale. */
+  themeColor?: string;
+}) => (
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -20,7 +29,7 @@ export const Head = ({ title, description }: { title?: string; description?: str
     <meta property="og:title" content={title ? `${title} · STMA` : "STMA · Mission control for your team's coding agents"} />
     <meta property="og:description" content={description ?? SITE_DESCRIPTION} />
     <meta property="og:site_name" content="STMA · Speak to my Agent" />
-    <meta name="theme-color" content="#fbfbf9" />
+    <meta name="theme-color" content={themeColor} />
     {/* The console must render on restricted/offline networks: no third-party
         font stylesheet. The faces come from this origin (ui/assets.ts). */}
     <link rel="icon" type="image/svg+xml" href={FAVICON_URL} />

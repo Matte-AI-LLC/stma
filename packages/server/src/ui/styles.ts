@@ -493,6 +493,7 @@ dialog.confirm p { margin: 0 0 16px; color: var(--txt-2); }
 .site-foot { padding: 56px 0 28px; border-top: 1px solid var(--line-3); background: #fff; }
 .site-foot-inner { display: flex; align-items: center; justify-content: space-between; gap: 16px; font: 400 13px/1 var(--sans); color: var(--mut); }
 .foot-grid { display: grid; grid-template-columns: minmax(0, 1.6fr) repeat(3, minmax(0, 1fr)); gap: 32px; }
+.foot-grid.cols-4 { grid-template-columns: minmax(0, 1.6fr) repeat(4, minmax(0, 1fr)); }
 .foot-brand { display: flex; flex-direction: column; gap: 14px; }
 .foot-brand p { margin: 0; max-width: 40ch; font: 400 13px/1.6 var(--sans); color: var(--txt-3); }
 .foot-col { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
@@ -505,8 +506,8 @@ dialog.confirm p { margin: 0 0 16px; color: var(--txt-2); }
   display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap;
   font: 400 12px/1 var(--sans); color: var(--mut);
 }
-@media (max-width: 860px) { .foot-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .foot-brand { grid-column: 1 / -1; } }
-@media (max-width: 480px) { .foot-grid { grid-template-columns: 1fr; } }
+@media (max-width: 860px) { .foot-grid, .foot-grid.cols-4 { grid-template-columns: repeat(2, minmax(0, 1fr)); } .foot-brand { grid-column: 1 / -1; } }
+@media (max-width: 480px) { .foot-grid, .foot-grid.cols-4 { grid-template-columns: 1fr; } }
 
 /* ---------- auth ---------- */
 /* The same ground as the landing page, quieter: arriving at a sign-in card from

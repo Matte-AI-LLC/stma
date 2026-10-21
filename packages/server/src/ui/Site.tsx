@@ -87,11 +87,20 @@ export function siteInfo(c: Context<AppEnv>): SiteInfo {
 export function siteDoor(site: SiteInfo): { href: string; short: string; long: string } | undefined {
   if (site.user) return undefined;
   if (site.codeDoor) return { href: '/signup', short: 'Get access', long: 'I have an access code' };
-  if (site.signupsOpen && !site.teaser) return { href: '/signup', short: 'Get started', long: 'Get started free' };
+  if (site.signupsOpen && !site.teaser) return { href: '/signup', short: 'Get started free', long: 'Get started free' };
   return undefined;
 }
 
-export const SiteHeader = ({ site, active }: { site: SiteInfo; active?: 'docs' | 'help' | 'pricing' | 'legal' }) => {
+export const SiteHeader = ({
+  site,
+  active,
+  landing,
+}: {
+  site: SiteInfo;
+  active?: 'docs' | 'help' | 'pricing' | 'legal';
+  /** The landing page: the links are its own sections, in the order it reads. */
+  landing?: boolean;
+}) => {
   const door = siteDoor(site);
   const on = (key: typeof active) => (key === active ? 'plain on' : 'plain');
   return (
@@ -102,23 +111,47 @@ export const SiteHeader = ({ site, active }: { site: SiteInfo; active?: 'docs' |
           Speak to my Agent
         </a>
         <nav class="site-nav" aria-label="Site">
-          <a class="plain wide-only" href="/#product">
-            Product
-          </a>
-          <a class="plain wide-only" href="/#security">
-            Security
-          </a>
-          <a class={on('docs')} href="/docs">
-            Docs
-          </a>
-          <a class={`${on('help')} wide-only`} href="/help">
-            Help
-          </a>
-          {site.pricing ? (
-            <a class={`${on('pricing')} wide-only`} href="/pricing">
-              Pricing
-            </a>
-          ) : null}
+          {landing ? (
+            <>
+              <a class="plain wide-only" href="#how">
+                How it works
+              </a>
+              <a class="plain wide-only" href="#integrations">
+                Integrations
+              </a>
+              <a class="plain wide-only" href="#security">
+                Security
+              </a>
+              {/* The page has its own Pricing section, so the link is always
+                  there; where billing is composed the real page is better. */}
+              <a class="plain wide-only" href={site.pricing ? '/pricing' : '#pricing'}>
+                Pricing
+              </a>
+              <a class="plain" href="/docs">
+                Docs
+              </a>
+            </>
+          ) : (
+            <>
+              <a class="plain wide-only" href="/#product">
+                Product
+              </a>
+              <a class="plain wide-only" href="/#security">
+                Security
+              </a>
+              <a class={on('docs')} href="/docs">
+                Docs
+              </a>
+              <a class={`${on('help')} wide-only`} href="/help">
+                Help
+              </a>
+              {site.pricing ? (
+                <a class={`${on('pricing')} wide-only`} href="/pricing">
+                  Pricing
+                </a>
+              ) : null}
+            </>
+          )}
           {site.user ? (
             <a class="btn btn-sm btn-primary" href="/app">
               Open console
@@ -139,56 +172,60 @@ export const SiteHeader = ({ site, active }: { site: SiteInfo; active?: 'docs' |
   );
 };
 
-export const SiteFooter = ({ site }: { site: SiteInfo }) => (
-  <footer class="site-foot">
-    <div class="container">
-      <div class="foot-grid">
-        <div class="foot-brand">
-          <a class="brand" href="/">
-            <Logo />
-            Speak to my Agent
-          </a>
-          <p>
-            Mission control for your team's coding agents: see every run, warn agents before they
-            share ground, give them the team's rules, hand work over at the exact commit, and keep
-            the record of what each one reported and what was observed.
-          </p>
-        </div>
-        <nav class="foot-col" aria-label="Product">
-          <h5>Product</h5>
-          <a href="/#product">Overview</a>
-          <a href="/docs">Documentation</a>
-          <a href="/help">Help &amp; troubleshooting</a>
-          {site.pricing ? <a href="/pricing">Pricing</a> : null}
-          <a href="/#security">Security</a>
-        </nav>
-        <nav class="foot-col" aria-label="Legal">
-          <h5>Legal</h5>
-          <a href="/terms">Terms of Service</a>
-          <a href="/privacy">Privacy Policy</a>
-          {site.privacy ? <a href="/privacy#rights">GDPR &amp; KVKK requests</a> : null}
-        </nav>
-        {site.support || site.privacy ? (
-          <nav class="foot-col" aria-label="Contact">
-            <h5>Contact</h5>
-            {/* Before Terms in the old footer, because somebody reading a footer
-                in trouble is looking for this one; its own column now. */}
-            {site.support ? <Mail to={site.support} label="Support" /> : null}
-            {site.support ? <NoScan><span class="foot-addr">{site.support}</span></NoScan> : null}
-            {site.privacy ? <Mail to={site.privacy} label="Data protection" /> : null}
-            {site.privacy ? <NoScan><span class="foot-addr">{site.privacy}</span></NoScan> : null}
+export const SiteFooter = ({ site }: { site: SiteInfo }) => {
+  const contact = Boolean(site.support || site.privacy);
+  return (
+    <footer class="site-foot">
+      <div class="container">
+        <div class={`foot-grid${contact ? ' cols-4' : ''}`}>
+          <div class="foot-brand">
+            <a class="brand" href="/">
+              <Logo />
+              Speak to my Agent
+            </a>
+            <p>Mission control for your team's coding agents.</p>
+          </div>
+          <nav class="foot-col" aria-label="Product">
+            <h5>Product</h5>
+            <a href="/#product">Overview</a>
+            <a href="/#how">How it works</a>
+            <a href="/#integrations">Integrations</a>
+            <a href="/#security">Security</a>
+            <a href={site.pricing ? '/pricing' : '/#pricing'}>Pricing</a>
           </nav>
-        ) : null}
+          <nav class="foot-col" aria-label="Docs">
+            <h5>Docs</h5>
+            <a href="/docs">Documentation</a>
+            <a href="/help">Help &amp; troubleshooting</a>
+          </nav>
+          <nav class="foot-col" aria-label="Legal">
+            <h5>Legal</h5>
+            <a href="/terms">Terms of Service</a>
+            <a href="/privacy">Privacy Policy</a>
+            {site.privacy ? <a href="/privacy#rights">GDPR &amp; KVKK requests</a> : null}
+          </nav>
+          {contact ? (
+            <nav class="foot-col" aria-label="Contact">
+              <h5>Contact</h5>
+              {/* Before Terms in the old footer, because somebody reading a footer
+                  in trouble is looking for this one; its own column now. */}
+              {site.support ? <Mail to={site.support} label="Support" /> : null}
+              {site.support ? <NoScan><span class="foot-addr">{site.support}</span></NoScan> : null}
+              {site.privacy ? <Mail to={site.privacy} label="Data protection" /> : null}
+              {site.privacy ? <NoScan><span class="foot-addr">{site.privacy}</span></NoScan> : null}
+            </nav>
+          ) : null}
+        </div>
+        <div class="foot-base">
+          <span>© 2026 Matte AI LLC</span>
+          <span>
+            {site.beta ? `${site.beta === 'public' ? 'Public' : 'Private'} beta · ` : ''}v{VERSION}
+          </span>
+        </div>
       </div>
-      <div class="foot-base">
-        <span>© 2026 Matte AI LLC</span>
-        <span>
-          {site.beta ? `${site.beta === 'public' ? 'Public' : 'Private'} beta · ` : ''}v{VERSION}
-        </span>
-      </div>
-    </div>
-  </footer>
-);
+    </footer>
+  );
+};
 
 /** A whole signed-out page: head, site header, the page's own content, footer. */
 export const SitePage = ({

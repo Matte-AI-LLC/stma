@@ -4,6 +4,7 @@ import path from 'node:path';
 import { afterAll, beforeAll, expect, it } from 'vitest';
 import { loadEnv } from '../src/env';
 import { startServer, type StartedServer } from '../src/server';
+import { LX_TAB_KEYS } from '../src/ui/siteStyles';
 
 /**
  * The pictures: the system diagram on /docs, the visual agent map, and the
@@ -501,24 +502,68 @@ it('says what the product is now, and offers no door that is not there', async (
   // The scope is the whole operation, not two agents comparing notes.
   expect(html).toContain('AgentOps');
   expect(html).not.toContain('Let your agents compare notes');
-  // The six pillars, each named by the verb the console uses for it.
-  for (const verb of ['See', 'Coordinate', 'Govern', 'Dispatch', 'Reproduce', 'Prove']) {
-    expect(html, `the landing page must carry the ${verb} pillar`).toContain(`· ${verb}</span>`);
-  }
   // The product is drawn, not described: the mock is the console's own shapes.
   expect(html).toContain('class="lx-window"');
   expect(html).toContain('class="lxg"');
   // Self-hosting needs no invitation, and the command is on the page.
   expect(html).toContain('npx @matteai/stma serve');
-  // This instance has no managed billing composed, so it sells nothing.
+  // This instance has no managed billing composed, so it sells nothing: the
+  // header and footer point at the page's own Pricing section, never at /pricing.
   expect(html).not.toContain('href="/pricing"');
+  expect(html).toContain('href="#pricing"');
   // The headline is the platform, not one of its features (owner's decision,
-  // 2026-09-27): handing work over is described under Dispatch.
+  // 2026-09-27); handing work over is one of the exchanges further down.
   expect(html).toContain('Mission control for your <em>team&#39;s coding agents.</em>');
   expect(html).not.toContain('without explaining it again.</em>');
-  expect(html).toContain('so nobody has to explain the task again');
   // No em dash anywhere on the page a stranger reads first (owner's word, same day).
   expect(html, 'the landing page must not carry an em dash').not.toContain('—');
+  // The licence is "source-available under the Elastic License 2.0, free to
+  // self-host", never open source or open-core (ELv2 limits one use).
+  expect(html).toContain('Elastic License 2.0');
+  expect(html).not.toMatch(/open[- ]source|open-core/i);
+});
+
+it('draws the homepage design: dark, in standards mode, every section reachable from the header', async () => {
+  const html = await (await fetch(`${srv.url}/`)).text();
+  // The design was made in standards mode; the product's other pages have no
+  // doctype, so this is the one that says so. Without it a browser lays the
+  // page out in quirks mode and every heading sits a few pixels off its design.
+  expect(html.startsWith('<!DOCTYPE html>')).toBe(true);
+  expect(html).toContain('name="theme-color" content="#0f1214"');
+  // The section ids the header and the footer link to.
+  for (const id of ['coordinate', 'product', 'how', 'integrations', 'security', 'pricing']) {
+    expect(html, `section #${id}`).toContain(`id="${id}"`);
+  }
+  for (const href of ['#how', '#integrations', '#security']) {
+    expect(html, `header link ${href}`).toContain(`class="plain wide-only" href="${href}"`);
+  }
+  // The collision, from both agents' side, in the messages the server sends.
+  expect(html).toContain('You were first, so you keep the right of way');
+  expect(html).toContain('STMA stopped this file edit: work_conflict.');
+  expect(html).toContain('The ground to leave alone is');
+  // What is read from and written to each tracker, one row per provider.
+  for (const provider of ['GitHub', 'Jira', 'ClickUp', 'Azure DevOps', 'Slack, Discord, email']) {
+    expect(html, provider).toContain(`<b>${provider}</b>`);
+  }
+  expect(html).toContain('Nothing. The connection is read-only.');
+});
+
+it('switches the feature exchanges without script: one radio and one rule per tab', async () => {
+  const html = await (await fetch(`${srv.url}/`)).text();
+  const cssUrl = /href="(\/style\.[0-9a-f]{10}\.css)"/.exec(html)?.[1]!;
+  const css = await (await fetch(`${srv.url}${cssUrl}`)).text();
+  const inputs = [...html.matchAll(/<input class="lx-tab-in" type="radio" name="lx-tab" id="lxt-([a-z]+)"/g)].map((m) => m[1]!);
+  // Every tab has a radio, a label that points at it and a panel, and the
+  // stylesheet has the sibling rules that make the pair work; the first is on.
+  expect(inputs).toEqual([...LX_TAB_KEYS]);
+  expect(html.match(/<input class="lx-tab-in"[^>]*checked/g)?.length).toBe(1);
+  for (const key of inputs) {
+    expect(html, `label for ${key}`).toContain(`for="lxt-${key}"`);
+    expect(html, `panel ${key}`).toContain(`lx-panel p-${key}`);
+    expect(css, `rule for ${key}`).toContain(`#lxt-${key}:checked ~ .lx-panels .p-${key}`);
+  }
+  // Script off must still leave one exchange showing, and it is the first.
+  expect(css).toContain('.lx-panel { display: none; }');
 });
 
 it('serves the stylesheet from a URL that changes when the stylesheet does', async () => {
