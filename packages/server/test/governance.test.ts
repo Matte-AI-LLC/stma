@@ -432,6 +432,14 @@ describe('governance page', () => {
     expect(owner.html).toContain('No preflight has run yet');
     expect(owner.html).toContain('No runs recorded yet');
 
+    // Every fold card's count is the same component beside its toggle. As a
+    // bare span between the text and the toggle, `space-between` put it in the
+    // middle of whatever width the note left: six cards, six places, all tiny.
+    expect(owner.html.match(/class="fold-count zero">0</g)?.length).toBe(6);
+    expect(owner.html).not.toContain('<span class="mono muted">0</span>');
+    // The page's copy carries no em dash; a cell with no value still shows one.
+    expect(owner.html).not.toMatch(/[a-z] — [a-z]/);
+
     // Both used to be "run this in a terminal", which put the team's rulebook
     // behind a CLI the rest of the team may not have installed.
     // Policy moved from a modal to its own page — eight lists and a consequence
@@ -811,8 +819,8 @@ describe('baseline from the UI', () => {
     const dialog = before.slice(before.indexOf('<dialog id="record-baseline"'));
     expect(dialog).toContain(`value="${repositoryProject!.id}"`);
     expect(dialog).toContain(`value="${legacyProject!.id}"`);
-    expect(dialog).toContain('duplicate-api — repository-bound');
-    expect(dialog).toContain('duplicate-api — duplicate-api-legacy');
+    expect(dialog).toContain('duplicate-api (repository-bound)');
+    expect(dialog).toContain('duplicate-api (duplicate-api-legacy)');
 
     const response = await post('/app/teams/bare-team/baseline', ownerJar, {
       snapshot: snapshot!.id,

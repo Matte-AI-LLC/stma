@@ -1240,9 +1240,9 @@ export function registerFleetTools(
   server.registerTool(
     'get_policy',
     {
-      title: 'Pull the rules you must follow',
+      title: 'Get the team policy',
       description:
-        'The effective policy for this team and project: protected paths you must not touch without asking, required review, commit conventions, expected runtimes and required environment variable names. Read it before you plan the work, not after you wrote it.',
+        "Returns the effective policy for a team and project: the team's published policy merged with the project's additions. The document lists guidance, denied actions, actions that require approval, required checks, protected paths, required environment variable names, expected runtimes, the kinds of claimed work that need a person's agreement, and the change budget. Also returns the policy hash, the published versions it was merged from, and a note when nothing has been published and the values are defaults. start_run returns the same document for the run it starts.",
       inputSchema: { team: teamParam, project: projectParam },
     },
     async ({ team, project }) => {
@@ -1273,9 +1273,9 @@ export function registerFleetTools(
   server.registerTool(
     'get_workflow',
     {
-      title: 'Pull the delivery flow this team follows',
+      title: 'Get the delivery workflow',
       description:
-        'How work is supposed to move in this team: where a change starts (ticket or not), how branches are named, which checks must pass, how many approvals a PR needs, and the environments on the road to production. Read it BEFORE you create a branch — the flow decides these things, not you. Returns the structured document plus a prose brief you can follow directly.',
+        "Returns the team's published workflow for a project (the project's own, otherwise the team-wide one), including whether a change starts from a ticket, branch naming conventions, required checks, approval count, merge strategy and environments, as a structured document plus a prose summary. Also returns the CI pipeline path for the flow's provider and whether that pipeline is complete or still a scaffold, with what is missing from it. Returns flow: null when no workflow is published.",
       inputSchema: { team: teamParam, project: projectParam },
     },
     async ({ team, project }) => {

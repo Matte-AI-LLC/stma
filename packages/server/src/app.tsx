@@ -6,6 +6,7 @@ import type { Db } from './db';
 import type { Env } from './env';
 import { sessionUser } from './auth/session';
 import { errorFields, recordErrorEvent, safeErrorPath } from './lib/errors';
+import { withDoctype } from './lib/doctype';
 import { logLine } from './lib/log';
 import { metrics } from './lib/metrics';
 import { setHosted, setUnmetered, withEntitlements } from './lib/entitlements';
@@ -267,6 +268,8 @@ export function createApp(
       c.res.headers.set('strict-transport-security', 'max-age=31536000; includeSubDomains');
     }
   });
+
+  app.use('*', withDoctype);
 
   // Hashed URLs are what pages link to; the plain ones stay for HTML that was
   // already in a browser when this deploy landed.

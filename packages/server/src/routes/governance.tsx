@@ -26,6 +26,16 @@ import { AppLayout } from '../ui/Layout';
 
 export const governanceRoutes = new Hono<AppEnv>();
 
+/**
+ * A fold card's count. It sits beside the card's toggle at one size on every
+ * card: as a bare span between the text and the toggle, `space-between` put it
+ * in the middle of whatever width the note left, so six cards drew six numbers
+ * at six places.
+ */
+const FoldCount = ({ n, bad }: { n: number; bad?: boolean }) => (
+  <span class={`fold-count${n === 0 ? ' zero' : bad ? ' bad' : ''}`}>{n}</span>
+);
+
 /** Every list on this page is a bounded window — governance must never become a load source. */
 const RECEIPT_LIMIT = 25;
 const CHECK_LIMIT = 25;
@@ -274,7 +284,7 @@ const governancePage = async (c: Context<AppEnv>) => {
     const checks = checkCount[0]?.n ?? 0;
     const from = cheapestWith((l) => l.governance) ?? 'a paid';
     return c.html(
-      <AppLayout user={user} active="governance" title={`Governance — ${team.name}`}>
+      <AppLayout user={user} active="governance" title={`Governance · ${team.name}`}>
         <div class="card card-pad joincard">
           <span class="tile tile-44 tile-gray">§</span>
           <h2 class="title m0">Governance</h2>
@@ -315,6 +325,9 @@ const governancePage = async (c: Context<AppEnv>) => {
     : undefined;
   if (inPath && !scopeProject) return c.notFound();
   const scopeMissing = Boolean(projectQuery) && !scopeProject;
+  // The live map takes the scope as a filter; opened from inside a project it
+  // stays inside it, like every other link this page draws.
+  const liveMapHref = `/app/agents?team=${encodeURIComponent(team.slug)}${scopeProject ? `&project=${encodeURIComponent(scopeProject.slug)}` : ''}`;
   const scopeId = scopeProject?.id;
 
   const scopes = await policyScopes(db, team.id, SCOPE_LIMIT);
@@ -392,7 +405,7 @@ const governancePage = async (c: Context<AppEnv>) => {
     <AppLayout
       user={user}
       active="governance"
-      title={`Governance — ${team.name}`}
+      title={`Governance · ${team.name}`}
       strip={
         <>
           <Lead
@@ -453,9 +466,9 @@ const governancePage = async (c: Context<AppEnv>) => {
             path={sectionHref(team.slug, null, 'governance')}
             projects={teamProjects}
             current={scopeProject?.id ?? null}
-            allLabel="Global — whole team"
+            allLabel="Global: whole team"
           />
-          <a class="chip" href="/app/agents">
+          <a class="chip" href={liveMapHref}>
             agent map
           </a>
         </>
@@ -464,7 +477,7 @@ const governancePage = async (c: Context<AppEnv>) => {
         <PageHead
           trail={scopedTrail({ team, project: scopeProject }, 'Governance')}
           title="Governance"
-          sub="Whether the rules this team published actually reached the agents — policy, receipts, environment baselines and the run trail."
+          sub="Whether the rules this team published actually reached the agents: policy, receipts, environment baselines and the run trail."
           actions={
             <>
               <button
@@ -493,10 +506,10 @@ const governancePage = async (c: Context<AppEnv>) => {
                   </a>
                 </>
               ) : null}
-              <a class="btn btn-sm" href={`/app/teams/${team.slug}/activity`}>
+              <a class="btn btn-sm" href={sectionHref(team.slug, scopeProject?.slug ?? null, 'activity')}>
                 Activity
               </a>
-              <a class="btn btn-sm" href="/app/agents">
+              <a class="btn btn-sm" href={liveMapHref}>
                 Live agent map
               </a>
             </>
@@ -507,7 +520,7 @@ const governancePage = async (c: Context<AppEnv>) => {
         { k: 'D', label: 'drift is the first table' },
         { k: 'F', label: 'freeze' },
       ]}
-      keysNote="receipts are attestations — the CLI recomputes the hash it actually applied"
+      keysNote="receipts are attestations: the CLI recomputes the hash it actually applied"
     >
       <div data-autorefresh="30" style="display:none"></div>
       {failure ? (
@@ -523,7 +536,7 @@ const governancePage = async (c: Context<AppEnv>) => {
         <div class="banner banner-error">
           <span class="ic">!</span>
           <span>
-            No project called “{projectQuery}” in this team — showing the whole team instead.
+            No project called “{projectQuery}” in this team, so the whole team is shown instead.
           </span>
           <button class="x" type="button" data-dismiss="t">
             ×
@@ -613,7 +626,7 @@ const governancePage = async (c: Context<AppEnv>) => {
               {scopes.length >= SCOPE_LIMIT ? ` First ${SCOPE_LIMIT} scopes only.` : ''}
             </div>
           </div>
-          <span class="mono muted">{visibleScopes.length}</span>
+          <FoldCount n={visibleScopes.length} />
         </summary>
         {visibleScopes.length === 0 ? (
           <div class="empty">
@@ -631,7 +644,7 @@ const governancePage = async (c: Context<AppEnv>) => {
               </a>
             ) : (
               <p class="muted small">
-                Ask a team owner to publish one — only owners can write policy.
+                Ask a team owner to publish one; only owners can write policy.
               </p>
             )}
           </div>
@@ -752,11 +765,11 @@ const governancePage = async (c: Context<AppEnv>) => {
               Last {RECEIPT_LIMIT}.
             </div>
           </div>
-          <span class="mono muted">{receipts.length}</span>
+          <FoldCount n={receipts.length} />
         </summary>
         {receipts.length === 0 ? (
           <div class="card-pad muted small">
-            No receipts yet — one is written every time an agent starts a run, whether it calls
+            No receipts yet. One is written every time an agent starts a run, whether it calls{' '}
             <code>start_run</code> over MCP or runs <span class="mono">stma run start</span>.
           </div>
         ) : (
@@ -821,13 +834,13 @@ const governancePage = async (c: Context<AppEnv>) => {
               {baselines.length >= BASELINE_LIMIT ? ` Newest ${BASELINE_LIMIT} shown.` : ''}
             </div>
           </div>
-          <span class="mono muted">{baselines.length}</span>
+          <FoldCount n={baselines.length} />
         </summary>
         {baselines.length === 0 ? (
           <div class="empty">
             <h2>No baseline recorded</h2>
             <p>
-              Without a baseline a preflight can only check policy rules — it cannot tell an agent
+              Without a baseline a preflight can only check policy rules: it cannot tell an agent
               that this machine drifted from the one the project is known to build on.
             </p>
             {isOwner ? (
@@ -870,14 +883,14 @@ const governancePage = async (c: Context<AppEnv>) => {
             <div class="card-title">Preflight results</div>
             <div class="card-note">
               What each machine was told before it started work. Criticals first, then the most
-              recent — last {CHECK_LIMIT}.
+              recent. Last {CHECK_LIMIT}.
             </div>
           </div>
-          <span class="mono muted">{checks.length}</span>
+          <FoldCount n={checks.length} />
         </summary>
         {checks.length === 0 ? (
           <div class="card-pad muted small">
-            No preflight has run yet — an agent checks in with <code>check_environment</code>
+            No preflight has run yet. An agent checks in with <code>check_environment</code>{' '}
             over MCP, with <span class="mono">stma env preflight</span>, or automatically
             through its run wrapper.
           </div>
@@ -920,12 +933,12 @@ const governancePage = async (c: Context<AppEnv>) => {
             <div class="card-note">
               Content a published <code>content:</code> deny rule names. Two kinds, and they answer
               different questions: <b>stopped</b> is an edit the local file guard refused, and{' '}
-              <b>in the checkout</b> is what the end-of-run scan found there anyway — which is the
+              <b>in the checkout</b> is what the end-of-run scan found there anyway, which is the
               half a guard on one client's file tools can never see. Who, which rule, which file,
               never the content, which stays on the agent's machine. Last {VIOLATION_LIMIT}.
             </div>
           </div>
-          <span class={`mono ${violations.length > 0 ? 'bad' : 'muted'}`}>{violations.length}</span>
+          <FoldCount n={violations.length} bad />
         </summary>
         {violations.length === 0 ? (
           <div class="card-pad muted small">
@@ -1009,11 +1022,11 @@ const governancePage = async (c: Context<AppEnv>) => {
               {EVENT_LIMIT}.
             </div>
           </div>
-          <span class="mono muted">{events.length}</span>
+          <FoldCount n={events.length} />
         </summary>
         {events.length === 0 ? (
           <div class="card-pad muted small">
-            No runs recorded yet — ask an agent to call <code>start_run</code>. Over MCP that
+            No runs recorded yet. Ask an agent to call <code>start_run</code>. Over MCP that
             needs nothing installed; the CLI and its hooks do it automatically.
           </div>
         ) : (
@@ -1065,7 +1078,7 @@ const governancePage = async (c: Context<AppEnv>) => {
             <>
               <p class="m0 sub">
                 No snapshots in this team yet. A baseline is a real machine, so one has to be
-                pushed first — ask an agent to call <code>push_snapshot</code>.
+                pushed first: ask an agent to call <code>push_snapshot</code>.
               </p>
               <div class="dialog-actions">
                 <button class="btn" type="button" data-close-dialog="t">
@@ -1096,7 +1109,7 @@ const governancePage = async (c: Context<AppEnv>) => {
                 </select>
                 <span class="help">
                   A baseline is the machine that <b>works</b>. Listed newest first, which after a
-                  debugging session is usually the broken one — so choose, do not take the top.
+                  debugging session is usually the broken one, so choose, do not take the top.
                   Showing the {promotable.length} most recent snapshots in this team.
                 </span>
               </div>
@@ -1114,7 +1127,7 @@ const governancePage = async (c: Context<AppEnv>) => {
                     <option value={p.id} selected={p.id === scopeProject?.id}>
                       {p.name}
                       {teamProjects.some((other) => other.id !== p.id && other.name === p.name)
-                        ? ` — ${p.repositoryIdentity ? 'repository-bound' : p.slug}`
+                        ? ` (${p.repositoryIdentity ? 'repository-bound' : p.slug})`
                         : ''}
                     </option>
                   ))}
@@ -1193,7 +1206,7 @@ governanceRoutes.post('/app/teams/:slug/policy', async (c) => {
   // Publishing an empty document silently removes every rule the agents were
   // following. If that is really the intent it deserves a different gesture.
   if (isEmptyPolicy(parsed.document)) {
-    return refuse('Every field was empty — that would publish a rulebook with no rules.');
+    return refuse('Every field was empty: that would publish a rulebook with no rules.');
   }
 
   const result = await publishPolicy(db, user.id, {

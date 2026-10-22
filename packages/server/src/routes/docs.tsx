@@ -959,8 +959,11 @@ docsRoutes.get('/docs', (c) => {
                 <tr id="tool-get_policy">
                   <td class="mono">get_policy</td>
                   <td>
-                    The effective rules for this team and project: protected paths, review
-                    requirements, expected runtimes, required environment variable names. Confirm
+                    The effective policy for this team and project, the team's merged with the
+                    project's additions: guidance, denied actions, actions that require approval,
+                    required checks, protected paths, required environment variable names, expected
+                    runtimes and the change budget, with its hash. <code>start_run</code> returns the
+                    same document for the run it starts. Confirm
                     the <code>hash</code> it returns with{' '}
                     <code>update_run {'{'}"policy_hash": …{'}'}</code> after you apply it. A
                     denied line shaped <code>content: "text" in path/** — reason</code> is also
@@ -972,11 +975,12 @@ docsRoutes.get('/docs', (c) => {
                 <tr id="tool-get_workflow">
                   <td class="mono">get_workflow</td>
                   <td>
-                    How work moves in this team: whether a change starts from a ticket, how
-                    branches are named, which checks must pass, PR approvals, and the environments
-                    on the road to production. Read it before creating a branch — it returns the
-                    structured flow plus a prose brief to follow directly. Project flows override
-                    the team-wide one, same as policy.
+                    The team's published workflow for a project: whether a change starts from a
+                    ticket, branch naming, required checks, PR approvals, merge strategy and the
+                    environments on the road to production, as a structured document plus a prose
+                    summary, and whether its CI pipeline is complete or still a scaffold. A
+                    project's own flow overrides the team-wide one, same as policy; with none
+                    published it answers <code>flow: null</code>.
                   </td>
                 </tr>
                 <tr id="tool-check_environment">

@@ -258,6 +258,47 @@ describe('the Claude app connects as a console, not an agent', () => {
     expect(byName.get('assign_work')).toMatchObject({ readOnlyHint: false, destructiveHint: true, openWorldHint: true });
     expect(byName.get('update_run')).toMatchObject({ readOnlyHint: false, destructiveHint: true, openWorldHint: false });
 
+    // The directory review asks a tool description to say what the tool returns,
+    // not to direct the assistant ("Read it BEFORE you create a branch"). It named
+    // get_workflow, get_policy and inbox; those are fixed. The tools still written
+    // as instructions are listed by name: a new tool cannot join them, and one
+    // rewritten must leave the list, so the list only shrinks. Several of them
+    // carry the call order a coding agent was measured on, so each rewrite is
+    // its own change with its own agent-lab round, not a sweep.
+    const DIRECTIVE: Array<[RegExp, string]> = [
+      [/\byou must\b/i, 'you must'],
+      [/\bbefore you\b/i, 'before you'],
+      [/\b(read|call|check|use) (it|this|here)\b[^.]*\b(before|first|when)\b/i, 'call it before/first/when'],
+      [/\b(BEFORE|AFTER|NEVER|ALWAYS|MUST|FIRST)\b/, 'capitalised directive'],
+      [/\bnot you\b/i, 'not you'],
+      [/\bfollow (it|directly)\b/i, 'follow it'],
+      [/^You are\b/, 'You are'],
+    ];
+    const STILL_DIRECTIVE = new Set([
+      'whoami',
+      'get_snapshot_checklist',
+      'search_past_issues',
+      'start_run',
+      'finish_run',
+      'list_active_agents',
+      'check_environment',
+      'get_evidence',
+      'assign_work',
+      'handoff_work',
+    ]);
+    for (const tool of described) {
+      const found = DIRECTIVE.filter(([pattern]) => pattern.test(tool.description)).map(([, name]) => name);
+      if (STILL_DIRECTIVE.has(tool.name)) {
+        expect(found.length, `${tool.name} reads as a description now; remove it from STILL_DIRECTIVE`).toBeGreaterThan(0);
+      } else {
+        expect(found, `${tool.name} directs the assistant: ${tool.description}`).toEqual([]);
+      }
+    }
+    const factual = new Map(described.map((tool) => [tool.name, tool.description]));
+    expect(factual.get('get_workflow')).toMatch(/^Returns the team's published workflow for a project/);
+    expect(factual.get('get_policy')).toMatch(/^Returns the effective policy/);
+    expect(factual.get('inbox')).toMatch(/^Returns work waiting to be picked up/);
+
     const init = await initialize(token.access_token);
     expect(init.body.result.serverInfo).toMatchObject({ name: 'stma', title: 'STMA' });
     expect(init.body.result.serverInfo.version).not.toBe('0.1.0');

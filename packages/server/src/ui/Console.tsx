@@ -531,7 +531,7 @@ export const ProjectScope = ({
   path: string;
   projects: { id: string; name: string; slug: string; repositoryIdentity?: string | null }[];
   current: string | null;
-  /** What the empty choice means on this page — "Global — whole team" on governance. */
+  /** What the empty choice means on this page — "Global: whole team" on governance. */
   allLabel?: string;
   /** Other query params this page is holding (e.g. tabs), carried through the submit. */
   extra?: Record<string, string>;

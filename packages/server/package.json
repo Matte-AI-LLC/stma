@@ -1,6 +1,6 @@
 {
   "name": "@matteai/stma-server",
-  "version": "0.20.2",
+  "version": "0.20.3",
   "type": "module",
   "scripts": {
     "build:connector": "tsup --config tsup.connector.config.ts",

@@ -18,7 +18,7 @@ export const css = /* css */ `
 .flow-steps li { display:flex; gap:10px; color:var(--txt-2); font-size:12px; }
 .flow-steps b { display:block; color:var(--ink); font-size:13px; }
 .flow-steps p { margin:4px 0; }
-.flow-steps time { font:10px var(--mono); overflow-wrap:anywhere; }
+.flow-steps time { display:block; font:10px var(--mono); overflow-wrap:anywhere; }
 .flow-step-number { border:1px solid var(--ctl-border); border-radius:50%; width:24px; height:24px; display:inline-flex; align-items:center; justify-content:center; flex:none; }
 .flow-steps .current .flow-step-number { background:var(--ink); color:white; border-color:var(--ink); }
 .flow-steps .done .flow-step-number { color:var(--green-ink); border-color:var(--green-line); background:var(--green-bg); }
@@ -119,12 +119,20 @@ code { font-family: var(--mono); }
 .small { font-size: 12px; }
 .mono { font-family: var(--mono); font-size: 13px; }
 .m0 { margin: 0; }
+/* The space under a form is a quirks-mode default: a browser adds it to every form
+   on a page with no doctype, and every page here was laid out with it. Pages have a
+   doctype now, which drops it, so it is written down. .m0 still removes it. */
+form { margin-block-end: 1em; }
 .overline {
   font: 500 12px/1 var(--mono);
   letter-spacing: .1em;
   text-transform: uppercase;
   color: var(--mut);
 }
+/* A label that stands alone above a heading is a block. As an inline span it sat in a
+   line box whose strut a page with no doctype ignores and a page with one does not,
+   which made the label's line 9px taller than the design. */
+span.overline, span.card-title { display: block; }
 
 /* ---------- app nav (dark) ---------- */
 .appnav { height: 56px; background: var(--dark); }
@@ -222,12 +230,24 @@ h1.title, h2.title { margin: 0; font: 600 26px/1.2 var(--sans); letter-spacing: 
 .card-note { font: 400 12px/1.4 var(--sans); color: var(--mut); margin-top: 3px; }
 .fold-card > summary { cursor: pointer; list-style: none; border-bottom: 0; }
 .fold-card > summary::-webkit-details-marker { display: none; }
+.fold-card > summary > :first-child { flex: 1 1 auto; min-width: 0; }
 .fold-card > summary::after {
-  content: '+'; flex: none; margin-left: 6px; color: var(--mut);
-  font: 500 18px/1 var(--sans);
+  content: '+'; flex: none; display: inline-flex; align-items: center; justify-content: center;
+  width: 28px; height: 28px; border: 1px solid var(--line); border-radius: 7px;
+  color: var(--txt-2); font: 500 17px/1 var(--sans);
 }
+.fold-card > summary:hover::after { border-color: var(--green-line); color: var(--green-strong); }
 .fold-card[open] > summary { border-bottom: 1px solid var(--line); }
 .fold-card[open] > summary::after { content: '−'; }
+/* A fold card's count, beside its toggle and one size on every card (governance). */
+.fold-count {
+  flex: none; display: inline-flex; align-items: center; justify-content: center;
+  min-width: 34px; height: 28px; padding: 0 10px; border-radius: 99px;
+  background: #f4f4f1; border: 1px solid var(--line);
+  font: 600 14px/1 var(--sans); font-variant-numeric: tabular-nums; color: var(--ink);
+}
+.fold-count.zero { background: #fafaf8; color: var(--mut); font-weight: 500; }
+.fold-count.bad { background: var(--red-bg); border-color: var(--red-bg-line); color: var(--red-ink); }
 .section-jump {
   display: flex; gap: 8px; flex-wrap: wrap; padding: 12px 16px;
   background: #fff; border: 1px solid var(--line); border-radius: 10px;
@@ -238,7 +258,10 @@ h1.title, h2.title { margin: 0; font: 600 26px/1.2 var(--sans); letter-spacing: 
   font: 500 12px/1 var(--sans);
 }
 .section-jump a:hover { border-color: var(--green); color: var(--green-strong); text-decoration: none; }
-.section-jump span { color: var(--mut); font: 400 11px/1 var(--sans); }
+.section-jump span {
+  min-width: 20px; padding: 3px 6px; border-radius: 99px; background: #f4f4f1; text-align: center;
+  color: var(--txt-2); font: 600 12px/1 var(--sans); font-variant-numeric: tabular-nums;
+}
 /* Agent connections: one page, three numbered sections (connect, test, yours). */
 .conn-head { display: flex; gap: 12px; align-items: flex-start; margin-top: 12px; scroll-margin-top: 16px; }
 .conn-head h2 { margin: 0; font: 600 18px/1.3 var(--sans); letter-spacing: -.01em; color: var(--ink); }
@@ -1063,7 +1086,7 @@ a.rail-link:hover { background: #1c2023; color: #fff; text-decoration: none; }
 .rail-who { min-width: 0; flex: 1; }
 .rail-who .n { font: 500 12px/1.2 var(--sans); color: var(--dark-txt); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .rail-who .r { font: 400 10px/1.2 var(--sans); color: var(--dark-mut-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.rail-out { background: none; border: none; padding: 0; cursor: pointer; font: 400 11px/1 var(--sans); color: var(--dark-mut-2); }
+.rail-out { display: block; background: none; border: none; padding: 0; cursor: pointer; font: 400 11px/1 var(--sans); color: var(--dark-mut-2); }
 .rail-out:hover { color: #fff; }
 
 /* Demo credentials on a test environment's sign-in page. Deliberately plain —
