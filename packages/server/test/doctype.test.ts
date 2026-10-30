@@ -184,6 +184,8 @@ describe('every shell is drawn in standards mode', () => {
       `${t}/delivery`,
       `${t}/repositories`,
       `${t}/connections`,
+      // The workspace's Work is its queue; a project's Work is drawn in work-console.test.ts.
+      `${t}/work`,
       `${t}/people/ada`,
       '/app/agents?team=standards',
       '/app/handoffs?team=standards',

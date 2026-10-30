@@ -165,11 +165,14 @@ export const HandoffFlow = ({
           {offer.offeredBy === userId &&
             offer.state !== 'completed' &&
             offer.state !== 'cancelled' && (
-              <form method="post" action={`/app/sessions/${sessionId}/handoff/cancel`}>
+              <form
+                method="post"
+                action={`/app/sessions/${sessionId}/handoff/cancel`}
+                data-confirm="Cancel this handoff? The brief stays available. This does not stop a local process or release a separate resumed run."
+              >
                 <button
                   class="btn"
                   type="submit"
-                  data-confirm="Cancel this handoff? The brief stays available. This does not stop a local process or release a separate resumed run."
                 >
                   {offer.kind === 'assignment' ? 'Cancel assignment' : 'Cancel offer'}
                 </button>

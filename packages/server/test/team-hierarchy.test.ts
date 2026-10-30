@@ -617,7 +617,7 @@ it('11. the person page shows a slice of that same list, and the same brief only
 
   // The handoff is on this page exactly once, and under one label: as work.
   expect(sessions).not.toContain(`/app/sessions/${crossHandoffSession}`);
-  expect(cardOf(aboutMember, 'Work')).toContain(`/app/sessions/${crossHandoffSession}`);
+  expect(cardOf(aboutMember, 'Dispatched work')).toContain(`/app/sessions/${crossHandoffSession}`);
 
   // And the acceptance line itself: the same rows, in the same order, as the
   // page the card links to.

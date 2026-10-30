@@ -4,14 +4,14 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { and, eq } from 'drizzle-orm';
 import { afterAll, beforeAll, expect, it } from 'vitest';
-import { agentEnrollments, agentInstallations, invites, memberships, oauthClients, oauthRefreshTokens, projects, teams, tokens, users } from '../src/db/schema';
+import { agentEnrollments, agentInstallations, invites, memberships, mfaChallenges, oauthClients, oauthRefreshTokens, projects, teams, tokens, userAuthenticators, users } from '../src/db/schema';
 import { createAgentEnrollment, redeemAgentEnrollment } from '../src/domain/enrollments';
 import { claimInviteMembership } from '../src/domain/invites';
 import { loadEnv } from '../src/env';
 import { isAdminUser } from '../src/lib/admin';
 import { randomHex, sha256hex } from '../src/lib/crypto';
 import { mailOutbox, sendMail } from '../src/lib/mailer';
-import { testAccountAvailable } from '../src/lib/testAccounts';
+import { TEST_ACCOUNT_UNAVAILABLE, testAccountAvailable } from '../src/lib/testAccounts';
 import { SecurityRefusal } from '../src/lib/securityHooks';
 import { startServer, type StartedServer } from '../src/server';
 
@@ -92,6 +92,8 @@ it('creates a distinct unverified identity with one empty workspace and a one-ti
   expect(page).toContain(`through ${day(7)} (UTC)`);
   expect(page).toContain('synthetic sign-in address, not a mailbox');
   expect(page).not.toContain('action="/app/account/email/change"');
+  // A mailbox-free demo identity has no authenticator of its own to add.
+  expect(page).not.toContain('action="/app/account/security/start"');
   expect(await (await get(`/admin/users/${account.id}`, operatorCookie)).text()).not.toContain(account.password);
 });
 
@@ -264,7 +266,7 @@ it('keeps password throttling and suppresses all mail to the synthetic address',
 it('locks identity changes, recovery and alternate review-access controls', async () => {
   const account = await create('locked-fields');
   const sid = cookie(await login(account.email!, account.password, '3'));
-  for (const route of ['email/change', 'email/verify', 'email/resend', 'password', 'password/verify', 'delete']) {
+  for (const route of ['email/change', 'email/verify', 'email/resend', 'password', 'password/verify', 'delete', 'security/start', 'security/confirm', 'security/recovery-codes', 'security/disable']) {
     expect(where(await post(`/app/account/${route}`, { email: 'other@example.com', password: 'differentPassword', current_password: account.password }, sid))).toContain('managed by an operator');
   }
   expect(where(await post(`/admin/users/${account.id}/email`, { email: 'other@example.com' }, operatorCookie))).toContain('managed by an operator');
@@ -367,4 +369,17 @@ it('caps the cookie at the remaining test lifetime using a valid integer Max-Age
   const age = /Max-Age=(\d+);/.exec(res.headers.getSetCookie().join(';'))?.[1];
   expect(Number(age)).toBeGreaterThan(0);
   expect(Number(age)).toBeLessThanOrEqual(120);
+});
+
+it('refuses a test identity that somehow has an authenticator, with no session and no challenge', async () => {
+  const account = await create('with-factor');
+  // Account refuses to add one, so the row is written by hand: this is the
+  // shape a database edit or a future bug would leave behind.
+  await srv.db.insert(userAuthenticators).values({ userId: account.id, secretRef: 'enc:v1:k1:unused', enabledAt: new Date() });
+  const res = await login(account.email!, account.password, '9');
+  expect(where(res)).toContain(TEST_ACCOUNT_UNAVAILABLE);
+  const set = res.headers.getSetCookie().join(' ');
+  expect(set).not.toMatch(/(^|\s)sid=[^;]/);
+  expect(set).not.toMatch(/(^|\s)mfa=[^;]/);
+  expect(await srv.db.select().from(mfaChallenges).where(eq(mfaChallenges.userId, account.id))).toHaveLength(0);
 });

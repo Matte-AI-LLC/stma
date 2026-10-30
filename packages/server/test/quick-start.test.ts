@@ -110,6 +110,8 @@ it('leads with the first result and handles closed registration without a dead s
   expect(docs).toContain('persistent launch');
   expect(docs).toContain('complete a separate browser approval');
   expect(docs).toContain('OAuth success is not repository readiness');
+  // The Claude app is a console, so the guide recommends two coding agents for the test.
+  expect(docs).toContain('The Claude app is your console, not a second agent: use two coding agents connected in checkouts.');
   expect(docs).toContain(`${srv.url}/mcp`);
 
   env.signupsOpen = false;
@@ -145,6 +147,7 @@ it('connects two scoped agents and exchanges a reply with one human on Cloud Fre
   expect(connections).toContain('<h2>Connect an agent</h2>');
   expect(connections).toContain('<h2>Test two agents together</h2>');
   expect(connections).toContain('id="first-message"');
+  expect(connections).toContain('The Claude app is your console, not a second agent');
   expect(connections).not.toContain('value="personal"');
   expect(connections).toContain('Copy Codex setup request');
   expect(connections).toContain('Copy Claude setup request');

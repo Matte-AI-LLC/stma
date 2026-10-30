@@ -169,7 +169,11 @@ export const RepositoryFlow = ({
               </FlowSection>
               {owner && (
                 <FlowSection title="Change binding">
-                  <form method="post" action={`${base}/rebind`}>
+                  <form
+                    method="post"
+                    action={`${base}/rebind`}
+                    data-confirm={`Move ${selected.fullName} to the selected project? Existing evidence keeps its original scope; new observations use the new project.`}
+                  >
                     <input type="hidden" name="binding" value={selected.id} />
                     <input type="hidden" name="expectedProject" value={selected.projectId ?? ''} />
                     <Field id="rebind-project" label="Project" required>
@@ -184,7 +188,6 @@ export const RepositoryFlow = ({
                     <button
                       class="btn"
                       type="submit"
-                      data-confirm={`Move ${selected.fullName} to the selected project? Existing evidence keeps its original scope; new observations use the new project.`}
                     >
                       Change project binding
                     </button>
@@ -219,12 +222,15 @@ export const RepositoryFlow = ({
               <p>{row.repo}</p>
               <span class="flow-status">Credential stored</span>
               {owner && (
-                <form method="post" action={`${base}/disconnect`}>
+                <form
+                  method="post"
+                  action={`${base}/disconnect`}
+                  data-confirm="Disconnect this connection and its bindings? Provider credentials are not revoked at the provider."
+                >
                   <input type="hidden" name="id" value={row.id} />
                   <button
                     class="btn"
                     type="submit"
-                    data-confirm="Disconnect this connection and its bindings? Provider credentials are not revoked at the provider."
                   >
                     Disconnect this connection
                   </button>

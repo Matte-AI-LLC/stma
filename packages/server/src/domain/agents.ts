@@ -1,5 +1,6 @@
 import { parseContentRules } from '@bridge/shared';
 import { membershipUser } from '../lib/securityHooks';
+import { bindExecutionRun, currentExecutionBinding, currentExecutionGrant, managedResourceRefusal } from '../lib/executionSecurity';
 import {
   ACTIVE_AGENT_RUN_STATUSES,
   areAttemptSiblings,
@@ -26,13 +27,14 @@ import {
   type RunCheckpointInput,
   type WorkClaim,
 } from '@bridge/shared';
-import { and, desc, eq, gt, inArray, isNull, lt, ne, or, sql } from 'drizzle-orm';
+import { and, desc, eq, gt, inArray, isNull, lt, ne, notInArray, or, sql } from 'drizzle-orm';
 import { rowsAffected, type Db } from '../db';
 import {
   agentEvents,
   agentInstallations,
   agentRuns,
   memberships,
+  policyReceipts,
   projects,
   teams,
   tokens,
@@ -50,8 +52,14 @@ import { track } from '../lib/track';
 import { teamForUser } from './access';
 import { effectiveLimits } from '../lib/entitlements';
 import { fingerprintJson } from '../lib/canonical';
+import type { AgentGrant } from '../lib/grants';
 import { writeRunCheckpoint } from './checkpoints';
+import { adapterListeningFor } from './companions';
 import { effectivePolicy } from './policies';
+import { mutateWorkInTransaction } from './work';
+import { workAccess } from './workAccess';
+import { activeRunLink, linkRunToWork, liveRunOfAgentForWork, runWorkReply, workRefusalText, workScopeOf } from './workLinks';
+import { agentPrincipal, WorkRefusal, workError, type WorkRefusalError } from './workTypes';
 
 const ACTIVE = [...ACTIVE_AGENT_RUN_STATUSES];
 
@@ -220,7 +228,13 @@ export async function runForOwner(db: Db, runId: string, userId: string) {
   return rows[0];
 }
 
-/** Transaction-only lookup that serializes every lifecycle transition. */
+/**
+ * Transaction-only lookup that serializes every lifecycle transition. Taken
+ * `for no key update`, which still excludes every other transition, because a
+ * rotation holds it while it waits for a Work lock, and a Work command holding
+ * one inserts rows that name this run (a delivery, a link): their foreign-key
+ * check takes `key share` on it, which `update` would make wait on us.
+ */
 async function runForOwnerLocked(db: Db, runId: string, userId: string) {
   const rows = await db
     .select({ run: agentRuns, installation: agentInstallations, owner: users, project: projects })
@@ -229,7 +243,7 @@ async function runForOwnerLocked(db: Db, runId: string, userId: string) {
     .innerJoin(users, eq(agentInstallations.userId, users.id))
     .leftJoin(projects, eq(agentRuns.projectId, projects.id))
     .where(and(eq(agentRuns.id, runId), eq(agentInstallations.userId, userId)))
-    .for('update', { of: agentRuns });
+    .for('no key update', { of: agentRuns });
   return rows[0];
 }
 
@@ -259,6 +273,10 @@ export interface StartRunInput {
   checkpoint?: RunCheckpointInput & { kind: 'start' };
   claims: WorkClaim[];
   attemptGroup?: string;
+  /** The Native Work item this run is for; only with `expectedSpecRevision`. */
+  workId?: string;
+  /** The contract revision the caller read; a different current one refuses the start. */
+  expectedSpecRevision?: number;
 }
 
 class StartRunRefused extends Error {}
@@ -278,16 +296,51 @@ function startRunRequestHash(input: StartRunInput): string {
     checkpoint: input.checkpoint ?? null,
     claims: input.claims,
     attemptGroup: input.attemptGroup ?? null,
+    // Only when present, so every start recorded before Native Work hashes as
+    // it always did and its retry is still recognised as the same start.
+    ...(input.workId
+      ? { workId: input.workId.toLowerCase(), expectedSpecRevision: input.expectedSpecRevision ?? null }
+      : {}),
   });
 }
 
+/** A Work refusal on a run path, in the shape the run tools already answer with, plus its code. */
+function workStartRefusal(error: WorkRefusalError) {
+  return { error: workRefusalText(error), code: error.code } as const;
+}
+
+/**
+ * Start a run. With `workId` and `expectedSpecRevision` the run is started for
+ * a Native Work item: it is linked to the work, pinned to the revision the
+ * caller read, inside the same transaction, and a contract that moved since is
+ * refused with nothing written. The grant is the credential the start was made
+ * under; only a work start reads it, because the link is that agent's act.
+ */
 export async function startAgentRun(
   db: Db,
   userId: string,
   input: StartRunInput,
   claimLeaseMinutes: number,
   fixedProjectId?: string | null,
+  grant?: AgentGrant,
 ) {
+  const managed = currentExecutionBinding();
+  const executionDenied = await managedResourceRefusal(db, grant ?? currentExecutionGrant(), { installationId: input.installationId });
+  if (executionDenied) return { error: executionDenied } as const;
+  if (grant?.execution) {
+    if (!managed || managed.attempt.id !== grant.execution.attemptId) return { error: 'An attempt start must run inside its current execution fence.' } as const;
+    if (managed.attempt.runId) {
+      const found = await runForOwner(db, managed.attempt.runId, userId);
+      if (!found || !['starting', 'active', 'waiting', 'blocked'].includes(found.run.status)) return { error: 'This attempt’s run has ended. It cannot start another run.' } as const;
+      const link = managed.job.workId ? await activeRunLink(db, found.run.id) : undefined;
+      return { run: found.run, conflicts: [] as RunConflict[], checkpoint: undefined, projectSplit: undefined, replayed: true,
+        ...(managed.job.workId ? { work: link ? runWorkReply(link) : null } : {}) } as const;
+    }
+    if (input.workId && input.workId !== managed.job.workId) return { error: 'This attempt is pinned to another work item.' } as const;
+    if (managed.job.assignment.branch && input.branch !== managed.job.assignment.branch) return { error: 'The checkout is not on the assignment’s branch.' } as const;
+    input = { ...input, requestId: managed.attempt.id, taskKey: managed.job.assignment.task,
+      workId: managed.job.workId ?? undefined, expectedSpecRevision: managed.job.specRevision ?? undefined };
+  }
   // Fail before lazy project creation. The transaction below rechecks and
   // locks the installation; this first read only prevents an invalid identity
   // from leaving a project row behind.
@@ -301,14 +354,45 @@ export async function startAgentRun(
   if (!access) return { error: `You are not a member of team "${input.team}".` } as const;
   if ((await effectiveLimits(db, access.team)).fleet !== 'full') return { error: 'Starting new runs requires an active fleet entitlement. Existing work can still be finished or handed off.' } as const;
 
+  // A run for a work item. Its scope is read here, without a lock, only to know
+  // which project counter the link will take last; everything that decides is
+  // checked again under that lock.
+  let forWork: { id: string; teamId: string; projectId: string; expected: number; grant: AgentGrant } | undefined;
+  if (input.workId !== undefined || input.expectedSpecRevision !== undefined) {
+    if (input.workId === undefined || input.expectedSpecRevision === undefined) {
+      return workStartRefusal(
+        workError('INVALID_INPUT', 'A work id and the expected spec revision go together: send both, or neither.'),
+      );
+    }
+    const scope = await workScopeOf(db, input.workId);
+    // The project half of the grant too, here and not only under the Work lock:
+    // everything between (the request id replay, the project, the repository)
+    // answers in its own words, so a work in another project would read as a
+    // refusal about a real id where one that does not exist reads NOT_FOUND.
+    if (
+      !scope ||
+      scope.teamId !== access.team.id ||
+      !grant ||
+      !(await workAccess(db, agentPrincipal(userId, grant), scope.teamId, scope.projectId))
+    ) {
+      return workStartRefusal(workError('NOT_FOUND', 'No work with that id is visible to this principal.'));
+    }
+    forWork = { ...scope, expected: input.expectedSpecRevision, grant };
+  }
+
   const requestHash = input.requestId ? startRunRequestHash(input) : null;
+  let started;
   try {
-    return await db.transaction(async (transaction) => {
+    started = await db.transaction(async (transaction) => {
       const tx = transaction as unknown as Db;
       await lockClaimWorkspace(tx, access.team.id);
       // One installation is the idempotency namespace. Locking it makes two
       // concurrent retries observe the same committed run instead of racing a
-      // unique index and leaking a half-created second run.
+      // unique index and leaking a half-created second run. `no key update`,
+      // not `update`: this transaction may end waiting for a Work lock, and a
+      // Work command holding one inserts rows that name this installation (an
+      // assignment's target), whose foreign-key check takes `key share` on it.
+      // `update` would make that check wait on us while we wait on it.
       const [installation] = await tx
         .select()
         .from(agentInstallations)
@@ -319,7 +403,7 @@ export async function startAgentRun(
             isNull(agentInstallations.revokedAt),
           ),
         )
-        .for('update');
+        .for('no key update');
       if (!installation) throw new StartRunRefused('Unknown or revoked agent installation.');
 
       if (input.requestId) {
@@ -362,12 +446,16 @@ export async function startAgentRun(
               )
             : undefined;
           if (checkpoint && 'error' in checkpoint) throw new StartRunRefused(checkpoint.error);
+          // The original start's link, read and never written again: a replay
+          // that linked again would be a second relation for one run.
+          const link = forWork ? await activeRunLink(tx, previous.id) : undefined;
           return {
             run: previous,
             conflicts,
             checkpoint,
             projectSplit: undefined,
             replayed: true,
+            ...(forWork ? { work: link ? runWorkReply(link) : null } : {}),
           } as const;
         }
       }
@@ -376,15 +464,19 @@ export async function startAgentRun(
       // Project creation is part of the logical start. A mismatched retry is
       // rejected above before it can leave a stray project behind.
       let projectSplit: string | undefined;
-      if (input.project) {
+      if (input.project || forWork) {
+        // A run for a work item that names no project starts in the work's own:
+        // the fixed-project path, so nothing is created and a repository that
+        // is not the project's is refused exactly as for a bound credential.
         const projectResult = await resolveProjectForWriteInTransaction(
           tx,
           access.team,
-          input.project,
+          input.project ?? '',
           userId,
           {
             repositoryIdentity: input.repositoryIdentity ?? input.checkpoint?.repositoryIdentity,
-            fixedProjectId,
+            fixedProjectId: fixedProjectId ?? (input.project ? undefined : forWork?.projectId),
+            fixedBy: fixedProjectId ? 'credential' : 'work',
           },
         );
         if ('error' in projectResult) throw new StartRunRefused(projectResult.error);
@@ -422,6 +514,7 @@ export async function startAgentRun(
         })
         .returning();
       if (!run) throw new Error('Run insert did not return a row.');
+      await bindExecutionRun(tx, run.id);
       await addAgentEvent(tx, run.id, 'run_started', {
         taskKey: run.taskKey,
         repo: run.repo,
@@ -453,12 +546,50 @@ export async function startAgentRun(
         .where(and(eq(agentRuns.id, run.id), eq(agentRuns.status, 'starting')))
         .returning();
       if (!active) throw new Error('Run left starting state during its start transaction.');
-      return { run: active, conflicts, checkpoint, projectSplit, replayed: false } as const;
+      if (!forWork) return { run: active, conflicts, checkpoint, projectSplit, replayed: false } as const;
+      // Last, because Work locks are the last locks any transaction takes: the
+      // project counter and the work row, after the claim workspace, the
+      // installation and the run. A refusal here rolls the whole start back.
+      const linked = await mutateWorkInTransaction(
+        tx,
+        {
+          teamId: forWork.teamId,
+          projectId: forWork.projectId,
+          workIds: [forWork.id],
+          actor: agentPrincipal(userId, forWork.grant),
+        },
+        linkRunToWork({
+          runId: active.id,
+          runProjectId: active.projectId,
+          expectedSpecRevision: forWork.expected,
+          via: 'run_start',
+        }),
+      );
+      const link = await activeRunLink(tx, active.id);
+      return {
+        run: active,
+        conflicts,
+        checkpoint,
+        projectSplit,
+        replayed: false,
+        work: link ? runWorkReply(link) : null,
+        workCommitted: linked.afterCommit,
+      } as const;
     });
   } catch (error) {
     if (error instanceof StartRunRefused) return { error: error.message } as const;
+    if (error instanceof WorkRefusal) return workStartRefusal(error.error);
     throw error;
   }
+  if (!('workCommitted' in started) || !started.workCommitted) return started;
+  const { workCommitted, ...reply } = started;
+  try {
+    await workCommitted(db);
+  } catch {
+    // The live refresh and the feed line are conveniences; the run and its
+    // link are committed, and a start must never fail after it happened.
+  }
+  return reply;
 }
 
 export async function replaceRunClaims(
@@ -488,6 +619,9 @@ type RunOwner = NonNullable<Awaited<ReturnType<typeof runForOwner>>>;
  * was released and no heartbeat renews it, so `lease_expires_at` is when it was let go.
  */
 export const RELEASED_CLAIM = 'released';
+
+/** At most this many moved claims are named on a rotation's event; a run declares far fewer. */
+export const ROTATION_CLAIMS_KEPT = 200;
 const stillHeld = ne(workClaims.source, RELEASED_CLAIM);
 
 async function replaceRunClaimsForFound(
@@ -968,7 +1102,10 @@ export async function heartbeatAgentRun(
     // which began before finish but waited for the lock re-reads the terminal
     // state here and cannot renew either the run or its leases.
     const found = await runForOwnerLocked(tx, runId, userId);
-    if (!found || !ACTIVE.includes(found.run.status as (typeof ACTIVE)[number])) return undefined;
+    if (!found) return undefined;
+    if (!ACTIVE.includes(found.run.status as (typeof ACTIVE)[number])) {
+      return found.run.rotatedToRunId ? rotatedAnswer(tx, runId, found.run.rotatedToRunId) : undefined;
+    }
     const checkpoint = checkpointInput
       ? await writeRunCheckpoint(
           tx,
@@ -1080,6 +1217,11 @@ export async function guardRunWrite(
     const tx = transaction as unknown as Db;
     await lockRunClaimWorkspace(tx, runId, userId);
     const found = await runForOwnerLocked(tx, runId, userId);
+    // A rotated run names its successor, so the hook asking for a closed run can
+    // adopt the live one instead of stopping the edit as "coordination unavailable".
+    if (found && !found.installation.revokedAt && found.run.rotatedToRunId) {
+      return rotatedAnswer(tx, runId, found.run.rotatedToRunId);
+    }
     if (!found || found.installation.revokedAt || !ACTIVE.includes(found.run.status as (typeof ACTIVE)[number])) return undefined;
     const [team] = await tx.select().from(teams).where(eq(teams.id, found.run.teamId));
     if (!team) return undefined;
@@ -1109,10 +1251,13 @@ export async function guardRunWrite(
     // declaration is a rewritten `planned` row or an explicit update_run that
     // restated the moved ground under either source (`ground_acknowledged`).
     const declaredAt = new Map(held.map((c) => [claimDeclarationKey(c), c.createdAt]));
+    // A successor keeps what the session acknowledged before the rotation: the
+    // events stay on the run that wrote them, the window is the session's.
+    const lineage = await sessionLineage(tx, found.run);
     const acknowledged = await tx
       .select({ detail: agentEvents.detail, createdAt: agentEvents.createdAt })
       .from(agentEvents)
-      .where(and(eq(agentEvents.runId, runId), eq(agentEvents.type, 'ground_acknowledged')))
+      .where(and(inArray(agentEvents.runId, lineage.runIds), eq(agentEvents.type, 'ground_acknowledged')))
       .orderBy(desc(agentEvents.createdAt))
       .limit(50);
     for (const ack of acknowledged) {
@@ -1123,7 +1268,7 @@ export async function guardRunWrite(
         if (!known || ack.createdAt > known) declaredAt.set(key, ack.createdAt);
       }
     }
-    const stale = await staleGroundFor(tx, found.run, input.claims, declaredAt);
+    const stale = await staleGroundFor(tx, found.run, input.claims, declaredAt, lineage);
     if (stale.length) reason = 'stale_ground';
     // A live holder outranks ground that moved: it is the one fact the agent can
     // act on now (name who holds it, or wait for them), and once it lets go the
@@ -1206,27 +1351,39 @@ export async function releaseGroundAfterCompletion(
     if (candidates.length !== 1) return undefined;
     const found = await runForOwnerLocked(tx, candidates[0]!.id, userId);
     if (!found || !ACTIVE.includes(found.run.status as (typeof ACTIVE)[number])) return undefined;
-    const held = await tx.select().from(workClaims).where(and(eq(workClaims.runId, found.run.id), stillHeld));
-    if (held.length === 0) return undefined;
-    // The same ground released twice in one run keeps the later moment: the
-    // unique index includes the source, so the earlier record makes way first.
-    const earlier = await tx.select().from(workClaims).where(and(eq(workClaims.runId, found.run.id), eq(workClaims.source, RELEASED_CLAIM)));
-    const again = earlier.filter((old) => held.some((row) => row.resourceType === old.resourceType && row.resourceKey === old.resourceKey && row.access === old.access));
-    if (again.length > 0) await tx.delete(workClaims).where(inArray(workClaims.id, again.map((row) => row.id)));
-    // Two sources can hold one resource (planned and observed); one record of it is enough.
-    const keep = new Map(held.map((row) => [`${row.resourceType}\0${row.resourceKey}\0${row.access}`, row.id]));
-    const spare = held.filter((row) => keep.get(`${row.resourceType}\0${row.resourceKey}\0${row.access}`) !== row.id);
-    if (spare.length > 0) await tx.delete(workClaims).where(inArray(workClaims.id, spare.map((row) => row.id)));
-    await tx
-      .update(workClaims)
-      .set({ source: RELEASED_CLAIM, leaseExpiresAt: new Date() })
-      .where(inArray(workClaims.id, [...keep.values()]));
+    const released = await releaseHeldClaims(tx, found.run.id);
+    if (released === 0) return undefined;
     await addAgentEvent(tx, found.run.id, 'claims_released', {
-      reason: 'work_completed', sessionId, count: held.length, installationId: scope.installationId,
+      reason: 'work_completed', sessionId, count: released, installationId: scope.installationId,
     });
     publishChange(found.run.teamId, 'claims');
-    return { runId: found.run.id, claims: held.length };
+    return { runId: found.run.id, claims: released };
   });
+}
+
+/**
+ * Mark everything a run still holds as released, keeping one record per piece
+ * of ground. The caller holds the claim workspace and the run row; returns how
+ * many held rows there were. Completion and a controlled rotation both let
+ * ground go this way, so the map remembers it either way.
+ */
+async function releaseHeldClaims(tx: Db, runId: string): Promise<number> {
+  const held = await tx.select().from(workClaims).where(and(eq(workClaims.runId, runId), stillHeld));
+  if (held.length === 0) return 0;
+  // The same ground released twice in one run keeps the later moment: the
+  // unique index includes the source, so the earlier record makes way first.
+  const earlier = await tx.select().from(workClaims).where(and(eq(workClaims.runId, runId), eq(workClaims.source, RELEASED_CLAIM)));
+  const again = earlier.filter((old) => held.some((row) => row.resourceType === old.resourceType && row.resourceKey === old.resourceKey && row.access === old.access));
+  if (again.length > 0) await tx.delete(workClaims).where(inArray(workClaims.id, again.map((row) => row.id)));
+  // Two sources can hold one resource (planned and observed); one record of it is enough.
+  const keep = new Map(held.map((row) => [`${row.resourceType}\0${row.resourceKey}\0${row.access}`, row.id]));
+  const spare = held.filter((row) => keep.get(`${row.resourceType}\0${row.resourceKey}\0${row.access}`) !== row.id);
+  if (spare.length > 0) await tx.delete(workClaims).where(inArray(workClaims.id, spare.map((row) => row.id)));
+  await tx
+    .update(workClaims)
+    .set({ source: RELEASED_CLAIM, leaseExpiresAt: new Date() })
+    .where(inArray(workClaims.id, [...keep.values()]));
+  return held.length;
 }
 
 /**
@@ -1292,11 +1449,22 @@ export async function finishAgentRun(
   status: Extract<AgentRunStatus, 'completed' | 'failed'>,
   detail?: string,
   checkpointInput?: RunCheckpointInput & { kind: 'delivery' | 'tested' },
+  /**
+   * `rest`: the finish came through the run route the hooks and the CLI use,
+   * written into the event so a later read can tell a hook's own close (a
+   * branch switch, whose next run carries the work on) from a finish the agent
+   * chose over MCP (`finish_run`, `handoff_work`), after which nothing does.
+   */
+  source?: 'rest',
 ) {
   return db.transaction(async (transaction) => {
     const tx = transaction as unknown as Db;
     const found = await runForOwnerLocked(tx, runId, userId);
     if (!found) return undefined;
+    // Before the replay answer below: a rotated run is `completed` too, and
+    // answering its finish as a replay would tell the caller its work ended
+    // when it goes on in the successor.
+    if (found.run.rotatedToRunId) return rotatedAnswer(tx, runId, found.run.rotatedToRunId);
     const checkpoint = checkpointInput
       ? await writeRunCheckpoint(
           tx,
@@ -1332,6 +1500,7 @@ export async function finishAgentRun(
     await addAgentEvent(tx, runId, 'run_finished', {
       status,
       detail: detail ? redactSecrets(detail) : undefined,
+      ...(source ? { source } : {}),
     });
     return {
       runId,
@@ -1347,6 +1516,425 @@ export async function finishAgentRun(
       },
     };
   });
+}
+
+// ---------------------------------------------------------------------------
+// Controlled run rotation (Native Work).
+// ---------------------------------------------------------------------------
+
+/**
+ * The answer every run call gets for a run a rotation closed: the run that
+ * replaced it, never a bare "unknown or inactive". A hook that lost the
+ * rotation's reply learns its successor here and adopts it, which is the only
+ * reason it never starts a second run for work it already has.
+ */
+export interface RunRotated {
+  error: string;
+  code: 'run_rotated';
+  rotatedTo: string;
+}
+
+/** A rotated answer, told apart from the plain `{ error }` refusals it would otherwise merge into. */
+export const isRunRotated = (value: unknown): value is RunRotated =>
+  typeof value === 'object' && value !== null && (value as { code?: unknown }).code === 'run_rotated' &&
+  typeof (value as { rotatedTo?: unknown }).rotatedTo === 'string';
+
+/**
+ * How deep a chain of rotations is read before the walk gives up. Not a limit
+ * anybody meets: a rotation is one per accept, and the bound only stops a
+ * cycle no write can make from running the query forever.
+ */
+const ROTATION_CHAIN_LIMIT = 10_000;
+
+/**
+ * The newest run a chain of rotations leads to from `successor`, in one read
+ * however long the chain is. A runtime pinned before rotations keeps its
+ * session's first run for as long as the session lasts, and the server follows
+ * the chain for it (`forRotated` in `routes/control.ts`), so in such a session
+ * the chain grows by one with every accept. A walk that stopped after a few
+ * hops answered the run it reached as rotated: the runtime was told 404,
+ * forgot its run and started an unlinked one beside the successor that holds
+ * the session's ground.
+ */
+async function newestSuccessor(db: Db, successor: string): Promise<string> {
+  const [row] = await db
+    .select({ id: agentRuns.id })
+    .from(agentRuns)
+    .where(
+      sql`${agentRuns.id} = (
+        with recursive chain(id, next, depth) as (
+          select r.id, r.rotated_to_run_id, 0 from agent_runs r where r.id = ${successor}
+          union all
+          select r.id, r.rotated_to_run_id, chain.depth + 1
+          from agent_runs r join chain on r.id = chain.next
+          where chain.depth < ${ROTATION_CHAIN_LIMIT}
+        )
+        select chain.id from chain order by chain.depth desc limit 1
+      )`,
+    )
+    .limit(1);
+  return row?.id ?? successor;
+}
+
+/** What every run door answers for a run a rotation closed: the newest run of its chain. */
+export async function rotatedAnswer(db: Db, runId: string, successor: string): Promise<RunRotated> {
+  const live = await newestSuccessor(db, successor);
+  return {
+    error: `run_rotated: run ${runId} was closed by a controlled rotation when this agent took work on another contract, and run ${live} replaced it. Use run_id ${live} from now on; do not start another run.`,
+    code: 'run_rotated',
+    rotatedTo: live,
+  };
+}
+
+/** What the accept reply says about the agent's run, in the wire's own words. */
+export type RunRotation =
+  | { done: true; run_id: string; from: string; detail: string; replayed?: true }
+  | { done: false; run_id?: string; reason: string; detail: string };
+
+const START_FROM_ASSIGNMENT = 'start_run with the call in the assignment, which carries work_id and expected_spec_revision';
+
+/**
+ * The way on when a run cannot be rotated yet. Never "finish it and start
+ * another": where native tracking owns the run, finishing it makes the hook
+ * forget it and start an unlinked run of its own beside the one started for
+ * the work, two live runs of one installation in one project. Asking again
+ * once the run can close rotates that very run, and the hook adopts its
+ * successor.
+ */
+const acceptAgain = (runId: string) =>
+  `${SEND_AGAIN(runId, 'send')}: the accept stands, and the run is rotated then. Do not finish that run or start another for this work.`;
+
+/**
+ * How an agent asks for the rotation again. Not by accepting alone: the reply
+ * that says the run was not moved names resume as the next call, and once the
+ * agent has resumed, accept is refused ("already accepted and resumed"), which
+ * left a waiting run no way onto the work. A resume asks for the rotation as
+ * the accept does, while no run of the agent is linked to the work yet.
+ */
+export const SEND_AGAIN = (run: string, lead = 'Send') =>
+  `${lead} update_handoff again with run_id ${run}, as accept if you have not resumed yet or as resume if you have`;
+
+const rotationDone = (from: string, to: string, key: string, revision: number, replayed = false): RunRotation => ({
+  done: true,
+  run_id: to,
+  from,
+  detail: `Run ${from} was closed and run ${to} started for ${key} at contract revision ${revision}. Send run_id ${to} in every call for this work, resume included; do not start another run.`,
+  ...(replayed ? { replayed: true as const } : {}),
+});
+
+/**
+ * Close the agent's current run and start its successor linked to the work it
+ * just accepted, pinned to the revision the assignment was made at (spec 5.3).
+ *
+ * The run is the one named by `runId`, else this installation's one live run
+ * in the project. A paired local adapter's run is rotated only when it is
+ * named: with no run_id an agent's call stands for a run its own credential
+ * started, the rule every other tool keeps (`ownedBy` in `mcp/fleet.ts`),
+ * because one agent identity may be paired with an adapter in every checkout
+ * on a machine and "the adapter's live run" could be another checkout's. A
+ * run already linked to this work at this revision is left alone; one linked
+ * to another work or revision, or to nothing, is rotated: a started run's
+ * relation is never edited, so new work gets a new run.
+ *
+ * A repeated accept (`replayed`) rotates only what the first one would have
+ * been about: a run linked to nothing, or to this work. A run that another
+ * work item's accept has moved onto that work since is left alone unless the
+ * agent names that run by its own id, because closing it would quietly end
+ * the other work's run. A concurrent accept that rotated the same run first is
+ * told apart the same way: its successor is answered as done only when it is
+ * linked to this work at this revision.
+ *
+ * It runs in its own transaction after the accept has committed, the reason
+ * `releaseGroundAfterCompletion` does: the claim lock order is workspace, then
+ * run, then Work last, and a rotation that cannot be made must never undo the
+ * accept. It is refused, and said so, while the old run waits on a person:
+ * closing it would take a question away from somebody. The ground it holds is
+ * not a reason to refuse, because it is not released: it moves to the
+ * successor (below). Idempotent: the closed run names its successor
+ * (`rotated_to_run_id`), so a second attempt answers with the same one.
+ */
+export async function rotateRunForWork(
+  db: Db,
+  userId: string,
+  grant: AgentGrant,
+  input: {
+    teamId: string;
+    projectId: string;
+    sessionId: string;
+    workId: string;
+    workKey: string;
+    specRevision: number;
+    runId?: string;
+    /** The accept was a retry of one already recorded. */
+    replayed?: boolean;
+    name: string;
+  },
+): Promise<RunRotation> {
+  const installationId = grant.installationId;
+  if (!installationId) {
+    return { done: false, reason: 'no_installation', detail: `This credential has no installation, so no run can be rotated; ${START_FROM_ASSIGNMENT}.` };
+  }
+  const reachable = await db
+    .select({ id: agentRuns.id, installationId: agentRuns.installationId, rotatedTo: agentRuns.rotatedToRunId, status: agentRuns.status })
+    .from(agentRuns)
+    .innerJoin(agentInstallations, eq(agentRuns.installationId, agentInstallations.id))
+    .where(
+      and(
+        eq(agentInstallations.userId, userId),
+        eq(agentRuns.teamId, input.teamId),
+        eq(agentRuns.projectId, input.projectId),
+        or(eq(agentRuns.installationId, installationId), adapterListeningFor(installationId)),
+        input.runId ? eq(agentRuns.id, input.runId) : inArray(agentRuns.status, ACTIVE),
+      ),
+    );
+  let candidate: string;
+  // The agent named this very run, by its own id and not by one a rotation retired.
+  let named = false;
+  if (input.runId) {
+    const row = reachable[0];
+    if (!row) {
+      return { done: false, reason: 'run_not_found', detail: `Run ${input.runId} is not a run of this agent in this project; ${START_FROM_ASSIGNMENT}.` };
+    }
+    // A run id from before an earlier rotation stands for the run that replaced it.
+    candidate = row.rotatedTo ? await newestSuccessor(db, row.rotatedTo) : row.id;
+    named = candidate === row.id;
+  } else {
+    const own = reachable.filter((row) => row.installationId === installationId);
+    if (own.length === 0) {
+      if (reachable.length === 0) {
+        return { done: false, reason: 'no_live_run', detail: `This agent has no live run in this project; ${START_FROM_ASSIGNMENT}.` };
+      }
+      return {
+        done: false,
+        reason: 'run_id_needed',
+        detail: `This agent has no live run of its own in this project, and a local adapter paired with it has ${reachable.length === 1 ? 'one' : reachable.length}, which may be another checkout's, so none was closed. ${SEND_AGAIN('of the run native tracking named in this checkout')}.`,
+      };
+    }
+    if (own.length > 1) {
+      return {
+        done: false,
+        reason: 'several_live_runs',
+        detail: `This agent has ${own.length} live runs in this project, so none was closed. ${SEND_AGAIN('naming the one to rotate (where native tracking runs, the run it named)')}; do not start another.`,
+      };
+    }
+    candidate = own[0]!.id;
+  }
+
+  let rotated: { reply: RunRotation; committed?: (db: Db) => Promise<void> };
+  try {
+    rotated = await db.transaction(async (transaction) => {
+      const tx = transaction as unknown as Db;
+      await lockClaimWorkspace(tx, input.teamId);
+      const found = await runForOwnerLocked(tx, candidate, userId);
+      if (!found) {
+        return { reply: { done: false, reason: 'run_not_found', detail: `Run ${candidate} is no longer available; ${START_FROM_ASSIGNMENT}.` } };
+      }
+      // Rotated since it was chosen: by an accept of this same work, whose
+      // answer stands, or by one of another work, whose run its successor now
+      // is. Only the first is this accept's answer.
+      if (found.run.rotatedToRunId) {
+        const live = await newestSuccessor(tx, found.run.rotatedToRunId);
+        const link = await activeRunLink(tx, live);
+        if (link && link.workId === input.workId && link.specRevision === input.specRevision) {
+          return { reply: rotationDone(found.run.id, live, input.workKey, input.specRevision, true) };
+        }
+        return {
+          reply: {
+            done: false,
+            run_id: live,
+            reason: 'rotated_for_other_work',
+            detail: `Run ${found.run.id} was closed for ${link ? link.key : 'other work'} by an accept answered at the same time, and its successor ${live} is that work's run, so nothing was closed for ${input.workKey}. When the work in run ${live} is done, ${acceptAgain(live)}`,
+          },
+        };
+      }
+      const current = await activeRunLink(tx, found.run.id);
+      if (current && current.workId === input.workId && current.specRevision === input.specRevision) {
+        const [before] = await tx
+          .select({ id: agentRuns.id })
+          .from(agentRuns)
+          .where(eq(agentRuns.rotatedToRunId, found.run.id))
+          .limit(1);
+        return {
+          reply: before
+            ? rotationDone(before.id, found.run.id, input.workKey, input.specRevision, true)
+            : {
+                done: false,
+                run_id: found.run.id,
+                reason: 'already_linked',
+                detail: `Run ${found.run.id} is already linked to ${input.workKey} at contract revision ${input.specRevision}; keep using it.`,
+              },
+        };
+      }
+      // Another live run of this agent is already the work's: started for it
+      // with start_run (the assignment's step, followed before the accept), or
+      // rotated onto it by an accept that named another run. Read here, under
+      // the claim workspace lock a start takes too, so a start that committed
+      // while this waited is seen; rotating the candidate as well would leave
+      // two linked live runs of one agent colliding on the work's ground.
+      const linkedRun = await liveRunOfAgentForWork(tx, input.workId, installationId, [found.run.id]);
+      if (linkedRun) {
+        return {
+          reply: {
+            done: false,
+            run_id: linkedRun.id,
+            reason: 'work_has_run',
+            detail: `Run ${linkedRun.id} of this agent is already linked to ${input.workKey}, so run ${found.run.id} was not closed. Send run_id ${linkedRun.id} in every call for this work, resume included; do not start another run.`,
+          },
+        };
+      }
+      if (input.replayed && !named && current && current.workId !== input.workId) {
+        return {
+          reply: {
+            done: false,
+            run_id: found.run.id,
+            reason: 'linked_to_other_work',
+            detail: `This accept was already recorded, and run ${found.run.id} is ${current.key}'s run now, so it was left alone. When the work in it is done, ${acceptAgain(found.run.id)}`,
+          },
+        };
+      }
+      if (!ACTIVE.includes(found.run.status as (typeof ACTIVE)[number])) {
+        return { reply: { done: false, run_id: found.run.id, reason: 'run_not_live', detail: `Run ${found.run.id} has ended; ${START_FROM_ASSIGNMENT}.` } };
+      }
+      if (found.run.status === 'waiting' || found.run.status === 'blocked') {
+        return {
+          reply: {
+            done: false,
+            run_id: found.run.id,
+            reason: 'run_waiting',
+            detail: `Run ${found.run.id} is ${found.run.status} on a person, so it was not closed. Once that is settled and the run is active again, ${acceptAgain(found.run.id)}`,
+          },
+        };
+      }
+      const now = new Date();
+      const [closed] = await tx
+        .update(agentRuns)
+        .set({ status: 'completed', endedAt: now, lastHeartbeatAt: now })
+        .where(and(eq(agentRuns.id, found.run.id), inArray(agentRuns.status, ACTIVE)))
+        .returning({ id: agentRuns.id });
+      if (!closed) {
+        return { reply: { done: false, run_id: found.run.id, reason: 'run_not_live', detail: `Run ${found.run.id} has ended; ${START_FROM_ASSIGNMENT}.` } };
+      }
+      // Same checkout, same branch and commit: the successor is the same
+      // session's run, named for its new work. No checkpoint is copied; a
+      // checkpoint is a report the old run made, not one this run made.
+      const [successor] = await tx
+        .insert(agentRuns)
+        .values({
+          installationId: found.run.installationId,
+          teamId: found.run.teamId,
+          projectId: found.run.projectId,
+          intent: input.name,
+          repo: found.run.repo,
+          branch: found.run.branch,
+          worktree: found.run.worktree,
+          baseSha: found.run.baseSha,
+          headSha: found.run.headSha,
+          status: 'active',
+          startedAt: now,
+          lastHeartbeatAt: now,
+        })
+        .returning();
+      if (!successor) throw new Error('Successor run insert did not return a row.');
+      // The ground the old run holds goes on with the session: its rows move to
+      // the successor as they are, so nothing is released under anybody, the
+      // right of way (`first_declared_at`) and what was acknowledged
+      // (`created_at`) are kept, and nothing reads as ground that moved under
+      // the successor. Releasing it would hand files this checkout may still
+      // have dirty to whoever waits on them, and refusing instead (what this
+      // did first) left the agent one way out, finishing the run, after which
+      // a hook starts a second, unlinked run beside the work's: a run's ground
+      // is renewed by every heartbeat and released only when the run ends.
+      const moved = await tx
+        .update(workClaims)
+        .set({ runId: successor.id })
+        .where(and(eq(workClaims.runId, found.run.id), stillHeld))
+        .returning({ type: workClaims.resourceType, key: workClaims.resourceKey, access: workClaims.access });
+      await tx.update(agentRuns).set({ rotatedToRunId: successor.id }).where(eq(agentRuns.id, found.run.id));
+      // The rules the session answered for go on with it. The receipt is what
+      // the server served the session and what its runtime reported having
+      // applied, both about this checkout; nothing runs the policy step again
+      // for a successor (a hook files a receipt at a start, and this is not
+      // one), so without a copy the run that carries the work's delivery read
+      // "never reported a policy hash" where the run before it had answered.
+      const [receipt] = await tx.select().from(policyReceipts).where(eq(policyReceipts.runId, found.run.id)).limit(1);
+      if (receipt) {
+        await tx.insert(policyReceipts).values({
+          runId: successor.id,
+          expectedHash: receipt.expectedHash,
+          reportedHash: receipt.reportedHash,
+          drift: receipt.drift,
+          createdAt: receipt.createdAt,
+        });
+        await tx.update(agentRuns).set({ policyHash: found.run.policyHash }).where(eq(agentRuns.id, successor.id));
+      }
+      const session = await sessionLineage(tx, found.run);
+      await addAgentEvent(tx, found.run.id, 'run_finished', {
+        status: 'completed',
+        reason: 'work_rotation',
+        rotatedTo: successor.id,
+        sessionId: input.sessionId,
+        workId: input.workId,
+        claimsMoved: moved.length,
+        // What moved, so the closed run's evidence still says what it declared
+        // and the successor's says which of its ground came from here
+        // (`evidenceForRun`): the rows themselves are the successor's now.
+        movedClaims: moved.slice(0, ROTATION_CLAIMS_KEPT),
+      });
+      await addAgentEvent(tx, successor.id, 'run_started', {
+        taskKey: null,
+        repo: successor.repo,
+        branch: successor.branch,
+        attemptGroup: null,
+        requestId: null,
+        reason: 'work_rotation',
+        rotatedFrom: found.run.id,
+        sessionId: input.sessionId,
+        workId: input.workId,
+        specRevision: input.specRevision,
+        // Read back by `sessionLineage`: the stale-ground window and the
+        // acknowledgments of the session this run continues.
+        sessionStartedAt: session.since.toISOString(),
+        sessionRunIds: session.runIds.slice(-SESSION_RUNS_KEPT),
+      });
+      // Named the way `nameRunForWork` names a hook-owned run, so the next
+      // assignment done in this session may rename it.
+      await addAgentEvent(tx, successor.id, 'run_named', { name: input.name, sessionId: input.sessionId });
+      // Last, because Work locks are the last locks any transaction takes.
+      const linked = await mutateWorkInTransaction(
+        tx,
+        {
+          teamId: input.teamId,
+          projectId: input.projectId,
+          workIds: [input.workId],
+          actor: agentPrincipal(userId, grant),
+        },
+        linkRunToWork({
+          runId: successor.id,
+          runProjectId: successor.projectId,
+          expectedSpecRevision: input.specRevision,
+          via: 'run_rotation',
+          rotatedFrom: found.run.id,
+        }),
+      );
+      return {
+        reply: rotationDone(found.run.id, successor.id, input.workKey, input.specRevision),
+        committed: linked.afterCommit,
+      };
+    });
+  } catch (error) {
+    if (!(error instanceof WorkRefusal)) throw error;
+    return { done: false, run_id: candidate, reason: error.error.code, detail: workRefusalText(error.error) };
+  }
+  if (rotated.committed) {
+    publishChange(input.teamId, 'claims');
+    publishChange(input.teamId, 'run');
+    try {
+      await rotated.committed(db);
+    } catch {
+      // The rotation is committed; a missed live refresh costs latency only.
+    }
+  }
+  return rotated.reply;
 }
 
 export async function markStaleAgentRuns(
@@ -1446,6 +2034,41 @@ export interface StaleGround {
 
 /** How far back to look for finished runs — a week-old merge is not news. */
 const STALE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** How many earlier runs of one session a rotation's successor remembers. */
+const SESSION_RUNS_KEPT = 20;
+
+/**
+ * The session a run continues: when it began reading the world and which runs
+ * it has been. A run's own start, for any run but a rotation's successor; a
+ * successor records on its `run_started` event the start and the runs of the
+ * session it took over (`rotateRunForWork`), because it carries that session's
+ * ground on, and a window that began at the rotation would drop ground that
+ * moved before it and was never acknowledged (it was refused as stale ground a
+ * moment earlier, and then allowed). One indexed read of the run's own events.
+ */
+export interface SessionLineage {
+  since: Date;
+  runIds: string[];
+}
+
+export async function sessionLineage(db: Db, run: { id: string; startedAt: Date }): Promise<SessionLineage> {
+  const [started] = await db
+    .select({ detail: agentEvents.detail })
+    .from(agentEvents)
+    .where(and(eq(agentEvents.runId, run.id), eq(agentEvents.type, 'run_started')))
+    .limit(1);
+  const detail = (started?.detail ?? null) as { reason?: unknown; sessionStartedAt?: unknown; sessionRunIds?: unknown } | null;
+  if (detail?.reason !== 'work_rotation') return { since: run.startedAt, runIds: [run.id] };
+  const at = typeof detail.sessionStartedAt === 'string' ? new Date(detail.sessionStartedAt) : null;
+  const earlier = Array.isArray(detail.sessionRunIds)
+    ? detail.sessionRunIds.filter((id): id is string => typeof id === 'string').slice(-SESSION_RUNS_KEPT)
+    : [];
+  return {
+    since: at && !Number.isNaN(at.getTime()) && at < run.startedAt ? at : run.startedAt,
+    runIds: [...new Set([...earlier, run.id])],
+  };
+}
 export const claimDeclarationKey = (claim: { resourceType: string; resourceKey: string; access?: string }) =>
   `${claim.resourceType}|${claim.resourceKey.toLowerCase()}|${claim.access ?? 'write'}`;
 
@@ -1480,9 +2103,11 @@ export async function staleGroundFor(
   run: { id: string; teamId: string; projectId: string | null; startedAt: Date },
   claims: readonly WorkClaim[],
   declaredAt?: ReadonlyMap<string, Date>,
+  lineage?: SessionLineage,
 ): Promise<StaleGround[]> {
   if (claims.length === 0) return [];
-  const since = new Date(Math.max(run.startedAt.getTime(), Date.now() - STALE_WINDOW_MS));
+  const session = lineage ?? (await sessionLineage(db, run));
+  const since = new Date(Math.max(session.since.getTime(), Date.now() - STALE_WINDOW_MS));
   const rows = await db
     .select({
       claim: workClaims,
@@ -1497,7 +2122,9 @@ export async function staleGroundFor(
     .innerJoin(users, eq(agentInstallations.userId, users.id))
     .where(
       and(
-        ne(agentRuns.id, run.id),
+        // The run and the runs a rotation replaced it from: one session, whose
+        // own released ground is not ground somebody else moved under it.
+        notInArray(agentRuns.id, session.runIds),
         eq(agentRuns.teamId, run.teamId),
         run.projectId ? eq(agentRuns.projectId, run.projectId) : isNull(agentRuns.projectId),
         // Finished, and finished *after* this run began reading the world — or

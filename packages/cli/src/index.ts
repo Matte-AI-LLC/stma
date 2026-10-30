@@ -37,12 +37,12 @@ import { LOCKFILE_NAMES, dotenvNames, scanEcosystems } from './collect.js';
 import {
   NEWS_TIMEOUT_MS,
   dueForCheck,
-  handoffKey,
   oneLine,
   quoted,
   rememberAnnounced,
   renderNews,
   unseen,
+  workStatusText,
   type News,
 } from './news.js';
 import { gitBlobHash } from './hash.js';
@@ -56,6 +56,7 @@ import { conflictReport, matchContentRules, parseContentRules, type RightOfWayCo
 import { checkNativeRuntime, prepareNativeRuntime } from './nativeInstall.js';
 import { appendCodexEntry, checkCodexEntry, codexConfigPath, readCodexConfig, removeCodexEntry, writeCodexConfig } from './codexConfig.js';
 import { authorizeLocalAdapter, isTerminalCredential, localOAuthConnection, revokeLocalAdapterCredential, revokeTerminalCredential, saveTerminalCredential } from './oauthLocal.js';
+import { workerCommand } from './worker.js';
 
 interface LocalConfig {
   server?: string;
@@ -85,8 +86,30 @@ interface LocalConfig {
    * carried since it was cut.
    */
   adapterRunCommits?: Record<string, string>;
+  /**
+   * The work a session's run was linked to when that run ended (a branch switch
+   * closed it, or it went stale while its human was away), kept until the run
+   * that replaces it has started. Written by the same write that forgets the
+   * old run: held only in memory across the register and start requests, it was
+   * lost to a timeout or a killed hook, and the replay started a run linked to
+   * nothing, because the session had already forgotten the run to ask about.
+   */
+  adapterRunWork?: Record<string, CarriedWork>;
   /** Persisted before a manual start request so a lost response cannot create a second run. */
   pendingStarts?: Record<string, ManualStartEnvelope>;
+  /**
+   * A run the server rotated, written before this session's run is moved to
+   * its successor and cleared by the same write that moves it. A hook killed
+   * between the two finishes the adoption on its next start.
+   */
+  pendingAdoption?: { session: string; from: string; to: string };
+  /**
+   * The contract revision each run was last told its work moved to. A
+   * heartbeat comes with every tool use, and the same sentence on each would
+   * bury everything else the hook has to say.
+   */
+  contractNoticed?: Record<string, number>;
+  workStatusNoticed?: Record<string, string>;
 }
 
 export interface ManualStartEnvelope {
@@ -382,6 +405,11 @@ async function apiRequest<T>(
         // an older CLI has to keep working — but a version mix that is visible in
         // the logs is one nobody has to reconstruct from a bug report.
         ...clientHeaders(),
+        // This runtime adopts a rotated run's successor (`onSessionRun`), so it
+        // asks to be told about a rotation with the 404 that names it. Without
+        // the header the server answers a rotated run's call for the successor,
+        // which is what keeps a runtime pinned before rotations to one run.
+        'x-stma-run-rotation': 'adopt',
         ...init.headers,
       },
     });
@@ -392,9 +420,11 @@ async function apiRequest<T>(
   const data = (await response.json().catch(() => ({}))) as T & { error?: string };
   if (!response.ok) {
     // Carry the status so callers can tell a request that will never succeed
-    // from one worth retrying later.
+    // from one worth retrying later, and the body, which for a rotated run names
+    // the run that replaced it.
     const failure = Object.assign(new Error(data.error ?? `HTTP ${response.status}`), {
       status: response.status,
+      body: data as unknown,
     });
     throw failure;
   }
@@ -425,10 +455,52 @@ async function request<T>(config: LocalConfig, endpoint: string, init: RequestIn
   try {
     return await apiRequest<T>(config, endpoint, init);
   } catch (error) {
-    const server = (process.env.STMA_URL ?? config.server ?? 'http://localhost:3000').replace(/\/$/, '');
-    const status = (error as { status?: number }).status;
-    const note = status === 404 ? await skewNote(server) : '';
-    fail(`Request to ${server} failed: ${error instanceof Error ? error.message : String(error)}${note}`);
+    return requestFailed(config, error);
+  }
+}
+
+/** A manual command's request that failed, said in the terminal; the command ends there. */
+async function requestFailed(config: LocalConfig, error: unknown): Promise<never> {
+  const server = (process.env.STMA_URL ?? config.server ?? 'http://localhost:3000').replace(/\/$/, '');
+  const status = (error as { status?: number }).status;
+  const note = status === 404 ? await skewNote(server) : '';
+  fail(`Request to ${server} failed: ${error instanceof Error ? error.message : String(error)}${note}`);
+}
+
+/**
+ * A manual run command (`stma run heartbeat`, `finish`, the `exec` wrapper) on
+ * a run a controlled rotation may have closed. Every request says it adopts a
+ * rotation (`apiRequest`), so the server answers such a run with the 404 that
+ * names its successor rather than answering for the successor itself; a
+ * command that did not adopt it then exited on that 404, the wrapper from
+ * inside its heartbeat timer with the agent still running. Here the successor
+ * is taken the way the hook takes it: the checkout's current run moves to it
+ * when it was the closed one, and the call is asked again about it. Bounded,
+ * because the server already names the newest run of the chain. `init` is a
+ * function where the run is named in the body rather than the address (the
+ * environment preflight), so the second ask names the successor there too.
+ */
+async function requestOnRun<T>(
+  config: LocalConfig,
+  runId: string,
+  endpoint: (runId: string) => string,
+  init: RequestInit | ((runId: string) => RequestInit),
+): Promise<{ value: T; runId: string }> {
+  let current = runId;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const body = typeof init === 'function' ? init(current) : init;
+      return { value: await apiRequest<T>(config, endpoint(current), body), runId: current };
+    } catch (error) {
+      const next = rotatedTo(error);
+      if (!next || next === current || attempt >= 2) return requestFailed(config, error);
+      const from = current;
+      // The claims the checkout declared stay: the rotation moved that ground
+      // to the successor, so the next heartbeat restates it on the right run.
+      updateConfig((latest) => (latest.currentRunId === from ? { ...latest, currentRunId: next } : latest));
+      console.log(`Run ${from} was closed by a controlled rotation when this agent took work on another contract; continuing with run ${next}.`);
+      current = next;
+    }
   }
 }
 
@@ -597,6 +669,11 @@ async function reportKnowledgeReceipt(flags: Flags): Promise<void> {
 }
 
 async function heartbeat(flags: Flags): Promise<void> {
+  await beat(flags);
+}
+
+/** One heartbeat on the run, and the run it was answered for: the successor when a rotation closed it. */
+async function beat(flags: Flags): Promise<string> {
   const config = loadConfig();
   const runId = one(flags, 'run') ?? config.currentRunId;
   if (!runId) fail('No current run. Pass --run or start one first.');
@@ -614,7 +691,7 @@ async function heartbeat(flags: Flags): Promise<void> {
           other.access === claim.access,
       ) === index,
   );
-  const result = await request<any>(config, `/api/agent/runs/${runId}/heartbeat`, {
+  const { value: result, runId: answered } = await requestOnRun<any>(config, runId, (id) => `/api/agent/runs/${id}/heartbeat`, {
     method: 'POST',
     body: JSON.stringify({
       status: one(flags, 'status'),
@@ -626,6 +703,7 @@ async function heartbeat(flags: Flags): Promise<void> {
   console.log(`Heartbeat: ${result.status}`);
   printConflicts(result.conflicts ?? []);
   printQuota(result);
+  return answered;
 }
 
 /**
@@ -709,7 +787,7 @@ async function finish(flags: Flags): Promise<void> {
   const config = loadConfig();
   const runId = one(flags, 'run') ?? config.currentRunId;
   if (!runId) fail('No current run. Pass --run or start one first.');
-  const result = await request<any>(config, `/api/agent/runs/${runId}/finish`, {
+  const { value: result, runId: finished } = await requestOnRun<any>(config, runId, (id) => `/api/agent/runs/${id}/finish`, {
     method: 'POST',
     body: JSON.stringify({
       status: one(flags, 'status') ?? 'completed',
@@ -717,9 +795,13 @@ async function finish(flags: Flags): Promise<void> {
       checkpoint: gitCheckpoint(randomUUID(), 'delivery', gitContext()),
     }),
   });
-  if (config.currentRunId === runId) {
-    updateConfig((latest) => ({ ...latest, currentRunId: undefined, currentClaims: undefined }));
-  }
+  // The run this checkout tracked is done, whether it was the one named or
+  // the successor a rotation moved it to on the way.
+  updateConfig((latest) =>
+    latest.currentRunId === runId || latest.currentRunId === finished
+      ? { ...latest, currentRunId: undefined, currentClaims: undefined }
+      : latest,
+  );
   console.log(`Run ${result.runId}: ${result.status}`);
 }
 
@@ -763,7 +845,11 @@ async function pullPolicy(flags: Flags): Promise<void> {
     const reportedHash = applyPolicy(cwd, result.document, result.hash, config.clientType);
     console.log(`Applied policy for ${config.clientType ?? 'generic'} and wrote .stma/effective-policy.json`);
     if (config.currentRunId) {
-      await request(config, `/api/agent/runs/${config.currentRunId}/policy-receipt`, {
+      // The current run may have been rotated by the wrapped agent taking work
+      // on another contract: the receipt goes on the successor, the run the
+      // checkout now works in, and the command does not end on the 404 that
+      // names it.
+      await requestOnRun(config, config.currentRunId, (id) => `/api/agent/runs/${id}/policy-receipt`, {
         method: 'POST',
         body: JSON.stringify({ expectedHash: result.hash, reportedHash }),
       });
@@ -773,29 +859,42 @@ async function pullPolicy(flags: Flags): Promise<void> {
 
 async function environment(flags: Flags, action: 'baseline' | 'preflight'): Promise<void> {
   const config = loadConfig();
-  const body = {
-    team: required(flags, 'team'),
-    project: required(flags, 'project'),
-    runId: one(flags, 'run') ?? config.currentRunId,
-    snapshot: collectSnapshot(),
-  };
+  const runId = one(flags, 'run') ?? config.currentRunId;
+  const team = required(flags, 'team');
+  const project = required(flags, 'project');
+  const snapshot = collectSnapshot();
+  const body = (run: string | undefined) => ({ team, project, runId: run, snapshot });
+  if (action === 'preflight' && runId) {
+    // Named in the body, the run is followed the same way: a check filed on a
+    // run a rotation closed would describe a checkout that run no longer holds.
+    const { value: result } = await requestOnRun<any>(config, runId, () => '/api/agent/environment/preflight', (run) => ({
+      method: 'POST',
+      body: JSON.stringify(body(run)),
+    }));
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
   const endpoint =
     action === 'baseline'
       ? '/api/control/environment-baselines'
       : '/api/agent/environment/preflight';
-  const result = await request<any>(config, endpoint, { method: 'POST', body: JSON.stringify(body) });
+  const result = await request<any>(config, endpoint, { method: 'POST', body: JSON.stringify(body(runId)) });
   console.log(JSON.stringify(result, null, 2));
 }
 
 async function execRun(flags: Flags, command: string[]): Promise<void> {
   if (command.length === 0) fail('Pass a command after --, for example: stma run exec ... -- claude');
   const started = await startRun(flags);
-  const runId = started.run.id as string;
+  // The wrapped agent may take work on another contract, which rotates this
+  // run: the wrapper then goes on with the successor, never the closed run.
+  let runId = started.run.id as string;
   let heartbeatBusy = false;
   const timer = setInterval(() => {
     if (heartbeatBusy) return;
     heartbeatBusy = true;
-    void heartbeat(new Map([['run', [runId]]])).finally(() => (heartbeatBusy = false));
+    void beat(new Map([['run', [runId]]]))
+      .then((answered) => (runId = answered))
+      .finally(() => (heartbeatBusy = false));
   }, 60_000);
   const child = spawn(command[0]!, command.slice(1), { cwd, stdio: 'inherit', env: process.env });
   const code = await new Promise<number>((resolve) => {
@@ -1270,6 +1369,36 @@ export function buildNativeHeartbeatRequest(
   };
 }
 
+/** The work item a session's ended run was linked to, as its finish or its heartbeat's 404 answered it. */
+interface CarriedWork {
+  workId: string;
+  key: string;
+  revision: number;
+}
+
+const WORK_KEY_SHAPE = /^[A-Z][A-Z0-9]{0,15}-\d{1,12}$/;
+
+/**
+ * The `work` block of a finish reply, or of the 404 a heartbeat on an ended run
+ * gets, shape-checked: its id goes into the next start and its key into the
+ * agent's context. Absent for a run linked to nothing, which is every run a
+ * server without Native Work finishes, and for work that no longer takes a run
+ * (accepted, cancelled or archived), which the server leaves out.
+ */
+function carriedWork(reply: unknown): CarriedWork | undefined {
+  const work = (reply as { work?: { work_id?: unknown; key?: unknown; pinned_revision?: unknown } } | null)?.work;
+  if (!work || typeof work.work_id !== 'string' || !RUN_ID_SHAPE.test(work.work_id)) return undefined;
+  if (typeof work.key !== 'string' || !WORK_KEY_SHAPE.test(work.key)) return undefined;
+  if (typeof work.pinned_revision !== 'number' || !Number.isSafeInteger(work.pinned_revision) || work.pinned_revision < 1) return undefined;
+  return { workId: work.work_id.toLowerCase(), key: work.key, revision: work.pinned_revision };
+}
+
+/** The work this session's next run is to carry, read back through the same shape check. */
+function storedCarry(local: LocalConfig, sessionKey: string): CarriedWork | undefined {
+  const stored = local.adapterRunWork?.[sessionKey];
+  return stored ? carriedWork({ work: { work_id: stored.workId, key: stored.key, pinned_revision: stored.revision } }) : undefined;
+}
+
 async function startNativeRun(
   profile: LoadedAdapterProfile,
   stored: { file: string; event: QueuedHookEvent },
@@ -1279,42 +1408,102 @@ async function startNativeRun(
   const sessionKey = hookSessionKey(adapter, event.payload);
   let local = loadProfileConfig(profile.id);
   const current = local.adapterRuns?.[sessionKey];
+  // The work the run this one replaces carried, kept on disk since that run was
+  // forgotten (`forgetAdapterRun`), so a replay knows it as the first try did.
+  const forWork = current ? undefined : storedCarry(local, sessionKey);
   if (current && event.notice) {
-    const environment = await completeNativeSetup(profile, current, event.id);
-    return [event.notice, environment].filter(Boolean).join('\n');
+    // Adopted first, as every other call adopts: the policy receipt filed here
+    // belongs on the run the session goes on in, and the server answers a
+    // rotated run with its successor rather than recording on a closed one.
+    const done = await onSessionRun(profile.id, sessionKey, current, (runId) => completeNativeSetup(profile, runId, event.id));
+    return [event.notice, done.notice, done.value].filter(Boolean).join('\n');
   }
   let request = event.request;
   if (!request) {
     if (current) {
       try {
-        await apiRequest(local, `/api/agent/runs/${current}/heartbeat`, { method: 'POST', body: JSON.stringify({ status: 'active' }) }, HOOK_REQUEST_TIMEOUT_MS);
-        const environment = await completeNativeSetup(profile, current, event.id);
-        return [`STMA native tracking owns run ${current} for this client session. Reuse this run_id; do not start a second MCP run.`, environment].filter(Boolean).join('\n');
+        // A rotated run is adopted here like on every other call: the session
+        // goes on in its successor, and nothing new is started for it.
+        const owned = await onSessionRun(profile.id, sessionKey, current, (runId) =>
+          apiRequest<any>(local, `/api/agent/runs/${runId}/heartbeat`, { method: 'POST', body: JSON.stringify({ status: 'active' }) }, HOOK_REQUEST_TIMEOUT_MS),
+        );
+        const environment = await completeNativeSetup(profile, owned.runId, event.id);
+        const status = workStatusNotice(profile.id, owned.runId, owned.value?.work_status);
+        const contract = contractNotice(profile.id, owned.runId, owned.value?.contract_changed);
+        return [owned.notice, `STMA native tracking owns run ${owned.runId} for this client session. Reuse this run_id; do not start a second MCP run.`, status, contract, environment].filter(Boolean).join('\n');
       } catch (error) {
         if ((error as { status?: number }).status !== 404) throw error;
-        forgetAdapterRun(profile.id, sessionKey, current);
+        // A run that ended linked to open work (it went stale while its human
+        // was away) is answered with that work, and the run started in its
+        // place is started for it.
+        forgetAdapterRun(
+          profile.id,
+          sessionKey,
+          sessionRun(profile.id, sessionKey, current),
+          carriedWork((error as { body?: unknown }).body),
+        );
         return startNativeRun(profile, stored);
       }
     }
     const installationId = await ensureAdapterInstallation(profile, event.id);
     local = loadProfileConfig(profile.id);
     const git = gitContext();
-    request = buildNativeStartRequest(
-      adapter,
-      event.id,
-      installationId,
-      event.payload,
-      git,
-      nativeClaims(),
-    );
+    request = {
+      ...buildNativeStartRequest(
+        adapter,
+        event.id,
+        installationId,
+        event.payload,
+        git,
+        nativeClaims(),
+      ),
+      // The run that ended (closed by a branch switch, or gone stale) carried
+      // this work: its replacement is started for the same work at the same
+      // contract revision, so the work keeps a live linked run instead of
+      // losing it to an unlinked one.
+      ...(forWork ? { workId: forWork.workId, expectedSpecRevision: forWork.revision } : {}),
+    };
     event.request = request;
     updateQueuedHookEvent(cwd, profile.id, stored.file, event);
   }
-  const result = await apiRequest<any>(local, '/api/agent/runs/start', {
-    method: 'POST',
-    headers: { 'x-stma-event-id': event.id },
-    body: JSON.stringify(request),
-  }, HOOK_REQUEST_TIMEOUT_MS);
+  const startWith = (body: Record<string, unknown>) =>
+    apiRequest<any>(local, '/api/agent/runs/start', {
+      method: 'POST',
+      headers: { 'x-stma-event-id': event.id },
+      body: JSON.stringify(body),
+    }, HOOK_REQUEST_TIMEOUT_MS);
+  let result: any;
+  // Read back through a shape check: the key and the reason go into the
+  // agent's context, and the file is one any process of this user can edit.
+  const persisted = event.workRefused;
+  let refused =
+    persisted && typeof persisted.key === 'string' && typeof persisted.reason === 'string'
+      ? { key: WORK_KEY_SHAPE.test(persisted.key) ? persisted.key : 'the work', reason: oneLine(persisted.reason, 300) }
+      : undefined;
+  try {
+    result = await startWith(request);
+  } catch (error) {
+    // The work refused the link (its contract moved since, it was cancelled,
+    // or this connection cannot reach it). The session still needs a run, so
+    // one starts linked to nothing, under the same request id, which the
+    // refused start left unused; and the agent is told the work lost its run.
+    const failure = error as { status?: number; body?: { code?: unknown; error?: unknown } };
+    const code = failure.body?.code;
+    if (typeof request.workId !== 'string' || typeof code !== 'string' || !failure.status || failure.status >= 500) throw error;
+    const { workId: _work, expectedSpecRevision: _revision, ...plain } = request;
+    request = plain;
+    // Written with the plain request, in the same write: a hook killed after
+    // it replays a start that answers with no word of the work, and the
+    // refusal is then the only thing left that says the work lost its run.
+    refused = { key: forWork?.key ?? 'the work', reason: oneLine(failure.body?.error, 300) || code };
+    event.request = request;
+    event.workRefused = refused;
+    updateQueuedHookEvent(cwd, profile.id, stored.file, event);
+    result = await startWith(request);
+  }
+  const workNotice = refused
+    ? `STMA: run ${result.run.id} could not be linked to ${refused.key}, which the run before it carried (${refused.reason}). ${refused.key} has no live run of this agent now: tell your human before going on with it, and do not start another run for it.`
+    : undefined;
   const runId = result.run.id as string;
   if (!current) {
     const started = gitContext();
@@ -1327,6 +1516,8 @@ async function startNativeRun(
       adapterRuns: { ...(latest.adapterRuns ?? {}), [sessionKey]: runId },
       ...(started.branch ? { adapterRunBranches: { ...(latest.adapterRunBranches ?? {}), [sessionKey]: started.branch } } : {}),
       ...(started.headSha ? { adapterRunCommits: { ...(latest.adapterRunCommits ?? {}), [sessionKey]: started.headSha } } : {}),
+      // The replacement has started, linked or not: the carry has done its job.
+      ...(latest.adapterRunWork?.[sessionKey] ? { adapterRunWork: withoutSession(latest.adapterRunWork, sessionKey) } : {}),
     }));
   }
   // The run exists the moment the server answered, and its id is the one thing
@@ -1349,6 +1540,12 @@ async function startNativeRun(
   const knowledge = result.knowledgeContext as Record<string, unknown> | undefined;
   const readiness = result.readiness as Record<string, any> | undefined;
   const notices: string[] = [`STMA native tracking owns run ${runId} for this client session. Reuse this run_id for planned scope and handoffs; do not start a second MCP run. File-tool guards do not cover arbitrary shell/MCP writes. Readiness and policy prose are not execution permission.`];
+  if (forWork && !workNotice && carriedWork({ work: result.work })?.workId === forWork.workId) {
+    notices.push(
+      `STMA: run ${runId} is linked to ${forWork.key} at contract revision ${forWork.revision}, as the run it replaced was. Send run_id ${runId} in every call for ${forWork.key}, submit_work included.`,
+    );
+  }
+  if (workNotice) notices.push(workNotice);
   if (environment) notices.push(environment);
   if (typeof knowledge?.context === 'string') {
     notices.push(
@@ -1460,7 +1657,21 @@ async function completeNativeSetup(
   }
 }
 
-function forgetAdapterRun(profileId: string, sessionKey: string, runId: string): void {
+/** A per-session map without this session's entry. */
+function withoutSession<T>(map: Record<string, T>, sessionKey: string): Record<string, T> {
+  const rest = { ...map };
+  delete rest[sessionKey];
+  return rest;
+}
+
+/**
+ * Forget the session's run. `carry` is the work that run was linked to, when
+ * the run ended with the work still open: it is kept in the same write, so the
+ * run started next for this session is started for that work even when the
+ * start is a replay after a lost response or a killed hook. Forgetting a run
+ * with nothing to carry drops whatever an earlier one left.
+ */
+function forgetAdapterRun(profileId: string, sessionKey: string, runId: string, carry?: CarriedWork): void {
   updateProfileConfig(profileId, (latest) => {
     const adapterRuns = { ...(latest.adapterRuns ?? {}) };
     delete adapterRuns[sessionKey];
@@ -1468,6 +1679,11 @@ function forgetAdapterRun(profileId: string, sessionKey: string, runId: string):
     delete adapterRunBranches[sessionKey];
     const adapterRunCommits = { ...(latest.adapterRunCommits ?? {}) };
     delete adapterRunCommits[sessionKey];
+    const adapterRunWork = carry
+      ? { ...(latest.adapterRunWork ?? {}), [sessionKey]: carry }
+      : latest.adapterRunWork
+        ? withoutSession(latest.adapterRunWork, sessionKey)
+        : undefined;
     return {
       ...latest,
       currentRunId: latest.currentRunId === runId ? undefined : latest.currentRunId,
@@ -1475,9 +1691,92 @@ function forgetAdapterRun(profileId: string, sessionKey: string, runId: string):
       adapterRuns,
       adapterRunBranches,
       adapterRunCommits,
+      ...(adapterRunWork ? { adapterRunWork } : {}),
     };
   });
 }
+
+const RUN_ID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * The run that replaced this one, when the server answered that a controlled
+ * rotation closed it (an agent took work on another contract). Shape-checked:
+ * the id goes into this session's state and into the agent's context. The
+ * server answers it with the 404 any closed run gets, so a runtime pinned
+ * before rotations forgets the run as it always did; this one reads the body
+ * first and adopts instead, before any caller's 404 handling forgets it.
+ */
+function rotatedTo(error: unknown): string | undefined {
+  const failure = error as { status?: number; body?: { code?: unknown; rotatedTo?: unknown } } | null;
+  if (failure?.status !== 404 || failure.body?.code !== 'run_rotated') return undefined;
+  const next = failure.body.rotatedTo;
+  return typeof next === 'string' && RUN_ID_SHAPE.test(next) ? next.toLowerCase() : undefined;
+}
+
+/**
+ * Move this session to the run's successor. The journal entry is written first
+ * and cleared by the same atomic write that moves the session, so a hook killed
+ * in between leaves an entry the next hook finishes, and never a session that
+ * points at nothing. The successor is the same session's run on the same
+ * branch, so the branch it began on and the commit the content scan reads from
+ * stay as they were: what the session put in the checkout is still all asked about.
+ */
+function adoptRotatedRun(profileId: string, sessionKey: string, from: string, to: string): string {
+  updateProfileConfig(profileId, (latest) => ({ ...latest, pendingAdoption: { session: sessionKey, from, to } }));
+  finishPendingAdoption(profileId);
+  return `STMA: run ${from} was closed by a controlled rotation when this agent took work on another contract. Native tracking now owns run ${to} for this client session. Reuse run_id ${to}; do not start a second run.`;
+}
+
+function finishPendingAdoption(profileId: string): void {
+  if (!loadProfileConfig(profileId).pendingAdoption) return;
+  updateProfileConfig(profileId, (latest) => {
+    const pending = latest.pendingAdoption;
+    if (!pending) return latest;
+    const { pendingAdoption: _finished, ...rest } = latest;
+    // A session that has already moved on (adopted, closed or replaced) keeps
+    // what it has: the journal only ever moves `from` to `to`.
+    if (rest.adapterRuns?.[pending.session] !== pending.from) return rest;
+    const current = rest.currentRunId === pending.from;
+    return {
+      ...rest,
+      adapterRuns: { ...rest.adapterRuns, [pending.session]: pending.to },
+      currentRunId: current ? pending.to : rest.currentRunId,
+      currentClaims: current ? [] : rest.currentClaims,
+    };
+  });
+}
+
+/**
+ * Ask the server about this session's run, and when the answer is that it was
+ * rotated, adopt the successor and ask again about that one. Never a new start:
+ * the work goes on in the run the server already made for it. Bounded, because
+ * the server follows a chain of rotations itself and a loop here could only
+ * mean the state and the server disagree.
+ */
+async function onSessionRun<T>(
+  profileId: string,
+  sessionKey: string,
+  runId: string,
+  call: (runId: string) => Promise<T>,
+): Promise<{ value: T; runId: string; notice?: string }> {
+  let current = runId;
+  let notice: string | undefined;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      return { value: await call(current), runId: current, notice };
+    } catch (error) {
+      const next = rotatedTo(error);
+      if (!next || next === current) throw error;
+      notice = adoptRotatedRun(profileId, sessionKey, current, next);
+      current = next;
+    }
+  }
+  return { value: await call(current), runId: current, notice };
+}
+
+/** The run this session holds now, after any adoption: what a failure should forget. */
+const sessionRun = (profileId: string, sessionKey: string, fallback: string): string =>
+  loadProfileConfig(profileId).adapterRuns?.[sessionKey] ?? fallback;
 
 /**
  * What a collision reported by the server should say in this agent's context.
@@ -1517,6 +1816,60 @@ function collisionNotices(conflicts: unknown): string[] {
 }
 
 /**
+ * The contract of the work this run carries moved under it (spec 4.2), as the
+ * heartbeat reports it, said once per run and revision. Built from the fields,
+ * shape-checked, never from the server's prose: this text becomes the agent's
+ * context.
+ */
+function contractNotice(profileId: string, runId: string, value: unknown): string | undefined {
+  const changed = value as { work_id?: unknown; key?: unknown; pinned_revision?: unknown; spec_revision?: unknown } | null;
+  if (!changed || typeof changed !== 'object') return undefined;
+  const { work_id: workId, key, pinned_revision: pinned, spec_revision: current } = changed;
+  if (typeof workId !== 'string' || !RUN_ID_SHAPE.test(workId)) return undefined;
+  if (typeof key !== 'string' || !WORK_KEY_SHAPE.test(key)) return undefined;
+  if (typeof pinned !== 'number' || !Number.isSafeInteger(pinned) || pinned < 1) return undefined;
+  if (typeof current !== 'number' || !Number.isSafeInteger(current) || current <= pinned) return undefined;
+  if (loadProfileConfig(profileId).contractNoticed?.[runId] === current) return undefined;
+  updateProfileConfig(profileId, (latest) => ({
+    ...latest,
+    contractNoticed: { ...Object.fromEntries(Object.entries(latest.contractNoticed ?? {}).slice(-19)), [runId]: current },
+  }));
+  return `STMA: the contract of ${key} moved from revision ${pinned} to ${current} while run ${runId} was working to it. Read it again with get_work {"work_id":"${workId}"} and tell your human before you go on: work done to revision ${pinned} is not delivered as revision ${current} without them.`;
+}
+
+/** A lifecycle warning is announced once while true, and can be announced again after work reopens. */
+function workStatusNotice(profileId: string, runId: string, value: unknown): string | undefined {
+  const status = value as { work_id?: unknown; key?: unknown; state?: unknown; archived?: unknown } | null;
+  const previous = loadProfileConfig(profileId).workStatusNoticed?.[runId];
+  if (!status) {
+    if (previous) updateProfileConfig(profileId, (latest) => {
+      const noticed = { ...latest.workStatusNoticed };
+      delete noticed[runId];
+      return { ...latest, workStatusNoticed: noticed };
+    });
+    const [workId, state, archived, extra] = typeof previous === 'string' ? previous.split(':') : [];
+    if (workId && RUN_ID_SHAPE.test(workId) && state &&
+      ['draft', 'ready', 'in_progress', 'in_review', 'accepted', 'cancelled'].includes(state) &&
+      (archived === 'true' || archived === 'false') && extra === undefined) {
+      return `STMA: Work state changed; read get_work {"work_id":"${workId}"} before continuing. The previous warning is no longer reported; this alone does not authorize execution.`;
+    }
+    return undefined;
+  }
+  if (typeof status.work_id !== 'string' || !RUN_ID_SHAPE.test(status.work_id)) return undefined;
+  if (typeof status.key !== 'string' || !WORK_KEY_SHAPE.test(status.key)) return undefined;
+  if (typeof status.state !== 'string' || !['draft', 'ready', 'in_progress', 'in_review', 'accepted', 'cancelled'].includes(status.state)) return undefined;
+  const text = workStatusText({ id: status.work_id, key: status.key, state: status.state, archived: status.archived === true });
+  if (!text) return undefined;
+  const identity = `${status.work_id}:${status.state}:${status.archived === true}`;
+  if (previous === identity) return undefined;
+  updateProfileConfig(profileId, (latest) => ({
+    ...latest,
+    workStatusNoticed: { ...Object.fromEntries(Object.entries(latest.workStatusNoticed ?? {}).slice(-19)), [runId]: identity },
+  }));
+  return `STMA: ${text}`;
+}
+
+/**
  * A hook-owned run is one branch. When the checkout moves to another branch —
  * a handoff received on a different branch is the ordinary case — the old run
  * is closed and a new one starts on the branch the work is now on, so its
@@ -1535,17 +1888,33 @@ async function migrateRunIfBranchChanged(
   const startedOn = local.adapterRunBranches?.[sessionKey];
   const now = gitContext().branch;
   if (!startedOn || !now || now === startedOn) return undefined;
+  // The run to close is the session's live one: a run rotated since the hook
+  // last looked is closed already, and its successor is what the switch ends.
+  let closing = runId;
+  // The work the closed run carried, which its replacement is started for: a
+  // run's link is never edited, so a run that ends linked leaves the work with
+  // no live run unless the next one is linked at its start (spec 5.3).
+  let work: CarriedWork | undefined;
   try {
-    await apiRequest(local, `/api/agent/runs/${runId}/finish`, {
-      method: 'POST', headers: { 'x-stma-event-id': `${stored.event.id}:switch` }, body: JSON.stringify({ status: 'completed' }),
-    }, HOOK_REQUEST_TIMEOUT_MS);
+    const finished = await onSessionRun(profile.id, sessionKey, runId, (id) =>
+      apiRequest(local, `/api/agent/runs/${id}/finish`, {
+        method: 'POST', headers: { 'x-stma-event-id': `${stored.event.id}:switch` }, body: JSON.stringify({ status: 'completed' }),
+      }, HOOK_REQUEST_TIMEOUT_MS),
+    );
+    closing = finished.runId;
+    work = carriedWork(finished.value);
   } catch (error) {
     if ((error as { status?: number }).status !== 404) throw error;
+    closing = sessionRun(profile.id, sessionKey, runId);
+    work = carriedWork((error as { body?: unknown }).body);
   }
-  forgetAdapterRun(profile.id, sessionKey, runId);
+  // The carry is written with the forgetting, before any request: the start
+  // after it registers the installation first, and a timeout or a killed hook
+  // there used to lose the work, which existed only in this function.
+  forgetAdapterRun(profile.id, sessionKey, closing, work);
   const started = await startNativeRun(profile, { ...stored, event: { ...stored.event, request: undefined } });
   return [
-    `STMA: this checkout switched from branch ${startedOn} to ${now}. Native tracking closed run ${runId} and started another on ${now}; use the new run_id below for scope and handoffs.`,
+    `STMA: this checkout switched from branch ${startedOn} to ${now}. Native tracking closed run ${closing} and started another on ${now}; use the new run_id below for scope and handoffs.`,
     started,
   ].filter(Boolean).join('\n');
 }
@@ -1568,8 +1937,14 @@ async function processHookEvent(
   }
   let local = loadProfileConfig(profile.id);
   let runId = local.adapterRuns?.[sessionKey];
+  // What the start below said, kept only when it was started for work the run
+  // before it carried: the agent was told to send that run's id with every
+  // call for the work, and that id has just changed.
+  let carriedStart: string | undefined;
   if (event.event === 'heartbeat' && !runId) {
-    await startNativeRun(profile, stored);
+    const carrying = Boolean(storedCarry(local, sessionKey));
+    const started = await startNativeRun(profile, stored);
+    if (carrying) carriedStart = started;
     local = loadProfileConfig(profile.id);
     runId = local.adapterRuns?.[sessionKey];
   }
@@ -1583,12 +1958,23 @@ async function processHookEvent(
   if (event.event === 'heartbeat') {
     const observed = nativeClaims();
     try {
-      const result = await apiRequest<any>(local, `/api/agent/runs/${runId}/heartbeat`, {
-        method: 'POST',
-        headers: { 'x-stma-event-id': event.id },
-        body: JSON.stringify(buildNativeHeartbeatRequest(event.payload, observed, event.id)),
-      }, HOOK_REQUEST_TIMEOUT_MS);
-      const notices: string[] = [...collisionNotices(result?.conflicts)];
+      const beat = await onSessionRun(profile.id, sessionKey, runId, (id) =>
+        apiRequest<any>(local, `/api/agent/runs/${id}/heartbeat`, {
+          method: 'POST',
+          headers: { 'x-stma-event-id': event.id },
+          body: JSON.stringify(buildNativeHeartbeatRequest(event.payload, observed, event.id)),
+        }, HOOK_REQUEST_TIMEOUT_MS),
+      );
+      const result = beat.value;
+      const notices: string[] = [
+        ...(carriedStart ? [carriedStart] : []),
+        ...(beat.notice ? [beat.notice] : []),
+        ...collisionNotices(result?.conflicts),
+      ];
+      const contract = contractNotice(profile.id, beat.runId, result?.contract_changed);
+      if (contract) notices.push(contract);
+      const status = workStatusNotice(profile.id, beat.runId, result?.work_status);
+      if (status) notices.push(status);
       const stale = Array.isArray(result?.stale) ? result.stale.length : result?.stale ? 1 : 0;
       if (stale) notices.push(`STMA warning: ${stale} stale-ground overlap(s) detected.`);
       if (result?.quota && result.quota.state !== 'ok' && result.quota.advice) {
@@ -1596,26 +1982,42 @@ async function processHookEvent(
       }
       return notices.join('\n') || undefined;
     } catch (error) {
-      if ((error as { status?: number }).status === 404) forgetAdapterRun(profile.id, sessionKey, runId);
+      // An ended run linked to open work is answered with it: the next event's
+      // start is made for that work.
+      if ((error as { status?: number }).status === 404) {
+        forgetAdapterRun(
+          profile.id,
+          sessionKey,
+          sessionRun(profile.id, sessionKey, runId),
+          carriedWork((error as { body?: unknown }).body),
+        );
+      }
       throw error;
     }
   }
 
-  await reportContentThatLanded(profile, local, runId, event.id, sessionKey);
+  let finished = runId;
   try {
-    await apiRequest(local, `/api/agent/runs/${runId}/finish`, {
-      method: 'POST',
-      headers: { 'x-stma-event-id': event.id },
-      body: JSON.stringify({
-        status: 'completed',
-        checkpoint: gitCheckpoint(event.id, 'delivery', gitContext()),
-      }),
-    }, HOOK_REQUEST_TIMEOUT_MS);
+    // The content scan goes with the finish, so a run rotated since the hook
+    // last looked is scanned and closed as its successor, the session's live run.
+    finished = (
+      await onSessionRun(profile.id, sessionKey, runId, async (id) => {
+        await reportContentThatLanded(profile, local, id, event.id, sessionKey);
+        return apiRequest(local, `/api/agent/runs/${id}/finish`, {
+          method: 'POST',
+          headers: { 'x-stma-event-id': event.id },
+          body: JSON.stringify({
+            status: 'completed',
+            checkpoint: gitCheckpoint(event.id, 'delivery', gitContext()),
+          }),
+        }, HOOK_REQUEST_TIMEOUT_MS);
+      })
+    ).runId;
   } catch (error) {
-    if ((error as { status?: number }).status === 404) forgetAdapterRun(profile.id, sessionKey, runId);
+    if ((error as { status?: number }).status === 404) forgetAdapterRun(profile.id, sessionKey, sessionRun(profile.id, sessionKey, runId));
     throw error;
   }
-  forgetAdapterRun(profile.id, sessionKey, runId);
+  forgetAdapterRun(profile.id, sessionKey, finished);
   return undefined;
 }
 
@@ -1635,13 +2037,20 @@ async function adapterFileGuard(flags: Flags): Promise<void> {
     const payload = readHookPayload();
     const key = hookSessionKey(profile.config, payload);
     const claims = fileToolClaims(cwd, payload);
+    finishPendingAdoption(profile.id);
     const local = loadProfileConfig(profile.id);
-    const runId = local.adapterRuns?.[key];
-    if (!runId) { reason = 'no_tracked_run'; throw new Error(reason); }
+    const tracked = local.adapterRuns?.[key];
+    if (!tracked) { reason = 'no_tracked_run'; throw new Error(reason); }
     const git = gitContext();
-    const reply = await apiRequest<any>(local, `/api/agent/runs/${runId}/write-guard`, {
-      method: 'POST', body: JSON.stringify({ claims, repositoryIdentity: git.repositoryIdentity, worktree: git.worktree }),
-    }, 4_000);
+    // A rotated run is adopted and its successor asked: the edit is guarded
+    // against the run the session is really in, never refused for the old one.
+    const guarded = await onSessionRun(profile.id, key, tracked, (id) =>
+      apiRequest<any>(local, `/api/agent/runs/${id}/write-guard`, {
+        method: 'POST', body: JSON.stringify({ claims, repositoryIdentity: git.repositoryIdentity, worktree: git.worktree }),
+      }, 4_000),
+    );
+    const reply = guarded.value;
+    const runId = guarded.runId;
     if (reply?.ok === true && reply.allowed === true && reply.runId === runId && reply.coverage === 'installed_file_tool_hook_only') {
       // The path is clear. Now the content — checked here, against the team's
       // published `content:` deny lines, and never sent: a report carries the
@@ -1804,6 +2213,13 @@ async function adapterHook(flags: Flags): Promise<void> {
     console.error(`[stma] ${enqueue.pendingEvents} lifecycle event(s) pending for ${profile.id}; another hook is syncing.`);
     return;
   }
+  try {
+    // An adoption a killed hook left half done is finished before anything
+    // reads which run this session holds.
+    finishPendingAdoption(profile.id);
+  } catch {
+    // The journal stays; the next hook finishes it.
+  }
   const deadline = Date.now() + (value === 'finish' ? 2_200 : 8_000);
   const notices: string[] = [];
   const delivered: Array<{ file: string; id: string }> = [];
@@ -1817,9 +2233,10 @@ async function adapterHook(flags: Flags): Promise<void> {
   // two of four agents correctly refused to act on work that had arrived inside
   // a tool result. The request is the same bounded GET as before; it now
   // overlaps work already in flight rather than queueing behind it.
+  const sessionKey = hookSessionKey(profile.config, payload);
   const waiting = value === 'finish'
     ? undefined
-    : newsNotice(profile, hookSessionKey(profile.config, payload), value === 'start');
+    : newsNotice(profile, sessionKey, value === 'start');
   try {
     const pending = readQueuedHookEvents(cwd, profile.id);
     for (const stored of pending.events) {
@@ -1853,7 +2270,9 @@ async function adapterHook(flags: Flags): Promise<void> {
     }
     hookOutput(
       profile.config.target,
-      [...notices, await waiting].filter(Boolean).join('\n\n') || undefined,
+      // Rendered after the queue, so a work assignment is announced with the
+      // run this session holds now: the queue may have just started it.
+      [...notices, (await waiting)?.(loadProfileConfig(profile.id).adapterRuns?.[sessionKey])].filter(Boolean).join('\n\n') || undefined,
       String(payload.hook_event_name ?? (value === 'heartbeat' ? 'PostToolUse' : value === 'finish' ? 'Stop' : 'UserPromptSubmit')),
     );
     // Delete only after stdout has received every server-generated notice. A
@@ -1871,6 +2290,9 @@ async function adapterHook(flags: Flags): Promise<void> {
     console.error(`[stma] ${delivery.pendingEvents} lifecycle event(s) pending for ${profile.id}.`);
   }
 }
+
+/** What is waiting, rendered once the session's run is known; undefined when nothing is to be said. */
+type NewsRender = (runId?: string) => string | undefined;
 
 /**
  * Ask the server what is waiting and only report what
@@ -1891,7 +2313,7 @@ async function adapterHook(flags: Flags): Promise<void> {
  * human pressing enter and their agent answering. A server that is slow, down,
  * or returning something unexpected must cost nothing but silence.
  */
-async function newsNotice(profile: LoadedAdapterProfile, sessionKey?: string, prompt = false): Promise<string | undefined> {
+async function newsNotice(profile: LoadedAdapterProfile, sessionKey?: string, prompt = false): Promise<NewsRender | undefined> {
   try {
     const config = loadProfileConfig(profile.id);
     const scope = sessionKey ? `${sessionKey}|` : '';
@@ -1923,10 +2345,19 @@ async function newsNotice(profile: LoadedAdapterProfile, sessionKey?: string, pr
     updateProfileConfig(profile.id, (latest) => ({
       ...latest,
       newsCheckedAt: news.checkedAt,
-      newsAnnounced: [...new Set([...(latest.newsAnnounced ?? []), ...fresh.map((h) => scope + handoffKey(h))])].slice(-100),
+      newsAnnounced: rememberAnnounced({ announced: latest.newsAnnounced }, fresh, { prefix: scope, limit: 100 }),
       ...(sessionKey ? { newsSessions: [...new Set([...(latest.newsSessions ?? []), sessionKey])].slice(-20) } : {}),
     }));
-    return renderNews(fresh, news.unreadSessions, config.mcpAlias);
+    // A work assignment is accepted with the session's run, which the caller
+    // reads once the queue this check overlapped is done.
+    // Rendering outside this function's catch must cost nothing either.
+    return (runId) => {
+      try {
+        return renderNews(fresh, news.unreadSessions, config.mcpAlias, { runId });
+      } catch {
+        return undefined;
+      }
+    };
   } catch {
     return undefined;
   }
@@ -1948,7 +2379,7 @@ async function watch(flags: Flags): Promise<void> {
   }
   const config = loadConfig();
   const { server } = await connection(config);
-  const announced = new Set<string>();
+  let announced: string[] = [];
   let firstPass = true;
 
   console.log(`stma: watching ${server} every ${seconds}s. Ctrl+C to stop.`);
@@ -1960,10 +2391,9 @@ async function watch(flags: Flags): Promise<void> {
       });
       if (response.ok) {
         const news = (await response.json()) as News;
-        for (const handoff of news.pendingHandoffs) {
-          const key = handoffKey(handoff);
-          if (announced.has(key)) continue;
-          announced.add(key);
+        const fresh = unseen(news, { announced });
+        announced = rememberAnnounced({ announced }, fresh, { limit: Infinity });
+        for (const handoff of fresh) {
           // The first pass reports the backlog quietly: everything is "new" to a
           // process that just started, and waking somebody for a week-old
           // handoff is how a notifier gets muted.
@@ -2313,6 +2743,17 @@ Commands:
   stma adapter repair [--profile ID] [--command stma] [--pin-runtime] [--apply]
   stma adapter disconnect --profile ID [--force=true] [--apply]
   stma version [--server]   this CLI's version, and optionally the server's
+
+Managed local worker (built CLI, from a canonical dedicated Git checkout):
+  stma worker configure --server HTTPS_ORIGIN --runtime-executable ABSOLUTE_CLAUDE_PATH
+                        --api-key-env ENV_NAME --dedicated
+                        [--max-runtime-seconds N] [--max-turns N] [--profile ID]
+             Registers a disabled claude-print-v1 target. Use a provider API-key env var;
+             the selected STMA CLI profile supplies separate worker authentication.
+             The installation owner must review and enable the target in Agent connections.
+  stma worker <start|status|doctor|pause|resume|stop|disable>
+             The worker runs in this foreground process. It accepts API-key auth only;
+             subscription login is not used.
 `);
 }
 
@@ -2368,6 +2809,10 @@ export async function main(): Promise<void> {
     });
   }
   const { flags, passthrough } = parseFlags(rest);
+  if (group === 'worker') return workerCommand(action, flags, {
+    sourceFile: fileURLToPath(import.meta.url),
+    connect: async (profile, server) => connection({ ...(profile ? loadProfileConfig(profile) : loadConfig()), ...(server ? { server } : {}) }),
+  });
   if (group === 'agent' && action === 'register') return register(flags);
   if (group === 'run' && action === 'start') return void (await startRun(flags));
   if (group === 'run' && action === 'heartbeat') return heartbeat(flags);

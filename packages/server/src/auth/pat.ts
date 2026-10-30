@@ -8,6 +8,7 @@ import type { AppEnv } from '../types';
 import { authorizeSecurity, setSecurityPrincipal } from '../lib/securityHooks';
 import { logLine } from '../lib/log';
 import { testAccountAvailable, TEST_ACCOUNT_UNAVAILABLE } from '../lib/testAccounts';
+import { ExecutionRefusal, guardExecutionHttp, resolveExecutionCredential, withExecutionRequest } from '../lib/executionSecurity';
 
 export function generatePat(): { token: string; hash: string; prefix: string } {
   const token = PAT_PREFIX + randomHex(20);
@@ -41,6 +42,8 @@ export const mcpAuth: MiddlewareHandler<AppEnv> = async (c, next) => {
 
   const db = c.get('db');
   const hash = sha256hex(match[1]!);
+  const attempt = match[1]!.startsWith('stma_attempt_') ? await resolveExecutionCredential(db, hash) : null;
+  if (match[1]!.startsWith('stma_attempt_') && !attempt) return unauthorized(c, 'The execution attempt credential expired or was revoked.', 'invalid_token');
   const rows = await db
     .select({
       token: tokens,
@@ -62,7 +65,7 @@ export const mcpAuth: MiddlewareHandler<AppEnv> = async (c, next) => {
     .leftJoin(teams, eq(tokens.teamId, teams.id))
     .leftJoin(projects, eq(tokens.projectId, projects.id))
     .leftJoin(agentInstallations, eq(agentInstallations.tokenId, tokens.id))
-    .where(eq(tokens.tokenHash, hash))
+    .where(attempt ? eq(tokens.id, attempt.parentTokenId) : eq(tokens.tokenHash, hash))
     .limit(1);
   const row = rows[0];
   // "Send a token" is the wrong advice for an agent that just sent one. Only the
@@ -161,6 +164,7 @@ export const mcpAuth: MiddlewareHandler<AppEnv> = async (c, next) => {
     if (row.installationId) await db.update(agentInstallations).set({ lastSeenAt: new Date() }).where(eq(agentInstallations.id, row.installationId));
   }
   const grant: AgentGrant = {
+    ...(attempt ? { execution: attempt.execution } : {}),
     tokenId: row.token.id,
     scope: row.token.scope,
     teamId: row.token.teamId,
@@ -181,5 +185,21 @@ export const mcpAuth: MiddlewareHandler<AppEnv> = async (c, next) => {
   c.set('mcpUser', row.user);
   c.set('mcpToken', row.token);
   c.set('mcpGrant', grant);
-  await next();
+  try {
+    await withExecutionRequest(db, grant, async (requestDb) => {
+      c.set('db', requestDb);
+      const body = c.req.method === 'POST' ? await c.req.json().catch(() => null) : null;
+      if (grant.execution && Array.isArray(body)) {
+        c.res = c.json({ error: 'Managed attempts send one MCP call per request so run and Work locks retain their order.', code: 'ATTEMPT_SCOPE' }, 403);
+        return;
+      }
+      const executionDenied = await guardExecutionHttp(requestDb, grant, c.req.path, c.req.method,
+        body && typeof body === 'object' && !Array.isArray(body) ? body as Record<string, unknown> : null);
+      if (executionDenied) { c.res = c.json({ error: executionDenied, code: 'ATTEMPT_SCOPE' }, 403); return; }
+      await next();
+    });
+  } catch (error) {
+    if (!(error instanceof ExecutionRefusal)) throw error;
+    c.res = c.json({ error: error.message, code: error.code }, 403);
+  } finally { c.set('db', db); }
 };

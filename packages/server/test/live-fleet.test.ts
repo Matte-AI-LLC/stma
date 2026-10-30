@@ -244,7 +244,7 @@ it('treats one person\'s parallel attempts as a fan-out, not a collision', async
   const attentionWhileLive = await (
     await fetch(`${srv.url}/app/teams/live/attention`, { headers: aliceCookie })
   ).text();
-  expect(attentionWhileLive).toContain('Recorded scope overlap');
+  expect(attentionWhileLive).toContain('Live scope overlap');
   expect(attentionWhileLive).toContain(`/app/agents?run=${other.data.runId}`);
 
   for (const run of [first, second, third]) {
@@ -254,7 +254,7 @@ it('treats one person\'s parallel attempts as a fan-out, not a collision', async
   const attentionAfterFinish = await (
     await fetch(`${srv.url}/app/teams/live/attention`, { headers: aliceCookie })
   ).text();
-  expect(attentionAfterFinish).not.toContain('Recorded scope overlap');
+  expect(attentionAfterFinish).not.toContain('Live scope overlap');
   expect(attentionAfterFinish).not.toContain(`/app/agents?run=${other.data.runId}`);
 
   // The newest ended run of an agent stays on the map for a day, so its exact link

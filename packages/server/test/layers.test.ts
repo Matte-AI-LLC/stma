@@ -336,6 +336,16 @@ describe('same product, different meter', () => {
     expect(features(PLANS.enterprise)).toEqual(features(UNMETERED));
   });
 
+  it('reads and exports run evidence on every rung', () => {
+    // Decided 2026-10-22: a person reviewing their own agent's delivery is the
+    // first value, not a paid extra, and a downgrade must not hide what a run
+    // already recorded. The switch stays so a composition resolver can narrow
+    // it; every evidence door then closes together (evidence-access.test.ts).
+    for (const plan of [PLANS.free, PLANS.solo, PLANS.team, PLANS.enterprise, UNMETERED]) {
+      expect(plan.evidence).toBe(true);
+    }
+  });
+
   it('never takes a feature away as the plan gets more expensive', () => {
     // A ladder that dips is a support ticket that reads "we upgraded and lost
     // the map". Ceilings climb, switches never go from on to off.
@@ -418,6 +428,20 @@ describe('the API surface is additive', () => {
     'get_evidence',
     'list_issues',
     'list_clickup_tasks',
+    // native work
+    'list_work',
+    'get_work',
+    'create_work',
+    'update_work',
+    'submit_work',
+    'record_work_evidence',
+    'get_work_context',
+    'get_work_changes',
+    // managed execution
+    'list_execution_targets',
+    'dispatch_work',
+    'get_execution',
+    'cancel_execution',
   ];
 
   const list = async (srv: StartedServer, token: string) => {

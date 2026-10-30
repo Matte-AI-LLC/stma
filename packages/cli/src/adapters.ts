@@ -72,6 +72,13 @@ export interface QueuedHookEvent {
   request?: Record<string, unknown>;
   /** Frozen server-generated notice, retained until stdout delivery succeeds. */
   notice?: string;
+  /**
+   * The work the carried start was refused for, and why, written with the
+   * plain request that replaced it: a replay of that request starts its run
+   * with no word of the work, and the agent must still be told the work lost
+   * its run.
+   */
+  workRefused?: { key: string; reason: string };
 }
 
 interface DeliveryRecord {

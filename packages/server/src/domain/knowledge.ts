@@ -62,6 +62,7 @@ import {
   validateNativeKnowledgeBody,
 } from '../lib/knowledgeImport';
 import { projectForTeam, teamForUser } from './access';
+import { adapterListensFor } from './companions';
 import { criticalAudit, membershipUser } from '../lib/securityHooks';
 import { canonicalRepositoryIdentity } from '../lib/projects';
 
@@ -1267,11 +1268,18 @@ export async function getKnowledgeContext(
       .innerJoin(agentInstallations, eq(agentRuns.installationId, agentInstallations.id))
       .where(and(eq(agentRuns.id, input.runId), eq(agentInstallations.userId, userId)))
       .limit(1);
+    // The run of a local adapter paired with this agent counts as its own here,
+    // as it does for update_run and finish_run: in a hooked checkout the run
+    // that carries the agent's work is the adapter's, and the hook and the
+    // accept reply tell the agent to resume with exactly that run, which this
+    // refused, leaving an accepted assignment no way to be begun.
     if (
       !owned ||
       owned.run.teamId !== scope.team.id ||
       owned.run.projectId !== (scope.project?.id ?? null) ||
-      (grant?.installationId && owned.run.installationId !== grant.installationId)
+      (grant?.installationId &&
+        owned.run.installationId !== grant.installationId &&
+        !(await adapterListensFor(db, owned.run.installationId, grant.installationId)))
     ) {
       return { error: 'That run cannot be linked to this Knowledge Hub scope.' } as const;
     }

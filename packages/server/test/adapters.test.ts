@@ -1,6 +1,6 @@
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync, existsSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, mkdirSync, existsSync, symlinkSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -486,5 +486,117 @@ describe('a checkout whose MCP entry is gone while its hooks remain', () => {
       if (previous === undefined) delete process.env.CODEX_HOME;
       else process.env.CODEX_HOME = previous;
     }
+  });
+});
+
+/**
+ * Repair is `installAdapter` with `replace: true` over the profile already on
+ * disk (`stma adapter repair --apply`). A person's own hook configuration lives
+ * in the same file as the hooks STMA put there, so recovering from a half
+ * removed or damaged install must restore STMA's entries and leave everything
+ * else alone: other hooks, other top-level keys, and a file it cannot read.
+ */
+describe('repairing an installed adapter keeps what the person had', () => {
+  const repair = (root: string, profileId: string, apply = true) => {
+    const profile = loadAdapterProfile(root, profileId);
+    if (!profile) throw new Error(`no profile ${profileId}`);
+    return installAdapter({ root, config: profile.config, command: 'stma', apply, replace: true });
+  };
+
+  it('restores the hooks it owns and leaves unrelated hooks and top-level keys deep-equal', () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'stma-adapter-'));
+    temporaryRoots.push(root);
+    installAdapter({ root, command: 'stma', apply: true, config: config('payments-implementer') });
+    const hookFile = path.join(root, '.codex', 'hooks.json');
+    const installed = JSON.parse(readFileSync(hookFile, 'utf8'));
+    const ownedCount = (value: any) => JSON.stringify(value).match(/--profile payments-implementer/g)?.length ?? 0;
+    const owned = ownedCount(installed);
+    expect(owned).toBeGreaterThan(2);
+
+    // The person's own configuration, and one STMA hook lost along the way.
+    const mine = {
+      permissions: { deny: ['rm -rf /'] },
+      env: { COMPANY_PROXY: 'http://proxy.internal' },
+    };
+    const companyStop = { hooks: [{ type: 'command', command: 'company-stop-audit' }] };
+    const damaged = {
+      ...installed,
+      ...mine,
+      hooks: {
+        ...installed.hooks,
+        Stop: [companyStop, ...installed.hooks.Stop],
+        PostToolUse: (installed.hooks.PostToolUse as unknown[]).filter(
+          (item) => !JSON.stringify(item).includes('--profile payments-implementer'),
+        ),
+      },
+    };
+    writeFileSync(hookFile, JSON.stringify(damaged, null, 2));
+    expect(ownedCount(damaged)).toBeLessThan(owned);
+
+    repair(root, 'payments-implementer');
+    const repaired = JSON.parse(readFileSync(hookFile, 'utf8'));
+    expect(ownedCount(repaired)).toBe(owned);
+    expect(repaired.permissions).toEqual(mine.permissions);
+    expect(repaired.env).toEqual(mine.env);
+    expect(repaired.hooks.Stop).toContainEqual(companyStop);
+    expect(JSON.stringify(repaired.hooks.PostToolUse)).toContain('--profile payments-implementer');
+
+    // Doing it again changes nothing: the bytes are identical.
+    const firstBytes = readFileSync(hookFile, 'utf8');
+    repair(root, 'payments-implementer');
+    expect(readFileSync(hookFile, 'utf8')).toBe(firstBytes);
+  });
+
+  it('keeps a Claude Code project\'s own settings keys', () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'stma-adapter-'));
+    temporaryRoots.push(root);
+    const claude = config('claude-payments', { target: 'claude-code' });
+    installAdapter({ root, command: 'stma', apply: true, config: claude });
+    const settings = path.join(root, '.claude', 'settings.local.json');
+    const current = JSON.parse(readFileSync(settings, 'utf8'));
+    const mine = {
+      permissions: { allow: ['Bash(npm test)'] },
+      mcpServers: { company: { command: 'company-mcp' } },
+    };
+    writeFileSync(settings, JSON.stringify({ ...current, ...mine }, null, 2));
+    repair(root, 'claude-payments');
+    const after = JSON.parse(readFileSync(settings, 'utf8'));
+    expect(after.permissions).toEqual(mine.permissions);
+    expect(after.mcpServers).toEqual(mine.mcpServers);
+    expect(JSON.stringify(after.hooks)).toContain('--profile claude-payments');
+  });
+
+  it('leaves a file it cannot read exactly as it found it, and rewrites nothing else', () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'stma-adapter-'));
+    temporaryRoots.push(root);
+    const installedAt = installAdapter({ root, command: 'stma', apply: true, config: config('payments-implementer') });
+    const hookFile = installedAt.hookPath;
+    const broken = '{ "hooks": { "Stop": [ this is not json';
+    writeFileSync(hookFile, broken);
+    const profileBefore = readFileSync(installedAt.adapterPath, 'utf8');
+
+    expect(() => repair(root, 'payments-implementer')).toThrow(/Refusing to replace invalid JSON/);
+    expect(readFileSync(hookFile, 'utf8')).toBe(broken);
+    expect(readFileSync(installedAt.adapterPath, 'utf8')).toBe(profileBefore);
+    // No half-written temporary file is left beside it either.
+    expect(readdirSync(path.dirname(hookFile)).filter((name) => name.endsWith('.tmp'))).toEqual([]);
+
+    // An array is not a configuration object, and is refused the same way.
+    writeFileSync(hookFile, '[]');
+    expect(() => repair(root, 'payments-implementer')).toThrow(/Refusing to replace invalid JSON/);
+    expect(readFileSync(hookFile, 'utf8')).toBe('[]');
+  });
+
+  it('writes nothing on a dry run', () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'stma-adapter-'));
+    temporaryRoots.push(root);
+    installAdapter({ root, command: 'stma', apply: true, config: config('payments-implementer') });
+    const hookFile = path.join(root, '.codex', 'hooks.json');
+    const damaged = JSON.stringify({ permissions: { deny: ['x'] }, hooks: {} }, null, 2);
+    writeFileSync(hookFile, damaged);
+    const dry = repair(root, 'payments-implementer', false);
+    expect(JSON.stringify(dry.hooks)).toContain('--profile payments-implementer');
+    expect(dry.hooks.permissions).toEqual({ deny: ['x'] });
+    expect(readFileSync(hookFile, 'utf8')).toBe(damaged);
   });
 });

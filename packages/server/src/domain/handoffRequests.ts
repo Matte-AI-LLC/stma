@@ -23,9 +23,13 @@ export async function createHandoffOnce(
   try {
     return await db.transaction(async (transaction) => {
       const tx = transaction as unknown as Db;
+      // `no key update`, which still serializes two retries: an assignment made
+      // from a work item waits here for a Work lock, and a Work command holding
+      // one writes a message naming this token, whose foreign-key check takes
+      // `key share` on it. `update` would make that check wait on us.
       const [credential] = await tx.select().from(tokens).where(and(
         eq(tokens.id, grant.tokenId), eq(tokens.userId, userId), isNull(tokens.revokedAt),
-      )).for('update');
+      )).for('no key update');
       if (!credential) throw new Refused('This credential is no longer available.');
       if (requestKey) {
         const [previous] = await tx.select({ receipt: handoffRequests, session: debugSessions })

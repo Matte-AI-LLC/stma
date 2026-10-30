@@ -21,12 +21,13 @@ import {
   eventsForRun,
   installationsForMember,
 } from '../domain/fleetReaders';
+import { contactTimeOf } from '../domain/connectionState';
 import { evidenceForRun } from '../domain/evidence';
 import { membershipUser } from '../lib/securityHooks';
 import { isCanonicalUuid } from '../lib/ids';
-import { runHref } from './runs';
-import { EvidenceChecks, EvidenceNext } from '../ui/Evidence';
-import { cheapestWith, effectiveLimits } from '../lib/entitlements';
+import { EVIDENCE_NOT_INCLUDED, runHref } from './runs';
+import { EvidenceChecks, EvidenceNext, ProviderStatus } from '../ui/Evidence';
+import { cheapestWith, effectiveLimits, evidenceAllowed } from '../lib/entitlements';
 import { teamsOf } from '../mcp/shared';
 import { initials, timeAgo } from '../lib/format';
 import { track } from '../lib/track';
@@ -412,7 +413,12 @@ agentsRoutes.get('/app/agents', async (c) => {
   const trail = selected ? await eventsForRun(db, selected.run.id) : [];
   // The same pack an agent gets from get_evidence. A reviewer and the agent
   // that asked for review must be looking at one answer, not two.
-  const pack = selected ? await evidenceForRun(db, selected.run.id, user.id) : null;
+  // Read only where the plan in force includes evidence: the same request-local
+  // answer the run page and get_evidence ask, so the doors cannot disagree.
+  const evidenceOpen = selected
+    ? await evidenceAllowed(db, selected.team, c.get('env').hosted)
+    : false;
+  const pack = selected && evidenceOpen ? await evidenceForRun(db, selected.run.id, user.id) : null;
   const receipt = selected
     ? (
         await db
@@ -445,7 +451,7 @@ agentsRoutes.get('/app/agents', async (c) => {
 
   const strip = (
     <>
-      <Lead text={rows.length > 0 ? 'Live' : 'Idle'} live={rows.length > 0} />
+      <Lead text={rows.length > 0 ? 'Live' : 'No live runs'} live={rows.length > 0} />
       <Vr />
       <span>
         {rows.length} {rows.length === 1 ? 'run' : 'runs'}
@@ -510,7 +516,7 @@ agentsRoutes.get('/app/agents', async (c) => {
             : [{ label: 'All workspaces', href: '/app' }, { label: 'Agent map' }]
       }
       title="Live agent map"
-      sub="Active work first, then every known agent identity — including idle or stale devices that would otherwise disappear."
+      sub="Active work first, then every known agent identity, including agents with no active run and stale devices that would otherwise disappear."
       actions={
         <>
           <button
@@ -858,10 +864,16 @@ agentsRoutes.get('/app/agents', async (c) => {
             <div class="ins-sec">
               <span class="ins-label">Merge readiness</span>
               <EvidenceChecks pack={pack} />
+              <ProviderStatus pack={pack} />
               <EvidenceNext pack={pack} />
               <a class="small" href={runHref(selected.team.slug, selected.run.id)}>
                 Open the run page: evidence that stays after the run ends, with Copy as Markdown
               </a>
+            </div>
+          ) : selected && !evidenceOpen ? (
+            <div class="ins-sec">
+              <span class="ins-label">Merge readiness</span>
+              <span class="muted small">{EVIDENCE_NOT_INCLUDED}</span>
             </div>
           ) : null}
 
@@ -1140,8 +1152,8 @@ agentsRoutes.get('/app/agents', async (c) => {
             <div>
               <div class="card-title">Agent inventory</div>
               <div class="card-note">
-                Durable identities across your teams. Idle agents stay visible after their run
-                leaves the live map; only an identity you own can be disabled here.
+                Durable identities across your teams. An agent with no active run stays visible after
+                its run leaves the live map; only an identity you own can be disabled here.
               </div>
             </div>
             <span class="mono muted">{installations.length}</span>
@@ -1151,7 +1163,9 @@ agentsRoutes.get('/app/agents', async (c) => {
               <th>Agent / owner</th>
               <th>Client / role</th>
               <th>Last context</th>
-              <th>Last seen</th>
+              <th title="The last authenticated request or run heartbeat from this agent. Not proof that its client is open.">
+                Last contact
+              </th>
               <th>Status</th>
               <th></th>
             </tr>
@@ -1161,12 +1175,14 @@ agentsRoutes.get('/app/agents', async (c) => {
               const heartbeatFresh = active
                 ? Date.now() - active.run.lastHeartbeatAt.getTime() < FRESH_MS
                 : false;
-              const seenAt = new Date(
-                Math.max(
-                  entry.installation.lastSeenAt.getTime(),
-                  context?.run.lastHeartbeatAt.getTime() ?? 0,
-                ),
-              );
+              // A registration is not a contact: an agent that never called STMA has
+              // only the time its row was created, and that is not printed as one.
+              const contactAt = contactTimeOf(entry.installation);
+              const heartbeatAt = context?.run.lastHeartbeatAt ?? null;
+              const seenAt =
+                contactAt || heartbeatAt
+                  ? new Date(Math.max(contactAt?.getTime() ?? 0, heartbeatAt?.getTime() ?? 0))
+                  : null;
               return (
                 <tr style={entry.installation.revokedAt ? 'color:var(--mut-2)' : undefined}>
                   <td>
@@ -1196,7 +1212,7 @@ agentsRoutes.get('/app/agents', async (c) => {
                       <span class="muted">Registered; no run yet</span>
                     )}
                   </td>
-                  <td class="muted">{timeAgo(seenAt) ?? '—'}</td>
+                  <td class="muted">{timeAgo(seenAt) ?? 'never recorded'}</td>
                   <td>
                     {entry.installation.revokedAt ? (
                       <span class="pill pill-muted"><span class="dot gray" />disabled</span>
@@ -1206,7 +1222,7 @@ agentsRoutes.get('/app/agents', async (c) => {
                         {heartbeatFresh ? active.run.status : 'heartbeat overdue'}
                       </span>
                     ) : (
-                      <span class="pill pill-muted"><span class="dot gray" />idle</span>
+                      <span class="pill pill-muted"><span class="dot gray" />no active run</span>
                     )}
                   </td>
                   <td style="text-align:right">

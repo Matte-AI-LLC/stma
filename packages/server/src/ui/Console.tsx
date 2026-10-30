@@ -320,7 +320,12 @@ export const Rail = ({ user, active }: { user: User; active?: RailKey }) => {
               active={active === 'agents' || active === 'tokens'}
               badge={rail.runs}
             />
-            <RailLink href={sectionHref(ws, project.slug, 'work')} label="Work" active={active === 'work'} />
+            <RailLink
+              href={sectionHref(ws, project.slug, 'work')}
+              label="Work"
+              active={active === 'work'}
+              badge={rail.work}
+            />
             <RailLink
               href={sectionHref(ws, project.slug, 'sessions')}
               label="Sessions"
@@ -382,7 +387,7 @@ export const Rail = ({ user, active }: { user: User; active?: RailKey }) => {
               active={active === 'agents'}
               badge={rail.runs}
             />
-            <RailLink href={sectionHref(ws, null, 'work')} label="Work" active={active === 'work'} />
+            <RailLink href={sectionHref(ws, null, 'work')} label="Work" active={active === 'work'} badge={rail.work} />
             <RailLink
               href={sectionHref(ws, null, 'sessions')}
               label="Sessions"

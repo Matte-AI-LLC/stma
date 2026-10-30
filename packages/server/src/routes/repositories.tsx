@@ -115,6 +115,8 @@ repositoriesRoutes.post('/app/teams/:slug/repositories/:action', async (c) => {
         binding.id,
         parsed.data.run,
       );
+      if (observation.reason === 'not_completed')
+        return fail('That build has not completed yet. Read it back after it finishes; existing observations are unchanged.', 409);
       if (!observation.recorded && observation.reason !== 'duplicate')
         return fail(
           `No new evidence recorded (${observation.reason}). Existing observations are unchanged.`,
@@ -151,10 +153,18 @@ repositoriesRoutes.post('/app/teams/:slug/repositories/:action', async (c) => {
         409,
       );
     const wr = result.value;
+    // A queued or running attempt cannot displace a completed observation.
+    if (wr.status !== 'completed')
+      return fail('That workflow run has not completed yet. Read it back after it finishes; existing observations are unchanged.', 409);
     const observation = await recordProviderObservation(db, access.team.id, 'github', {
       repositoryId: binding.repositoryId,
       deliveryId: `read:${wr.id}:${wr.run_attempt}:${wr.updated_at}`,
       subjectId: `workflow:${wr.id}`,
+      // The workflow's own name, what a Work criterion names; an absent or odd
+      // one is dropped by `recordProviderObservation`, never fatal.
+      subjectName: wr.name,
+      // The workflow's own id: two workflow files may share a name.
+      subjectDefinition: wr.workflow_id,
       commitSha: wr.head_sha,
       kind: 'workflow',
       state: ['success', 'failure'].includes(wr.conclusion ?? '') ? wr.conclusion : 'unknown',

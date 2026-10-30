@@ -1,18 +1,24 @@
-import { and, desc, eq, gte, inArray, isNull, lte } from 'drizzle-orm';
+import { and, desc, eq, gte, inArray, isNotNull, isNull, lte, ne } from 'drizzle-orm';
+import { alias } from 'drizzle-orm/pg-core';
 import type { Db } from '../db';
 import { currentProviderFacts, exactProviderEvidence } from './providerEvidence';
 import {
   agentEvents,
   agentInstallations,
   agentRuns,
+  debugSessions,
   environmentChecks,
+  handoffs,
   knowledgeContexts,
   knowledgeItems,
   knowledgeReceipts,
   knowledgeVersions,
   policyReceipts,
   projects,
+  providerObservations,
+  repositoryBindings,
   runCheckpoints,
+  teamIntegrations,
   teams,
   users,
   workClaims,
@@ -121,6 +127,298 @@ export async function handoverFor(db: Db, checkpointId: string) {
 
 export type Handover = NonNullable<Awaited<ReturnType<typeof handoverFor>>>;
 
+/**
+ * Why a provider line is empty, from stored facts only.
+ *
+ * "No provider observation" used to cover five different situations: nothing
+ * is connected, the connection's last check failed, the provider spoke about an
+ * older commit of this run, the checkpoint is of another repository, or a
+ * result simply has not arrived. A reviewer acts differently on each. Nothing
+ * here calls a provider: a page load must not depend on one, and the stored
+ * `lastCheck` is the only word on a connection's health STMA has. STMA cannot
+ * tell a result still pending from one that will never come, and says so.
+ */
+export type ProviderState =
+  | 'observed'
+  | 'no_checkpoint'
+  | 'repository_mismatch'
+  | 'not_connected'
+  | 'connection_failing'
+  | 'older_commit_only'
+  | 'no_observation';
+
+const CONNECTION_LIMIT = 10;
+const OLDER_CHECKPOINT_LIMIT = 10;
+/** Outgoing handoffs listed in one pack. */
+export const HANDOVER_LIMIT = 10;
+/** Knowledge versions named in one pack; the manifest hash covers all of them. */
+export const KNOWLEDGE_VERSION_LIMIT = 20;
+
+const PROVIDER_LABELS: Record<string, string> = {
+  github: 'GitHub',
+  'azure-devops': 'Azure DevOps',
+};
+const providerLabel = (provider: string) => PROVIDER_LABELS[provider] ?? provider;
+
+interface LastCheck {
+  ok: boolean;
+  at: string | null;
+  error: string | null;
+}
+
+function readLastCheck(config: unknown): LastCheck | null {
+  const raw = (config as { lastCheck?: unknown } | null)?.lastCheck as
+    | { ok?: unknown; at?: unknown; error?: unknown }
+    | undefined;
+  if (!raw || typeof raw.ok !== 'boolean') return null;
+  return {
+    ok: raw.ok,
+    at: typeof raw.at === 'string' ? raw.at : null,
+    error: typeof raw.error === 'string' ? raw.error.slice(0, 120) : null,
+  };
+}
+
+async function providerStatus(
+  db: Db,
+  run: { id: string; teamId: string; projectId: string | null },
+  checkpoint: { id: string; commitSha: string } | undefined,
+  repository: { project: string | null; checkpoint: string | null; matches: boolean },
+  exactFacts: number,
+) {
+  const connections = run.projectId
+    ? (
+        await db
+          .select({
+            provider: repositoryBindings.provider,
+            fullName: repositoryBindings.fullName,
+            config: teamIntegrations.config,
+          })
+          .from(repositoryBindings)
+          .innerJoin(teamIntegrations, eq(teamIntegrations.id, repositoryBindings.connectionId))
+          .where(
+            and(
+              eq(repositoryBindings.teamId, run.teamId),
+              eq(repositoryBindings.projectId, run.projectId),
+              isNotNull(repositoryBindings.verifiedAt),
+            ),
+          )
+          .limit(CONNECTION_LIMIT)
+      ).map((row) => ({
+        provider: row.provider,
+        fullName: row.fullName,
+        lastCheck: readLastCheck(row.config),
+      }))
+    : [];
+  const failing = connections.find((connection) => connection.lastCheck?.ok === false);
+  const failingWords = failing
+    ? `The ${providerLabel(failing.provider)} connection for ${failing.fullName} failed its last check${failing.lastCheck?.at ? ` at ${failing.lastCheck.at}` : ''}${failing.lastCheck?.error ? ` (${failing.lastCheck.error})` : ''}, so STMA may not be hearing from it.`
+    : null;
+
+  // Earlier delivery/tested checkpoints of this run whose commit a provider did
+  // report on. Listed so a reviewer can see the green belongs to another
+  // commit; never attached to the newest one. Read only when the newest commit
+  // has nothing exact, because that is the only time the answer changes.
+  const olderCommits: Array<{
+    checkpointId: string;
+    commitSha: string;
+    reportedAt: string;
+    facts: Array<{ provider: string; kind: string; subjectId: string; state: string; observedAt: string }>;
+  }> = [];
+  if (checkpoint && repository.matches && exactFacts === 0 && run.projectId && connections.length > 0) {
+    const earlier = (
+      await db
+        .select({
+          id: runCheckpoints.id,
+          commitSha: runCheckpoints.commitSha,
+          repositoryIdentity: runCheckpoints.repositoryIdentity,
+          createdAt: runCheckpoints.createdAt,
+        })
+        .from(runCheckpoints)
+        .where(
+          and(
+            eq(runCheckpoints.runId, run.id),
+            inArray(runCheckpoints.kind, ['delivery', 'tested']),
+            ne(runCheckpoints.commitSha, checkpoint.commitSha),
+          ),
+        )
+        .orderBy(desc(runCheckpoints.createdAt), desc(runCheckpoints.id))
+        .limit(OLDER_CHECKPOINT_LIMIT)
+    ).filter((row) => canonicalRepositoryIdentity(row.repositoryIdentity) === repository.project);
+    const newestBySha = new Map<string, (typeof earlier)[number]>();
+    for (const row of earlier) {
+      const sha = row.commitSha.toLowerCase();
+      if (sha !== checkpoint.commitSha.toLowerCase() && !newestBySha.has(sha)) newestBySha.set(sha, row);
+    }
+    if (newestBySha.size > 0) {
+      const observed = await db
+        .select({
+          provider: repositoryBindings.provider,
+          fact: providerObservations,
+        })
+        .from(providerObservations)
+        .innerJoin(repositoryBindings, eq(providerObservations.bindingId, repositoryBindings.id))
+        .where(
+          and(
+            eq(repositoryBindings.teamId, run.teamId),
+            eq(repositoryBindings.projectId, run.projectId),
+            eq(providerObservations.projectId, run.projectId),
+            inArray(providerObservations.commitSha, [...newestBySha.keys()]),
+          ),
+        )
+        .orderBy(desc(providerObservations.observedAt))
+        .limit(100);
+      for (const [sha, row] of newestBySha) {
+        const facts = currentProviderFacts(observed.filter((item) => item.fact.commitSha === sha));
+        if (facts.length === 0) continue;
+        olderCommits.push({
+          checkpointId: row.id,
+          commitSha: row.commitSha,
+          reportedAt: row.createdAt.toISOString(),
+          facts: facts.map((item) => ({
+            provider: item.provider,
+            kind: item.fact.kind,
+            subjectId: item.fact.subjectId,
+            state: item.fact.state,
+            observedAt: item.fact.observedAt.toISOString(),
+          })),
+        });
+      }
+    }
+  }
+
+  const exact = 'No provider observation of this exact commit.';
+  const named = connections
+    .map((connection) => `${providerLabel(connection.provider)} (${connection.fullName})`)
+    .join(', ');
+  let state: ProviderState;
+  let detail: string;
+  if (!checkpoint) {
+    state = 'no_checkpoint';
+    detail =
+      'No provider result can be attached: no delivery or tested checkpoint names a commit. A branch or a moving run head is never used instead.';
+  } else if (!repository.matches) {
+    state = 'repository_mismatch';
+    detail = `No provider result is attached: the checkpoint names ${repository.checkpoint ?? 'an unknown repository'}, not the project's repository ${repository.project ?? '(none bound)'}.`;
+  } else if (exactFacts > 0) {
+    state = 'observed';
+    detail = `A connected provider reported on this exact commit.${failingWords ? ` ${failingWords} A newer result may not have arrived.` : ''}`;
+  } else if (connections.length === 0) {
+    state = 'not_connected';
+    detail = `${exact} No GitHub or Azure DevOps repository is connected and bound to this project.`;
+  } else if (failingWords) {
+    state = 'connection_failing';
+    detail = `${exact} ${failingWords}`;
+  } else if (olderCommits.length > 0) {
+    state = 'older_commit_only';
+    detail = `${exact} A provider reported on an older commit of this run (${olderCommits.map((row) => row.commitSha.slice(0, 12)).join(', ')}); that result belongs to that commit and is not carried to this one.`;
+  } else {
+    state = 'no_observation';
+    detail = `${exact} ${named} ${connections.length === 1 ? 'is' : 'are'} connected; STMA cannot tell a result still pending from one that will never come.`;
+  }
+  return { state, detail, connections, olderCommits };
+}
+
+const receivingInstallations = alias(agentInstallations, 'evidence_receiving_installations');
+const addressedInstallations = alias(agentInstallations, 'evidence_addressed_installations');
+
+/**
+ * What STMA checks before it records a resume of a handoff that carries a
+ * commit. `transitionHandoff` takes either the checkout the receiver reports at
+ * resume or, when only the commit has moved on, a clean checkpoint its own
+ * receiving run reported at that commit (where it began, or later). Which of
+ * the two applied is not stored, so the sentence names both and says so.
+ */
+export const RESUME_RULE =
+  "STMA records a resume only when the receiving agent reports this exact repository and commit in a clean worktree, either as its checkout when it resumes or as a clean checkpoint its own run reported there, and refuses it otherwise. This pack does not record which of the two it was. Either way it is the receiver's report, not a provider check.";
+
+/**
+ * Where this run's checkpoints were handed over, and how far the receiver got.
+ * Read from the handoff rows: who accepted it, and when it was accepted,
+ * resumed and completed. A step with no time is a step nobody recorded.
+ */
+async function handoversForRun(db: Db, runId: string) {
+  const rows = await db
+    .select({
+      sessionId: handoffs.sessionId,
+      title: debugSessions.title,
+      kind: handoffs.kind,
+      state: handoffs.state,
+      checkpointId: runCheckpoints.id,
+      checkpointKind: runCheckpoints.kind,
+      repositoryIdentity: runCheckpoints.repositoryIdentity,
+      commitSha: runCheckpoints.commitSha,
+      receiver: receivingInstallations.name,
+      addressedTo: addressedInstallations.name,
+      createdAt: handoffs.createdAt,
+      acceptedAt: handoffs.acceptedAt,
+      resumedAt: handoffs.resumedAt,
+      completedAt: handoffs.completedAt,
+    })
+    .from(handoffs)
+    .innerJoin(runCheckpoints, eq(runCheckpoints.id, handoffs.checkpointId))
+    .innerJoin(debugSessions, eq(debugSessions.id, handoffs.sessionId))
+    .leftJoin(receivingInstallations, eq(receivingInstallations.id, handoffs.installationId))
+    .leftJoin(addressedInstallations, eq(addressedInstallations.id, handoffs.targetInstallationId))
+    .where(eq(runCheckpoints.runId, runId))
+    .orderBy(desc(handoffs.createdAt))
+    .limit(HANDOVER_LIMIT);
+  return rows.map((row) => ({
+    sessionId: row.sessionId,
+    title: row.title,
+    kind: row.kind,
+    state: row.state,
+    checkpointId: row.checkpointId,
+    checkpointKind: row.checkpointKind,
+    repositoryIdentity: row.repositoryIdentity,
+    commitSha: row.commitSha,
+    receiver: row.receiver ?? null,
+    addressedTo: row.addressedTo ?? null,
+    createdAt: row.createdAt.toISOString(),
+    acceptedAt: row.acceptedAt?.toISOString() ?? null,
+    resumedAt: row.resumedAt?.toISOString() ?? null,
+    completedAt: row.completedAt?.toISOString() ?? null,
+    resumeRule: RESUME_RULE,
+  }));
+}
+
+const claimKey = (type: string, key: string, access: string | null) => `${type}\0${key}\0${access ?? 'write'}`;
+
+/**
+ * The ground a controlled rotation moved (`rotateRunForWork`), read off the
+ * event it wrote: the claim rows themselves move to the successor, so without
+ * this the closed run read as one that declared nothing, and the successor's
+ * pack listed its predecessor's ground as its own work's.
+ */
+async function rotatedGround(db: Db, runId: string) {
+  const movedOut: { type: string; key: string; access: string | null; movedTo: string }[] = [];
+  const carriedIn = new Map<string, string>();
+  const rotationsOf = (ids: string[]) =>
+    ids.length
+      ? db
+          .select({ runId: agentEvents.runId, detail: agentEvents.detail })
+          .from(agentEvents)
+          .where(and(inArray(agentEvents.runId, ids), eq(agentEvents.type, 'run_finished')))
+      : Promise.resolve([]);
+  const named = (detail: unknown) => {
+    const event = detail as { reason?: unknown; rotatedTo?: unknown; movedClaims?: unknown } | null;
+    if (event?.reason !== 'work_rotation' || typeof event.rotatedTo !== 'string' || !Array.isArray(event.movedClaims)) return [];
+    return event.movedClaims.flatMap((claim) => {
+      const { type, key, access } = (claim ?? {}) as { type?: unknown; key?: unknown; access?: unknown };
+      return typeof type === 'string' && typeof key === 'string'
+        ? [{ type, key, access: typeof access === 'string' ? access : null, movedTo: event.rotatedTo as string }]
+        : [];
+    });
+  };
+  for (const row of await rotationsOf([runId])) movedOut.push(...named(row.detail));
+  const predecessors = await db.select({ id: agentRuns.id }).from(agentRuns).where(eq(agentRuns.rotatedToRunId, runId));
+  for (const row of await rotationsOf(predecessors.map((run) => run.id))) {
+    for (const claim of named(row.detail)) {
+      if (claim.movedTo === runId) carriedIn.set(claimKey(claim.type, claim.key, claim.access), row.runId);
+    }
+  }
+  return { movedOut, carriedIn };
+}
+
 export async function evidenceForRun(db: Db, runId: string, viewerId: string) {
   const rows = await db
     .select({
@@ -169,6 +467,15 @@ export async function evidenceForRun(db: Db, runId: string, viewerId: string) {
     found.projectRepositoryIdentity,
     checkpoint,
   );
+  const repository = {
+    project: projectRepositoryIdentity,
+    checkpoint: checkpointRepositoryIdentity,
+    matches: checkpointRepositoryMatches,
+  };
+  const [provider, handovers] = await Promise.all([
+    providerStatus(db, found.run, checkpoint, repository, currentProviderFacts.length),
+    handoversForRun(db, runId),
+  ]);
   const providerFailures = currentProviderFacts.filter((row) =>
     ['failure', 'closed'].includes(row.fact.state),
   );
@@ -181,6 +488,7 @@ export async function evidenceForRun(db: Db, runId: string, viewerId: string) {
   void viewerId;
 
   const claims = await db.select().from(workClaims).where(eq(workClaims.runId, runId));
+  const rotation = await rotatedGround(db, runId);
   const receiptRows = await db
     .select()
     .from(policyReceipts)
@@ -333,11 +641,19 @@ export async function evidenceForRun(db: Db, runId: string, viewerId: string) {
     },
     {
       key: 'scope',
-      state: claims.length === 0 ? 'unknown' : 'ok',
+      state: claims.length + rotation.movedOut.length === 0 ? 'unknown' : 'ok',
       detail:
-        claims.length === 0
+        claims.length + rotation.movedOut.length === 0
           ? 'This run declared no scope, so nobody could be warned about it.'
-          : `Recorded ${claims.length} claim(s). This does not cover undeclared work.`,
+          : `Recorded ${claims.length + rotation.movedOut.length} claim(s). This does not cover undeclared work.${
+              rotation.movedOut.length
+                ? ` ${rotation.movedOut.length} moved to run ${rotation.movedOut[0]!.movedTo} when this run was closed for other work, and are held there.`
+                : ''
+            }${
+              rotation.carriedIn.size
+                ? ` ${claims.filter((claim) => rotation.carriedIn.has(claimKey(claim.resourceType, claim.resourceKey, claim.access))).length} came from the run before this one, which declared them for its own work.`
+                : ''
+            }`,
     },
     {
       key: 'checkpoint',
@@ -504,7 +820,28 @@ export async function evidenceForRun(db: Db, runId: string, viewerId: string) {
           provenance: 'client_report',
         }
       : null,
+    /** The project's bound repository beside the one the checkpoint names. */
+    repository,
     providerFacts: currentProviderFacts,
+    /**
+     * Why the provider line says what it says. Exact facts never move between
+     * commits: `olderCommits` names results that belong to earlier checkpoints
+     * of this run so a reviewer can see they are not this commit's.
+     */
+    provider,
+    /** Where this run's checkpoints were handed over, newest first. */
+    handovers,
+    policy: receipt
+      ? {
+          expectedHash: receipt.expectedHash,
+          reportedHash: receipt.reportedHash,
+          drift: receipt.drift,
+          servedAt: receipt.createdAt.toISOString(),
+          // The receipt stores the effective document's hash, not the bundle
+          // versions merged into it; naming versions here would be a guess.
+          versions: null,
+        }
+      : null,
     providerCoverage: checkpoint
       ? checkpointRepositoryMatches
         ? `At most 100 provider events for exact checkpoint ${checkpoint.commitSha}; current facts are deduplicated by provider subject. Individual workflow results do not establish all required checks or human approval.`
@@ -521,6 +858,12 @@ export async function evidenceForRun(db: Db, runId: string, viewerId: string) {
           matches: knowledgeReceipt?.reportedManifestHash ? knowledgeMatches : null,
           stale: knowledgeStale,
           compliance: null,
+          versionIds: knowledgeVersionIds.slice(0, KNOWLEDGE_VERSION_LIMIT),
+          itemIds: (knowledgeManifest?.versions ?? [])
+            .map((version) => version.itemId)
+            .filter((id): id is string => Boolean(id))
+            .slice(0, KNOWLEDGE_VERSION_LIMIT),
+          versionCount: knowledgeVersionIds.length,
         }
       : null,
     verdict: 'Informational evidence, not authorization to merge or deploy.',
@@ -553,11 +896,20 @@ export async function evidenceForRun(db: Db, runId: string, viewerId: string) {
       team: found.team.slug,
       project: found.projectName ?? found.run.repo ?? null,
     },
-    scope: claims.map((claim) => ({
-      type: claim.resourceType,
-      key: claim.resourceKey,
-      access: claim.access,
-    })),
+    // A claim a rotation carried says where it went or where it came from;
+    // every other claim reads as it always did.
+    scope: [
+      ...claims.map((claim) => {
+        const from = rotation.carriedIn.get(claimKey(claim.resourceType, claim.resourceKey, claim.access));
+        return {
+          type: claim.resourceType,
+          key: claim.resourceKey,
+          access: claim.access,
+          ...(from ? { carriedFrom: from } : {}),
+        };
+      }),
+      ...rotation.movedOut,
+    ],
     checks,
     trail: trail.map((event) => ({ type: event.type, at: event.at.toISOString() })),
     /** What a reviewer should look at first — nothing more, and never a verdict. */

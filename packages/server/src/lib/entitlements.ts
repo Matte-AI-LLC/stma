@@ -122,7 +122,15 @@ export interface PlanLimits {
   fleet: FleetAccess;
   /** Publishing policy, receipts and drift, preflight, the governance screen. */
   governance: boolean;
-  /** Merge-evidence packs: `get_evidence` and the evidence view. */
+  /**
+   * Reading a run's evidence: `get_evidence`, the run page, its Markdown, the
+   * map's inspector and the hosted organization project console. On at every rung since 2026-10-22: a person reviewing their
+   * own agent's delivery is the first value, not a paid extra, and a downgrade
+   * must not hide what a run already recorded. It stays a switch so a
+   * composition resolver can narrow it, and then every door closes together,
+   * because each reads it through `effectiveLimits` (`evidenceAllowed`). Audit,
+   * identity enforcement and retention are separate and untouched by it.
+   */
   evidence: boolean;
   /**
    * The verified savings ledger.
@@ -151,7 +159,7 @@ export const PLANS = {
     retentionDays: 90,
     fleet: 'readonly',
     governance: false,
-    evidence: false,
+    evidence: true,
     savings: false,
   },
   solo: {
@@ -168,8 +176,9 @@ export const PLANS = {
     // Rules for your own agents is exactly the Solo case: one person, several
     // machines, and no other human to agree with.
     governance: true,
-    // Evidence is for showing somebody else. Solo has no somebody else.
-    evidence: false,
+    // A run's evidence is also how one person checks their own agent's
+    // delivery before merging it, so it is on here as on every rung.
+    evidence: true,
     savings: true,
   },
   team: {
@@ -331,6 +340,33 @@ export function effectivePlanLabel(
   }
   const days = Math.max(1, Math.ceil((endsAt.getTime() - now.getTime()) / 86_400_000));
   return `Team evaluation · ${days} ${days === 1 ? 'day' : 'days'} left`;
+}
+
+/**
+ * What a member is told when the plan in force does not include run evidence.
+ * No plan in `PLANS` turns it off since 2026-10-22; a composition resolver can,
+ * or a grant to a smaller plan, and then the run page, its Markdown, the map's
+ * inspector, the organization project console and `get_evidence` close together
+ * because they ask `evidenceAllowed` one question. It names no plan: "included
+ * from the X plan up" would be untrue there. `get_evidence` answers with it
+ * through `requireFeature`'s `narrowed`.
+ */
+export const EVIDENCE_NOT_INCLUDED =
+  'Reading run evidence is not included in the plan this workspace is on right now. Nothing recorded for this run is deleted; it reads again as soon as the plan includes evidence.';
+
+/**
+ * May this workspace read run evidence right now? The one request-local answer
+ * every evidence door asks: the run page, its Markdown, the map's inspector, the
+ * hosted composition's organization project console and, through
+ * `requireFeature`, `get_evidence`. A web door that read `PLANS` or
+ * nothing at all is how one person was told two different things.
+ */
+export async function evidenceAllowed(
+  db: Db,
+  team: { id: string; plan: string | null },
+  hosted = isHosted(),
+): Promise<boolean> {
+  return (await effectiveLimits(db, team, hosted)).evidence;
 }
 
 /** The cheapest plan that carries a feature — what an upgrade message names. */

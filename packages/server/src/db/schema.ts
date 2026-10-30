@@ -1,19 +1,122 @@
 import { sql } from 'drizzle-orm';
+import type { ExecutionJobDto } from '@bridge/shared';
 import {
   bigint,
   boolean,
   check,
+  foreignKey,
   index,
   integer,
   jsonb,
   pgTable,
   primaryKey,
+  real,
   text,
   timestamp,
+  unique,
   uniqueIndex,
   uuid,
   type AnyPgColumn,
 } from 'drizzle-orm/pg-core';
+
+/** A dedicated local installation remains worker-only after it is disabled. */
+export const executionTargets = pgTable('execution_targets', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  installationId: uuid('installation_id').notNull().references(() => agentInstallations.id, { onDelete: 'cascade' }).unique(),
+  ownerId: uuid('owner_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  teamId: uuid('team_id').notNull().references(() => teams.id, { onDelete: 'cascade' }),
+  projectId: uuid('project_id').notNull().references(() => projects.id, { onDelete: 'cascade' }),
+  checkoutPath: text('checkout_path').notNull(),
+  checkoutFingerprint: text('checkout_fingerprint').notNull(),
+  runtime: text('runtime').notNull(),
+  runtimeVersion: text('runtime_version').notNull(),
+  permissionProfile: text('permission_profile').notNull(),
+  maxRuntimeSeconds: integer('max_runtime_seconds').notNull(),
+  maxTurns: integer('max_turns').notNull(),
+  enabled: boolean('enabled').notNull().default(false),
+  quarantined: boolean('quarantined').notNull().default(false),
+  grantVersion: integer('grant_version').notNull().default(1),
+  lastSeenAt: timestamp('last_seen_at', { withTimezone: true }),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [check('execution_target_limits', sql`${t.maxRuntimeSeconds} between 60 and 3600 and ${t.maxTurns} between 1 and 100`),
+  uniqueIndex('execution_checkout_owner').on(t.ownerId, t.checkoutFingerprint),
+  index('execution_targets_team').on(t.teamId), index('execution_targets_project').on(t.projectId)]);
+
+export const workerInstances = pgTable('worker_instances', {
+  id: uuid('id').primaryKey(),
+  targetId: uuid('target_id').notNull().references(() => executionTargets.id, { onDelete: 'cascade' }),
+  lastSeenAt: timestamp('last_seen_at', { withTimezone: true }).notNull().defaultNow(),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [index('worker_instances_target').on(t.targetId)]);
+
+export const executionJobs = pgTable('execution_jobs', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  targetId: uuid('target_id').notNull().references(() => executionTargets.id, { onDelete: 'cascade' }),
+  sessionId: uuid('session_id').notNull().references(() => debugSessions.id, { onDelete: 'cascade' }),
+  handoffId: uuid('handoff_id').notNull().references(() => handoffs.id, { onDelete: 'cascade' }),
+  // DEFERRABLE INITIALLY DEFERRED lives in custom migration0058 (not expressible
+  // in Drizzle's schema API); its catalog contract is covered by cascade tests.
+  workId: uuid('work_id').references(() => workItems.id, { onDelete: 'no action' }),
+  specRevision: integer('spec_revision'),
+  principalKind: text('principal_kind').notNull(),
+  principalId: uuid('principal_id').notNull(),
+  actorUserId: uuid('actor_user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  actorTokenId: uuid('actor_token_id').references(() => tokens.id, { onDelete: 'set null' }),
+  actorSecurityPrincipal: jsonb('actor_security_principal').$type<import('../lib/securityHooks').SecurityPrincipal>().notNull(),
+  requestId: uuid('request_id').notNull(),
+  requestHash: text('request_hash').notNull(),
+  grantVersion: integer('grant_version').notNull(),
+  state: text('state').notNull().default('queued'),
+  maxRuntimeSeconds: integer('max_runtime_seconds').notNull(),
+  maxTurns: integer('max_turns').notNull(),
+  assignment: jsonb('assignment').$type<ExecutionJobDto['assignment']>().notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  uniqueIndex('execution_request_once').on(t.principalKind, t.principalId, t.requestId),
+  uniqueIndex('execution_assignment_active').on(t.handoffId).where(sql`state in ('queued','leased','starting','running','cancel_requested','dispatch_unknown','lost')`),
+  index('execution_target_queue').on(t.targetId, t.createdAt),
+  index('execution_jobs_session').on(t.sessionId),
+  index('execution_jobs_actor_user').on(t.actorUserId),
+  index('execution_jobs_actor_token').on(t.actorTokenId),
+  index('execution_jobs_work').on(t.workId),
+  index('execution_jobs_handoff').on(t.handoffId),
+]);
+
+export const executionAttempts = pgTable('execution_attempts', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  jobId: uuid('job_id').notNull().references(() => executionJobs.id, { onDelete: 'cascade' }).unique(),
+  // Both pinned worker/run references are deferred by custom migration0058.
+  workerId: uuid('worker_id').notNull().references(() => workerInstances.id, { onDelete: 'no action' }),
+  fence: integer('fence').notNull(),
+  state: text('state').notNull().default('leased'),
+  leaseExpiresAt: timestamp('lease_expires_at', { withTimezone: true }).notNull(),
+  deadlineAt: timestamp('deadline_at', { withTimezone: true }).notNull(),
+  providerSessionId: uuid('provider_session_id').notNull().unique(),
+  runId: uuid('run_id').references(() => agentRuns.id, { onDelete: 'no action' }).unique(),
+  processStopped: boolean('process_stopped').notNull().default(false),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [index('execution_attempts_worker').on(t.workerId)]);
+
+export const executionAttemptGrants = pgTable('execution_attempt_grants', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  attemptId: uuid('attempt_id').notNull().references(() => executionAttempts.id, { onDelete: 'cascade' }).unique(),
+  parentTokenId: uuid('parent_token_id').notNull().references(() => tokens.id, { onDelete: 'cascade' }),
+  tokenHash: text('token_hash').notNull().unique(),
+  expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+  revokedAt: timestamp('revoked_at', { withTimezone: true }),
+}, (t) => [index('execution_grants_parent_token').on(t.parentTokenId)]);
+
+export const executionEvents = pgTable('execution_events', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  jobId: uuid('job_id').notNull().references(() => executionJobs.id, { onDelete: 'cascade' }),
+  attemptId: uuid('attempt_id').references(() => executionAttempts.id, { onDelete: 'cascade' }),
+  requestHash: text('request_hash').notNull(),
+  state: text('state').notNull(),
+  reason: text('reason').notNull(),
+  detail: text('detail'),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [index('execution_events_job').on(t.jobId, t.createdAt), index('execution_events_attempt').on(t.attemptId)]);
 
 export const users = pgTable(
   'users',
@@ -77,6 +180,15 @@ export const users = pgTable(
     isTest: boolean('is_test').notNull().default(false),
     /** Its one isolated demo workspace. Deletion disables the identity, never widens it. */
     testWorkspaceId: uuid('test_workspace_id').references((): AnyPgColumn => teams.id, { onDelete: 'set null' }),
+    /**
+     * When this account's second factor last changed: an authenticator app
+     * enabled, disabled or reset by an operator, or a recovery code spent.
+     *
+     * Core reads nothing from it. It exists so an organization that requires
+     * an authenticator can tell a credential minted before the change from one
+     * minted after it without deleting rows: `tokens.created_at` against this.
+     */
+    secondFactorChangedAt: timestamp('second_factor_changed_at', { withTimezone: true }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [uniqueIndex('users_email_unique').on(t.email).where(sql`email is not null`)],
@@ -439,7 +551,109 @@ export const webSessions = pgTable('web_sessions', {
   userAgent: text('user_agent'),
   lastIp: text('last_ip'),
   lastSeenAt: timestamp('last_seen_at', { withTimezone: true }),
+  /**
+   * When this browser session completed an authenticator-app or recovery-code
+   * step. Null for every other session, including those of accounts without an
+   * authenticator. A session is never created before the step is done
+   * (`auth/signIn.ts`), so this records how it began rather than gating it.
+   */
+  mfaAt: timestamp('mfa_at', { withTimezone: true }),
 });
+
+/**
+ * One authenticator app per account (RFC 6238 TOTP).
+ *
+ * `secret_ref` is the sealed envelope from `sealAuthSecret` and never the
+ * secret itself: there is no plaintext fallback, so a server without an
+ * encryption key offers no enrollment at all. A row with `enabled_at` null is
+ * an enrollment still waiting for its first valid code and grants nothing.
+ * `last_step` is the highest TOTP time step ever accepted, which is the replay
+ * guard: a code is accepted only by an update that moves it forward.
+ */
+export const userAuthenticators = pgTable('user_authenticators', {
+  userId: uuid('user_id')
+    .primaryKey()
+    .references(() => users.id, { onDelete: 'cascade' }),
+  secretRef: text('secret_ref').notNull(),
+  pendingExpiresAt: timestamp('pending_expires_at', { withTimezone: true }),
+  enabledAt: timestamp('enabled_at', { withTimezone: true }),
+  lastStep: bigint('last_step', { mode: 'number' }),
+  lastUsedAt: timestamp('last_used_at', { withTimezone: true }),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+/**
+ * Single-use recovery codes, stored as sha256(user id + code). The codes are
+ * random rather than chosen, so a slow hash would add nothing, and a digest
+ * lookup is what makes spending one a single atomic update.
+ */
+export const recoveryCodes = pgTable(
+  'recovery_codes',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    codeHash: text('code_hash').notNull().unique(),
+    usedAt: timestamp('used_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index('recovery_codes_user').on(t.userId)],
+);
+
+/**
+ * A sign-in waiting for its authenticator step.
+ *
+ * Deliberately not a `web_sessions` row: a browser here holds only the `mfa`
+ * cookie naming this id, so it is signed out to every reader of sessions by
+ * construction. `next` was sanitized when the row was written and is where the
+ * finished sign-in goes; `session_days` carries a shorter session length where
+ * the sign-in path had one.
+ */
+export const mfaChallenges = pgTable(
+  'mfa_challenges',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    method: text('method').notNull(),
+    next: text('next').notNull(),
+    sessionDays: real('session_days'),
+    attempts: integer('attempts').notNull().default(0),
+    expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+    consumedAt: timestamp('consumed_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index('mfa_challenges_user').on(t.userId)],
+);
+
+/**
+ * Every time an operator reset somebody's authenticator app: when, whose, who
+ * did it and which of a closed set of reasons they chose. The operator's
+ * record, read on `/admin/users/:id`; written only by `lib/authenticatorResets`
+ * on the transaction that removes the app. No age sweep, a row cap. The
+ * subject is the account row and its name is read when the page is drawn, so
+ * an account deleted at its owner's request is shown by its scrubbed name; the
+ * operator's name is kept as it read then, because who did it must survive
+ * that operator's account changing later.
+ */
+export const authenticatorResets = pgTable(
+  'authenticator_resets',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    at: timestamp('at', { withTimezone: true }).notNull().defaultNow(),
+    subjectId: uuid('subject_id').references(() => users.id, { onDelete: 'set null' }),
+    actorId: uuid('actor_id').references(() => users.id, { onDelete: 'set null' }),
+    actorLabel: text('actor_label').notNull(),
+    /** 'lost_device' | 'lost_recovery_codes' | 'compromised'. Validated in lib/authenticatorResets. */
+    reason: text('reason').notNull(),
+  },
+  (t) => [
+    index('authenticator_resets_subject').on(t.subjectId, t.at),
+    index('authenticator_resets_at').on(t.at),
+  ],
+);
 
 export const snapshots = pgTable(
   'snapshots',
@@ -546,6 +760,15 @@ export const agentRuns = pgTable(
      */
     costCents: integer('cost_cents'),
     costSource: text('cost_source'),
+    /**
+     * Set when the server closed this run to start its successor for a
+     * different work item or contract revision (a controlled rotation). A hook
+     * that lost the answer reads it here and adopts the successor rather than
+     * starting a second run.
+     */
+    rotatedToRunId: uuid('rotated_to_run_id').references((): AnyPgColumn => agentRuns.id, {
+      onDelete: 'set null',
+    }),
     startedAt: timestamp('started_at', { withTimezone: true }).notNull().defaultNow(),
     lastHeartbeatAt: timestamp('last_heartbeat_at', { withTimezone: true })
       .notNull()
@@ -558,6 +781,10 @@ export const agentRuns = pgTable(
     uniqueIndex('agent_runs_installation_start_request')
       .on(t.installationId, t.startRequestId)
       .where(sql`start_request_id is not null`),
+    // The predecessor of a run, read by the evidence pack and the rotation, and
+    // the `set null` every deleted run runs on this table itself: agent_runs is
+    // never swept, so unindexed each of those was a scan of every run there is.
+    index('agent_runs_rotated_to').on(t.rotatedToRunId).where(sql`rotated_to_run_id is not null`),
   ],
 );
 
@@ -1413,6 +1640,19 @@ export const providerObservations = pgTable('provider_observations', {
   projectId: uuid('project_id').references(() => projects.id, { onDelete: 'set null' }),
   deliveryId: text('delivery_id').notNull(),
   subjectId: text('subject_id').notNull(),
+  /**
+   * The stable name a person can write into a criterion (a workflow or pipeline
+   * name). `subject_id` names one run of it and changes on every push. Null on
+   * rows older than the column and wherever the provider did not say.
+   */
+  subjectName: text('subject_name'),
+  /**
+   * The provider's id of the workflow or pipeline definition the run belongs
+   * to, beside its name: a name is not unique (two workflow files called `CI`),
+   * and only runs of one definition supersede each other. Null on rows older
+   * than the column and wherever the provider did not say.
+   */
+  subjectDefinition: text('subject_definition'),
   commitSha: text('commit_sha').notNull(),
   kind: text('kind').notNull(),
   state: text('state').notNull(),
@@ -1626,4 +1866,551 @@ export const savingConfirmations = pgTable(
     uniqueIndex('saving_confirmations_ref_idx').on(t.kind, t.refId),
     index('saving_confirmations_team_idx').on(t.teamId, t.createdAt),
   ],
+);
+
+// ---------------------------------------------------------------------------
+// Native Work (2026-10-23). A work item outlives the agents, runs, sessions and
+// trackers that touch it. Its contract is frozen in immutable revisions, its
+// deliveries and evidence are append-only, and a person's decision is a new
+// row, never an overwrite. Every mutation goes through one command envelope
+// (domain/work.ts): the receipt slot is reserved first, then the project
+// counter row is locked, then the work rows, and the event is written in the
+// same commit. Work locks are always the last locks a transaction takes.
+// ---------------------------------------------------------------------------
+
+/**
+ * Per-project sequence source for work numbers (WORK-42) and the event cursor.
+ * Its row lock is what serializes every Work mutation inside one project; two
+ * projects never wait for each other. Neither sequence promises to be gapless.
+ */
+export const workProjectCounters = pgTable('work_project_counters', {
+  projectId: uuid('project_id')
+    .primaryKey()
+    .references(() => projects.id, { onDelete: 'cascade' }),
+  teamId: uuid('team_id')
+    .notNull()
+    .references(() => teams.id, { onDelete: 'cascade' }),
+  nextWorkNumber: bigint('next_work_number', { mode: 'bigint' }).notNull().default(sql`1`),
+  nextEventSeq: bigint('next_event_seq', { mode: 'bigint' }).notNull().default(sql`1`),
+});
+
+export const workItems = pgTable(
+  'work_items',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    teamId: uuid('team_id')
+      .notNull()
+      .references(() => teams.id, { onDelete: 'cascade' }),
+    /** A work item belongs to one project for its whole life; it is never moved. */
+    projectId: uuid('project_id')
+      .notNull()
+      .references(() => projects.id, { onDelete: 'cascade' }),
+    number: bigint('number', { mode: 'bigint' }).notNull(),
+    /** `WORK-42`: a label inside one project, never an identity. */
+    displayKey: text('display_key').notNull(),
+    origin: text('origin').notNull().default('native'),
+    state: text('state').notNull().default('draft'),
+    /** Aggregate version: every successful mutation moves it by one. */
+    version: bigint('version', { mode: 'bigint' }).notNull().default(sql`1`),
+    /** The current contract revision; moves only when a contract field changes. */
+    specRevision: integer('spec_revision').notNull().default(1),
+    ownerUserId: uuid('owner_user_id').references(() => users.id, { onDelete: 'set null' }),
+    acceptorUserId: uuid('acceptor_user_id').references(() => users.id, { onDelete: 'set null' }),
+    priority: text('priority').notNull().default('normal'),
+    dueAt: timestamp('due_at', { withTimezone: true }),
+    labels: jsonb('labels').$type<string[]>().notNull().default([]),
+    currentDeliveryId: uuid('current_delivery_id').references((): AnyPgColumn => workDeliveries.id, {
+      onDelete: 'set null',
+    }),
+    currentAcceptanceId: uuid('current_acceptance_id').references(
+      (): AnyPgColumn => workAcceptances.id,
+      { onDelete: 'set null' },
+    ),
+    /** Moves whenever evidence about the current delivery changes, provider facts included. */
+    evidenceEpoch: bigint('evidence_epoch', { mode: 'bigint' }).notNull().default(sql`0`),
+    /** `human` (a user id) or `agent` (an installation id), from the authenticated principal. */
+    createdByKind: text('created_by_kind').notNull(),
+    createdById: uuid('created_by_id').notNull(),
+    /** The person behind the principal; for an agent, the installation's owner. */
+    createdByUserId: uuid('created_by_user_id').references(() => users.id, { onDelete: 'set null' }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+    archivedAt: timestamp('archived_at', { withTimezone: true }),
+  },
+  (t) => [
+    uniqueIndex('work_items_project_number').on(t.projectId, t.number),
+    // A constraint, not an index: work_links' composite foreign key needs it to
+    // exist inside CREATE TABLE, before any foreign key that references it.
+    unique('work_items_scope').on(t.id, t.teamId, t.projectId),
+    index('work_items_project_state').on(t.projectId, t.state, t.updatedAt, t.id),
+    index('work_items_team_updated').on(t.teamId, t.updatedAt),
+    check(
+      'work_items_state',
+      sql`${t.state} in ('draft', 'ready', 'in_progress', 'in_review', 'accepted', 'cancelled')`,
+    ),
+    check('work_items_origin', sql`${t.origin} in ('native', 'external')`),
+    check('work_items_priority', sql`${t.priority} in ('low', 'normal', 'high', 'urgent')`),
+    check('work_items_created_by_kind', sql`${t.createdByKind} in ('human', 'agent', 'system')`),
+  ],
+);
+
+/** One immutable contract revision. A changed contract is a new row, never an update. */
+export const workRevisions = pgTable(
+  'work_revisions',
+  {
+    workId: uuid('work_id')
+      .notNull()
+      .references(() => workItems.id, { onDelete: 'cascade' }),
+    revision: integer('revision').notNull(),
+    title: text('title').notNull(),
+    goal: text('goal').notNull(),
+    nonGoals: text('non_goals').notNull(),
+    scope: jsonb('scope').notNull(),
+    riskTier: text('risk_tier').notNull(),
+    artifactKind: text('artifact_kind'),
+    contextRefs: jsonb('context_refs').notNull(),
+    acceptancePolicy: jsonb('acceptance_policy').notNull(),
+    /** sha256 of the canonical contract including its criteria. */
+    contentHash: text('content_hash').notNull(),
+    /** `native`, or `external` when a tracker snapshot produced it. */
+    source: text('source').notNull().default('native'),
+    createdByKind: text('created_by_kind').notNull(),
+    createdById: uuid('created_by_id').notNull(),
+    createdByUserId: uuid('created_by_user_id').references(() => users.id, { onDelete: 'set null' }),
+    changeReason: text('change_reason'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.workId, t.revision] }),
+    check('work_revisions_source', sql`${t.source} in ('native', 'external')`),
+  ],
+);
+
+/** The acceptance criteria of one revision. A criterion keeps its id while its meaning holds. */
+export const workCriteria = pgTable(
+  'work_criteria',
+  {
+    workId: uuid('work_id')
+      .notNull()
+      .references(() => workItems.id, { onDelete: 'cascade' }),
+    revision: integer('revision').notNull(),
+    criterionId: text('criterion_id').notNull(),
+    text: text('text').notNull(),
+    required: boolean('required').notNull().default(true),
+    evidenceKinds: jsonb('evidence_kinds').$type<string[]>().notNull(),
+    verificationRule: jsonb('verification_rule').notNull(),
+    position: integer('position').notNull(),
+  },
+  (t) => [primaryKey({ columns: [t.workId, t.revision, t.criterionId] })],
+);
+
+/**
+ * What a work item is related to: runs, assignments, handoffs, Knowledge. One
+ * typed nullable column per target kind and a CHECK that exactly one is set, so
+ * no id is left unchecked. A wrong link is corrected by a superseding row; a
+ * started run's link is never edited.
+ */
+export const workLinks = pgTable(
+  'work_links',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    workId: uuid('work_id').notNull(),
+    teamId: uuid('team_id').notNull(),
+    projectId: uuid('project_id').notNull(),
+    kind: text('kind').notNull(),
+    runId: uuid('run_id').references(() => agentRuns.id, { onDelete: 'cascade' }),
+    /** An assignment and a handoff are both `handoffs` rows; `kind` says which. */
+    handoffId: uuid('handoff_id').references(() => handoffs.id, { onDelete: 'cascade' }),
+    knowledgeItemId: uuid('knowledge_item_id').references(() => knowledgeItems.id, {
+      onDelete: 'cascade',
+    }),
+    /** The contract revision the target was bound to; null means legacy_unversioned. */
+    specRevision: integer('spec_revision'),
+    createdByKind: text('created_by_kind').notNull(),
+    createdById: uuid('created_by_id').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    supersededAt: timestamp('superseded_at', { withTimezone: true }),
+    supersededByLinkId: uuid('superseded_by_link_id').references((): AnyPgColumn => workLinks.id, {
+      onDelete: 'set null',
+    }),
+    correctionReason: text('correction_reason'),
+  },
+  (t) => [
+    foreignKey({
+      columns: [t.workId, t.teamId, t.projectId],
+      foreignColumns: [workItems.id, workItems.teamId, workItems.projectId],
+      name: 'work_links_work_scope_fk',
+    }).onDelete('cascade'),
+    index('work_links_work').on(t.workId, t.kind),
+    uniqueIndex('work_links_active_run')
+      .on(t.runId)
+      .where(sql`run_id is not null and superseded_at is null`),
+    uniqueIndex('work_links_active_handoff')
+      .on(t.handoffId)
+      .where(sql`handoff_id is not null and superseded_at is null`),
+    // Every link, superseded ones included, for the cascade a deleted run or
+    // handoff runs (`where run_id = $1`), which the two partial unique indexes
+    // above cannot answer: without these a session sweep or an account
+    // deletion scanned the whole table once per row it removed.
+    index('work_links_run').on(t.runId).where(sql`run_id is not null`),
+    index('work_links_handoff').on(t.handoffId).where(sql`handoff_id is not null`),
+    check('work_links_kind', sql`${t.kind} in ('run', 'assignment', 'handoff', 'knowledge')`),
+    check(
+      'work_links_one_target',
+      sql`num_nonnulls(${t.runId}, ${t.handoffId}, ${t.knowledgeItemId}) = 1 and (
+        (${t.kind} = 'run' and ${t.runId} is not null) or
+        (${t.kind} in ('assignment', 'handoff') and ${t.handoffId} is not null) or
+        (${t.kind} = 'knowledge' and ${t.knowledgeItemId} is not null))`,
+    ),
+  ],
+);
+
+/** `work_id` waits on `depends_on_id` meeting the named revision. Same project only. */
+export const workDependencies = pgTable(
+  'work_dependencies',
+  {
+    workId: uuid('work_id')
+      .notNull()
+      .references(() => workItems.id, { onDelete: 'cascade' }),
+    dependsOnId: uuid('depends_on_id')
+      .notNull()
+      .references(() => workItems.id, { onDelete: 'cascade' }),
+    requiredSpecRevision: integer('required_spec_revision'),
+    kind: text('kind').notNull().default('blocks'),
+    createdByKind: text('created_by_kind').notNull(),
+    createdById: uuid('created_by_id').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.workId, t.dependsOnId] }),
+    index('work_dependencies_upstream').on(t.dependsOnId),
+    check('work_dependencies_not_self', sql`${t.workId} <> ${t.dependsOnId}`),
+    check('work_dependencies_kind', sql`${t.kind} = 'blocks'`),
+  ],
+);
+
+/** Something stopping the work, with an owner and a next step. Separate from the lifecycle. */
+export const workBlockers = pgTable(
+  'work_blockers',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    workId: uuid('work_id')
+      .notNull()
+      .references(() => workItems.id, { onDelete: 'cascade' }),
+    kind: text('kind').notNull(),
+    ownerUserId: uuid('owner_user_id').references(() => users.id, { onDelete: 'set null' }),
+    reason: text('reason').notNull(),
+    nextAction: text('next_action').notNull(),
+    /** Dedupe key for a blocker STMA raises itself; '' for one a person or agent set. */
+    sourceRef: text('source_ref').notNull().default(''),
+    createdByKind: text('created_by_kind').notNull(),
+    createdById: uuid('created_by_id').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    resolvedAt: timestamp('resolved_at', { withTimezone: true }),
+    resolvedByKind: text('resolved_by_kind'),
+    resolvedById: uuid('resolved_by_id'),
+    resolutionReason: text('resolution_reason'),
+  },
+  (t) => [
+    index('work_blockers_work').on(t.workId, t.resolvedAt),
+    uniqueIndex('work_blockers_open_source')
+      .on(t.workId, t.kind, t.sourceRef)
+      .where(sql`resolved_at is null and source_ref <> ''`),
+  ],
+);
+
+/** One immutable delivery: the exact artifact set submitted against one contract revision. */
+export const workDeliveries = pgTable(
+  'work_deliveries',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    workId: uuid('work_id')
+      .notNull()
+      .references(() => workItems.id, { onDelete: 'cascade' }),
+    specRevision: integer('spec_revision').notNull(),
+    sequence: integer('sequence').notNull(),
+    artifacts: jsonb('artifacts').notNull(),
+    artifactSetHash: text('artifact_set_hash').notNull(),
+    runId: uuid('run_id').references(() => agentRuns.id, { onDelete: 'set null' }),
+    note: text('note'),
+    submittedByKind: text('submitted_by_kind').notNull(),
+    submittedById: uuid('submitted_by_id').notNull(),
+    submittedByUserId: uuid('submitted_by_user_id').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    supersedesDeliveryId: uuid('supersedes_delivery_id').references(
+      (): AnyPgColumn => workDeliveries.id,
+      { onDelete: 'set null' },
+    ),
+    submittedAt: timestamp('submitted_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex('work_deliveries_work_sequence').on(t.workId, t.sequence),
+    index('work_deliveries_work_revision').on(t.workId, t.specRevision),
+    // For the `set null` a deleted run runs: runs are never swept, so without
+    // it every run a workspace or account deletion removes scanned this table.
+    index('work_deliveries_run').on(t.runId).where(sql`run_id is not null`),
+  ],
+);
+
+/**
+ * One observation about one criterion of one delivery. Provenance is decided by
+ * the server; a later row supersedes an earlier one without deleting it.
+ */
+export const workEvidence = pgTable(
+  'work_evidence',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    workId: uuid('work_id')
+      .notNull()
+      .references(() => workItems.id, { onDelete: 'cascade' }),
+    deliveryId: uuid('delivery_id')
+      .notNull()
+      .references(() => workDeliveries.id, { onDelete: 'cascade' }),
+    criterionId: text('criterion_id').notNull(),
+    specRevision: integer('spec_revision').notNull(),
+    sourceKind: text('source_kind').notNull(),
+    sourceRef: text('source_ref').notNull(),
+    sourceVersion: text('source_version'),
+    assertion: text('assertion').notNull(),
+    excerpt: text('excerpt'),
+    provenance: text('provenance').notNull(),
+    reportedByKind: text('reported_by_kind').notNull(),
+    reportedById: uuid('reported_by_id').notNull(),
+    reportedByUserId: uuid('reported_by_user_id').references(() => users.id, { onDelete: 'set null' }),
+    observedAt: timestamp('observed_at', { withTimezone: true }),
+    recordedAt: timestamp('recorded_at', { withTimezone: true }).notNull().defaultNow(),
+    supersedesId: uuid('supersedes_id').references((): AnyPgColumn => workEvidence.id, {
+      onDelete: 'set null',
+    }),
+    withdrawnAt: timestamp('withdrawn_at', { withTimezone: true }),
+  },
+  (t) => [
+    index('work_evidence_delivery').on(t.deliveryId, t.criterionId, t.recordedAt),
+    check('work_evidence_assertion', sql`${t.assertion} in ('pass', 'fail', 'inconclusive')`),
+    check(
+      'work_evidence_provenance',
+      sql`${t.provenance} in ('agent_reported', 'stma_observed', 'provider_observed', 'human_decision')`,
+    ),
+  ],
+);
+
+/**
+ * A person's recorded decision on one delivery. The evidence manifest it was
+ * made on is stored whole beside its hash, so the decision can be reread
+ * exactly as it was made. A new decision is a new row.
+ */
+export const workAcceptances = pgTable(
+  'work_acceptances',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    workId: uuid('work_id')
+      .notNull()
+      .references(() => workItems.id, { onDelete: 'cascade' }),
+    specRevision: integer('spec_revision').notNull(),
+    deliveryId: uuid('delivery_id')
+      .notNull()
+      .references(() => workDeliveries.id, { onDelete: 'cascade' }),
+    evidenceManifest: jsonb('evidence_manifest').notNull(),
+    evidenceManifestHash: text('evidence_manifest_hash').notNull(),
+    evidenceEpoch: bigint('evidence_epoch', { mode: 'bigint' }).notNull(),
+    decision: text('decision').notNull(),
+    reason: text('reason').notNull().default(''),
+    /** request_changes: the criterion ids that are not met. */
+    criteria: jsonb('criteria').$type<string[]>().notNull().default([]),
+    actorUserId: uuid('actor_user_id').references(() => users.id, { onDelete: 'set null' }),
+    /** The actor's standing when they decided: role, acceptor or owner override, self-review. */
+    actorScopeSnapshot: jsonb('actor_scope_snapshot').notNull(),
+    policyVersion: integer('policy_version'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    index('work_acceptances_work').on(t.workId, t.createdAt),
+    check('work_acceptances_decision', sql`${t.decision} in ('accept', 'request_changes')`),
+  ],
+);
+
+/** A tracker record this work is tied to, and who owns which field. */
+export const workExternalRefs = pgTable(
+  'work_external_refs',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    workId: uuid('work_id')
+      .notNull()
+      .references(() => workItems.id, { onDelete: 'cascade' }),
+    teamId: uuid('team_id')
+      .notNull()
+      .references(() => teams.id, { onDelete: 'cascade' }),
+    projectId: uuid('project_id')
+      .notNull()
+      .references(() => projects.id, { onDelete: 'cascade' }),
+    provider: text('provider').notNull(),
+    /** Set null when the connection is removed; the locator keeps the row readable, and unavailable. */
+    connectionId: uuid('connection_id').references(() => teamIntegrations.id, { onDelete: 'set null' }),
+    connectionLocator: text('connection_locator').notNull(),
+    remoteId: text('remote_id').notNull(),
+    remoteUrl: text('remote_url'),
+    mode: text('mode').notNull(),
+    /** The provider's own ordering token (an update time); an older one never replaces a newer. */
+    remoteRevision: text('remote_revision'),
+    lastObservedAt: timestamp('last_observed_at', { withTimezone: true }),
+    snapshot: jsonb('snapshot'),
+    snapshotHash: text('snapshot_hash'),
+    /** A newer remote snapshot waiting for a person to reconcile it. */
+    pendingSnapshot: jsonb('pending_snapshot'),
+    pendingRevision: text('pending_revision'),
+    syncState: text('sync_state').notNull().default('current'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    detachedAt: timestamp('detached_at', { withTimezone: true }),
+  },
+  (t) => [
+    uniqueIndex('work_external_refs_remote')
+      .on(t.teamId, t.provider, t.connectionLocator, t.remoteId)
+      .where(sql`detached_at is null`),
+    index('work_external_refs_work').on(t.workId),
+    check(
+      'work_external_refs_mode',
+      sql`${t.mode} in ('reference', 'external_authoritative', 'imported_native')`,
+    ),
+    check(
+      'work_external_refs_sync_state',
+      sql`${t.syncState} in ('current', 'external_change_pending', 'conflict', 'unavailable', 'detached')`,
+    ),
+  ],
+);
+
+/**
+ * Append-only record of every Work mutation, in committed project order. The
+ * payload carries what changed and short reasons, never bodies; the filter
+ * columns hold the bounded fields a list filter reads, before and after, so a
+ * delta reader can tell an item leaving a filter from an item changing in it.
+ */
+export const workEvents = pgTable(
+  'work_events',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    teamId: uuid('team_id')
+      .notNull()
+      .references(() => teams.id, { onDelete: 'cascade' }),
+    projectId: uuid('project_id')
+      .notNull()
+      .references(() => projects.id, { onDelete: 'cascade' }),
+    projectSeq: bigint('project_seq', { mode: 'bigint' }).notNull(),
+    workId: uuid('work_id')
+      .notNull()
+      .references(() => workItems.id, { onDelete: 'cascade' }),
+    workVersion: bigint('work_version', { mode: 'bigint' }).notNull(),
+    type: text('type').notNull(),
+    actorKind: text('actor_kind').notNull(),
+    actorId: uuid('actor_id'),
+    actorUserId: uuid('actor_user_id').references(() => users.id, { onDelete: 'set null' }),
+    payload: jsonb('payload').notNull(),
+    filterBefore: jsonb('filter_before'),
+    filterAfter: jsonb('filter_after').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex('work_events_project_seq').on(t.projectId, t.projectSeq),
+    index('work_events_work').on(t.workId, t.projectSeq),
+  ],
+);
+
+/**
+ * Idempotency receipts: one per (principal, request id), reserved inside the
+ * mutation's own transaction before anything else is locked, so a lost
+ * response retried with the same key never produces a second mutation and a
+ * refused one leaves no receipt. A person is their user id and an agent its
+ * installation (never a browser session or a rotating access token). The
+ * receipt holds a result reference, never a copy of the response, and the
+ * credential scope it was made under. No foreign key to the work: a create
+ * reserves its slot before the work row exists. No TTL: purging receipts would
+ * end the dedupe guarantee and is its own decision.
+ */
+export const workCommands = pgTable(
+  'work_commands',
+  {
+    principalKind: text('principal_kind').notNull(),
+    principalId: uuid('principal_id').notNull(),
+    requestId: uuid('request_id').notNull(),
+    operation: text('operation').notNull(),
+    canonicalHash: text('canonical_hash').notNull(),
+    teamId: uuid('team_id')
+      .notNull()
+      .references(() => teams.id, { onDelete: 'cascade' }),
+    projectId: uuid('project_id')
+      .notNull()
+      .references(() => projects.id, { onDelete: 'cascade' }),
+    workId: uuid('work_id').notNull(),
+    resultRef: uuid('result_ref'),
+    /** Null only inside the transaction that reserved the slot; set before it commits. */
+    resultVersion: bigint('result_version', { mode: 'bigint' }),
+    /**
+     * The command found nothing to change and wrote no event. A replay reads
+     * the events at `result_version` to rebuild its reply, and for such a
+     * command those belong to the command before it, whose sequence it never
+     * wrote and must not name.
+     */
+    unchanged: boolean('unchanged').notNull().default(false),
+    scopeSnapshot: jsonb('scope_snapshot').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.principalKind, t.principalId, t.requestId] }),
+    index('work_commands_work').on(t.workId),
+  ],
+);
+
+/**
+ * A delta reader's first-page snapshot, kept so later pages answer from the
+ * same moment without a transaction held open between requests. Only the
+ * principal's own project and filter, ten minutes, at most 500 items.
+ */
+export const workSnapshots = pgTable(
+  'work_snapshots',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    principalKind: text('principal_kind').notNull(),
+    principalId: uuid('principal_id').notNull(),
+    projectId: uuid('project_id')
+      .notNull()
+      .references(() => projects.id, { onDelete: 'cascade' }),
+    filterFingerprint: text('filter_fingerprint').notNull(),
+    scopeFingerprint: text('scope_fingerprint').notNull(),
+    asOfSeq: bigint('as_of_seq', { mode: 'bigint' }).notNull(),
+    items: jsonb('items').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+  },
+  (t) => [index('work_snapshots_expires').on(t.expiresAt)],
+);
+
+/**
+ * The key delta cursors are signed with. The server has no general secret and
+ * replicas must agree, so it lives here, generated once on first use. It signs
+ * cursors only; a cursor grants nothing, and every page re-checks access.
+ */
+export const workCursorKeys = pgTable('work_cursor_keys', {
+  id: text('id').primaryKey(),
+  secret: text('secret').notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+/** How many bytes of context each read served: the per-work cost a pilot measures. */
+export const workContextReads = pgTable(
+  'work_context_reads',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    workId: uuid('work_id')
+      .notNull()
+      .references(() => workItems.id, { onDelete: 'cascade' }),
+    teamId: uuid('team_id')
+      .notNull()
+      .references(() => teams.id, { onDelete: 'cascade' }),
+    principalKind: text('principal_kind').notNull(),
+    principalId: uuid('principal_id').notNull(),
+    bytes: integer('bytes').notNull(),
+    incomplete: boolean('incomplete').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index('work_context_reads_work').on(t.workId, t.createdAt)],
 );

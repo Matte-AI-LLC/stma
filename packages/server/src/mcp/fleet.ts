@@ -7,6 +7,7 @@ import {
   QUOTA_WARNING_PCT,
   conflictReport,
   describeHolder,
+  parseContentRules,
   snapshotSchema,
   type AgentRole,
   type ClaimConflict,
@@ -16,13 +17,14 @@ import {
 } from '@bridge/shared';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { randomUUID } from 'node:crypto';
-import { and, desc, eq, inArray, or } from 'drizzle-orm';
+import { and, desc, eq, inArray, isNull, or } from 'drizzle-orm';
 import { z } from 'zod/v3';
 import type { Db } from '../db';
 import {
   agentInstallations,
   agentRuns,
   debugSessions,
+  executionAttempts,
   handoffs,
   memberships,
   messages,
@@ -39,9 +41,14 @@ import {
   recordRunCost,
   registerAgent,
   nameRunForWork,
+  isRunRotated,
   releaseGroundAfterCompletion,
+  SEND_AGAIN,
+  rotateRunForWork,
+  rotatedAnswer,
   runForOwner,
   startAgentRun,
+  type RunRotation,
 } from '../domain/agents';
 import {
   activeFlowFor,
@@ -60,7 +67,7 @@ import type { Env } from '../env';
 import { queueHandoffNotification } from '../lib/notifications';
 import { notifyTeam } from '../lib/notify';
 import { MONTH_MS, hitCounter } from '../lib/counters';
-import { effectiveLimits } from '../lib/entitlements';
+import { EVIDENCE_NOT_INCLUDED, effectiveLimits } from '../lib/entitlements';
 import { resolveProjectForWrite } from '../lib/projects';
 import { redactSecrets } from '../lib/redact';
 import { track } from '../lib/track';
@@ -78,9 +85,13 @@ import { HANDOFF_ACTIONS, launchCheck, transitionHandoff } from '../domain/colla
 import { createHandoffOnce } from '../domain/handoffRequests';
 import {
   announceAssignment,
+  assignmentStepRefusal,
+  credentialStepPositions,
   handoffAllowance,
   resolveAssignee,
   resolveAssignmentProject,
+  thoseSteps,
+  whichSteps,
   writeAssignment,
   type AssignmentDraft,
 } from '../domain/assignments';
@@ -89,7 +100,25 @@ import { fingerprintJson } from '../lib/canonical';
 import { logLine } from '../lib/log';
 import { receiveSetupReceipt, setupReceiptSchema } from '../domain/setupReceipts';
 import { checkpointManifest, latestRunCheckpoint, writeRunCheckpoint } from '../domain/checkpoints';
-import { err, failed, requireFeature, resolveTeam, text } from './shared';
+import { mutateWorkInTransaction } from '../domain/work';
+import { workAccess } from '../domain/workAccess';
+import {
+  assignWorkInTransaction,
+  handoffContractChanged,
+  handoffWorkStatus,
+  liveRunOfAgentForWork,
+  runContractChanged,
+  runWorkStatus,
+  workOfHandoff,
+  workRefusalText,
+  workScopeOf,
+  type WorkAssignment,
+} from '../domain/workLinks';
+import { WorkRefusal, agentPrincipal, wireBigint } from '../domain/workTypes';
+import { chargeTeamDay, chooseTeam, err, failed, requireFeature, resolveTeam, teamsOf, text } from './shared';
+
+/** The day's allowance ran out under the Work lock: the assignment rolls back with the charge. */
+class TeamDayExceeded extends Error {}
 
 /**
  * The fleet half of STMA, over MCP.
@@ -200,59 +229,6 @@ const conflictAdvice = (conflicts: RightOfWayConflict[]) => {
 };
 
 /**
- * Peer-authored handoff steps are useful, but they are also the most likely
- * place for a sender model to accidentally tell the receiver to provision or
- * use a second secret.  Tool descriptions are advisory, so enforce the
- * source-machine boundary before the brief is persisted.
- *
- * A step may mention a credential only when it explicitly asks the source
- * machine/agent for a non-secret outcome.  The durable STMA lifecycle steps
- * carry the general warning separately, so ordinary handoffs never need to
- * mention secrets at all.
- */
-const unsafeCredentialHandoffStep = (step: string): boolean => {
-  const text = step.toLowerCase();
-  const mentionsCredential =
-    /\b(?:credential|secret|token|password|passphrase|api[-_ ]?key|private[-_ ]?key)\b/.test(text) ||
-    /(?:^|[\s/])\.(?:env|private)(?:[\s/.]|$)/.test(text) ||
-    /\bsetup:local\b/.test(text);
-  if (!mentionsCredential) return false;
-
-  const sourceMachineOnly =
-    /\b(?:source|sending|originating)[- ](?:machine|agent|device)\b/.test(text) &&
-    /\b(?:non[- ]secret|pass\/fail|outcome|result)\b/.test(text);
-  const receiverProvisioning =
-    /\b(?:receiver|receiving agent|your|its own|on this machine|locally)\b/.test(text) ||
-    /\b(?:setup:local|provision|configure|create|generate|recreate|copy|paste|enter|export|import|store)\b/.test(text);
-
-  return !sourceMachineOnly || receiverProvisioning;
-};
-
-/**
- * Which steps the credential rule refuses, as the 1-based positions an agent
- * can act on.
- *
- * The refusal used to restate the rule, that a step "cannot tell the receiver
- * to obtain, create, copy, use or configure a credential", and an agent whose
- * step was a warning ("do not copy a credential") read that as a
- * misunderstanding: it reworded the warning and was refused again (agent lab,
- * 2026-09-22, L3). The rule stays, because telling a prohibition from an
- * instruction by pattern is how a real instruction gets through. The answer
- * changes: it names the steps and says to leave them out, a warning included,
- * because the brief STMA writes already carries that warning for every
- * receiver (`assignments.ts`, and the lifecycle steps below).
- */
-const credentialStepPositions = (steps: readonly string[]): number[] =>
-  steps.flatMap((step, index) => (unsafeCredentialHandoffStep(step) ? [index + 1] : []));
-
-const whichSteps = (positions: readonly number[]): string =>
-  positions.length === 1
-    ? `Step ${positions[0]} of next_steps mentions`
-    : `Steps ${positions.join(', ')} of next_steps mention`;
-
-const thoseSteps = (positions: readonly number[]): string => (positions.length === 1 ? 'that step' : 'those steps');
-
-/**
  * The installation this token stands for, created on first use. Tokens are
  * already one-per-machine by convention, so the token id is a stable device
  * fingerprint that never leaves the server and is never a hostname.
@@ -296,9 +272,11 @@ async function actionableRuns(db: Db, userId: string, grant: AgentGrant) {
     .select({ run: agentRuns, installation: agentInstallations })
     .from(agentRuns)
     .innerJoin(agentInstallations, eq(agentRuns.installationId, agentInstallations.id))
+    .leftJoin(executionAttempts, eq(executionAttempts.runId, agentRuns.id))
     .where(
       and(
         eq(agentInstallations.userId, userId),
+        grant.execution ? eq(executionAttempts.id, grant.execution.attemptId) : isNull(executionAttempts.id),
         grant.installationId
           ? or(
               eq(agentRuns.installationId, grant.installationId),
@@ -341,6 +319,29 @@ async function servedPolicyHash(db: Db, userId: string, runId: string): Promise<
 
 const noRunError =
   'No run_id given and you have no active run. Call start_run first — it returns the run_id every other fleet tool needs.';
+
+/**
+ * Where a published content rule is enforced, said wherever the policy
+ * document is served to an agent (`get_policy`, `start_run`). A `content:` line
+ * sits among the denied actions, where every other line is a sentence an agent
+ * is trusted to follow, and an agent in the 2026-10-21 lab concluded from that
+ * that nothing stops one, refused to try the edit its human asked it to try,
+ * and so the guard never ran. Both halves are said, because outside the hooks
+ * the rule really is only a rule.
+ */
+const CONTENT_RULE_ENFORCEMENT =
+  'Denied actions that start with "content:" are checked, not only listed. In a checkout where STMA hooks run, the file-tool guard stops an edit that would add the named text under the named path and records the stop on the Governance page, and when the run finishes the hook reports the text if it is in the run\'s changes anyway. A shell command, or an agent without the hooks, is not stopped: there the rule is one to keep.';
+
+const contentRuleNote = (deny: readonly string[] | undefined): string | undefined =>
+  deny && parseContentRules(deny).length > 0 ? CONTENT_RULE_ENFORCEMENT : undefined;
+
+/**
+ * `get_evidence` for a run id that names nothing this connection may read. One
+ * sentence for "no such run" and "another workspace's run", in the shape of
+ * `launch_check`'s, because two would tell a caller which ids exist.
+ */
+const RUN_NOT_VISIBLE =
+  'No run with this id is visible to this connection: it does not exist, or it is in a workspace this connection cannot read. Nothing was read. Without run_id, get_evidence reads your newest active run.';
 
 /** This credential's own live runs: which one an omitted `run_id` may stand for. */
 const ownedBy = (grant: AgentGrant) => (row: { run: { installationId: string } }) =>
@@ -508,9 +509,24 @@ export function registerFleetTools(
           .extend({ kind: z.literal('start') })
           .optional()
           .describe('Immutable client-reported repository/commit observation at run start.'),
+        work_id: z
+          .string()
+          .uuid()
+          .optional()
+          .describe(
+            'The Native Work item this run is for, as an assignment or get_work names it. Links the run to the work, pinned to expected_spec_revision; send both or neither.',
+          ),
+        expected_spec_revision: z
+          .number()
+          .int()
+          .positive()
+          .optional()
+          .describe(
+            'The contract revision of work_id you read. A different current revision refuses the start with CONTRACT_CHANGED and writes nothing.',
+          ),
       },
     },
-    async ({ request_id, team, project, repository_identity, task, intent, branch, base_sha, head_sha, scope, agent, role, attempt_group, worktree, checkpoint, issue, clickup_task }) => {
+    async ({ request_id, team, project, repository_identity, task, intent, branch, base_sha, head_sha, scope, agent, role, attempt_group, worktree, checkpoint, issue, clickup_task, work_id, expected_spec_revision }) => {
       const resolved = await resolveTeam(db, user.id, team, env.hosted, grant);
       if (failed(resolved)) return err(resolved.error);
       // Claiming ground is the paid half. Reading the map is not — list_active_agents
@@ -590,8 +606,13 @@ export function registerFleetTools(
       // the ticket's summary becomes the intent nobody typed, and the map says
       // what the work is instead of echoing "PAY-421". A tracker hiccup stays
       // silent — a run must never fail because an issue tracker blinked.
+      // Not for a run started for a work item: its task is the work's key
+      // (`WORK-12`, what an assignment of it pre-fills), STMA's own and not a
+      // ticket, and asking Jira about it would label the run with whatever
+      // issue happens to share that key.
       if (
         grant.scope !== 'project' &&
+        work_id === undefined &&
         issue === undefined &&
         clickup_task === undefined &&
         taskKey &&
@@ -626,17 +647,27 @@ export function registerFleetTools(
           checkpoint: toCheckpoint(checkpoint),
           claims: toWorkClaims(scope),
           attemptGroup: attempt_group,
+          workId: work_id,
+          expectedSpecRevision: expected_spec_revision,
         },
         env.agentClaimLeaseMinutes,
         grant.projectId,
+        grant,
       );
-      if ('error' in result) return err(result.error);
+      if ('error' in result) return err(result.error ?? 'The run could not be started.');
+      // A run started for a work item that named no project starts in the
+      // work's own, so the policy and Knowledge below are read for that one.
+      const runProject =
+        project ??
+        (work_id && result.run.projectId
+          ? (await db.select({ name: projects.name }).from(projects).where(eq(projects.id, result.run.projectId)).limit(1))[0]?.name
+          : undefined);
 
       const declared = toWorkClaims(scope);
       const readiness = await runStartReadiness(db, user.id, {
         run: result.run,
         team: resolved.team.slug,
-        project,
+        project: runProject,
         claims: declared,
         replayed: result.replayed,
       });
@@ -653,7 +684,7 @@ export function registerFleetTools(
         user.id,
         {
           team: resolved.team.slug,
-          project,
+          project: runProject,
           query: contextQuery || undefined,
           maxItems: 10,
           runId: result.run.id,
@@ -692,7 +723,7 @@ export function registerFleetTools(
         runId: result.run.id,
         replayed: result.replayed,
         team: resolved.team.slug,
-        project: project ?? null,
+        project: runProject ?? null,
         agent: installation.name,
         role: installation.role ?? null,
         attemptGroup: result.run.attemptGroup,
@@ -704,12 +735,20 @@ export function registerFleetTools(
           env.agentWaitingLeaseMinutes,
         ),
         checkpoint: result.checkpoint ?? null,
+        // Only for a run started for a work item: the link, the revision it is
+        // pinned to and the state the work is in now.
+        ...('work' in result && result.work !== undefined ? { work: result.work } : {}),
         conflicts: describeConflicts(result.conflicts),
         conflictAdvice: conflictAdvice(result.conflicts),
         advisory: readiness.advisory,
         enforcement: readiness.enforcement,
         policy: policy
-          ? { hash: policy.hash, document: policy.document, warning: policy.warning }
+          ? {
+              hash: policy.hash,
+              document: policy.document,
+              warning: policy.warning,
+              contentRules: contentRuleNote(policy.document.permissions?.deny),
+            }
           : null,
         knowledgeContext,
         projectNote: result.projectSplit,
@@ -739,7 +778,7 @@ export function registerFleetTools(
             : undefined,
         hint: `Keep the run alive with update_run {"run_id":"${result.run.id}"}. Active work expires after ${env.agentClaimLeaseMinutes} minutes without a heartbeat; update_run status "waiting" or "blocked" keeps its claims for ${Math.max(env.agentClaimLeaseMinutes, env.agentWaitingLeaseMinutes)} minutes while a human responds. Call finish_run when you are done.`,
         deliveryHint: flowRef
-          ? `This team follows a delivery flow ("${flowRef.flow.name}"). Call get_workflow {"team":"${resolved.team.slug}"${project ? `,"project":${JSON.stringify(project)}` : ''}} before you branch — the branch naming, required checks and the road to production are decided there, not by you.`
+          ? `This team follows a delivery flow ("${flowRef.flow.name}"). Call get_workflow {"team":"${resolved.team.slug}"${runProject ? `,"project":${JSON.stringify(runProject)}` : ''}} before you branch — the branch naming, required checks and the road to production are decided there, not by you.`
           : undefined,
         flowAdvice:
           flowWarnings.length > 0
@@ -849,7 +888,8 @@ export function registerFleetTools(
           await servedPolicyHash(db, user.id, runId),
           policy_hash,
         );
-        if (recorded) policyReceipt = { drift: recorded.drift, expectedHash: recorded.expectedHash };
+        // A rotated run records nothing; the heartbeat below answers with its successor.
+        if (recorded && !isRunRotated(recorded)) policyReceipt = { drift: recorded.drift, expectedHash: recorded.expectedHash };
       }
       const result = await heartbeatAgentRun(
         db,
@@ -908,6 +948,11 @@ export function registerFleetTools(
         conflictRuns: [...new Set(result.conflicts.map((conflict) => conflict.existing.runId))],
         stale: result.stale.length,
       });
+      // A run working to a contract that has moved since it was linked is told
+      // on its every heartbeat; one linked to nothing, or to the current
+      // revision, gets the reply it always got.
+      const contractChanged = await runContractChanged(db, result.runId);
+      const workStatus = await runWorkStatus(db, result.runId);
       // Conflicts only ever describe runs that are BOTH live, so the moment the
       // other one finishes the warning disappears with it — while the change it
       // made is still sitting under this run's feet. This asks the other
@@ -916,6 +961,8 @@ export function registerFleetTools(
         runId: result.runId,
         status: result.status,
         leaseMinutes: result.leaseMinutes,
+        ...(contractChanged ? { contract_changed: contractChanged } : {}),
+        ...(workStatus ? { work_status: workStatus } : {}),
         checkpoint: result.checkpoint ?? null,
         cost: costEcho
           ? {
@@ -1022,7 +1069,7 @@ export function registerFleetTools(
         status: result.status,
       });
       // If the task was an issue, the issue is where the team will look.
-      const commented = result.replayed
+      const commented = result.replayed || grant.execution
         ? { commented: false as const }
         : await commentOnRunTracker(db, env, {
             teamId: result.scope.teamId,
@@ -1242,7 +1289,7 @@ export function registerFleetTools(
     {
       title: 'Get the team policy',
       description:
-        "Returns the effective policy for a team and project: the team's published policy merged with the project's additions. The document lists guidance, denied actions, actions that require approval, required checks, protected paths, required environment variable names, expected runtimes, the kinds of claimed work that need a person's agreement, and the change budget. Also returns the policy hash, the published versions it was merged from, and a note when nothing has been published and the values are defaults. start_run returns the same document for the run it starts.",
+        "Returns the effective policy for a team and project: the team's published policy merged with the project's additions. The document lists guidance, denied actions, actions that require approval, required checks, protected paths, required environment variable names, expected runtimes, the kinds of claimed work that need a person's agreement, and the change budget. A denied action that starts with \"content:\" names text that may not be added under a path, and in a checkout where STMA hooks run the file-tool guard stops an edit that would add it. Also returns the policy hash, the published versions it was merged from, where content rules are enforced when the document has any, and a note when nothing has been published and the values are defaults. start_run returns the same document for the run it starts.",
       inputSchema: { team: teamParam, project: projectParam },
     },
     async ({ team, project }) => {
@@ -1263,6 +1310,7 @@ export function registerFleetTools(
         document: policy.document,
         sources: policy.sources.map((s) => ({ scope: s.scope, version: s.version })),
         warning: policy.warning,
+        contentRules: contentRuleNote(policy.document.permissions?.deny),
         note: empty,
       });
     },
@@ -1401,7 +1449,7 @@ export function registerFleetTools(
     {
       title: 'Why is this change mergeable?',
       description:
-        'The merge-readiness pack for one run: what it held, whether it applied the policy it was served, whether its machine matched the project baseline, who it collided with, and its trail. Read it before asking a human to review, and fix what it calls out first. It reports what was recorded — it never guesses, so "unconfirmed" means nobody checked, not that it passed.',
+        'Returns the merge-readiness pack for one run: what it held, whether it applied the policy it was served, whether its machine matched the project baseline, who it collided with, its newest delivery checkpoint and its trail, with the checks that need attention listed as blocking and the ones nobody answered as unconfirmed. It reports what was recorded and never guesses, so "unconfirmed" means nobody checked, not that it passed. It is evidence for a reviewer, not approval to merge.',
       inputSchema: {
         run_id: z
           .string()
@@ -1414,14 +1462,34 @@ export function registerFleetTools(
       const addressable = run_id ? [] : await actionableRuns(db, user.id, grant);
       const runId = run_id ?? addressable.find(ownedBy(grant))?.run.id;
       if (!runId) return err(noRunHint(addressable, grant));
-      const pack = await evidenceForRun(db, runId, user.id);
-      if (failed(pack)) return err(pack.error);
-      // Membership check: the pack names a person, their machine and what they
-      // touched, so it stays inside the team it belongs to.
-      const resolved = await resolveTeam(db, user.id, pack.who.team, env.hosted, grant);
-      if (failed(resolved)) return err('That run is not in one of your teams.');
-      const evidenceGate = await requireFeature(db, env, resolved.team, (l) => l.evidence, 'Evidence packs');
+      // Membership before anything about the run is read: the pack names a
+      // person, their machine and what they touched, so it stays inside the
+      // workspace it belongs to. A run that does not exist and a run in a
+      // workspace this connection cannot read get one sentence, or the reply
+      // would say which ids are real.
+      const [where] = await db
+        .select({ teamId: agentRuns.teamId })
+        .from(agentRuns)
+        .where(eq(agentRuns.id, runId))
+        .limit(1);
+      const member = where
+        ? (await teamsOf(db, user.id, grant)).find((row) => row.team.id === where.teamId)
+        : undefined;
+      if (!member) return err(RUN_NOT_VISIBLE);
+      // A member past the day's allowance is told that, not that the run is gone.
+      const resolved = await resolveTeam(db, user.id, member.team.slug, env.hosted, grant);
+      if (failed(resolved)) return err(resolved.error);
+      const evidenceGate = await requireFeature(
+        db,
+        env,
+        resolved.team,
+        (l) => l.evidence,
+        'Evidence packs',
+        EVIDENCE_NOT_INCLUDED,
+      );
       if (evidenceGate) return err(evidenceGate.error);
+      const pack = await evidenceForRun(db, runId, user.id);
+      if (failed(pack)) return err(RUN_NOT_VISIBLE);
       return text({
         ...pack,
         hint:
@@ -1457,7 +1525,17 @@ export function registerFleetTools(
     inputSchema: {
       session_id: z.string().uuid(),
       action: z.enum(HANDOFF_ACTIONS),
-      run_id: z.string().uuid().optional().describe('Receiving run. Required for a Knowledge-linked resume and must belong to this installation with an immutable start checkpoint.'),
+      // Two readers of one field: work filed against a Native Work item names
+      // the run to move onto it, which in a hooked checkout is the paired
+      // adapter's, and the hook and the replies say to send it. "Must belong to
+      // this installation" alone read as forbidding exactly that call.
+      run_id: z
+        .string()
+        .uuid()
+        .optional()
+        .describe(
+          "Receiving run. For an assignment or handoff of a Native Work item: on accept or resume, the run that carries the work, which may be the run native tracking owns for this session (a paired local adapter's run); the accept moves it onto the work. For a Knowledge-linked resume of any other handoff it is required, and must be a run of this installation with an immutable start checkpoint.",
+        ),
       repository_identity: z.string().trim().min(1).max(300).optional(),
       commit_sha: z.string().regex(/^[a-f0-9]{40,64}$/i).optional(),
       worktree_clean: z.boolean().optional(),
@@ -1491,12 +1569,96 @@ export function registerFleetTools(
           : result.error!,
       );
     }
+    // Work taken from a Native Work item runs in a run linked to that contract.
+    // When the agent's current run is another work's, another revision's or
+    // nobody's, it is closed and its successor started and linked: after the
+    // accept has committed and in its own transaction, so a rotation that
+    // cannot be made never undoes the accept, and the reply says why instead.
+    // A retried accept asks again and is answered with the same successor, and
+    // it never closes a run that another work item's accept moved onto that
+    // work since, unless the agent names that run itself.
+    // A resume asks again, for a run the accept could not move: one waiting on
+    // a person, or one the accept needed named. The reply to such an accept
+    // names `resume` as the next call, and once the agent has resumed an accept
+    // is refused, so a rotation offered only on accept had no door left. A
+    // resume of work that already has a run of this agent rotates nothing and
+    // says nothing about runs, so the ordinary resume reads as it always did.
+    let runRotation: RunRotation | undefined;
+    if ((action === 'accept' || action === 'resume') && grant.installationId) {
+      const filed = await workOfHandoff(db, result.handoff.id);
+      if (
+        filed &&
+        !handoffContractChanged(filed) &&
+        !handoffWorkStatus(filed) &&
+        filed.link.specRevision !== null &&
+        (action === 'accept' || !(await liveRunOfAgentForWork(db, filed.work.id, grant.installationId, [])))
+      ) {
+        const [thread] = await db
+          .select({ title: debugSessions.title })
+          .from(debugSessions)
+          .where(eq(debugSessions.id, session_id))
+          .limit(1);
+        try {
+          runRotation = await rotateRunForWork(db, user.id, grant, {
+            teamId: filed.work.teamId,
+            projectId: filed.work.projectId,
+            sessionId: session_id,
+            workId: filed.work.id,
+            workKey: filed.work.displayKey,
+            specRevision: filed.link.specRevision,
+            runId: run_id,
+            replayed: 'replayed' in result && result.replayed === true,
+            // The name `nameRunForWork` would give the run, so it leaves it be.
+            name: (thread?.title ?? filed.work.displayKey).replace(/^(Assignment|Handoff):\s*/i, '').trim().slice(0, 200),
+          });
+        } catch {
+          runRotation = {
+            done: false,
+            reason: 'rotation_failed',
+            // Not "start a run": where native tracking owns the run, that would
+            // be a second live run beside it. Asking again rotates this one.
+            detail: `The run could not be rotated just now; the accept stands. ${SEND_AGAIN('of your live run')} to try once more; do not start another run for this work.`,
+          };
+        }
+      }
+    }
     // The call that moves this work on, stated rather than left to be found by
     // refusal: in the two-device round of 2026-09-19 all four agents were refused
     // at least once here, most by completing work they had accepted and never resumed.
     const offer = result.handoff;
+    // Work filed against a work item ends in a delivery, not in `complete`:
+    // only submit_work puts it in review, and an agent told only to complete
+    // left it in progress with nothing for the acceptor to decide. Said only
+    // for such work; every other handoff's `next` is exactly what it was.
+    const carried =
+      offer.state === 'accepted' || offer.state === 'in_progress' ? await workOfHandoff(db, offer.id) : undefined;
+    const carriedChanged = carried ? handoffContractChanged(carried) : undefined;
+    const carriedStatus = carried ? handoffWorkStatus(carried) : undefined;
+    const delivery = carried && !carriedChanged && !carriedStatus
+      ? {
+          tool: 'submit_work',
+          arguments: { work_id: carried.work.id, spec_revision: carried.link.specRevision ?? carried.work.specRevision },
+          alsoSend: [
+            'request_id, a new uuid you reuse on a retry',
+            'expected_version, the version get_work answers now',
+            'artifacts with exact versions: the repository and the full commit, a versioned document or a file digest',
+            'run_id of your run linked to this work',
+          ],
+        }
+      : undefined;
+    // update_handoff is named again for complete: "the same call" after
+    // submit_work read as submit_work with complete, which nothing accepts.
+    const deliver = delivery && carried
+      ? `When the work is done, submit_work for ${carried.work.displayKey}, then update_handoff with session_id ${session_id} and action complete: completing alone does not put the work in review, the delivery does.`
+      : undefined;
     const next =
-      offer.state === 'accepted'
+      carried && (carriedChanged || carriedStatus)
+        ? {
+            when: 'before taking any further action on this assignment',
+            call: { tool: 'get_work', arguments: { work_id: carried.work.id } },
+            then: carriedStatus?.next_action ?? `Ask whoever sent this assignment to cancel it and assign ${carried.work.displayKey} again at revision ${carried.work.specRevision}.`,
+          }
+        : offer.state === 'accepted'
         ? {
             // Code arrived: resume verifies the commit the receiver starts from, so it
             // belongs before the first change. One that came after the first commit is
@@ -1511,13 +1673,22 @@ export function registerFleetTools(
                 ? ['run_id of your live run in this project; it needs a start checkpoint']
                 : []),
             ],
-            then: 'The same call with "complete" once the work is done. Complete is refused before resume.',
+            then: deliver
+              ? `${deliver} Complete is refused before resume.`
+              : 'The same call with "complete" once the work is done. Complete is refused before resume.',
           }
         : offer.state === 'in_progress'
-          ? {
-              when: 'the work is done',
-              call: { tool: 'update_handoff', arguments: { session_id, action: 'complete' } },
-            }
+          ? delivery
+            ? {
+                when: 'the work is done',
+                call: { tool: delivery.tool, arguments: delivery.arguments },
+                alsoSend: delivery.alsoSend,
+                then: `Then update_handoff with session_id ${session_id} and action complete: completing alone does not put ${carried!.work.displayKey} in review, the delivery does.`,
+              }
+            : {
+                when: 'the work is done',
+                call: { tool: 'update_handoff', arguments: { session_id, action: 'complete' } },
+              }
           : undefined;
     const verificationNote = partial
       ? `Nothing was verified: ${missing.join(' and ')} ${missing.length === 1 ? 'was' : 'were'} not sent, and verification is one report of all three. ${offer.checkpointId ? 'This handoff carries code: send all three with resume.' : 'This work carries no code to verify, so none is needed.'}`
@@ -1550,7 +1721,7 @@ export function registerFleetTools(
     // The work has a name and the run that will do it, opened by a hook, has none.
     // Best effort and after the transition, like the release above: a map label
     // must never undo or refuse an accept.
-    if ((action === 'accept' || action === 'resume') && grant.installationId && !('replayed' in result && result.replayed)) {
+    if ((action === 'accept' || action === 'resume') && grant.installationId && !carriedChanged && !carriedStatus && !('replayed' in result && result.replayed)) {
       try {
         const [work] = await db
           .select({ teamId: debugSessions.teamId, projectId: debugSessions.projectId, title: debugSessions.title })
@@ -1583,6 +1754,10 @@ export function registerFleetTools(
     return text({
       ...result,
       ...(next ? { next } : {}),
+      ...(runRotation ? { run_rotation: runRotation } : {}),
+      // A replay reports the current work without encouraging obsolete execution.
+      ...(carriedChanged ? { contract_changed: carriedChanged } : {}),
+      ...(carriedStatus ? { work_status: carriedStatus } : {}),
       ...(verificationNote ? { verificationNote } : {}),
       ...(groundReleased
         ? { groundReleased, groundNote: 'The files this run held are free for other agents now. The run is still live; its next guarded edit or declared scope holds ground again.' }
@@ -1658,18 +1833,34 @@ export function registerFleetTools(
             'Where the work is, as list_projects shows it — name, slug or repository. An existing project is always used; only a name no project has creates one, and the answer says so. Omit it and the agent\'s one project is used, if it is connected to only one.',
           ),
         via: z.string().max(60).optional().describe('Your agent name, e.g. "claude-code".'),
+        work_id: z
+          .string()
+          .uuid()
+          .optional()
+          .describe(
+            "The Native Work item this assignment is for. Links the assignment to the work, pinned to expected_spec_revision, and its project is the work's own; send both or neither.",
+          ),
+        expected_spec_revision: z
+          .number()
+          .int()
+          .positive()
+          .optional()
+          .describe(
+            'The contract revision of work_id you read. A different current revision refuses the assignment with CONTRACT_CHANGED and writes nothing.',
+          ),
       },
     },
-    async ({ request_id, to_agent, to, device, task, brief, next_steps, branch, scope, team, project, via }) => {
+    async ({ request_id, to_agent, to, device, task, brief, next_steps, branch, scope, team, project, via, work_id, expected_spec_revision }) => {
       const steps = next_steps ?? [];
-      const refusedSteps = credentialStepPositions(steps);
-      if (refusedSteps.length) {
-        return err(
-          `${whichSteps(refusedSteps)} a credential or a source-only file, so nothing was written. Leave ${thoseSteps(refusedSteps)} out entirely, a warning not to copy or use one included: the assignment STMA writes already tells the agent that credentials never travel with the work. A check that needs a credential is run by whoever holds it, outside the steps.`,
-        );
+      const refusedSteps = assignmentStepRefusal(steps);
+      if (refusedSteps) return err(refusedSteps);
+      if ((work_id === undefined) !== (expected_spec_revision === undefined)) {
+        return err('INVALID_INPUT: work_id and expected_spec_revision go together: send both, or neither. Nothing was written.');
       }
+      const workId = work_id?.toLowerCase();
       const committedDb = db;
       let announce: (() => Promise<void>) | undefined;
+      let workCommitted: ((db: Db) => Promise<void>) | undefined;
       const result = await createHandoffOnce(
         db,
         user.id,
@@ -1687,9 +1878,20 @@ export function registerFleetTools(
           team: team ?? null,
           project: project ?? null,
           via: via ?? null,
+          // Only when present, so an assignment made without a work item hashes
+          // as it always did and its retry is still recognised.
+          ...(workId ? { work_id: workId, expected_spec_revision } : {}),
         }),
         async (db) => {
-          const resolved = await resolveTeam(db, user.id, team, env.hosted, grant);
+          // With a work item the day's call is charged under the Work lock,
+          // below: the charge holds the workspace's `rate_counters` row until
+          // commit, and held while this waits for the Work counter it closed a
+          // cycle with handoff_work (its run, then this row) and a Work command
+          // (the counter, then a row naming that run), and made every call in
+          // the workspace queue behind the wait.
+          const resolved = workId
+            ? await chooseTeam(db, user.id, team, grant)
+            : await resolveTeam(db, user.id, team, env.hosted, grant);
           if (failed(resolved)) return { error: resolved.error };
           const assignee = await resolveAssignee(db, resolved.team.id, to_agent, { owner: to, device });
           if ('error' in assignee) return { error: assignee.error };
@@ -1699,7 +1901,33 @@ export function registerFleetTools(
           // than left as an assignment nobody can ever accept.
           let target: AssignmentDraft['project'] = null;
           let projectNote: string | null = null;
-          if (project) {
+          let workScope: Awaited<ReturnType<typeof workScopeOf>> = undefined;
+          if (workId) {
+            // The work's own project, read and never created or locked: the
+            // Work locks taken below must be the last this transaction takes,
+            // and a project resolver that can create a project takes the
+            // workspace row. Visibility first, so a work this credential cannot
+            // see is never described.
+            workScope = await workScopeOf(db, workId);
+            if (
+              !workScope ||
+              workScope.teamId !== resolved.team.id ||
+              !(await workAccess(db, agentPrincipal(user.id, grant), workScope.teamId, workScope.projectId))
+            ) {
+              return { error: 'NOT_FOUND: No work with that id is visible to this principal. Nothing was written.' };
+            }
+            const [own] = await db.select().from(projects).where(eq(projects.id, workScope.projectId)).limit(1);
+            if (!own) return { error: 'NOT_FOUND: No work with that id is visible to this principal. Nothing was written.' };
+            if (project) {
+              const named = await projectForTeam(db, resolved.team.id, project);
+              if (named?.id !== own.id) {
+                return {
+                  error: `INVALID_INPUT: that work is filed in project "${own.name}", which is not "${project}". Omit project, or name the work's own. Nothing was written.`,
+                };
+              }
+            }
+            target = { id: own.id, name: own.name, repositoryIdentity: own.repositoryIdentity };
+          } else if (project) {
             const pr = await resolveAssignmentProject(db, resolved.team, project, user.id, grant.projectId);
             if (failed(pr)) return { error: pr.error };
             target = {
@@ -1722,11 +1950,7 @@ export function registerFleetTools(
             };
           }
 
-          // Charged after every refusal above: a typo costs nothing.
-          const allowance = await handoffAllowance(db, env, resolved.team);
-          if ('error' in allowance) return { error: allowance.error };
-
-          const draft: AssignmentDraft = {
+          const baseDraft: Omit<AssignmentDraft, 'work'> = {
             team: { id: resolved.team.id, slug: resolved.team.slug },
             project: target,
             agent: assignee.agent,
@@ -1737,16 +1961,70 @@ export function registerFleetTools(
             branch: branch ?? null,
             scope: toWorkClaims(scope),
           };
-          const ids = { sessionId: randomUUID(), handoffId: randomUUID() };
-          const created = await writeAssignment(db, env, draft, ids);
+          let draft: AssignmentDraft;
+          let created: Awaited<ReturnType<typeof writeAssignment>>;
+          let heard: boolean;
+          let workReply: Record<string, unknown> | undefined;
+          if (workScope) {
+            // Work locks, then the allowance, then the assignment rows: the
+            // order the Work `assign` operation takes, so the two cannot wait
+            // on each other. A refusal rolls back the whole assignment.
+            let assigned: WorkAssignment | undefined;
+            try {
+              const done = await mutateWorkInTransaction(
+                db,
+                {
+                  teamId: workScope.teamId,
+                  projectId: workScope.projectId,
+                  workIds: [workScope.id],
+                  actor: agentPrincipal(user.id, grant),
+                },
+                async (tx, ctx) => {
+                  const charged = await chargeTeamDay(tx, resolved.team, env.hosted);
+                  if (charged) throw new TeamDayExceeded(charged.error);
+                  assigned = await assignWorkInTransaction(tx, ctx, {
+                    env,
+                    team: resolved.team,
+                    draft: baseDraft,
+                    expectedSpecRevision: expected_spec_revision!,
+                    revisionField: 'expected_spec_revision',
+                  });
+                  return { events: assigned.events, resultRef: assigned.created.handoffId };
+                },
+              );
+              workCommitted = done.afterCommit;
+              workReply = {
+                work_id: workScope.id,
+                key: assigned!.draft.work!.key,
+                version: wireBigint(done.versions.get(workScope.id)!),
+                spec_revision: assigned!.draft.work!.specRevision,
+                link_id: assigned!.linkId,
+                execution_requested: false,
+              };
+            } catch (error) {
+              if (error instanceof TeamDayExceeded) return { error: error.message };
+              if (error instanceof WorkRefusal) return { error: `${workRefusalText(error.error)} Nothing was written.` };
+              throw error;
+            }
+            draft = assigned!.draft;
+            created = assigned!.created;
+            heard = assigned!.hookWillAnnounce;
+          } else {
+            // Charged after every refusal above: a typo costs nothing.
+            const allowance = await handoffAllowance(db, env, resolved.team);
+            if ('error' in allowance) return { error: allowance.error };
+            draft = baseDraft;
+            const ids = { sessionId: randomUUID(), handoffId: randomUUID() };
+            created = await writeAssignment(db, env, draft, ids);
+            // Whether anybody has to touch the other machine is the thing a lead
+            // wants to know. It is a fact about the pairing *and* the project: an
+            // adapter hears only its own project, so a pairing elsewhere is silence.
+            heard = (
+              await agentsHeardIn(db, [assignee.agent.installationId], resolved.team.id, target?.id ?? null)
+            ).has(assignee.agent.installationId);
+          }
           announce = () => announceAssignment(committedDb, env, resolved.team, draft, created);
           const owner = assignee.agent.owner === user.username ? 'you' : assignee.agent.owner;
-          // Whether anybody has to touch the other machine is the thing a lead
-          // wants to know. It is a fact about the pairing *and* the project: an
-          // adapter hears only its own project, so a pairing elsewhere is silence.
-          const heard = (
-            await agentsHeardIn(db, [assignee.agent.installationId], resolved.team.id, target?.id ?? null)
-          ).has(assignee.agent.installationId);
           const machine = assignee.agent.device ?? 'that machine';
           return {
             sessionId: created.sessionId,
@@ -1774,11 +2052,21 @@ export function registerFleetTools(
                     (assignee.agent.adapters > 0
                       ? `Its paired local adapter hears only assignments in its own project, and this one is ${target ? `in "${target.name}"` : 'in no project'}; assign it in the adapter's project to have the hook announce it.`
                       : 'No local adapter is paired with this agent; once one is (Agent connections → Listens for), its prompt hook announces assignments in that project by itself.')),
+              // Only for an assignment made from a work item. Assigning never
+              // starts anything: the agent starts when it takes the work.
+              ...(workReply ? { work: workReply } : {}),
             },
           };
         },
       );
       if ('error' in result) return err(result.error);
+      if (!result.replayed && workCommitted) {
+        try {
+          await workCommitted(committedDb);
+        } catch {
+          // The assignment and its link are committed; a missed live refresh costs latency only.
+        }
+      }
       if (!result.replayed && announce) {
         try {
           await announce();
@@ -1881,6 +2169,20 @@ export function registerFleetTools(
       // includes a paired adapter's. Omitted: only its own — see `noRunHint`.
       const run = run_id ? mine.find((r) => r.run.id === run_id) : mine.find(ownedBy(grant));
       if (run_id && !run) {
+        // A run a rotation closed is answered with the run that replaced it, as
+        // every other run door answers it. "Omit it" handed off with no run in
+        // a hooked checkout: there the successor is the paired adapter's, and an
+        // omitted run_id stands only for a run this credential started, so the
+        // work's run went on holding its files under the receiver.
+        const [closed] = await db
+          .select({ successor: agentRuns.rotatedToRunId })
+          .from(agentRuns)
+          .where(eq(agentRuns.id, run_id.toLowerCase()))
+          .limit(1);
+        if (closed?.successor) {
+          const rotated = await rotatedAnswer(db, run_id.toLowerCase(), closed.successor);
+          if (mine.some((r) => r.run.id === rotated.rotatedTo)) return { error: rotated.error };
+        }
         return { error: 'That run_id is not one of your active runs. Omit it to hand off your newest run, or list yours with list_active_agents.' };
       }
       if (run) {
@@ -2248,8 +2550,10 @@ export const FLEET_TOOL_PARAMS: Record<string, readonly string[]> = {
     'issue',
     'clickup_task',
     'checkpoint',
+    'work_id',
+    'expected_spec_revision',
   ],
-  update_run: ['run_id', 'status', 'scope', 'scope_source', 'policy_hash', 'usage', 'checkpoint'],
+  update_run:['run_id', 'status', 'scope', 'scope_source', 'policy_hash', 'usage', 'checkpoint'],
   finish_run: ['run_id', 'status', 'note', 'checkpoint'],
   list_active_agents: ['team', 'project'],
   get_evidence: ['run_id'],
@@ -2271,6 +2575,8 @@ export const FLEET_TOOL_PARAMS: Record<string, readonly string[]> = {
     'team',
     'project',
     'via',
+    'work_id',
+    'expected_spec_revision',
   ],
   handoff_work: [
     'request_id',

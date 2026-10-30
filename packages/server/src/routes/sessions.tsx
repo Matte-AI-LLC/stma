@@ -42,7 +42,9 @@ import {
   sectionHref,
 } from '../lib/scope';
 import { FlowEmpty, FlowSection } from '../ui/ProductFlow';
+import { WORK_STATE_LABEL } from '../domain/connectionState';
 import { z } from 'zod/v3';
+import type { Child } from 'hono/jsx';
 
 export const sessionsRoutes = new Hono<AppEnv>();
 
@@ -108,7 +110,7 @@ export interface SessionScope {
  *  - **Dispatched work.** A thread carrying a `handoffs` row is an assignment
  *    or a handoff, not a conversation somebody joined; project pages stopped
  *    counting it as an open session on 2026-09-19 for exactly this reason. The
- *    person page has a Work card above this one and `/app/handoffs` has the
+ *    person page has a Dispatched work card above this one and `/app/handoffs` has the
  *    rest, so listing it here would put one brief on one page twice under two
  *    different labels.
  *  - **The announcements channel.** It is created lazily by whoever first
@@ -335,8 +337,21 @@ const sessionsPage = async (c: Context<AppEnv>) => {
         ) : null}
       </div>
       <p class="row">
-        <a class="btn" href={scopeTeam ? sectionHref(scopeTeam.slug, scopeProject?.slug, 'work') : '/app/handoffs'}>
-          Work — assignments and handoffs
+        {/* Where the assignments and handoffs this page leaves out are listed:
+            the Dispatched ledger, which in a project is its Work's dispatched
+            tab. A workspace's Work is its queue of work items since Native Work,
+            so a button sending there led away from what the page points at. */}
+        <a
+          class="btn"
+          href={
+            scopeTeam && scopeProject
+              ? `${sectionHref(scopeTeam.slug, scopeProject.slug, 'work')}?tab=dispatched`
+              : scopeTeam
+                ? `/app/handoffs?team=${encodeURIComponent(scopeTeam.slug)}`
+                : '/app/handoffs'
+          }
+        >
+          Dispatched
         </a>
         {/* A filter with no way out is a trap: the tabs and the pager all keep
             the person, so this is the only link on the page that drops it. */}
@@ -417,7 +432,7 @@ const sessionsPage = async (c: Context<AppEnv>) => {
                     ? // Pointing them at "open a session" would be advice for
                       // somebody else's page; what is missing here is rows, and
                       // the two places the rest of their work is are named.
-                      'A thread counts here once they open it or write in it. Work assigned to or by them is on Work, and everything they did is on their own page.'
+                      'A thread counts here once they open it or write in it. Work assigned to or by them is on Dispatched, and everything they did is on their own page.'
                     : status === 'open'
                       ? 'When something "works on my machine", open a session here — or let your agent do it with the open_session tool.'
                       : 'Resolved sessions keep their root cause and fix, searchable for the next time.'}
@@ -817,7 +832,7 @@ sessionsRoutes.get('/app/sessions/:id', async (c) => {
             </div>
             <div class="card-note mono">
               {team.slug} · opened by {opener ?? 'unknown'} · {fmtDate(session.createdAt)}
-              {offer ? ` · ${work} ${offer.state === 'completed' ? 'completed — reported' : offer.state.replace('_', ' ')}` : ''}
+              {offer ? ` · ${work} ${WORK_STATE_LABEL[offer.state] ?? offer.state.replace('_', ' ')}` : ''}
             </div>
           </div>
           {session.kind === 'announcements' ? (
@@ -960,11 +975,16 @@ sessionsRoutes.get('/app/sessions/:id', async (c) => {
 });
 
 /**
- * The work ledger, at three addresses, the same three the sessions list answers.
- * `/app/teams/:slug/projects/:project/work` is the rail's; `?team=`/`?project=`
- * still answer.
+ * The dispatched-work ledger: assignments and handoffs, which agent holds them
+ * and what the records say about each.
+ *
+ * It answers `/app/handoffs` (and its `?team=`/`?project=` filters) as it
+ * always did. Since Native Work it is also the `?tab=dispatched` view of a
+ * project's Work address, which `routes/work.tsx` owns: that page passes its tab
+ * row in as `tabs`, so the ledger sits under the same tabs as the native list
+ * instead of being a second page with a different idea of what "Work" means.
  */
-const workPage = async (c: Context<AppEnv>) => {
+export const dispatchedLedger = async (c: Context<AppEnv>, tabs?: Child) => {
   const user = c.get('user');
   if (!user) return loginRedirect(c);
   const db = c.get('db');
@@ -1003,12 +1023,14 @@ const workPage = async (c: Context<AppEnv>) => {
     <AppLayout
       user={user}
       active="work"
-      title="Work"
+      // Dispatched, not Work: since Native Work the rail's Work is work items,
+      // and this ledger is the assignments and handoffs the queue links to.
+      title="Dispatched"
       bleed
       head={
         <PageHead
-          title="Work"
-          trail={scopedTrail({ team: workTeam, project: workProject }, 'Work')}
+          title="Dispatched"
+          trail={scopedTrail({ team: workTeam, project: workProject }, 'Dispatched')}
           sub="Assignments and handoffs: work given to an agent or waiting to be picked up, separate from unread messages. The code travels through git; STMA carries the brief and scope."
           actions={
             <>
@@ -1026,6 +1048,7 @@ const workPage = async (c: Context<AppEnv>) => {
       }
       keysNote="Latest 50 handoffs · completion is an agent report"
     >
+      {tabs ? <div class="wk-tabbar">{tabs}</div> : null}
       <FlowSection title="Handoff ledger">
         {rows.length ? (
           <div class="scroll-x">
@@ -1090,8 +1113,11 @@ const workPage = async (c: Context<AppEnv>) => {
   );
 };
 
+const workPage = (c: Context<AppEnv>) => dispatchedLedger(c);
+
+// A project's own address, `/app/teams/:slug/projects/:project/work`, is the native Work
+// list (`routes/work.tsx`, registered first); this ledger is its `?tab=dispatched`.
 sessionsRoutes.get('/app/handoffs', workPage);
-sessionsRoutes.get('/app/teams/:slug/projects/:project/work', workPage);
 
 sessionsRoutes.post('/app/sessions/:id/handoff/:action', async (c) => {
   const user = c.get('user');

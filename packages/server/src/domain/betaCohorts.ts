@@ -345,7 +345,10 @@ export async function betaLedger(db: Db, limit = BETA_LEDGER_MAX): Promise<BetaL
         // Nothing writes a row when an evidence pack is read: `get_evidence`
         // assembles what is already stored and returns it without tracking. So
         // silence here is silence, and reporting it as "not used" would be the
-        // one claim this codebase refuses to make everywhere else.
+        // one claim this codebase refuses to make everywhere else. Since
+        // 2026-10-22 every plan carries evidence, so `carries` below turns this
+        // into `kept` on every row; `unrecorded` remains the answer only for a
+        // landing plan that would ever drop it.
         state: 'unrecorded',
         evidence: 'nothing records an evidence-pack read, so this cannot be answered from stored rows',
       },

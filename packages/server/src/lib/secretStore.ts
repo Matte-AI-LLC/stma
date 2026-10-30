@@ -79,3 +79,57 @@ export async function revealIntegrationSecret(value: string, context: string) {
     );
   return store.open(value, context);
 }
+
+/**
+ * Authenticator-app secrets, sealed with the same keyring as integration
+ * credentials and separated from them by the associated data.
+ *
+ * The integration path above keeps a plaintext compatibility mode for
+ * self-hosted instances that have no key yet. This one never does, whatever
+ * `STMA_INTEGRATION_REQUIRE_ENCRYPTION` says: a seed readable from a database
+ * dump would turn a database read into the second factor itself. With no key
+ * configured, sealing throws and the account page offers no enrollment at all.
+ *
+ * The context binds an envelope to its account, so a sealed secret copied onto
+ * another user's row does not open there.
+ */
+const authContext = (userId: string) => `authenticator:v1:${userId}`;
+
+export const AUTH_SECRETS_UNAVAILABLE =
+  'Authenticator apps need an encryption key on this server. Ask the operator to set STMA_INTEGRATION_KEYS.';
+
+/** Whether this server can seal a new authenticator secret right now. Never throws. */
+export function authSecretsAvailable(): boolean {
+  try {
+    return configured() !== undefined;
+  } catch {
+    return false;
+  }
+}
+
+export async function sealAuthSecret(value: string, userId: string): Promise<string> {
+  const store = configured();
+  if (!store) throw new Error(AUTH_SECRETS_UNAVAILABLE);
+  return store.seal(value, authContext(userId));
+}
+
+/** Throws when the key is missing or the envelope does not belong to this account. */
+export async function openAuthSecret(reference: string, userId: string): Promise<string> {
+  if (!reference.startsWith('enc:')) throw new Error('Authenticator secret is not sealed.');
+  const store = configured();
+  if (!store) throw new Error(AUTH_SECRETS_UNAVAILABLE);
+  return store.open(reference, authContext(userId));
+}
+
+/**
+ * Re-seal one authenticator secret under the active key version, checked by
+ * opening the result before it is returned. Key rotation
+ * (`scripts/rotate-integration-secrets.ts`) moves every row through this, so
+ * the rule a rotation depends on is the one the suite exercises.
+ */
+export async function resealAuthSecret(reference: string, userId: string): Promise<string> {
+  const plain = await openAuthSecret(reference, userId);
+  const sealed = await sealAuthSecret(plain, userId);
+  if ((await openAuthSecret(sealed, userId)) !== plain) throw new Error('Encryption roundtrip failed.');
+  return sealed;
+}

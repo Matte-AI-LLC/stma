@@ -22,9 +22,9 @@ Person / account
   │    role: owner | member       │                      │
   │                               ├─ team policy         ├─ project policy additions
   │                               ├─ people/invites      ├─ snapshots/sessions/runs
-  │                               ├─ announcements       └─ project delivery flow
-  │                               ├─ team delivery flow
-  │                               └─ scoped Knowledge Hub
+  │                               ├─ announcements       ├─ project delivery flow
+  │                               ├─ team delivery flow  └─ work items: contract revisions,
+  │                               └─ scoped Knowledge Hub    criteria, deliveries, decisions
   │
   ├─ Browser-approved MCP OAuth grant
   │    client + machine + personal | one team | one project
@@ -75,6 +75,10 @@ The nouns are deliberately separate:
 - A **run** is a leased declaration of intent and work scope by one installation.
 - A **checkpoint** is an immutable client report of repository identity, commit, clean/dirty state
   and optional test results at start, delivery or tested time. It is not provider verification.
+- A **work item** is a durable unit of work in one project: an immutable-revision contract, the
+  criteria it is judged against, the runs and assignments linked to it, deliveries with their
+  evidence, and a person's recorded decision. It is not a run, an assignment or a handoff, and none
+  of them ends it; see F11.
 - A **knowledge item** has immutable draft/published versions and an explicit workspace or
   selected-project audience. A **knowledge context** freezes the exact versions served to a run or
   checkpoint; its receipt records client provenance, not compliance.
@@ -131,11 +135,13 @@ local data only when the client deliberately includes it in a tool call.
 | Create a workspace | `/app` | signed-in person | team overview |
 | Create a project | Projects | exact workspace + repository identity | project page or selected project access |
 | Add a human | workspace → Members and invites (also Invite people on Overview and People and agents), or owner agent `create_invite` | exact team; an emailed invitation also carries its one address | joined team; its owners emailed |
-| Connect an agent | workspace → Agent connections (also Connect agent on the overview, a project page or a project's Agents, which open it in that scope) | the workspace or project in the address; client-specific native setup request with stable MCP URL; browser-selected team/project | OAuth installation or connect command |
+| Connect an agent | workspace → Agent connections (also Connect agent on the overview, a project page or a project's Agents, which open it in that scope) | the workspace or project in the address; `entry` when the person came through a door; client-specific native setup request with stable MCP URL; browser-selected team/project | OAuth installation or connect command |
+| Use STMA from Claude | the guide's Add STMA to Claude, or Agent connections `#claude-app` | `entry=claude-app`, the workspace in the address | OAuth console connection, no machine |
 | First two-agent result | workspace → Agent connections → Test | durable launch ID, exact scope, own account | server-observed send/reply |
 | See live work | Agent map | current team/project filters | selected run inspector |
 | Discuss or hand off | Sessions / `inbox` | team/project/run | durable thread or handoff queue |
-| Recover a handoff | Work (`/app/handoffs`, or the project's `…/projects/<project>/work`) → session inspector | named human + accepting installation | explicit next action, no browser impersonation |
+| File, assign or decide work | Work in the workspace rail (the queue, `/app/teams/<slug>/work`) or a project's Work (`…/projects/<project>/work`) | exact workspace/project; the work's key in the address | the work item page, its contract, assignment and decision |
+| Recover a handoff | Dispatched (`/app/handoffs`, or the **Dispatched** tab of a project's Work, `…/projects/<project>/work?tab=dispatched`) → session inspector | named human + accepting installation | explicit next action, no browser impersonation |
 | Publish rules | team → Governance | exact team/project | effective policy + receipts |
 | Define delivery | team → Delivery | exact team/project | published flow + setup pack/pipeline |
 | See or change a plan | Account → Plan and billing, or the workspace rail → Plan & billing | every workspace the person is in; changes on the exact billable team | each workspace's plan in force; Checkout/Portal/current plan |
@@ -337,6 +343,76 @@ Still open, deliberately:
 - **A code still belongs to the browser that asked.** The reset mail carries a link that makes the
   device reading it into that browser, which covers the case that mattered; looking the code up by
   address instead would put an address field back on an unauthenticated page.
+
+## F0c - Authenticator app (TOTP)
+
+**Actor:** the account's owner, from `/app/account`; at sign-in, whoever holds the phone; when
+both phone and recovery codes are gone, an STMA operator.
+
+1. **Enrolling needs strong re-authentication.** The current password, checked against the shared
+   sign-in throttle, or, for an account with no password (GitHub, organization-only, dev), a
+   sign-in from the last ten minutes. An emailed code is never accepted for this.
+2. **Nothing turns on until the app produces a valid code.** Enrolling writes a pending, sealed
+   secret that grants nothing and expires after ten minutes; the first valid code activates it,
+   writes ten recovery codes, marks the current browser session as having completed the step and
+   signs every other browser out. The QR code, the manual key and the recovery codes are each shown
+   once.
+3. **Every browser sign-in path asks for the code**: password, the emailed code, GitHub,
+   organization single sign-on, review access and dev login. Single sign-on is not treated as this
+   step, whatever the identity provider claims. With the app on, the emailed sign-in code is not
+   sent and is never offered as a fallback, and `AUTH_2FA` changes nothing about it. An
+   organization sign-in waiting for the code holds no organization access; when the code is
+   accepted, its organization proof moves to the new session only if the member is still active
+   and the organization's policy has not changed in between (F10).
+4. **Recovery codes are single use.** Signing in with one ends every other session and mails the
+   address, and so does spending one on Account to confirm a change. Making new codes needs
+   re-authentication and a current code, and the old set stops working at once. Turning the app off needs the same, signs every other browser out and mails
+   the address.
+5. **A lost phone:** a recovery code, otherwise an operator reset on `/admin/users/:id`, which
+   needs a reason from a closed list, the username typed out and the operator's own sign-in from
+   the last ten minutes, ends every session and mails the account. It is recorded on the same
+   transaction that removes the app (when, whose, which operator, which reason; never a secret or a
+   code), shown on that person's operator page and kept within a row cap with no age sweep. A
+   password reset by email leaves the authenticator on: the mailbox is never the way around it.
+6. **Agent connections are not changed** by enabling, disabling, recovering or resetting, the
+   same as a password reset, except in an organization that requires an authenticator (F10 item
+   10), where a human's connections approved before the change stop working there and must be
+   approved again; the page says both. The terminal invite door
+   (`POST /api/invites/redeem`) refuses an existing account that has an authenticator, without
+   checking its password, and points it to the browser. The cost is deliberate: whoever holds a
+   live invite code and an address learns that the account uses an authenticator app, because
+   answering after the password check would make this door a way to test the password.
+
+Authorization invariants:
+
+- **The pending state grants nothing.** A browser between its password and its code holds only an
+  `mfa` cookie naming a challenge; no `web_sessions` row exists, so the console, OAuth consent,
+  `/app/tokens` and every other reader of sessions see it as signed out. Completing the step
+  writes a new session with a new id. A challenge is claimed before its code is checked, so it
+  checks one code at a time, and it dies with its sessions: a password reset, a password change,
+  **Sign out everywhere**, a recovery-code sign-in, ending review access and an operator reset each
+  end every sign-in still waiting at the code step, not only the signed-in browsers.
+- **One door.** Every session is written through `auth/signIn.ts`, and a test fails if anything
+  else writes one. A sign-in that found no authenticator checks again once its session is
+  written, and takes the session back for the code step if one was turned on in between.
+- **A code works once and in order.** The highest accepted time step only moves forward, so the
+  same code, or an older one after a newer one, is refused, even from two challenges at once, and
+  that refusal is not charged as a guess. Wrong codes are counted per account across challenges,
+  five per fixed fifteen-minute window: the attempt is spent before the code is checked, so a burst
+  of parallel guesses gets five checks and no more, and once the count is reached even a right code
+  is refused until the window ends. A password reset does not lift that wait, and the mail that
+  announces the lock names the step whoever tripped it got past (the password, GitHub, an
+  organization sign-in, or a browser already signed in), so it tells only an account whose
+  password was that step to change it.
+- **The secret is stored only encrypted**, with the server's integration key under its own
+  associated data; a server with no key offers no enrollment. Losing the key afterwards stops code
+  checks and leaves recovery codes, never email or password alone. No code, secret, URI or
+  recovery code appears in a log line, a mail or an operator page.
+
+Still open, deliberately: step-up for the password and address changes, and honouring an identity
+provider's own MFA claim. Also open: organization audit of a member's personal authenticator
+changes; the emailed sign-in code still pending after a password reset, which this flow does not
+end; and a key-loss and restore drill for sealed authenticator secrets.
 
 ## F1 — Invite and join a human
 
@@ -544,6 +620,24 @@ Guards and dead ends:
    default. Claude Code does not use these hints for permissions.
 6. `whoami` returns `planLabel` beside the stored `plan`: the label the console prints, so the beta,
    a grant or an evaluation reads the same in a chat as on the page.
+7. **Two doors, one account.** A Claude app console (this section) and a coding agent in a checkout
+   (F2, `stma connect`) are different things, and Agent connections names them as two. The console
+   is not an agent in a checkout: it installs no hooks, has no file guard, and nobody can assign it
+   work. One account can use both. The connector is not refused by `launch_check`, because the
+   directory review path calls it over a Claude app connection, so the Test card says when an
+   exchange included the console and that it proves STMA reached it, not that a coding agent works
+   in a checkout. A Claude app connection is console access whose reach the person chose on consent
+   (Personal, a workspace or a project); adding it again creates another connection, and the consent
+   page says how many live ones exist. The door a person asked for is a closed value, `entry`
+   (`claude-app` or `coding-client`), carried by `/app/tokens?entry=`, a hidden field on the new
+   workspace form and the sign-in `next` address, and it ends as the fragment `#claude-app` or
+   `#connect` on the workspace's Agent connections page. Any other value is dropped and never
+   echoed.
+8. **A connection's status is five separate facts.** Authorization, local adapter, last contact,
+   task and next step each carry the time they were observed and where the observation came from,
+   and what STMA cannot see is listed as unknown. STMA records requests that arrive with a
+   credential; it has no process heartbeat and cannot read a checkout, so it never calls a
+   connection or a run online, offline, idle, running or healthy.
 
 ## F3 — Solo, multiple agents, multiple machines
 
@@ -570,7 +664,9 @@ Guards and dead ends:
 **Success:** a real cross-installation greeting/reply, with one human and no project, repository
 write, snapshot, run, policy or invitation required. Cloud Free supports this two-device path;
 being a solo user does not require the paid Solo or Team plan. The endpoint/username/installation
-check in F2 proves connection, not message delivery or autonomous agent wake-up.
+check in F2 proves connection, not message delivery or autonomous agent wake-up. Managed execution
+is a separate opt-in for one configured project target and works only while its foreground worker
+process is running.
 
 **Guards:** two separate localhost instances cannot communicate. Self-hosters need one secured
 address reachable from both machines and matching `BASE_URL` before authorization. A stopped agent
@@ -804,7 +900,7 @@ destination; its page still answers its address.
 
 Console navigation keeps these evidence levels visible: Governance groups are collapsed by
 default with count-bearing deep links, Activity filters are URL state and carry into CSV, and
-Needs attention links only to a still-live exact run. If that run expires before inspection, Agent
+Needs attention links only to a still-live exact run for items that need action (ended runs are only counted). If that run expires before inspection, Agent
 map says the target is gone and does not silently select another agent. Notification delivery is
 a personal setting, not an inbox destination. Agent inventory is the map's Identities tab and
 sorts active identities first, then newest seen within each state. The scope graph above the
@@ -917,6 +1013,11 @@ completion/handoff should close its own run without closing another installation
   Content still never leaves the machine — a report carries the rule's published words and a path
   and has no field for anything else. It is not proof that nothing landed: one checkout, at the end
   of one run, and an agent connected over MCP only has no hook to run either half.
+  `get_policy` and `start_run` say this to the agent whenever the effective policy holds a content
+  rule (`contentRules`), both halves of it: stopped at the file tool where the hooks run, a rule to
+  keep where they do not. Without it the line reads like every other denied action, a sentence an
+  agent is trusted to follow, and one agent concluded that nothing stops it (agent lab,
+  2026-10-21).
 - **Assign work** can take the task from a connected tracker. With one connected, the dialog grows
   a **Ticket** field, and which tracker a reference belongs to is read off its shape: `#42`,
   `owner/repo#42` and a github.com issue URL are GitHub, `PROJ-42` is Jira, a ClickUp link or
@@ -1135,9 +1236,46 @@ Markdown to copy or download. It is read by workspace members only (the address 
 workspace, so an organization-managed workspace's role check applies), posts nothing anywhere and
 is not a merge approval. Only the canonical spelling of the run id is answered.
 
-The Needs attention page composes bounded handoffs, recorded overlaps and missing/hash-drift receipts;
-its review links do not approve anything. New launch cohorts are durable and sequential. Historical
-feature-use totals remain independent retained-window counts, not a funnel.
+The review pack contract (2026-10-22). The page and its Markdown are sectioned by whose word each
+line is: Identity (workspace, project, the project's bound repository, run id, agent, owner,
+branch), Delivered commit (checkpoint id, kind, full commit, whether its repository is the
+project's), Reported by the agent, Observed by STMA, Observed by the provider, Handover, Policy and
+Knowledge, and Still open. A provider fact is attached only to the newest delivery/tested
+checkpoint's exact commit; when there is none the pack says why, from stored facts only: no
+checkpoint, a repository that is not the project's, nothing connected and bound, a connection whose
+stored last check failed, a result for an older commit of the run (named as that commit's and never
+carried forward), or nothing yet, worded so STMA does not claim to know pending from never. The
+Handover lists the handoffs of this run's checkpoints with the receiver and its accept, resume and
+completion times; a recorded resume means the receiver reported that exact repository and commit
+in a clean worktree, either as its checkout when it resumed or as a clean checkpoint its own run
+reported there, which STMA refuses otherwise; the pack does not record which, and either way it is
+the receiver's report. Policy
+and Knowledge give the full hashes and the Knowledge versions served, and say a receipt is not
+compliance, approval or proof the text was followed. **Copy for a pull request** is a short block
+of at most twelve lines. Both say only workspace members can open the link; no guest link exists.
+Every value somebody else wrote is redacted and escaped, so a pasted pack cannot form a link, image,
+HTML, heading, table cell or mention; the only live address is STMA's own run page. The run page,
+its Markdown, the map's inspector, the hosted organization project console and `get_evidence` read
+one entitlement decision (`evidenceAllowed`), so a composition that narrows evidence closes every
+one of them together (402 on the pages, a sentence in place of the console's attention counts). A handoff thread's "what was handed over" is the receiver's continuity record, not the
+evidence pack, and is not gated by it.
+
+The Needs attention page separates what needs action now from what is waiting on someone and what is
+only worth a look. It recomputes scope overlaps from the live claims of live runs with the agent map's
+own pairing, never from retained overlap events, so an overlap ends when a run ends or a claim lapses
+and a real one cannot fall out of an event window; an overlap where one run only reads is a count, not
+a row. Hash drift is the only receipt state that needs action, and a receipt nobody has answered is
+listed, as advisory, only once the run has been alive for fifteen minutes without reporting. A
+handoff has an age and no expiry; it stays until it is completed or cancelled. A `needs_attention`
+handoff is described as orphaned only when its accepting member or connection is actually gone, and
+otherwise as reported blocked by the receiving agent. A row names a responsible person only when a record says so (the accepting member, else the
+named person, else the owner of the named agent) and otherwise says it is not assigned to a person; the
+sender is shown as the sender. Every bound is stated in words, so a list that stops at N is never read
+as a total, and the page contains no action control: its links are read only, and accepting, resuming
+and cancelling keep their own authorization. In an organization-managed workspace only the admin and operator workspace roles may open the page; the other granular roles are refused, because it names run owners and projects. New launch cohorts are durable and sequential. Historical
+feature-use totals remain independent retained-window counts, not a funnel. Activation is read by
+operators only, as counts of eligible workspaces per stage, never counts of events: a connection is not
+counted as activation, and a person's answer is kept apart from the milestones STMA observed.
 
 **Actor:** an owner defines/publishes; a coding agent may implement a generated setup pack.
 
@@ -1187,6 +1325,10 @@ is composed through the private operator layer; core code must not import it.
    again — including how long its history is kept — and checkout returns. An evaluation cannot be
    started while one runs. Every give, change and revoke is in the operator's ceiling history; the
    operator's note is shown to the operator only.
+7. Basic run evidence (read the run page, copy and download its Markdown, `get_evidence`) is on
+   every plan for runs the principal may already see. A downgrade deletes no evidence and opens
+   nothing outside membership, a credential's project scope or revocation. It is not enterprise
+   audit, identity enforcement or retention, which stay separate.
 
 Failure must leave the current entitlement intact and say that no charge was made when Checkout did
 not start. Billing state never belongs in the public package or public database migrations.
@@ -1205,6 +1347,7 @@ not start. Billing state never belongs in the public package or public database 
 | Pause a tracker integration | workspace owner | STMA stops calling that provider for the workspace — reads and writes — while the credential and every project mapping are kept; the owner's own connection test is the one call that still goes out |
 | Remove one project mapping | workspace owner | that project resolves no tracker; the connection and the other mappings are untouched |
 | Disconnect a tracker integration | workspace owner | encrypted credential and every mapping deleted, without needing the decryption key; the owner is told where to revoke the app at the provider |
+| Revoke one organization credential | organization owner, or identity admin for ordinary members | that installation and credential stop; its runs become stale; the person and their other connections keep access |
 
 Every destructive screen must name scope and consequence before confirmation. Revocation cannot be
 undone by re-registering the same fingerprint or replaying an enrollment. Server-side revocation
@@ -1248,17 +1391,525 @@ Enterprise plan. Engineering can use a test tenant; a paying customer is not a p
    terminated person holding a live credential cannot be undone by anybody. Each removal is
    recorded per workspace under one group, carrying the role it removed — which is what
    reassignment needs — and marked when it left no owner behind.
+   Deactivation also releases that person's remaining live runs in the organization's workspaces,
+   including runs under a connection the organization did not issue, and drops their granular
+   workspace roles, so a reactivation restores nothing until an administrator reassigns access.
+   Administrators can read the member's credentials and an after-the-fact access report that keeps
+   three answers apart: STMA access to the organization that was cut, cleanup on the person's
+   machines that only they or a device administrator can do, and provider credentials they
+   connected that must be revoked at the provider. An auditor reads names there only for the
+   workspaces the organization console shows it, and a count for the rest. There is no organization-wide control that
+   revokes every agent at once.
 8. Service identities use explicit project grants and their own one-time prompts, no browser
    login and no human seat. Policy/role changes require fresh enrollment instead of upgrading
    already issued credentials. The final active organization owner cannot be removed.
+9. **Authenticator apps.** An organization sign-in for an account with an authenticator app (F0c)
+   stops at the code page like every other sign-in, and single sign-on never counts as that step,
+   whatever the ID token says about how the provider authenticated. The organization proof waits
+   on that sign-in and reaches the new session only if the member is still active and the policy
+   version unchanged when the code is accepted.
+10. **Requiring an authenticator app.** An organization owner switches the requirement on from the
+   organization page, and only from its preview, which lists the active people who would lose
+   access until they add an app, those who already have one and those provisioned but never signed
+   in, and counts what ends: agent connections approved by people, service identity connections,
+   unused approvals and, where SSO is enforced, organization sign-ins (everybody signs in again,
+   the owner included). It takes effect at once; there is no grace period and no scheduled date.
+   The switch refuses, and changes nothing, when the owner's own session has not completed the
+   authenticator step since their last change (which would lock them out), when the server cannot
+   store authenticator secrets, when the policy version moved since the preview, or when more
+   people would lose access than the preview showed. Switching on or off bumps the policy version,
+   so everything approved under the previous one, service connections included as with every
+   policy change (item 8), stops on its next request; switching off therefore revives nothing the
+   requirement had stopped. Switching off needs a session that still meets the requirement, so a
+   password alone cannot undo it. Identity administrators cannot change it, the operator console
+   has no switch for it, and the operator's only way past it is the break-glass command with
+   `--disable-mfa`: a dry run by default, compare-and-swap on the policy version, one organization,
+   SSO enforcement untouched, refused when nothing is required, recorded as `mfa_recovery`. The
+   organization audit records `organization_mfa_required` (with counts, never names) and
+   `organization_mfa_relaxed`.
+   While it is set, a browser session must have completed the authenticator step since the
+   account's last second-factor change, and a human's agent credential, its refresh and a pending
+   approval must postdate that change, so enabling, disabling, an operator reset or a spent
+   recovery code stops older ones on their next request without deleting them. Without the step
+   the organization page shows only how to add an authenticator, the last owner holding one cannot
+   turn it off, and service identities keep their own model. A plan change does not relax it.
 
 Organization audit exports cover identity/admin events only. The export's stated coverage is
 derived from the actions the server actually writes rather than listed separately, so it can
 neither over- nor under-claim; membership changes are deliberately outside it and belong to the
-operator's own record. Optional signatures and a hash chain
+operator's own record. Both the workspace and the organization audit export also have an
+opt-in paged form on the same address (`?v=2` starts it, `?cursor=` continues it). It fixes its
+upper bound, the sequence and hash of the newest event, when the first page is served, so events
+written later never enter it; it checks the reader's access again on every page; and its cursor is
+navigation, never a grant: it belongs to the person, stream and scope that started the export,
+expires after an hour, and a changed or foreign one is refused. Starting a paged export from a
+page on another site is refused; continuing one is not. The server checks each event it serves
+for its sequence, its hash and its link to the event before it, and the cursor carries the hash
+of the last event already served, so an event missing or changed inside the snapshot, or a
+signing key that changed since the first page, refuses the next page instead of serving it.
+Pages served before such a change stay as served. The offline verifier checks the pages against a
+keyring the reader obtained independently and refuses a skipped, duplicated, reordered or altered
+page, a last page that contradicts its own header, and a missing tail; a key carried inside the
+pages is never trusted, and a valid export proves the log only up to the moment its snapshot was
+taken, which the verifier reports. Optional signatures and a hash chain
 do not establish complete action coverage, legal hold or protection from a compromised operator.
 Provider-tenant acceptance and deployed recovery/deprovision testing remain release gates. SAML,
 SCIM Groups, data-residency promises and HA/SLA are not supplied by this foundation.
+
+## F11 - Native Work
+
+**Actors:** members and workspace owners in the console; connected agents over MCP and REST; the
+work's owner and acceptor, who are people. **Distribution:** core, every plan, no tracker needed.
+**Entry points:** the project's **Work** page (`/app/teams/:slug/projects/:project/work`), the
+workspace's **Work** queue, eight Native Work MCP tools (`list_work`, `get_work`, `create_work`,
+`update_work`, `submit_work`, `record_work_evidence`, `get_work_context`, `get_work_changes`) and
+their REST twins under `/api/agent/`; four managed-execution MCP tools (`list_execution_targets`,
+`dispatch_work`, `get_execution`, `cancel_execution`) coordinate explicitly enabled local targets.
+
+A work item is a durable unit of work that outlives the agents, runs, sessions and trackers that
+touch it. Work, assignment, run and handoff are four records; the end of one never ends another.
+
+### Optional managed local execution
+
+An assignment still waits for its named agent unless a person separately requests managed
+execution. The first managed worker is a foreground local Claude Code worker using the fixed
+`claude-print-v1` runtime and `restricted-files-v1` profile. A project target is configured by the
+CLI and starts disabled. Its installation owner enables that exact target in the project's Agent
+connections page after reviewing its client-reported checkout path, project, runtime and version,
+permission profile, timeout, requested CLI turn limit, and single-job concurrency. A workspace owner may disable
+a target but cannot enable another person's machine.
+
+Configuration binds a canonical dedicated checkout to the project's repository. Before spawning
+Claude, the worker checks for API-key authentication in a per-attempt isolated configuration
+directory; subscription and other authentication modes fail closed. The STMA CLI profile supplies
+separate local API authentication. Empty queue polls use bounded exponential backoff from 5 to 30
+seconds plus bounded jitter.
+
+The profile allows scoped Read/Edit/Write/Glob/Grep tools and the target project's STMA MCP and
+hooks. It does not allow shell, subagents, web access, Git or tests. A same-OS-user process is not
+isolated from that user's other files or credentials; this is not an OS sandbox. Operations that
+need provider or human permission stop as `needs_input`. The worker runs in the foreground only:
+there is no OS service, laptop wake-up or cloud fallback. The CLI's local API authentication is
+separate from the model provider account.
+
+`list_execution_targets` reports readiness only from a fresh worker heartbeat; an ordinary MCP
+contact does not make a target ready. `dispatch_work` names an existing assignment session, target
+and request ID. Its queued response does not mean a process started. `get_execution` reports the
+job, attempt, worker-reported state and bounded events. `cancel_execution` requests cancellation;
+`cancel_requested` is not proof that the process stopped. A worker-reported successful turn is not
+delivery evidence, work completion or human acceptance. A separately authorized subscriber
+compatibility run completed. The fixed local runtime's API-key execution path passed controlled
+runs on Windows and macOS. This does not verify `stma worker` CLI configuration/start or
+interactive enrollment, Native Work delivery, or active-process cancellation. Ordinary-agent T2
+and the two-device T3 lab are separate flows and do not broaden managed-worker coverage. Ordinary
+MCP clients see 49 tools; attempt-scoped worker credentials see only their
+18 shared allowed tools, omitting the other schemas from the worker's model context while keeping
+request authorization in force.
+
+For managed assignments, the prompt directs the agent to read the exact assignment session using
+`get_session` and follow its state: `offered` means accept then resume; `accepted` means resume;
+`needs_attention` means resolve any blocker within the profile before resuming, or ask a human;
+`in_progress` means continue. Other states or a refused action mean stop before writing and ask a
+human. Assignments carry no source checkpoint, so the prompt directs
+the agent to omit repository, commit and clean-worktree proof, then complete the assignment after
+the task. For Native Work assignments, it directs the agent to follow `get_work` delivery
+requirements and submit required artifacts and evidence before completion. Unavailable commands or
+evidence require a human step. These instructions do not add a write guard; existing profile and
+hook boundaries remain the enforcement mechanisms. Concurrent lifecycle hooks wait up to 10 seconds
+for the current lock owner. A timeout or lost ownership fails closed; the worker does not evict an
+existing lock automatically.
+
+### Identity, versions and principals
+
+1. A work item belongs to one project for its whole life and is named inside it by `WORK-<n>`, a
+   label that is never an identity: the id is a uuid and a path or tool argument accepts only the
+   canonical spelling. Numbers and event sequences come from a per-project counter and are not
+   promised to be gapless.
+2. Three numbers move independently and travel as decimal strings. `version` steps by one on every
+   successful command. `spec_revision` steps only when the contract or the criteria change.
+   `evidence_epoch` steps when evidence about the current delivery changes, a provider
+   observation a criterion reads included (on accepted work, only one that makes the acceptance
+   stale; item 6 of "Deliveries, evidence and the decision").
+3. A **principal** is `human` only for a browser session. Every bearer credential, a person's own
+   token included, is an `agent` principal, because a token that can be pasted into a script cannot
+   stand for somebody looking at a screen. Only `human` can record a decision. Receipts are keyed by
+   principal kind, a durable id (the user for a person, the installation for an agent, the token
+   only for a legacy credential with no installation) and the request id, so a request id retried
+   across MCP and REST is one command.
+
+### Lifecycle
+
+| State | Meaning | Leaves by |
+| --- | --- | --- |
+| `draft` | The contract is being written | `ready`, `cancelled` |
+| `ready` | The contract is complete; nothing has started | `in_progress`, `draft`, `cancelled` |
+| `in_progress` | Somebody is working on it | `in_review`, `cancelled` |
+| `in_review` | A delivery for the current revision waits for a decision | accepted or sent back by a decision, `in_progress`, `cancelled` |
+| `accepted` | A person recorded a decision on one delivery | an explicit `reopen` with a reason |
+| `cancelled` | Stopped, with a reason | an explicit `reopen` with a reason, which returns it to `draft` |
+
+- `ready` needs an owner, an acceptor, a goal, at least one criterion and an artifact kind; a
+  refusal (`CONTRACT_INCOMPLETE`) lists what is missing by wire name, and ready work stays refused
+  from any change that would leave it incomplete.
+- Accepted comes only from a decision. Leaving accepted or cancelled is never a plain
+  `transition`: it is `reopen`, or a contract change on accepted work with `reopen_reason` in the same
+  command. The old acceptance stays in history and stops being current.
+- `archive` is soft, allowed on draft, accepted or cancelled work with no open run or assignment
+  linked; archived work is read-only until a reopen.
+- `blocked`, `stale_evidence`, `acceptance_stale`, `needs_decision` and `dependency_changed` are
+  flags computed from records on every read. They are not states and are not stored.
+- A run that fails, goes stale or finishes never moves work to accepted or cancelled. Cancelling does
+  not stop an agent that is running, and the reply says which runs and assignments were still linked.
+
+### The command envelope
+
+Every mutation, from every door, runs through one function in one transaction, in this order:
+
+1. Reserve the receipt slot. A different command under a used request id is `REQUEST_ID_REUSED`; the
+   same one is a replay: access is read again (a receipt is not authority, so a revoked credential
+   reads `NOT_FOUND`), nothing is written, and the reply is rebuilt from the receipt and the events
+   the command wrote.
+2. Lock the project's counter row, then the work row(s). Work locks are always the last locks a
+   transaction takes; a Work path takes no run, installation, team, binding, handoff or advisory
+   lock after one.
+3. Re-read access and authority under the locks; compare `expected_version` (`VERSION_CONFLICT`,
+   which names the current version to a caller who may read it).
+4. Apply the operation, then step the version by one and write at least one event with a project
+   sequence and the bounded filter fields before and after. A refusal is thrown, so the receipt, the
+   counter and every row roll back and the same request id can be retried corrected. A patch that
+   names only what the work already holds (a Save with nothing edited, or the person a field already
+   names, a member who has left included) changes nothing: it writes no event, steps no version and
+   answers with the version it found and `changed: []`, so no other open form goes stale over it.
+5. After commit: a live-refresh notice for the workspace, a line in the activity feed for the few
+   events a lead acts on (filed, ready, delivered, accepted, changes requested, cancelled, an
+   acceptance gone stale), whose detail is the key and never a title, and any best-effort
+   notification. No provider call is made inside a transaction.
+
+Events are an append-only record of what changed by id and wire field name. They carry no contract,
+criterion, brief or evidence body, but they do carry the reason a person or an agent wrote for the
+change itself: a cancel, transition or archive reason, a reopen reason, `change_reason` and
+`reopen_reason` on a patch, why a blocker was resolved or a dependency removed, why a link was
+corrected, and why a tracker's version was taken or its reference converted or detached. `get_work` returns them in its events section and the
+console's timeline shows them, so that text lives in `work_events` as well as in the row it explains.
+
+### Authority
+
+| Operation | Member | Owner, acceptor or workspace owner | Agent connection |
+| --- | --- | --- | --- |
+| create | draft | draft | draft only |
+| patch contract, criteria, owner, acceptor | no | yes | only its own draft, while it is a draft |
+| patch priority, due date, labels | yes | yes | only its own draft |
+| `ready`, back to `draft`, `cancel`, `reopen`, `archive`, dependencies, tracker reconcile | no | yes | no |
+| start (`ready` to `in_progress`) | yes | yes | no; starting a linked run does it |
+| move to `in_review` | only with a current, undecided delivery | same | no; submitting does it |
+| `link` | yes | yes | only runs it can act on |
+| `assign` | yes | yes | yes |
+| `set_blocker` | yes | yes | if it filed the work or is linked to it |
+| `resolve_blocker` | who raised it, or its owner | yes | blockers it raised |
+| submit a delivery | no; an agent linked to the work submits | same | if linked |
+| record evidence | no | no | if linked |
+| decision | no | the acceptor; or a workspace owner with a reason | never |
+
+"Contract authority" is the work's owner, its acceptor or a workspace owner, and always a person.
+"Linked" means the named target or taker of an assignment or handoff filed against the work, or the
+owner of a run linked to it, a run its paired local adapter started included. An agent that wants a
+change it may not make records a blocker of kind `contract_change_request`. A person's observation
+is a human check inside the decision, so a person cannot write evidence rows.
+
+### Contract revisions
+
+1. Creating writes revision 1. A change to the contract or the criteria writes the next revision
+   when its canonical content differs from the current one; an identical resend revises nothing.
+   Criteria keep their id while their meaning holds. Priority, due date, labels, owner and acceptor
+   never revise.
+2. A revision has effects. Ready work stays ready only if still complete. In-review work returns
+   to in progress and needs a new delivery. Accepted work needs `reopen_reason` and goes to in
+   progress. Cancelled work is not patched. Assignments and runs pinned to the earlier revision are
+   named in the event as `contract_changed` and are not stopped.
+
+### Assignments, runs and handoffs
+
+1. `link` ties a run, an assignment or a handoff of the same project, or a Knowledge item the project
+   can read, to the work.
+   A run, assignment or handoff is on one work at a time; Knowledge may be on many. A wrong link is
+   corrected by a new link that names the old one and a reason; the old row is superseded, never
+   edited or deleted. A link made after the fact carries no revision, and the checks that compare a pinned revision skip
+   it.
+2. `assign` records an assignment to one named agent, pinned to the contract revision the caller
+   read, through the same allowance and notification path as `assign_work`. It answers
+   `execution_requested: false` and starts nothing. Draft work is refused (`CONTRACT_INCOMPLETE`),
+   a stale revision is `CONTRACT_CHANGED`, and the reply carries the exact `start_run` call. Its task
+   is the work's key and never its title: the task is the thread's title (the subject of the email
+   to the agent's owner), the activity line, the team webhook's message and the pre-filled run task,
+   and the title is somebody's text. The agent reads the title, contract and criteria with
+   `get_work` in the detail view, which the assignment names.
+3. `start_run` and `assign_work` accept `work_id` with `expected_spec_revision`, both or neither. A
+   run started that way is linked at that revision in the transaction that creates it, and ready work
+   becomes in progress. A moved revision, a draft, closed work or a run in another project is
+   refused and the whole start rolls back. A start replay never links twice. A start for work the
+   agent (its installation, or a local adapter listening for it) already has a live run linked to is
+   refused (`INVALID_TRANSITION`) and names that run; parallel attempts with one `attempt_group` in
+   two worktrees stay allowed. A work id outside the credential's project reads as missing at every
+   door, before anything else in the start is judged.
+4. A new `update_handoff` accept or resume refuses (`CONTRACT_CHANGED`) an assignment or handoff whose
+   pinned revision is no longer current, and refuses draft, closed or archived work; the handoff does
+   not move and the sender cancels and assigns again. A link with no revision skips the check.
+   A replay of an action already taken still returns its recorded result. If the work is now a
+   draft, in review, accepted, cancelled or archived, or its contract moved, that reply names
+   `get_work` instead of execution or delivery and rotates no run.
+5. When an agent accepts work on a revision, STMA replaces the run the agent already has open with
+   one linked to the work (a **controlled rotation**): the run named by `run_id`, else the agent's
+   own one live run in the project; a paired local adapter's run only when it is named, because it
+   may be another checkout's. The ground the old run holds moves to the successor, so nothing is
+   released under anybody. It is not done when another live run of the agent is already linked to
+   the work (started for it before the accept, say): the reply names that run (`work_has_run`) and
+   the one named is left open, because rotating it as well would give one agent two linked live runs.
+   This is decided under the same lock a start takes, so a start and an accept sent together cannot
+   both link a run. It is not done while that run is waiting for a person; the accept stands
+   and the reply says to send `update_handoff` again with that `run_id` once it is active, as accept
+   before the agent resumes or as resume after, never to finish the run and start another (in a
+   hooked checkout that ends with two live runs). A resume asks for the rotation as an accept does
+   while no live run of the agent is linked to the work, because after a resume an accept is refused.
+   For work filed against a work item a resume may name a paired adapter's run (the run the hook owns,
+   or its successor), and a repeat resume may name another run than the first one did: that is how a
+   later client session's new hook-owned run, or a successor a rotation named, is moved onto the
+   work. A Knowledge-linked handoff of other work still takes only this installation's own run, and
+   only the run it was first resumed with. A repeated accept or resume leaves
+   alone a run that another work item's accept has moved onto that work since, unless the agent
+   names it. A runtime that sends `x-stma-run-rotation: adopt` (the current CLI) is told the old run
+   is closed with a 404 naming its successor (`run_rotated`, `rotatedTo`) and moves its session onto
+   it, and so do the manual `stma run heartbeat`, `stma run finish` and `stma run exec`. A caller
+   that does not say so, a runtime pinned before this release among them, has its heartbeat, write
+   guard, finish, policy receipt and policy-violation reports on the old run answered for the newest
+   run of the chain however many accepts made it, the write guard's reply naming the run it was asked about, so
+   its session keeps one live run and its guarded edits go through until
+   `stma adapter repair --pin-runtime --apply`; the MCP tools always answer the old id with the
+   successor's, `handoff_work` included. The closed run's evidence pack still lists the ground it
+   declared, marked as moved to its successor, and the successor's marks what it carried over. When
+   the contract moves under a linked run or a taken assignment, `update_run`, the hook's heartbeat,
+   the assignment's announcement and `update_handoff` say `contract_changed` (pinned and current
+   revision) for as long as it holds. The successor carries the session on: the policy receipt the old run
+   filed, the window in which ground that moved under the session is still news, and what the
+   session acknowledged. It has no start checkpoint of its own. A hook-owned run is one branch, so a
+   branch switch afterwards closes the work's run; the REST finish answers a linked run's `work`,
+   and the hook starts the next run for the same work at the same revision. So does a run that went
+   stale while its human was away: the REST heartbeat and finish 404s on that person's ended run name the
+   open work it was linked to. The hook keeps that work on disk with the session until the next run
+   has started, so a lost response or a killed hook does not lose it. Only ready or in-progress work
+   is carried automatically; a draft, a delivery awaiting review, or closed/archived work is not.
+   If the work refuses the link (its contract moved)
+   the next run starts linked to nothing and the hook says the work lost its run.
+6. An assignment made from a work item ends in a delivery. Its brief, the hook's announcement and
+   `update_handoff`'s `next` name `submit_work` before `complete`, because completing the
+   assignment alone moves nothing into review; the hook's announcement carries the run native
+   tracking owns for the session in its accept call, so that run is the one moved onto the work.
+   When the contract moves or the work is no longer actionable, news gives its current state and
+   asks the agent to read the work instead of resuming or submitting again. Linked MCP/REST
+   heartbeats carry `work_status`; native hooks announce a lifecycle change once while it holds.
+   When a warning clears, a hook asks the agent to read the work before continuing. News remembers
+   the latest state per work assignment, so returning to a previously seen state is announced too.
+   Explicit delivery APIs still permit a deliberate replacement while in review.
+   Every assignment made without work is announced and answered exactly as before.
+7. The end of a run, an assignment or a handoff never moves the work's state. The two moves that
+   follow an agent's act are a linked run's start (`ready` to `in_progress`) and a submitted delivery
+   (to `in_review`); a person does everything else, and a decision alone reaches `accepted`.
+
+### Dependencies and blockers
+
+1. A dependency is another work item of the same project, by id or key, with an optional required
+   revision. A cycle, a self-edge, a duplicate edge and the fifty-first edge are refused, and
+   two opposite edges added at once let exactly one win.
+2. An edge is **met** only while the upstream is accepted, its current acceptance is an accept
+   decision for its current revision (at least the required one), that acceptance's evidence epoch is
+   still the upstream's, what it read has not moved without the epoch (a provider's verified
+   repositories, the project's repository identity, a checkpoint its evidence named), and the
+   upstream's own dependencies still match what it was accepted against. Staleness carries down a
+   chain. Accepted work whose snapshot moved reads
+   `dependency_changed`; its acceptance row is untouched.
+3. A blocker has a kind, a reason, a next action, an optional owner and an optional source reference.
+   Raising one with the same kind and source reference as an open one returns that one. Resolving
+   needs a reason, and a resolved blocker raised again is a new row. At most fifty are open at a time.
+4. `acceptor_unavailable` is never stored. Work that is not accepted or cancelled, is past draft and
+   has no acceptor, or names one who is no longer a member, reads as blocked by it, and it clears when
+   a member is named.
+5. `blocked` is true for work that is not archived, accepted or cancelled and has an open blocker,
+   `acceptor_unavailable` or an unmet dependency. The list filter, the change feed and the flag read
+   one predicate, so they cannot disagree.
+
+### Deliveries, evidence and the decision
+
+1. A delivery is an immutable set of artifacts for the current revision, submitted by an agent linked
+   to the work. The domain would take a person's delivery (without inline evidence), but no door
+   offers one in this release: the console has no submit form, and every bearer credential, a
+   person's own token included, is an agent. A code artifact is a canonical repository
+   identity and a full commit SHA and must match the project's repository and, when a checkpoint is
+   named, the checkpoint's; a branch is only a label. A document is exact only with a provider
+   version or a digest; a link alone is `unversioned`. A file is a name and a digest. A later
+   delivery supersedes the earlier one and carries no evidence over; submitting moves the work to in
+   review (ready work passes through in progress, which the event records).
+2. Provenance is decided by the server. Everything an agent sends is `agent_reported`, and it can
+   write nothing else; a person's check inside a decision is `human_decision`; a provider's observation
+   of a delivered commit is never copied into the work but read from the verified repository binding
+   whenever readiness is computed. A body field named `provenance`, or a provider source kind, is
+   refused. Evidence rows are superseded, never deleted. A criterion's `evidence_kinds` name
+   exactly the sources its `verification_rule` reads, and a rule that reads any other is refused
+   when the criterion is written, so a criterion that says it asks for a provider observation or a
+   person's check can never be met by an agent's report.
+3. Readiness is computed on read, never stored, per criterion against the current delivery: `pass`,
+   `fail`, `unknown`, `stale` or `inconclusive`, with a closed list of reasons (`no_delivery`,
+   `delivery_for_older_revision`, `no_evidence`, `older_than_max_age`, `unversioned`,
+   `reported_inconclusive`, `no_verified_binding`, `repository_not_bound`, `no_code_artifact`, `not_observed`,
+   `conflicting_observations`, `provider_state_unknown`, `observations_truncated`,
+   `source_deleted`). Unknown, missing, stale and unreachable evidence is never a pass, and evidence
+   whose checkpoint no longer exists reads unavailable. A current fail in any row a selector reads
+   is that selector's result: a later pass from another reporter, or about something else, does not
+   hide it, including a failure reported about an unversioned document; a mutable link can never
+   establish a pass. A reporter replaces its own row with `supersedes_id`. A version a report names must
+   be one the delivery carries, whatever its source kind. `ready_for_review` means every required
+   criterion passes against a delivery for the current revision; it never means accepted,
+   merge-ready or deploy-ready.
+   Detail evidence rows and the console show `current`, `stale`, `unavailable`, `superseded` or
+   `withdrawn` validity separately from the raw assertion and provenance. A replacement on another
+   page still marks the old row superseded; a current reported pass is not independent verification.
+4. A provider selector matches the stable workflow or pipeline name (or the exact subject id) on
+   every delivered commit, through a verified binding of this project that is the repository the
+   commit was delivered in: GitHub's `owner/name` on github.com, or the clone addresses Azure DevOps
+   gives its organization, project and repository. Another bound repository holding the same commit,
+   a fork, is not the delivery; a delivered repository no binding of the provider stands for reads
+   `repository_not_bound`. A name is not one workflow (two workflow files may both be called `CI`,
+   and an Azure DevOps pipeline name repeats across folders), so runs are grouped by the provider's
+   own id of the workflow or pipeline: the latest run of each is current for it, and a current fail
+   of one is the selector's fail whatever another of the same name says. A run completed with
+   anything but success or failure (timed out, cancelled, never started) is recorded as `unknown`,
+   through the webhook as through the read-back, so a completed rerun that did not pass replaces the
+   attempt before it and is never a pass. Read-back of a queued or running workflow/build records
+   nothing and asks the person to retry after completion, leaving the last completed observation intact.
+   Historical unknown rows are not relabelled: completion was not stored on them.
+   A workflow fact moves the evidence epoch and the version of every work,
+   however many, whose current delivery holds that commit in that repository and whose current
+   contract has a criterion that reads it; a fact no criterion reads moves nothing. Archived work is
+   skipped unless it is accepted, because accepted work still stands for what depends on it.
+   Pull-request facts move nothing.
+5. A **decision** is a person's, in the console: the acceptor, or a workspace owner who gives a
+   reason (`owner_override`). It carries the version, revision, delivery, evidence epoch and evidence
+   manifest hash the person was shown; the manifest is rebuilt under the work lock, and any difference
+   is refused (`VERSION_CONFLICT` or `EVIDENCE_STALE`, naming what moved). Accepting needs every
+   required criterion to pass and nothing blocking the work. Requesting changes needs a reason and the
+   criteria not met and returns the work to in progress. A criterion that asks for a human check is
+   checked inside the decision against one exact artifact version, which writes an evidence row of
+   its own provenance. The acceptance row stores the manifest whole, its hash, the epoch and the
+   actor's standing, including whether the actor also produced the work (`self_review`); a contract
+   can require an independent acceptor, which refuses an accept by someone who delivered or ran part
+   of it.
+6. After acceptance a new current provider failure of the delivered commit, including one in a
+   conflicting completed tie, marks the acceptance stale when the criterion no longer reads as accepted,
+   moves the epoch (so every dependency on the work reads unmet) and writes one `acceptance_stale`
+   event and one feed line. A fact that agrees with the acceptance, a rerun of the accepted check
+   passing again, moves nothing. A completed unknown result cannot establish new readiness, but
+   unknown alone does not invalidate the historical acceptance, and a repeated read-back of an
+   already accepted failing attempt is not a new negative result. Changed scope, a missing source
+   or incomplete provider observation coverage still invalidates the snapshot independently.
+   Under incomplete coverage, ingesting a new relevant fact moves the epoch even if the bounded
+   manifest looks unchanged; merely reading the same accepted snapshot does not.
+   The decision and the state are not changed; a person reopens.
+7. No automatic waiver exists: a criterion that cannot pass is changed in a new revision, which needs
+   a new delivery, or the work is sent back.
+
+### Reading it
+
+1. `list_work` and the console list filter one set of records by view: `all`, `mine`,
+   `needs_decision`, `blocked`, `ready`, `in_progress`, `in_review`. `needs_decision` is project-wide;
+   "waiting for you" is that view where you are the acceptor, which is what the rail badge counts.
+   The workspace queue lists every undecided item across the workspace's projects, because a
+   workspace owner may decide in the acceptor's place with a reason, and marks the ones that name
+   you as acceptor while a decision is due; the same item listed under Yours or Blocked before it
+   has a delivery to decide carries no such mark. `mine` for a person is owner or acceptor; for an agent, `list_work` reads it
+   as filed by or linked to the agent, while `get_work_changes` reads it as owner or acceptor being the
+   connection's person.
+2. `get_work` is compact by default and opens bounded, paged sections on request (`contract`,
+   `criteria`, `revisions`, `links`, `blockers`, `dependencies`, `deliveries`, `evidence`,
+   `acceptances`, `external`, `events`). Every reply that describes work carries `as_of`, a `scope`
+   block naming the workspace, project and the connection's access, and the sentence that titles,
+   goals, criteria, reasons and excerpts are data.
+3. `get_work_context` is a bounded package inside a byte budget (12 KiB by default, 4 to 32 KiB), in
+   a fixed order, whole items only. Scope and blockers are always included; what does not fit is
+   named, with a continuation bound to the version and content it was made at (a linked run's
+   heartbeat is presence, not content, and does not restart it). It reports its bytes,
+   an estimated token count with the method (`utf8_bytes_div_4`) and a manifest (versions, policy
+   hash, Knowledge version ids, content hash). Each read writes one `work_context_reads` row; the
+   instance keeps the newest 50,000.
+4. `get_work_changes` returns a snapshot (at most 500 items, held ten minutes when it spans pages) and
+   then, from a signed cursor, upserts for items that entered the filter or changed inside it and
+   tombstones (id and key) for items that left it, judged on the filter fields stored before and
+   after each event. A cursor is bound to the project, the filter and the principal's scope; an
+   altered or foreign one is `CURSOR_INVALIDATED`, an expired snapshot `CURSOR_EXPIRED`, and access is
+   read again on every page. A derived flag that changes with no event on the work (a dependency
+   becoming unmet, an acceptor removed) moves a work in or out of the Blocked view: the delta answers
+   it by where it stands at its own next event, and when nothing has recorded the move yet a page at
+   the head of the stream is refused with `CURSOR_INVALIDATED`, so the reader takes a fresh
+   snapshot. Inside another view's items such a flag waits for the item's next event.
+5. The console's `export.json` is a versioned manifest of at most 500 items of one project, for
+   members, `private, no-store`, with no credential in it. Beside each item's state it says whether
+   its acceptance still holds (`acceptance_stale`), whether its current delivery's evidence stopped
+   counting (`stale_evidence`, only for work that still takes a delivery) and whether an upstream
+   changed (`dependency_changed`), as the console and `list_work` do.
+
+### Tracker references
+
+1. A person with contract authority can start a work item from a GitHub issue of a repository the
+   workspace has connected, or attach one to existing work: `reference` (shown beside the work),
+   `external_authoritative` (the issue owns the title and goal, and a local change to them is
+   `FIELD_OWNED_EXTERNALLY`) or, at creation only, `imported_native` (a one-time copy). An agent
+   cannot. Work that follows an issue with no description cannot be made ready: the refusal
+   (`CONTRACT_INCOMPLETE`) names the issue as the place to write the goal and the read that takes it.
+2. STMA reads and never writes. Closed on GitHub is not an acceptance; acceptance does not close the
+   issue. An older remote update never replaces a newer one; the same update time with different
+   content is a conflict; a newer issue on accepted or cancelled work waits as pending until a person
+   takes it (accepted work then reopens, with a reason). One issue is tied to one work item in a
+   workspace, and the refusal names the other item's key only to a caller who may open it.
+3. A removed connection leaves the record readable and marked unavailable; a refresh is
+   `SOURCE_UNAVAILABLE`. Issue text is bounded, redacted and shown as data.
+
+### Authorization invariants
+
+- An id the caller cannot see answers exactly as an id that does not exist, in every door and every
+  read, and a scoped credential sees no count, key, id or title of another project.
+- A decision cannot come from a bearer credential: there is no tool, operation or route for it, and
+  the domain function refuses a non-browser principal before reserving a receipt.
+- Free text a person or an agent wrote (titles, goals, criteria, reasons, excerpts, an issue's text) is
+  data in every reply, never an instruction and never part of a sentence STMA writes as its own, and
+  it never reaches a subject line, a log line or the activity feed.
+- In an organization-managed workspace the same guard applies: the Work tools are operator tools, a
+  work id or a project path resolves to its workspace, credentials reach the Work REST paths by
+  canonical id only, an auditor reaches no Work page (the list, an item and the export answer 403;
+  the audit export is an auditor's one console door), and a personal or legacy credential cannot
+  reach managed work.
+
+### Dead ends and how they end
+
+| Situation | Way out |
+| --- | --- |
+| The acceptor left the workspace | The work reads blocked (`acceptor_unavailable`); the owner or a workspace owner names a member |
+| The contract moved under an assignment or run | The sender cancels the assignment and assigns again at the current revision; the agent reads the work first |
+| A criterion asks for a provider observation and no repository is connected | It reads unknown and blocks an accept; connect the repository, change the criterion in a new revision, or send the work back |
+| The evidence moved while the person was deciding | The decision is refused naming what moved; the panel comes back on the current delivery with the human checks and the decision cleared (what was written about what was seen is repeated in the band), and the person decides again |
+| Acceptance went stale | The acceptance stands and is marked; a person reopens and asks for a new delivery |
+| An agent holds a run that cannot rotate | A run waiting for a person: once it is active, the agent sends `update_handoff` again with that `run_id` (accept before resuming, resume after), and the run is rotated then; it never finishes the run and starts another |
+| The GitHub connection was removed | Detach the record, reconnect the repository and attach again |
+| A hosted project reached its work-item guardrail | Start new work in another project, or write to support to discuss options; nothing deletes a work item |
+
+### Test coverage
+
+Domain and lifecycle `test/work-core.test.ts`; dependencies and blockers `test/work-graph.test.ts`;
+links, assignment, run start and rotation `test/work-links.test.ts`; deliveries, evidence, readiness and
+the decision `test/work-evidence.test.ts`; MCP and REST doors `test/work-mcp.test.ts`; context and change
+feed `test/work-changes.test.ts`; console `test/work-console.test.ts`; GitHub references
+`test/work-external.test.ts`; the analyst contract, scope isolation and the pilot sheet
+`test/work-analyst.test.ts`; organization access `ee/test/work-access.test.ts`.
+Real-agent acceptance (two agents on one repository from filing to a person's decision, a contract
+changed under a running agent, a claim made about the wrong commit, a document delivery, an analyst
+limited to one project, an assignment to a closed client, and an older client that knows nothing of
+Work) has not been run: these tests drive the same doors with scripted principals.
 
 ## Returned-design recovery contracts
 
@@ -1295,8 +1946,10 @@ SCIM Groups, data-residency promises and HA/SLA are not supplied by this foundat
 | one-use enrollment + project/team enforcement | `packages/server/test/scoped-enrollment.test.ts` |
 | terminal connect: ten-minute project-only command, non-consuming preview, initialize confirms, legacy path unchanged | `packages/server/test/terminal-connect.test.ts` |
 | MCP OAuth and the Claude app: discovery, exact callbacks, PKCE, rotation, the two-minute refresh replay and reuse revocation; consent without a machine, Personal proposed, a first workspace made on the consent page, tool hints | `packages/server/test/mcp-oauth.test.ts`, `packages/server/test/claude-connector.test.ts` |
+| connection status as five separate facts with a source and an observed time, the observed life of assigned work, and the two doors: closed `entry` through sign-in, signup and a first workspace, the Claude app console's labelling and its first-test qualification | `packages/server/test/connection-state.test.ts`, `packages/server/test/two-doors.test.ts` |
+| adapter repair keeps unrelated hooks and top-level keys, is idempotent and leaves an unreadable file untouched | `packages/server/test/adapters.test.ts` |
 | emailed invitations and link limits; review access; mailbox-free test accounts; the operator-built demo workspace | `packages/server/test/workspace-invitations.test.ts`, `packages/server/test/review-access.test.ts`, `packages/server/test/test-accounts.test.ts`, `packages/server/test/demo-workspace.test.ts` |
-| what a handoff carried on its thread; the run page and its Markdown; the operator's per-workspace pilot sheet; reported tests and sources in the evidence pack | `packages/server/test/pilot-readiness.test.ts`, `packages/server/test/evidence-checkpoints.test.ts` |
+| what a handoff carried on its thread; the run page and its Markdown; the operator's per-workspace pilot sheet; reported tests and sources in the evidence pack; evidence on every plan through one decision; provider states, handovers and safe Markdown in the review pack | `packages/server/test/pilot-readiness.test.ts`, `packages/server/test/evidence-checkpoints.test.ts`, `packages/server/test/evidence-access.test.ts`, `packages/server/test/evidence-review-pack.test.ts` |
 | one human, two enrollments, first reply on Cloud Free + quick-start entry points | `packages/server/test/quick-start.test.ts` |
 | persistent launch replay, lifecycle acceptance, exact provider facts, receipt scope, encryption rotation and concurrent project/policy writes | `packages/server/test/product-readiness.test.ts` |
 | generated setup prompt and URL correctness | `packages/server/test/findings-2026-08-25.test.ts` |
@@ -1314,10 +1967,14 @@ SCIM Groups, data-residency promises and HA/SLA are not supplied by this foundat
 | unread origin and handoff queues | `packages/server/test/personal-inbox.test.ts`, `packages/server/test/news.test.ts` |
 | named-agent assignments: name resolution, installation addressing, lifecycle enforcement, hook wording, browser form; the named project (display name, repository, id, a same-named legacy sibling, a new name, project pages by slug); adapter pairing at consent and on Agent connections, the paired hook hearing only its own project, picker exclusion, violation attribution, the 0041 backfill | `packages/server/test/assignments.test.ts` |
 | content rules: grammar, added-text extraction, browser publish, unpublished-rule refusal, governance evidence; shipped runtime stops a real edit | `packages/server/test/content-rules.test.ts`, `packages/server/test/multi-device-topology.test.ts` |
+| agent-facing replies of 2026-10-22: one `get_evidence` refusal for a missing and a foreign run, a narrowed feature refused without a plan name, `contentRules` on `get_policy` and `start_run`, the launch refusal naming Agent connections | `packages/server/test/agent-replies-2026-10-22.test.ts` |
 | project policy/preflight receipts | `packages/server/test/governance.test.ts`, `packages/server/test/readiness-e2e.test.ts` |
 | delivery wizard/render/apply/setup packs | `packages/server/test/delivery.test.ts` |
 | tracker integrations: GitHub issue gating, ClickUp OAuth connect/map/pause/disconnect, both ClickUp id spaces on the wire, a mapping whose project is gone, one-attempt comment delivery and its replay safety, and nothing of a token, title or body reaching the activity feed or its CSV | `packages/server/test/integrations.test.ts` |
+| Native Work, F11: the command envelope, replay and version conflicts, revisions, the lifecycle and reopen, flags and the read model; blockers, dependencies and cycles; links, assignment, run start, the pinned revision at accept and the controlled run rotation; deliveries, provenance, readiness, the evidence epoch and the decision; the MCP and REST doors and their parity; context budget and the change feed; the console; GitHub issue references; one-project isolation and text written as instructions; the operator's pilot figures and the demo workspace; organization access | `packages/server/test/work-core.test.ts`, `work-graph.test.ts`, `work-links.test.ts`, `work-evidence.test.ts`, `work-mcp.test.ts`, `work-changes.test.ts`, `work-console.test.ts`, `work-external.test.ts`, `work-analyst.test.ts`, `packages/server/test/demo-workspace.test.ts`, `ee/test/work-access.test.ts` |
 | core/private/public packaging boundary | `packages/server/test/layers.test.ts` |
+| public trust statements: the snapshot's fixed fields, retention figures, no child process in the server, the not-promised list; what two runs claim on different files and on a shared contract | `packages/server/test/trust-claims.test.ts`, `packages/server/test/scenario-claims.test.ts` |
+| F0c authenticator app: enrollment, every sign-in path, replay, parallel guesses against the throttle and one challenge, recovery codes, pending sign-ins ended with sessions, the operator reset with its record and the operator's recent sign-in, the invite door, other-site posts refused, one door for sessions and its re-check; the organization sign-in across the code, the requirement engine and the owner's switch (preview, self-lock guard, compare-and-swap, audit, switching off without revival, the break-glass and its strict arguments, the scan for other writers) | `packages/server/test/authenticator.test.ts`, `packages/server/test/authenticator-race.test.ts`, `packages/server/test/test-accounts.test.ts`, `ee/test/oidc.test.ts`, `ee/test/organization-mfa.test.ts` |
 
 ## Change protocol for humans and agents
 
@@ -1362,8 +2019,9 @@ Review questions:
   one-use scoped enrollments; removing the compatibility path requires a separately versioned API
   migration.
 - Setup prompts are reviewed consent envelopes, not unattended installers. Operations remain visible
-  with only secrets redacted; the client initiates every MCP call, and STMA cannot wake it or inspect
-  local files by itself.
+  with only secrets redacted. Ordinary MCP calls remain client-initiated. A configured foreground
+  worker polls only for assigned work in its configured checkout and guards file edits. It cannot
+  wake a machine. It runs as the same OS user, without an OS sandbox that isolates that user's files.
 - Jira is team-connected and has no project mapping, so project credentials deliberately receive no
   Jira ticket enrichment.
 - ClickUp is connected by a workspace owner through ClickUp OAuth. A connection alone grants no
@@ -1387,8 +2045,35 @@ Review questions:
   critical audit as `integration_connected`, `integration_disconnected` and
   `integration_scope_changed`, whose subject is the provider and its locator — never the credential,
   and never a task, list or message.
+- Native Work reads GitHub issues and nothing else. It never writes to a tracker, refreshes an issue
+  by itself or reads Jira or ClickUp records as references. It sends no email for "waiting for you":
+  the rail badge and the Needs decision view carry it. An assignment starts nothing; a separate
+  `dispatch_work` request to an explicitly enabled target creates execution. "Sent", "accepted" and
+  "started" are separate recorded facts, and the console never says an agent is running when only an
+  assignment or ordinary agent heartbeat is recorded.
+- An analyst reading work from the user's own MCP client uses an ordinary connection. There is no
+  read-only credential: the tools that write are on the same connection, and the Claude apps ask
+  before each of them.
+- A delivery is its submitter's report, a decision is a person's, and a provider observation covers
+  one workflow on one exact commit. None of them is a proof that the work is correct or safe to merge.
 - Announcements and the member directory are team-level coordination surfaces visible to project
   credentials; other project data is filtered.
+- STMA cannot see a checkout. Whether hooks are present and trusted on disk, and whether a client is
+  open, are shown as unknown ("not checked from here"); only requests that arrived with a
+  credential, and an agent's own run heartbeats, are evidence.
+- A handoff's start is shown only from the agent's resume call (or the handoff state it moved to).
+  Waiting for a person is shown from a needs-attention mark, or from the waiting report of a run that
+  was named for this very work after the work was accepted; an agent's waiting run proves nothing
+  about work it has not accepted. Whether the prompt hook announced an assignment to the agent is
+  not recorded, and the page says so, and only while the work is unaccepted.
+- A command offered on the page (the optional hooks) is built only from values that no shell could
+  read as more than one word; a project name with a quote, semicolon or `$` yields a sentence and no
+  Copy button, because the name is free text any member's agent can create.
+- `get_evidence` resolves the caller's membership of the run's workspace before it reads the run,
+  and a run id that does not exist and one in a workspace the connection cannot read get the same
+  answer, so the reply never says which ids are real. A feature the workspace's own plan row
+  includes but a composition narrowed is refused without naming a plan to buy (`requireFeature`);
+  for evidence the sentence is `EVIDENCE_NOT_INCLUDED`.
 - CI/headless service identities use the operator-provisioned lifecycle in F10; a copied human
   credential is not a service identity. The public core alone does not supply that lifecycle.
 - Enterprise identity, audit export and residency controls are not implied until their signed scope,
@@ -1397,3 +2082,12 @@ Review questions:
   not provide organization-wide publication, connectors, OCR, semantic retrieval, automatic chat
   ingestion or a guarantee that published reference text is true or followed. Hosted corpus
   guardrails bound an unpriced service surface; they do not define customer-plan capacity.
+- Client support has levels, and the README's client table states them: every client speaks MCP,
+  Claude Code and Codex can carry hooks and the file-tool guard, Cursor carries lifecycle events
+  only, and a client connected by MCP alone is warned but never stopped. What the collector sends
+  is a fixed snapshot of names, versions and git metadata; everything else STMA holds is text a
+  person or an agent chose to write, and STMA cannot promise that a secret never appears in it.
+  Revoking a connection ends server access only: it does not stop a running local process and
+  does not revoke a GitHub, Azure DevOps, Jira or ClickUp token at its provider. The same
+  statements are on the guide's Data and trust section. A public sentence about the product holds only while
+  a test or a recorded run stands behind it; one nobody has run is written down as unknown, not as passed.

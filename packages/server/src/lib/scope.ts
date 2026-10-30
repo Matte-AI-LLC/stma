@@ -17,9 +17,12 @@ import type { AppEnv } from '../types';
  * trails and each page's own links read it rather than writing paths by hand,
  * which is how the two halves stay in step when a section moves.
  *
- * Two workspace forms deliberately live outside `/app/teams/`: the work ledger
- * and the sessions list answer for the account as well, where there is no
- * workspace in the address to hang them under.
+ * One workspace form deliberately lives outside `/app/teams/`: the sessions list
+ * answers for the account as well, where there is no workspace in the address to
+ * hang it under. Work used to be the second; since Native Work a workspace's Work
+ * is its queue at `/app/teams/<slug>/work`, and the old assignment and handoff
+ * ledger is the dispatched tab of a project's Work (and `/app/handoffs`, which
+ * still answers).
  *
  * One rule follows from HTML rather than from taste, and every page states it
  * where it applies: a GET form that *picks* a project submits to the workspace
@@ -40,7 +43,7 @@ export type SectionKey =
 const WORKSPACE_FORM: Record<SectionKey, (team: string) => string> = {
   // "People and agents" across the workspace; inside a project, that project's roster.
   agents: (team) => `/app/teams/${team}/agents`,
-  work: (team) => `/app/handoffs?team=${encodeURIComponent(team)}`,
+  work: (team) => `/app/teams/${team}/work`,
   sessions: (team) => `/app/sessions?team=${encodeURIComponent(team)}`,
   activity: (team) => `/app/teams/${team}/activity`,
   knowledge: (team) => `/app/teams/${team}/knowledge`,

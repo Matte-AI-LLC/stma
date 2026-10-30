@@ -1,4 +1,4 @@
-import { and, desc, eq, gte, inArray, or } from 'drizzle-orm';
+import { and, count, desc, eq, gte, inArray, max, min, or, sql, sum } from 'drizzle-orm';
 import type { Db } from '../db';
 import {
   agentInstallations,
@@ -13,10 +13,26 @@ import {
   teams,
   tokens,
   users,
+  workAcceptances,
+  workContextReads,
+  workDeliveries,
+  workEvidence,
+  workExternalRefs,
+  workItems,
+  workRevisions,
 } from '../db/schema';
 import type { Env } from '../env';
 import { isAdminUser } from '../lib/admin';
 import { membershipHistory } from '../lib/memberships';
+import {
+  ACTIVATION_STAGES,
+  EXCLUSION_LABELS,
+  excludedWorkspaces,
+  workspaceActivation,
+  type ExclusionReason,
+  type StageDefinition,
+  type StageReading,
+} from './activation';
 import { providerFactsForCheckpoint } from './evidence';
 import { providerName } from './evidenceSummary';
 import { savingsLedger, type SavingsLedger } from './savings';
@@ -56,6 +72,9 @@ export const PILOT_DEFAULT_DAYS = 28;
 export const PILOT_MAX_DAYS = 182;
 const WORK_ROWS = 50;
 const DELIVERY_ROWS = 25;
+const NATIVE_WORK_ROWS = 50;
+/** Decisions are read for the window's totals; a pilot of five teams does not reach this. */
+const NATIVE_DECISION_SCAN = 500;
 const RUN_SCAN = 2000;
 const LIVE = ['starting', 'active', 'waiting', 'blocked'];
 
@@ -114,6 +133,83 @@ export interface PilotDelivery {
   at: Date;
 }
 
+/** One Native Work item, as a pilot reads it: what it is, where it stands and what reading it cost. */
+export interface PilotWorkItem {
+  key: string;
+  project: string;
+  title: string;
+  state: string;
+  archived: boolean;
+  createdAt: Date;
+  /** `person` or `agent`, from the principal that filed it. */
+  filedBy: 'person' | 'agent';
+  /** Filed by the operator's own account, so not the participant using the product. */
+  byOperator: boolean;
+  /** `native`, or `external` when a tracker record owns its title and goal. */
+  origin: string;
+  /** How a GitHub issue is tied to it, when one is. */
+  tracker: string | null;
+  deliveries: number;
+  firstDeliveryAt: Date | null;
+  /** The newest recorded decision on it, a person's. */
+  decision: {
+    decision: string;
+    at: Date;
+    byOperator: boolean;
+    standing: string | null;
+    selfReview: boolean;
+  } | null;
+  /** Reads of its context package in the window, and the bytes they served. */
+  contextReads: number;
+  contextBytes: number;
+}
+
+/**
+ * What the Native Work records say about a pilot. Counts of rows STMA wrote:
+ * a delivery is its submitter's report, a decision is a person's, and the
+ * context figures are bytes STMA served, not tokens a model consumed.
+ */
+export interface PilotNativeWork {
+  items: {
+    total: number;
+    archived: number;
+    byState: Record<string, number>;
+    createdInWindow: number;
+    filedByAgents: number;
+    filedByOperator: number;
+    withTracker: number;
+  };
+  deliveriesInWindow: number;
+  decisions: {
+    accepted: number;
+    changesRequested: number;
+    ownerOverrides: number;
+    selfReviews: number;
+    byOperator: number;
+  };
+  /**
+   * Evidence rows recorded in the window, by who stands behind them. Provider
+   * observations are read live from the connected repository when readiness is
+   * computed and are not copied into the work, so they are not counted here.
+   */
+  evidence: { agentReported: number; humanDecision: number };
+  context: {
+    reads: number;
+    bytes: number;
+    averageBytes: number | null;
+    largestBytes: number | null;
+    /** Reads that could not fit every item in the budget and answered with a continuation. */
+    incomplete: number;
+    byAgents: number;
+    byPeople: number;
+    /** Works accepted whose context was read in the window, and the average bytes read per such work. */
+    acceptedWorks: number;
+    bytesPerAcceptedWork: number | null;
+  };
+  rows: PilotWorkItem[];
+  rowsTruncated: boolean;
+}
+
 export interface PilotWeek {
   from: Date;
   to: Date;
@@ -126,6 +222,23 @@ export interface PilotWeek {
   resumed: number;
   verifiedResumes: number;
   completed: number;
+}
+
+/** One stage of the first value path for this workspace, with where it was read from. */
+export interface PilotStage extends StageDefinition, StageReading {
+  /** Reached once every earlier observed stage is. */
+  reached: boolean;
+}
+
+export interface PilotActivation {
+  /** Why this workspace is left out of every cohort, when it is. */
+  excluded: { reason: ExclusionReason; label: string } | null;
+  stages: PilotStage[];
+  repeatDays: string[];
+  participants: number;
+  runs: { participant: number; withRepositoryChange: number };
+  /** True when more checkpoints existed than were read. */
+  truncated: boolean;
 }
 
 export interface PilotSheet {
@@ -162,7 +275,9 @@ export interface PilotSheet {
     cancelledOrDeclined: number;
   };
   deliveries: PilotDelivery[];
+  nativeWork: PilotNativeWork;
   warnings: SavingsLedger;
+  activation: PilotActivation;
   weeks: PilotWeek[];
   expansion: {
     access: { at: Date; action: string; who: string; role: string | null; source: string }[];
@@ -181,7 +296,239 @@ export const PILOT_NOT_RECORDED = [
   'Support minutes, by kind.',
   'The commercial offer shown, and whether money was collected (Stripe status is on /admin/billing).',
   'Consent to quote the participant.',
+  'Tool retries and re-reads of one work item: a retried request id is one receipt, so a retry is not counted, and every read of a context package is one row whether or not the agent needed it.',
+  'Tokens: the context figures are UTF-8 bytes STMA served, not what a model consumed, and a read made by a client outside STMA (a copied export, a pasted answer) is not seen.',
+  "Whether a delivery's evidence was right: STMA records the readiness it computed and the decision a person made, not whether the person was correct.",
 ] as const;
+
+/**
+ * The Native Work half of the sheet. Every figure is a count of rows STMA
+ * wrote, read in a fixed number of queries whatever the workspace holds.
+ *
+ * What it keeps apart is the pilot kit's whole point. A delivery is what its
+ * submitter said it was. A decision is a person's, and the sheet records the
+ * standing it was made under (the acceptor, or an owner overriding) and whether
+ * the person who decided was also the one who produced the work. Context bytes
+ * are what STMA served to a reader, which is a cost of reading and says nothing
+ * about whether the reading helped. `work_context_reads` is trimmed to its newest
+ * 50,000 rows for the whole instance, so a long window on a busy server may
+ * undercount, and the page says so.
+ */
+async function nativeWorkReading(
+  db: Db,
+  teamId: string,
+  since: Date,
+  operatorIds: Set<string>,
+  isOperator: (ids: string[]) => Promise<void>,
+): Promise<PilotNativeWork> {
+  const filed = await db
+    .select({
+      state: workItems.state,
+      archived: sql<number>`count(*) filter (where ${workItems.archivedAt} is not null)`.mapWith(Number),
+      total: count(),
+    })
+    .from(workItems)
+    .where(eq(workItems.teamId, teamId))
+    .groupBy(workItems.state);
+  const byState: Record<string, number> = {};
+  let archived = 0;
+  let total = 0;
+  for (const row of filed) {
+    byState[row.state] = row.total;
+    archived += row.archived;
+    total += row.total;
+  }
+
+  const createdBy = await db
+    .select({ kind: workItems.createdByKind, userId: workItems.createdByUserId, n: count() })
+    .from(workItems)
+    .where(and(eq(workItems.teamId, teamId), gte(workItems.createdAt, since)))
+    .groupBy(workItems.createdByKind, workItems.createdByUserId);
+  await isOperator(createdBy.map((row) => row.userId).filter((id): id is string => Boolean(id)));
+  const createdInWindow = createdBy.reduce((sum, row) => sum + row.n, 0);
+  const filedByAgents = createdBy.filter((row) => row.kind === 'agent').reduce((sum, row) => sum + row.n, 0);
+  const filedByOperator = createdBy
+    .filter((row) => row.kind === 'human' && row.userId && operatorIds.has(row.userId))
+    .reduce((sum, row) => sum + row.n, 0);
+
+  const [withTracker] = await db
+    .select({ n: count() })
+    .from(workExternalRefs)
+    .where(and(eq(workExternalRefs.teamId, teamId), sql`${workExternalRefs.detachedAt} is null`));
+
+  const [delivered] = await db
+    .select({ n: count() })
+    .from(workDeliveries)
+    .innerJoin(workItems, eq(workItems.id, workDeliveries.workId))
+    .where(and(eq(workItems.teamId, teamId), gte(workDeliveries.submittedAt, since)));
+
+  const decisionRows = await db
+    .select({
+      decision: workAcceptances.decision,
+      actorUserId: workAcceptances.actorUserId,
+      scope: workAcceptances.actorScopeSnapshot,
+    })
+    .from(workAcceptances)
+    .innerJoin(workItems, eq(workItems.id, workAcceptances.workId))
+    .where(and(eq(workItems.teamId, teamId), gte(workAcceptances.createdAt, since)))
+    .orderBy(desc(workAcceptances.createdAt))
+    .limit(NATIVE_DECISION_SCAN);
+  await isOperator(decisionRows.map((row) => row.actorUserId).filter((id): id is string => Boolean(id)));
+  const standingOf = (scope: unknown): string | null => {
+    const standing = scope && typeof scope === 'object' ? (scope as { standing?: unknown }).standing : undefined;
+    return typeof standing === 'string' ? standing : null;
+  };
+  const selfReviewOf = (scope: unknown) =>
+    Boolean(scope && typeof scope === 'object' && (scope as { self_review?: unknown }).self_review === true);
+  const decisions = {
+    accepted: decisionRows.filter((row) => row.decision === 'accept').length,
+    changesRequested: decisionRows.filter((row) => row.decision === 'request_changes').length,
+    ownerOverrides: decisionRows.filter((row) => standingOf(row.scope) === 'owner_override').length,
+    selfReviews: decisionRows.filter((row) => selfReviewOf(row.scope)).length,
+    byOperator: decisionRows.filter((row) => row.actorUserId && operatorIds.has(row.actorUserId)).length,
+  };
+
+  const evidenceRows = await db
+    .select({ provenance: workEvidence.provenance, n: count() })
+    .from(workEvidence)
+    .innerJoin(workItems, eq(workItems.id, workEvidence.workId))
+    .where(and(eq(workItems.teamId, teamId), gte(workEvidence.recordedAt, since)))
+    .groupBy(workEvidence.provenance);
+  const evidenceCount = (provenance: string) => evidenceRows.find((row) => row.provenance === provenance)?.n ?? 0;
+
+  const readRows = await db
+    .select({
+      kind: workContextReads.principalKind,
+      reads: count(),
+      bytes: sum(workContextReads.bytes).mapWith(Number),
+      largest: max(workContextReads.bytes),
+      incomplete: sql<number>`count(*) filter (where ${workContextReads.incomplete})`.mapWith(Number),
+    })
+    .from(workContextReads)
+    .where(and(eq(workContextReads.teamId, teamId), gte(workContextReads.createdAt, since)))
+    .groupBy(workContextReads.principalKind);
+  const reads = readRows.reduce((acc, row) => acc + row.reads, 0);
+  const bytes = readRows.reduce((acc, row) => acc + (row.bytes ?? 0), 0);
+  const perAccepted = await db
+    .select({ workId: workContextReads.workId, bytes: sum(workContextReads.bytes).mapWith(Number) })
+    .from(workContextReads)
+    .innerJoin(workItems, eq(workItems.id, workContextReads.workId))
+    .where(
+      and(eq(workContextReads.teamId, teamId), gte(workContextReads.createdAt, since), eq(workItems.state, 'accepted')),
+    )
+    .groupBy(workContextReads.workId);
+
+  // The rows: everything filed in the window plus anything that moved in it.
+  const itemRows = await db
+    .select({ item: workItems, title: workRevisions.title, project: projects.name })
+    .from(workItems)
+    .innerJoin(
+      workRevisions,
+      and(eq(workRevisions.workId, workItems.id), eq(workRevisions.revision, workItems.specRevision)),
+    )
+    .innerJoin(projects, eq(projects.id, workItems.projectId))
+    .where(and(eq(workItems.teamId, teamId), or(gte(workItems.createdAt, since), gte(workItems.updatedAt, since))))
+    .orderBy(desc(workItems.updatedAt))
+    .limit(NATIVE_WORK_ROWS + 1);
+  const rowsTruncated = itemRows.length > NATIVE_WORK_ROWS;
+  const shown = itemRows.slice(0, NATIVE_WORK_ROWS);
+  const ids = shown.map((row) => row.item.id);
+  const [deliveryRows, trackerRows, decidedRows, readByWork] = ids.length
+    ? await Promise.all([
+        db
+          .select({ workId: workDeliveries.workId, n: count(), first: min(workDeliveries.submittedAt) })
+          .from(workDeliveries)
+          .where(inArray(workDeliveries.workId, ids))
+          .groupBy(workDeliveries.workId),
+        db
+          .select({ workId: workExternalRefs.workId, mode: workExternalRefs.mode })
+          .from(workExternalRefs)
+          .where(and(inArray(workExternalRefs.workId, ids), sql`${workExternalRefs.detachedAt} is null`)),
+        db
+          .select({
+            workId: workAcceptances.workId,
+            decision: workAcceptances.decision,
+            actorUserId: workAcceptances.actorUserId,
+            scope: workAcceptances.actorScopeSnapshot,
+            at: workAcceptances.createdAt,
+          })
+          .from(workAcceptances)
+          .where(inArray(workAcceptances.workId, ids))
+          .orderBy(desc(workAcceptances.createdAt))
+          .limit(NATIVE_DECISION_SCAN),
+        db
+          .select({ workId: workContextReads.workId, reads: count(), bytes: sum(workContextReads.bytes).mapWith(Number) })
+          .from(workContextReads)
+          .where(and(inArray(workContextReads.workId, ids), gte(workContextReads.createdAt, since)))
+          .groupBy(workContextReads.workId),
+      ])
+    : [[], [], [], []];
+  await isOperator(decidedRows.map((row) => row.actorUserId).filter((id): id is string => Boolean(id)));
+  await isOperator(shown.map((row) => row.item.createdByUserId).filter((id): id is string => Boolean(id)));
+  const rows: PilotWorkItem[] = shown.map(({ item, title, project }) => {
+    const first = deliveryRows.find((row) => row.workId === item.id);
+    const decided = decidedRows.find((row) => row.workId === item.id);
+    const read = readByWork.find((row) => row.workId === item.id);
+    return {
+      key: item.displayKey,
+      project,
+      title,
+      state: item.state,
+      archived: item.archivedAt !== null,
+      createdAt: item.createdAt,
+      filedBy: item.createdByKind === 'agent' ? 'agent' : 'person',
+      byOperator: Boolean(item.createdByKind === 'human' && item.createdByUserId && operatorIds.has(item.createdByUserId)),
+      origin: item.origin,
+      tracker: trackerRows.find((row) => row.workId === item.id)?.mode ?? null,
+      deliveries: first?.n ?? 0,
+      firstDeliveryAt: first?.first ? new Date(first.first) : null,
+      decision: decided
+        ? {
+            decision: decided.decision,
+            at: decided.at,
+            byOperator: Boolean(decided.actorUserId && operatorIds.has(decided.actorUserId)),
+            standing: standingOf(decided.scope),
+            selfReview: selfReviewOf(decided.scope),
+          }
+        : null,
+      contextReads: read?.reads ?? 0,
+      contextBytes: read?.bytes ?? 0,
+    };
+  });
+
+  return {
+    items: {
+      total,
+      archived,
+      byState,
+      createdInWindow,
+      filedByAgents,
+      filedByOperator,
+      withTracker: withTracker?.n ?? 0,
+    },
+    deliveriesInWindow: delivered?.n ?? 0,
+    decisions,
+    evidence: {
+      agentReported: evidenceCount('agent_reported'),
+      humanDecision: evidenceCount('human_decision'),
+    },
+    context: {
+      reads,
+      bytes,
+      averageBytes: reads ? Math.round(bytes / reads) : null,
+      largestBytes: readRows.length ? Math.max(...readRows.map((row) => Number(row.largest ?? 0))) : null,
+      incomplete: readRows.reduce((acc, row) => acc + row.incomplete, 0),
+      byAgents: readRows.filter((row) => row.kind === 'agent').reduce((acc, row) => acc + row.reads, 0),
+      byPeople: readRows.filter((row) => row.kind === 'human').reduce((acc, row) => acc + row.reads, 0),
+      acceptedWorks: perAccepted.length,
+      bytesPerAcceptedWork: perAccepted.length
+        ? Math.round(perAccepted.reduce((acc, row) => acc + (row.bytes ?? 0), 0) / perAccepted.length)
+        : null,
+    },
+    rows,
+    rowsTruncated,
+  };
+}
 
 export async function pilotSheet(
   db: Db,
@@ -425,6 +772,23 @@ export async function pilotSheet(
     .where(and(eq(projects.teamId, teamId), gte(projects.createdAt, since)))
     .orderBy(projects.createdAt);
 
+  const [reading, exclusion] = await Promise.all([
+    workspaceActivation(db, env, [teamId], now),
+    excludedWorkspaces(db, env, [teamId]),
+  ]);
+  const path = reading.byTeam.get(teamId)!;
+  const excludedReason = exclusion.get(teamId) ?? null;
+  const activation: PilotActivation = {
+    excluded: excludedReason ? { reason: excludedReason, label: EXCLUSION_LABELS[excludedReason] } : null,
+    stages: ACTIVATION_STAGES.map((stage) => ({ ...stage, ...path.stages[stage.key], reached: path.reached[stage.key] })),
+    repeatDays: path.repeatDays,
+    participants: path.participants,
+    runs: { participant: path.diagnostics.participantRuns, withRepositoryChange: path.diagnostics.changedRuns },
+    truncated: reading.truncated,
+  };
+
+  const nativeWork = await nativeWorkReading(db, teamId, since, operatorIds, isOperator);
+
   return {
     team: { id: team.id, name: team.name, slug: team.slug, createdAt: team.createdAt },
     window: { since, until: now, days: window.days },
@@ -464,7 +828,9 @@ export async function pilotSheet(
       cancelledOrDeclined: inWindow.filter((row) => row.state === 'cancelled' || row.state === 'declined').length,
     },
     deliveries,
+    nativeWork,
     warnings: await savingsLedger(db, teamId, window.days),
+    activation,
     weeks,
     expansion: { access, projects: newProjects },
     runsScanned: runs.length,
@@ -475,6 +841,60 @@ export async function pilotSheet(
 const day = (at: Date | null | undefined) => (at ? at.toISOString().slice(0, 10) : '-');
 const stamp = (at: Date | null | undefined) => (at ? at.toISOString().slice(0, 16).replace('T', ' ') : '-');
 const cell = (value: string | null | undefined) => (value ?? '-').replace(/\|/g, '/').replace(/\s+/g, ' ').trim() || '-';
+
+/** Whole hours from a work item being filed to its first delivery, or null. */
+export const hoursToFirstDelivery = (row: Pick<PilotWorkItem, 'createdAt' | 'firstDeliveryAt'>): number | null =>
+  row.firstDeliveryAt ? Math.max(0, Math.round((row.firstDeliveryAt.getTime() - row.createdAt.getTime()) / 3_600_000)) : null;
+
+const bytesLabel = (value: number | null) =>
+  value === null ? '-' : value >= 1024 ? `${(value / 1024).toFixed(1)} KiB` : `${value} B`;
+
+/** What a decision row says about who made it and under what standing, in words. */
+export const decisionLabel = (decision: NonNullable<PilotWorkItem['decision']>): string =>
+  `${decision.decision === 'accept' ? 'accepted' : 'changes requested'} ${stamp(decision.at)}${
+    decision.byOperator ? ' (operator)' : ''
+  }${decision.standing === 'owner_override' ? ', owner override' : ''}${decision.selfReview ? ', the reviewer also produced the work' : ''}`;
+
+/**
+ * The Native Work part of the report, as Markdown lines. Counts of rows STMA
+ * wrote, with the half it cannot know named in the closing list of the sheet.
+ */
+function nativeWorkMarkdown(native: PilotNativeWork): string[] {
+  const out: string[] = [];
+  const items = native.items;
+  const states = Object.entries(items.byState)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([state, n]) => `${n} ${state.replace('_', ' ')}`);
+  out.push('## Native Work');
+  out.push(
+    `${items.total} work item(s) in the workspace${items.archived ? ` (${items.archived} archived)` : ''}${states.length ? `: ${states.join(', ')}` : ''}. ${items.createdInWindow} filed in the window, ${items.filedByAgents} of them by an agent and ${items.filedByOperator} by the operator; ${items.withTracker} tied to a GitHub issue now.`,
+  );
+  const d = native.decisions;
+  out.push(
+    `In the window: ${native.deliveriesInWindow} delivery(ies) (each is its submitter's report); ${d.accepted} accepted and ${d.changesRequested} sent back by a person (${d.ownerOverrides} by an owner overriding the acceptor, ${d.selfReviews} where the reviewer also produced the work, ${d.byOperator} by the operator). Evidence rows recorded: ${native.evidence.agentReported} reported by an agent and ${native.evidence.humanDecision} from a person's check inside a decision (a provider's observation is read from the repository when readiness is computed and is not copied into the work, so it is not counted here).`,
+  );
+  const c = native.context;
+  out.push(
+    `Context served: ${c.reads} read(s), ${bytesLabel(c.bytes)} in all (${bytesLabel(c.averageBytes)} on average, ${bytesLabel(c.largestBytes)} the largest), ${c.byAgents} by agents and ${c.byPeople} by people, ${c.incomplete} that did not fit the budget and ended with a continuation. ${c.acceptedWorks ? `${c.acceptedWorks} accepted work item(s) were read, ${bytesLabel(c.bytesPerAcceptedWork)} each on average.` : 'No accepted work item was read in the window.'} Bytes are what STMA served, not tokens a model used; the instance keeps only its newest 50,000 reads, so a long window on a busy server may undercount.`,
+  );
+  out.push('');
+  if (native.rows.length > 0) {
+    out.push('| Filed | Key | Title | Project | State | Filed by | Origin | Deliveries | First delivery | Decision | Context |');
+    out.push('| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |');
+    for (const row of native.rows) {
+      const hours = hoursToFirstDelivery(row);
+      out.push(
+        `| ${stamp(row.createdAt)} | ${row.key} | ${cell(row.title)} | ${cell(row.project)} | ${row.state.replace('_', ' ')}${row.archived ? ' (archived)' : ''} | ${row.filedBy}${row.byOperator ? ' (operator)' : ''} | ${row.origin}${row.tracker ? `, GitHub ${row.tracker.replace('_', ' ')}` : ''} | ${row.deliveries} | ${row.firstDeliveryAt ? `${stamp(row.firstDeliveryAt)} (${hours} h after filing)` : '-'} | ${row.decision ? decisionLabel(row.decision) : '-'} | ${row.contextReads} read(s), ${bytesLabel(row.contextBytes)} |`,
+      );
+    }
+    if (native.rowsTruncated) out.push('Only the most recently changed work items are listed.');
+    out.push('');
+  } else {
+    out.push('- No work item was filed or changed in the window.');
+    out.push('');
+  }
+  return out;
+}
 
 /**
  * The sheet as Markdown, for the weekly one-page report. The report adds what
@@ -524,10 +944,36 @@ export function pilotSheetMarkdown(sheet: PilotSheet, plan: string): string {
       `- ${stamp(row.at)} · ${cell(row.task ?? 'untitled run')} · ${row.agent} for ${row.owner}${row.operator ? ' (operator)' : ''} · ${row.kind} ${row.commitSha.slice(0, 12)}${row.clean ? '' : ' (dirty)'} · tests: ${row.failed.length ? `failing ${cell(row.failed.join(', '))}` : `${row.passed} passed`} (agent's report) · provider: ${row.provider.length ? row.provider.join(', ') : row.repositoryMatches ? 'no observation of this commit' : 'repository does not match the project'}`,
     );
   out.push('');
+  out.push(...nativeWorkMarkdown(sheet.nativeWork));
   out.push('## Warnings people answered');
   const w = sheet.warnings;
   out.push(
     `${w.observedTotal} moment(s) observed; ${w.answered} answered, ${w.confirmed} helpful and changed behaviour, ${w.rejected} not helpful; ${w.minutesSaved} minute(s) reported saved by those who confirmed.`,
+  );
+  out.push('');
+  out.push('## First value path');
+  out.push(
+    'Connected is not activation: stage 2 says an agent was authorised, stage 3 says the repository changed. Each stage is read from stored rows, as of the export; a stage can read lower later if the rows behind it are deleted.',
+  );
+  if (sheet.activation.excluded)
+    out.push(`This workspace is excluded from cohorts: ${sheet.activation.excluded.label}.`);
+  out.push('');
+  const stageLine = (stage: PilotStage) =>
+    `- ${stage.number}. ${stage.label}: ${
+      stage.basis === 'observed'
+        ? `${stamp(stage.at)} (observed: ${stage.source})`
+        : stage.basis === 'implied'
+          ? `implied, no timestamp (${stage.source})`
+          : 'not observed'
+    }`;
+  out.push('Observed by STMA');
+  for (const stage of sheet.activation.stages.filter((entry) => entry.kind === 'observed')) out.push(stageLine(stage));
+  out.push('');
+  out.push('Answered by a person');
+  for (const stage of sheet.activation.stages.filter((entry) => entry.kind === 'answered')) out.push(stageLine(stage));
+  out.push('');
+  out.push(
+    `Days with first-work or verified-resume moments (UTC): ${sheet.activation.repeatDays.length ? sheet.activation.repeatDays.join(', ') : 'none'}. Participant runs: ${sheet.activation.runs.participant}, of which ${sheet.activation.runs.withRepositoryChange} reported a repository change. An agent that reports no checkpoint is not seen as work here.${sheet.activation.truncated ? ' Only part of the checkpoint history was read.' : ''}`,
   );
   out.push('');
   out.push('## Weekly');

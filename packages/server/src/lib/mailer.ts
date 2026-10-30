@@ -37,6 +37,12 @@ export type MailKind =
   | 'password_changed'
   | 'failed_sign_ins'
   | 'review_sign_in'
+  | 'authenticator_enabled'
+  | 'authenticator_disabled'
+  | 'recovery_codes_regenerated'
+  | 'recovery_code_used'
+  | 'authenticator_reset_by_operator'
+  | 'authenticator_locked'
   | 'activity'
   | 'workspace_invite'
   | 'billing';
@@ -488,6 +494,74 @@ export function failedSignInsEmail(
 }
 
 /**
+ * What a person had already passed when the authenticator step was asked for.
+ * `browser` is a code typed on Account, by a browser that was already signed
+ * in; `development` is the dev login, which asks for no password.
+ */
+export type AuthenticatorFirstStep = 'password' | 'github' | 'organization' | 'browser' | 'development';
+
+/**
+ * Somebody entered wrong authenticator codes for this account until it locked.
+ *
+ * Not the password mail, because the two locks mean different things and lift
+ * differently. Every code step comes after a first step has already been
+ * accepted, so whoever tripped this lock got past that step: which one is the
+ * fact the account holder most needs, and the password mail cannot say it. It
+ * is named per step, because telling an account signed in through GitHub, an
+ * organization or a browser alone to change a password sends its holder after
+ * the wrong door, and an account with no password has none to change. And the
+ * code step reopens at the end of its window whatever happens to the password,
+ * so telling somebody that a reset gets them back in would be untrue.
+ */
+export function authenticatorLockedEmail(
+  baseUrl: string,
+  resetAt: Date,
+  step: AuthenticatorFirstStep,
+  options: { hasPassword?: boolean } = {},
+): Omit<MailMessage, 'to'> {
+  const until = `${resetAt.toISOString().slice(11, 16)} UTC`;
+  const line =
+    'Several wrong authenticator codes were entered for your STMA account, so the code step is ' +
+    `refused until ${until}.`;
+  const signOut = 'sign out the other browsers from Account';
+  const passwordToo = step === 'password' || (step === 'browser' && options.hasPassword === true);
+  const why = {
+    password:
+      'Those codes came after your password was accepted, so whoever entered them knows your password.',
+    github:
+      'Those codes came after your GitHub account signed you in, so whoever entered them can sign in to that GitHub account.',
+    organization:
+      "Those codes came after your organization's sign-in accepted you, so whoever entered them can sign in as you there.",
+    browser:
+      'Those codes were entered on the Account page of a browser already signed in to your account.',
+    development:
+      "Those codes came after this server's development sign-in, which asks for no password.",
+  }[step];
+  const act = {
+    password: `If this was not you, change your password now and ${signOut}.`,
+    github: `If this was not you, secure your GitHub account and ${signOut}.`,
+    organization: `If this was not you, tell your organization's administrator and ${signOut}.`,
+    browser: passwordToo
+      ? `If this was not you, ${signOut} and change your password.`
+      : `If this was not you, ${signOut}.`,
+    development: `If this was not you, ${signOut}, and turn development sign-in off on this server.`,
+  }[step];
+  const wait = passwordToo
+    ? `The code step opens again at ${until} either way; changing the password does not shorten the wait.`
+    : `The code step opens again at ${until} either way.`;
+  const links = [...(passwordToo ? [`${baseUrl}/forgot`] : []), `${baseUrl}/app/account#security`];
+  return {
+    kind: 'authenticator_locked',
+    subject: 'Wrong authenticator codes on your STMA account',
+    text: [line, why, `${act} ${wait}`, ...links].join('\n\n'),
+    html: wrap([
+      ...[line, why, `${act} ${wait}`].map((part) => esc(part)),
+      ...links.map((link) => `<a href="${esc(link)}">${esc(link)}</a>`),
+    ]),
+  };
+}
+
+/**
  * The account signed in without a code, because an operator gave it review
  * access (`lib/reviewAccess.ts`). The code would have come to this address, so
  * the notice does: the address holder is the one who can tell an expected
@@ -552,6 +626,89 @@ export function passwordChangedEmail(
         help
           ? `<span style="color:#6b7075;font-size:13px">If you cannot get back in, write to <a href="mailto:${esc(supportEmail)}" style="color:#6b7075">${esc(supportEmail)}</a> from this address.</span>`
           : '',
+      ].filter(Boolean),
+    ),
+  };
+}
+
+/**
+ * The account's authenticator app changed.
+ *
+ * Five notices share one shape: what changed, when, from which browser as it
+ * described itself, and what to do if it was not you. None of them carries a
+ * code, a secret, a QR code or a recovery code, and none needs to: the person
+ * who made the change already has those, and the person who did not must not
+ * be handed them by mail.
+ */
+export type AuthenticatorNotice =
+  | 'authenticator_enabled'
+  | 'authenticator_disabled'
+  | 'recovery_codes_regenerated'
+  | 'recovery_code_used'
+  | 'authenticator_reset_by_operator';
+
+export function authenticatorNoticeEmail(
+  kind: AuthenticatorNotice,
+  input: {
+    baseUrl: string;
+    supportEmail?: string;
+    browser?: string | null;
+    at?: Date;
+    codesLeft?: number;
+    /** Where a recovery code was used: to sign in (the default), or to confirm a change on Account. */
+    usedOn?: 'sign_in' | 'account';
+  },
+): Omit<MailMessage, 'to'> {
+  const at = `${(input.at ?? new Date()).toISOString().slice(0, 16).replace('T', ' ')} UTC`;
+  const from = input.browser ? ` from a browser that describes itself as "${input.browser.slice(0, 120)}"` : '';
+  const what: Record<AuthenticatorNotice, { subject: string; line: string }> = {
+    authenticator_enabled: {
+      subject: 'An authenticator app was added to your STMA account',
+      line: `An authenticator app was turned on for your STMA account at ${at}${from}. Signing in now asks for a code from it, and every other browser was signed out.`,
+    },
+    authenticator_disabled: {
+      subject: 'The authenticator app was removed from your STMA account',
+      line: `The authenticator app on your STMA account was turned off at ${at}${from}. Its recovery codes no longer work, and every other browser was signed out.`,
+    },
+    recovery_codes_regenerated: {
+      subject: 'New recovery codes for your STMA account',
+      line: `New recovery codes were made for your STMA account at ${at}${from}. The previous ones no longer work.`,
+    },
+    recovery_code_used: {
+      subject:
+        input.usedOn === 'account'
+          ? 'A recovery code was used on your STMA account'
+          : 'A recovery code was used to sign in to your STMA account',
+      line: `A recovery code was used ${
+        input.usedOn === 'account' ? 'to confirm a change on the Account page of' : 'to sign in to'
+      } your STMA account at ${at}${from}. Every other browser was signed out. ${
+        input.codesLeft === undefined ? '' : `${input.codesLeft} recovery code${input.codesLeft === 1 ? '' : 's'} left.`
+      }`.trim(),
+    },
+    authenticator_reset_by_operator: {
+      subject: 'The authenticator app on your STMA account was reset',
+      line: `An STMA operator removed the authenticator app from your STMA account at ${at}, and every browser was signed out. You can sign in with your password again and add an authenticator app from Account.`,
+    },
+  };
+  const { subject, line } = what[kind];
+  const act =
+    kind === 'authenticator_reset_by_operator'
+      ? 'If you did not ask for this, reset your password now and write to support from this address.'
+      : 'If this was not you, reset your password now, then open Account and Agent connections and remove anything you do not recognise.';
+  const account = `${input.baseUrl}/app/account#security`;
+  const reset = `${input.baseUrl}/forgot`;
+  const help = input.supportEmail ? `If you cannot get back in, write to ${input.supportEmail} from this address.` : '';
+  return {
+    kind,
+    subject,
+    text: [line, act, account, reset, help].filter(Boolean).join('\n\n'),
+    html: wrap(
+      [
+        esc(line),
+        esc(act),
+        `<a href="${esc(account)}">${esc(account)}</a>`,
+        `<a href="${esc(reset)}">${esc(reset)}</a>`,
+        help ? esc(help) : '',
       ].filter(Boolean),
     ),
   };

@@ -18,6 +18,7 @@ import {
 import { grantAllowsProject, type AgentGrant } from '../lib/grants';
 import { verifyCheckpointResume } from './checkpoints';
 import { getKnowledgeContext, knowledgeContextReference, retainedContextReplayError } from './knowledge';
+import { handoffWorkRefusal, workOfHandoff } from './workLinks';
 import { fingerprintJson } from '../lib/canonical';
 import { canonicalRepositoryIdentity } from '../lib/projects';
 
@@ -91,9 +92,10 @@ export async function launchCheck(
     if (!row || !(await launchForViewer(tx as unknown as Db, id, userId, grant)))
       return {
         error:
-          'No launch with this id is visible to this connection. A launch is started on a workspace\'s ' +
-          'Connect & test page, which shows its id; only connections within that workspace (and, for ' +
-          'a launch between your own agents, only yours) can send, reply to or read it.',
+          'No launch with this id is visible to this connection. A launch is started in the Test ' +
+          'section of a workspace\'s Agent connections page, which shows its id; only connections ' +
+          'within that workspace (and, for a launch between your own agents, only yours) can send, ' +
+          'reply to or read it.',
       };
     if (action === 'status')
       return {
@@ -561,12 +563,20 @@ export async function transitionHandoff(
           replayLimited:
             'This context predates exact response retention; call get_knowledge_context to read it again.',
         } as Record<string, unknown>);
-      if (receiverRunId && resumed?.runId !== receiverRunId) {
+      // Work filed against a Native Work item is the exception: its receiving
+      // run is not evidence of where the work began (no Knowledge link, no
+      // code checked), and a repeat resume naming another run is the door the
+      // replies point to for moving that run onto the work, in a later client
+      // session whose hook started a new one, or after a rotation named a
+      // successor. Refused, it left the work with no live linked run.
+      const filed = await workOfHandoff(tx as unknown as Db, offer.id);
+      if (receiverRunId && resumed?.runId !== receiverRunId && (offer.knowledgeContextId || !filed)) {
         return { error: 'This handoff was already resumed by a different receiving run.' };
       }
       return {
         handoff: offer,
         verification,
+        ...(filed ? { replayed: true as const } : {}),
         knowledgeUpdate: {
           previous: knowledgeContextReference(previous),
           current,
@@ -584,6 +594,15 @@ export async function transitionHandoff(
     };
     if (!allowed[action]?.includes(offer.state))
       return { error: lifecycleRefusal(action, offer.state) };
+    // Work filed against a Native Work item is taken and begun on the contract
+    // it was assigned at, or not at all. Read here, before anything below is
+    // written, and without a Work lock: two rows read, nothing locked that a
+    // Work transaction could be waiting on.
+    if (action === 'accept' || action === 'resume') {
+      const filed = await workOfHandoff(tx as unknown as Db, offer.id);
+      const refused = filed ? handoffWorkRefusal(filed, offer.kind) : null;
+      if (refused) return refused;
+    }
     let knowledgeUpdate:
       | {
           previous: ReturnType<typeof knowledgeContextReference>;

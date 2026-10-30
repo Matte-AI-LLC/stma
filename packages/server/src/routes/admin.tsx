@@ -21,6 +21,8 @@ import {
   webSessions,
 } from '../db/schema';
 import { describeCohort } from '../auth/accessCodes';
+import { authenticatorStatus, removeAuthenticator } from '../auth/secondFactor';
+import { currentSessionCreatedAt, endPendingSignIns, invalidateAllSessions } from '../auth/session';
 import {
   BETA_LEDGER_MAX,
   betaLedger,
@@ -30,10 +32,35 @@ import {
   nearestTheLine,
 } from '../domain/betaCohorts';
 import { adminConfigured, isAdminEmail, isAdminUser, isAdminUsername, reservedUsername } from '../lib/admin';
+import {
+  AUTHENTICATOR_RESET_LABELS,
+  AUTHENTICATOR_RESET_REASONS,
+  authenticatorResetLabel,
+  authenticatorResetsFor,
+  recordAuthenticatorReset,
+} from '../lib/authenticatorResets';
 import { hashPassword, randomHex } from '../lib/crypto';
 import { TEST_EMAIL_DOMAIN, TEST_ACCOUNT_LOCKED } from '../lib/testAccounts';
 import { DEMO_WORKSPACE, seedDemoWorkspace } from '../domain/demoWorkspace';
-import { PILOT_NOT_RECORDED, pilotSheet, pilotSheetMarkdown, pilotWindow } from '../domain/pilotSheet';
+import {
+  ACTIVATION_COHORT_MAX,
+  ACTIVATION_SMALL_N,
+  ACTIVATION_STAGES,
+  EXCLUSION_LABELS,
+  REPEAT_GAP_HOURS,
+  REPEAT_OBSERVABLE_AFTER_HOURS,
+  activationCohorts,
+  type CohortRow,
+  type StageKey,
+} from '../domain/activation';
+import {
+  PILOT_NOT_RECORDED,
+  decisionLabel,
+  hoursToFirstDelivery,
+  pilotSheet,
+  pilotSheetMarkdown,
+  pilotWindow,
+} from '../domain/pilotSheet';
 import {
   REVIEW_ACCESS_MAX_DAYS,
   parseReviewLastDay,
@@ -89,7 +116,7 @@ import {
   setPlanGrant,
   type PlanGrant,
 } from '../lib/planGrants';
-import { emailChangedNotice, mailHealth, mailTransport, sendMail } from '../lib/mailer';
+import { authenticatorNoticeEmail, emailChangedNotice, mailHealth, mailTransport, sendMail } from '../lib/mailer';
 import { metrics } from '../lib/metrics';
 import { criticalAudit, SecurityRefusal } from '../lib/securityHooks';
 import { track } from '../lib/track';
@@ -872,15 +899,136 @@ adminRoutes.get('/admin', async (c) => {
 const pct = (n: number, of: number) => (of > 0 ? Math.round((n / of) * 100) : 0);
 const usd = (cents: number | null) => (cents === null ? 'unknown' : `$${(cents / 100).toFixed(2)}`);
 
+const OBSERVED_STAGES = ACTIVATION_STAGES.filter((stage) => stage.kind === 'observed');
+const ANSWERED_STAGES = ACTIVATION_STAGES.filter((stage) => stage.kind === 'answered');
+
+const StageCell = ({ row, stage }: { row: CohortRow; stage: StageKey }) => {
+  const counts = row.stages[stage];
+  return (
+    <td>
+      {counts.reached} of {counts.of}
+      {!row.smallN && counts.of > 0 ? (
+        <span class="muted small"> ({Math.round((counts.reached / counts.of) * 100)}%)</span>
+      ) : null}
+      {counts.implied > 0 ? <div class="muted small">{counts.implied} implied, no timestamp</div> : null}
+    </td>
+  );
+};
+
+/**
+ * The first value path for the eligible workspaces, by week of creation. Counts
+ * are workspaces ("n of m"), never events; the person's answer has a column of
+ * its own so it cannot be read as one more milestone.
+ */
+const FirstValueCard = ({ data }: { data: Awaited<ReturnType<typeof activationCohorts>> }) => {
+  const rows = [...data.rows, ...(data.rows.length > 1 ? [data.total] : [])];
+  return (
+    <section class="card" id="first-value-path">
+      <div class="card-head">
+        <div>
+          <div class="card-title">First value path (eligible workspaces)</div>
+          <div class="card-note">
+            One row per week of creation, counted in workspaces: two people in one team are one customer. Connected is
+            not activation. Stages 1 to 4 and 6 are what STMA observed; stage 5 is what a person answered and is kept
+            apart. Operator, test, review and demo accounts and workspaces are left out of every number.
+          </div>
+        </div>
+      </div>
+      <div class="card-pad small">
+        <ol style="margin:0 0 10px;padding-left:18px">
+          {ACTIVATION_STAGES.map((stage) => (
+            <li>
+              <b>{stage.label}</b> ({stage.kind === 'answered' ? 'answered by a person' : 'observed by STMA'}):{' '}
+              {stage.definition}
+            </li>
+          ))}
+        </ol>
+        <p style="margin:0">
+          Days are UTC. A workspace counts toward a stage once every earlier observed stage is reached. An agent that
+          never reports a checkpoint is not seen as doing work, so a low number here means "not observed", not "no
+          work".
+        </p>
+      </div>
+      {rows.length === 0 ? (
+        <div class="card-pad muted">No eligible workspace yet.</div>
+      ) : (
+        <div class="scroll-x">
+          <table class="tbl">
+            <tr>
+              <th>Created</th>
+              <th>Eligible</th>
+              <th>Accounts</th>
+              {OBSERVED_STAGES.map((stage) => (
+                <th>
+                  {stage.number}. {stage.label}
+                </th>
+              ))}
+              <th style="border-left:2px solid var(--line)">
+                {ANSWERED_STAGES[0]!.number}. {ANSWERED_STAGES[0]!.label} (answered by a person)
+              </th>
+              <th>Reading</th>
+            </tr>
+            {rows.map((row) => (
+              <tr>
+                <td class="muted">{row.weekStart ? `Week of ${fmtDate(row.weekStart)}` : 'All weeks read'}</td>
+                <td>{row.eligible}</td>
+                <td class="muted">{row.creators}</td>
+                {OBSERVED_STAGES.map((stage) => (
+                  <StageCell row={row} stage={stage.key} />
+                ))}
+                <td style="border-left:2px solid var(--line)">
+                  <StageCell row={row} stage="human_confirmed" />
+                </td>
+                <td class="muted small">
+                  {row.smallN ? `Fewer than ${ACTIVATION_SMALL_N} workspaces: too few to read as a rate.` : ''}
+                  {row.notYetObservable > 0
+                    ? ` ${row.notYetObservable} not yet observable for repeat use.`
+                    : ''}
+                </td>
+              </tr>
+            ))}
+          </table>
+        </div>
+      )}
+      <div class="card-pad muted small">
+        <p style="margin:0 0 6px">
+          Read {data.considered} workspace{data.considered === 1 ? '' : 's'}
+          {data.truncated ? ` (the newest ${ACTIVATION_COHORT_MAX}; the instance has more)` : ''}. Left out of every
+          number: {data.excluded.total}
+          {data.excluded.total > 0
+            ? ` (${(Object.keys(EXCLUSION_LABELS) as Array<keyof typeof EXCLUSION_LABELS>)
+                .filter((reason) => data.excluded.byReason[reason] > 0)
+                .map((reason) => `${data.excluded.byReason[reason]} ${EXCLUSION_LABELS[reason]}`)
+                .join(', ')})`
+            : ''}
+          . The demo workspace is recognised by the row the product writes when an operator builds it; one built
+          before that record existed is caught only when its owner is a test account.
+        </p>
+        <p style="margin:0 0 6px">
+          Repeat use needs two first-work or verified-resume moments on different UTC days at least {REPEAT_GAP_HOURS} hours apart, and is
+          not judged until the first is {REPEAT_OBSERVABLE_AFTER_HOURS} hours old. Acquisition source: {data.acquisition}.
+        </p>
+        <p style="margin:0">
+          Stages are recomputed on each load from rows that outlive the product's sweeps, except enrollments (deleted
+          30 days after they expire) and handoffs of resolved sessions. Deleting an account removes its runs and
+          checkpoints, so a stage can fall later. The pilot sheet export is the record.
+          {data.checkpointsTruncated ? ' Only part of the checkpoint history was read.' : ''}
+        </p>
+      </div>
+    </section>
+  );
+};
+
 adminRoutes.get('/admin/usage', async (c) => {
   const user = c.get('user')!;
   const db = c.get('db');
-  const [windows, funnel, cohorts, rows, economics] = await Promise.all([
+  const [windows, funnel, cohorts, rows, economics, firstValue] = await Promise.all([
     usageWindows(db),
     activationFunnel(db),
     launchCohorts(db),
     teamUsage(db),
     economicObservation(db),
+    activationCohorts(db, c.get('env')),
   ]);
   const top = funnel[0]?.teams ?? 0;
 
@@ -917,7 +1065,7 @@ adminRoutes.get('/admin/usage', async (c) => {
           <div>
             <div class="card-title">Independent feature adoption counts</div>
             <div class="card-note">
-              These are independent retained-history totals, not a sequential funnel. Solo use needs no second human. Legacy activity cannot prove activation.
+              These are independent retained-history totals, not a sequential funnel. Solo use needs no second human. Legacy activity cannot prove activation. Includes operator, test and demo workspaces; see First value path for eligible counts.
             </div>
           </div>
         </div>
@@ -943,6 +1091,8 @@ adminRoutes.get('/admin/usage', async (c) => {
       </div>
 
       <section class="card card-pad"><h3>Launch cohorts · last 30 days</h3><p>Durable, sequential connection-test milestones. A hello is not real work. Completion is an authenticated report, not provider verification. Older unobserved launches remain unknown.</p>{cohorts.map((row) => <p>{row.intent}: {row.opened} opened → {row.first} sender → {row.second} second installation → {row.exchanged} exchanged → {row.realResultReported} real handoff reported complete. Mean time to exchange: {row.meanSecondsToExchange === null ? 'unknown' : `${Math.round(Number(row.meanSecondsToExchange))}s`}.</p>)}</section>
+
+      <FirstValueCard data={firstValue} />
 
       <div class="card">
         <div class="card-head">
@@ -1143,8 +1293,10 @@ adminRoutes.get('/admin/usage', async (c) => {
  *   flag, so a beta workspace on `free` is swept at 90 days today. It is not in
  *   the table because unsetting the flag does not change it — which is the
  *   point: lifting it would have made the flip the day history is deleted.
- * - **An evidence-pack read is not recorded**, so that switch answers
- *   `unrecorded` rather than pretending silence means unused.
+ * - **Every plan carries evidence since 2026-10-22**, so that switch reads
+ *   `kept` on every row and the flip closes no evidence. Were a landing plan
+ *   ever to drop it, it would answer `unrecorded`, because nothing records an
+ *   evidence-pack read and silence is not the same as unused.
  *
  * Devices per member is counted the way `push_snapshot` counts it: distinct
  * device labels per person over the last `DEVICE_WINDOW_DAYS`, so the busiest
@@ -1340,9 +1492,9 @@ adminRoutes.get('/admin/beta', async (c) => {
               <code>push_snapshot</code> counts them: the busiest member's distinct device labels
               over the last {DEVICE_WINDOW_DAYS} days. Retention is deliberately absent: the beta
               does not lift it, so the sweep already keeps each workspace's own rule — free's 90
-              days, or what the plan you gave it keeps — and unsetting the flag deletes nothing. And nothing records an evidence-pack
-              read, so that switch cannot be answered from stored rows for any workspace: it is
-              the <code>?</code> above and never a verdict.
+              days, or what the plan you gave it keeps, and unsetting the flag deletes nothing. Run
+              evidence is on every plan, so its square reads kept on every row and the flip closes
+              none of it.
             </div>
           </div>
         </div>
@@ -1412,10 +1564,9 @@ adminRoutes.get('/admin/beta', async (c) => {
                   <div class="mono muted small">{ceilingSummary(w.ceilings)}</div>
                 </td>
                 <td>
-                  {/* Only what this workspace is actually using. Evidence packs
-                      are `unrecorded` for every row — nothing writes when one is
-                      read — so the pill would be the same noise on every line
-                      and the card note says it once instead. */}
+                  {/* Only what this workspace is actually using. Evidence is
+                      kept on every row, since every plan carries it, so it never
+                      appears here and the card note says it once instead. */}
                   {w.losing.length === 0 ? (
                     <span class="muted small">nothing recorded in use</span>
                   ) : (
@@ -2628,6 +2779,46 @@ adminRoutes.get('/admin/teams/:id/pilot', async (c) => {
         <Stat label="Warnings confirmed" value={w.confirmed} note={`of ${w.answered} answered · ${w.minutesSaved} min reported`} />
       </div>
 
+      <section class="card scroll-x" style="margin-top:14px" id="first-value-path">
+        <div class="card-head">
+          <div>
+            <div class="card-title">First value path</div>
+            <div class="card-note">
+              Connected is not activation. Stages marked observed are what STMA recorded; the person's answer is
+              kept apart. {sheet.activation.excluded ? `Excluded from cohorts: ${sheet.activation.excluded.label}.` : ''}
+            </div>
+          </div>
+        </div>
+        <table class="tbl">
+          <tr>
+            <th>Stage</th>
+            <th>Lane</th>
+            <th>Reached</th>
+            <th>When</th>
+            <th>Read from</th>
+          </tr>
+          {sheet.activation.stages.map((stage) => (
+            <tr>
+              <td class="name">
+                {stage.number}. {stage.label}
+              </td>
+              <td class="muted">{stage.kind === 'answered' ? 'answered by a person' : 'observed by STMA'}</td>
+              <td>{stage.reached ? 'yes' : stage.basis ? 'not yet (an earlier stage is missing)' : 'no'}</td>
+              <td class="muted">
+                {stage.basis === 'observed' ? fmtDate(stage.at) : stage.basis === 'implied' ? 'implied, no timestamp' : '-'}
+              </td>
+              <td class="muted small">{stage.basis ? stage.source : 'not observed'}</td>
+            </tr>
+          ))}
+        </table>
+        <div class="card-pad muted small">
+          Participant runs: {sheet.activation.runs.participant}, of which {sheet.activation.runs.withRepositoryChange}{' '}
+          reported a repository change. An agent that reports no checkpoint is not seen as work. Days with first-work
+          moments (UTC): {sheet.activation.repeatDays.length ? sheet.activation.repeatDays.join(', ') : 'none'}.
+          {sheet.activation.truncated ? ' Only part of the checkpoint history was read.' : ''}
+        </div>
+      </section>
+
       <div class="card scroll-x" style="margin-top:14px">
         <div class="card-head">
           <div>
@@ -2785,6 +2976,98 @@ adminRoutes.get('/admin/teams/:id/pilot', async (c) => {
             ))}
           </table>
         )}
+      </div>
+
+      <div class="card scroll-x" style="margin-top:14px" id="native-work">
+        <div class="card-head">
+          <div>
+            <div class="card-title">Native Work</div>
+            <div class="card-note">
+              Counts of rows STMA wrote. A delivery is its submitter's report; a decision is a person's, with the
+              standing it was made under. Context is bytes STMA served, not tokens a model used, and the instance keeps
+              only its newest 50,000 reads.
+            </div>
+          </div>
+        </div>
+        <div class="card-pad small">
+          {sheet.nativeWork.items.total} work item(s)
+          {sheet.nativeWork.items.archived ? ` (${sheet.nativeWork.items.archived} archived)` : ''}:{' '}
+          {Object.entries(sheet.nativeWork.items.byState)
+            .sort(([a], [b]) => a.localeCompare(b))
+            .map(([state, n]) => `${n} ${state.replace('_', ' ')}`)
+            .join(', ') || 'none yet'}
+          . {sheet.nativeWork.items.createdInWindow} filed in the window, {sheet.nativeWork.items.filedByAgents} by an
+          agent, {sheet.nativeWork.items.filedByOperator} by the operator; {sheet.nativeWork.items.withTracker} tied to a
+          GitHub issue. In the window: {sheet.nativeWork.deliveriesInWindow} delivery(ies),{' '}
+          {sheet.nativeWork.decisions.accepted} accepted, {sheet.nativeWork.decisions.changesRequested} sent back (
+          {sheet.nativeWork.decisions.ownerOverrides} by an owner overriding the acceptor,{' '}
+          {sheet.nativeWork.decisions.selfReviews} where the reviewer also produced the work,{' '}
+          {sheet.nativeWork.decisions.byOperator} by the operator). Evidence recorded:{' '}
+          {sheet.nativeWork.evidence.agentReported} reported by an agent,{' '}
+          {sheet.nativeWork.evidence.humanDecision} from a person's check (a provider's observation is read from the
+          repository, not copied into the work, so it is not counted).
+        </div>
+        <div class="card-pad small">
+          Context served: {sheet.nativeWork.context.reads} read(s), {sheet.nativeWork.context.bytes} bytes in all
+          {sheet.nativeWork.context.averageBytes !== null
+            ? ` (${sheet.nativeWork.context.averageBytes} on average, ${sheet.nativeWork.context.largestBytes} the largest)`
+            : ''}
+          , {sheet.nativeWork.context.byAgents} by agents and {sheet.nativeWork.context.byPeople} by people,{' '}
+          {sheet.nativeWork.context.incomplete} that ended with a continuation.{' '}
+          {sheet.nativeWork.context.bytesPerAcceptedWork !== null
+            ? `${sheet.nativeWork.context.acceptedWorks} accepted work item(s) were read, ${sheet.nativeWork.context.bytesPerAcceptedWork} bytes each on average.`
+            : 'No accepted work item was read in the window.'}
+        </div>
+        {sheet.nativeWork.rows.length === 0 ? (
+          <div class="card-pad muted">No work item was filed or changed in the window.</div>
+        ) : (
+          <table class="tbl">
+            <tr>
+              <th>Filed</th>
+              <th>Work</th>
+              <th>State</th>
+              <th>Filed by</th>
+              <th>Deliveries</th>
+              <th>Decision</th>
+              <th>Context</th>
+            </tr>
+            {sheet.nativeWork.rows.map((row) => (
+              <tr>
+                <td class="muted">{timeAgo(row.createdAt)}</td>
+                <td>
+                  <span class="mono small">{row.key}</span> <span class="name">{row.title}</span>
+                  <div class="small muted">
+                    {row.project}
+                    {row.tracker ? ` · GitHub ${row.tracker.replace('_', ' ')}` : ''}
+                  </div>
+                </td>
+                <td>
+                  {row.state.replace('_', ' ')}
+                  {row.archived ? ' (archived)' : ''}
+                </td>
+                <td class="small">
+                  {row.filedBy}
+                  {row.byOperator ? (
+                    <span class="pill pill-owner" style="margin-left:6px">
+                      operator
+                    </span>
+                  ) : null}
+                </td>
+                <td class="small">
+                  {row.deliveries}
+                  {row.firstDeliveryAt ? ` · first ${hoursToFirstDelivery(row)} h after filing` : ''}
+                </td>
+                <td class="small">{row.decision ? decisionLabel(row.decision) : '-'}</td>
+                <td class="small">
+                  {row.contextReads} read(s), {row.contextBytes} bytes
+                </td>
+              </tr>
+            ))}
+          </table>
+        )}
+        {sheet.nativeWork.rowsTruncated ? (
+          <div class="card-pad muted small">Only the most recently changed work items are listed.</div>
+        ) : null}
       </div>
 
       <div class="grid2" style="margin-top:14px">
@@ -2981,6 +3264,7 @@ adminRoutes.post('/admin/users/:id/test-access', async (c) => {
         ...(passwordHash ? { passwordHash } : {}),
       }).where(eq(users.id, id));
       await tx.delete(webSessions).where(eq(webSessions.userId, id));
+      await endPendingSignIns(tx as unknown as Db, id);
       // Reopening a test account must not revive old credentials. Renewal is an
       // explicit new setup boundary, as disabling or rotating already is.
       await tx.update(tokens).set({ revokedAt: new Date() }).where(and(eq(tokens.userId, id), isNull(tokens.revokedAt)));
@@ -3174,6 +3458,8 @@ adminRoutes.get('/admin/users/:id', async (c) => {
   const suggestedLastDay = new Date(Date.now() + 29 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
   const latestLastDay = new Date(Date.now() + REVIEW_ACCESS_MAX_DAYS * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
   const testWorkspace = workspaceRows.find((row) => row.team.id === account.testWorkspaceId)?.team;
+  const factor = await authenticatorStatus(db, account.id);
+  const resets = account.isTest ? [] : await authenticatorResetsFor(db, account.id);
   const testProjects = account.isTest && testWorkspace
     ? await db.select().from(projects).where(eq(projects.teamId, testWorkspace.id)).orderBy(projects.name)
     : [];
@@ -3262,14 +3548,51 @@ adminRoutes.get('/admin/users/:id', async (c) => {
           </form>
         )}
       </div> : null}
+      {!account.isTest ? <div class="card card-pad" style="margin-top:14px" id="authenticator">
+        <div class="card-title">Authenticator app</div>
+        <p class="small muted">
+          The independent way back in for somebody who has lost both the phone and every recovery
+          code. Check it is them first, out of band, the way you would before moving an address.
+          Resetting removes the app and its recovery codes, signs every browser out and mails the
+          account. Agent connections are not touched. The secret is never shown here. It needs your
+          own sign-in from the last 10 minutes, and each reset is recorded below.
+        </p>
+        {factor.state === 'active' ? (
+          <>
+            <p class="m0">
+              <span class="pill pill-active">on</span> since {fmtDate(factor.enabledAt)}, {factor.recoveryCodesLeft}{' '}
+              recovery code{factor.recoveryCodesLeft === 1 ? '' : 's'} left.
+            </p>
+            <form method="post" action={`/admin/users/${account.id}/authenticator/reset`} style="display:flex;flex-direction:column;gap:10px;margin-top:12px;max-width:420px">
+              <label class="field m0"><span>Reason</span><select class="in" name="reason" required><option value="">Choose a reason</option>{AUTHENTICATOR_RESET_REASONS.map((reason) => <option value={reason}>{AUTHENTICATOR_RESET_LABELS[reason]}</option>)}</select></label>
+              <label class="field m0"><span>Type the username to confirm</span><input class="in" name="confirm" autocomplete="off" placeholder={account.username} required /></label>
+              <button class="btn btn-danger" type="submit" style="align-self:flex-start">Reset authenticator app</button>
+            </form>
+          </>
+        ) : (
+          <p class="m0 muted">{factor.state === 'pending' ? 'Being set up, not on yet.' : 'Off.'}</p>
+        )}
+        <div class="card-title" style="margin-top:14px">Reset history</div>
+        {resets.length === 0 ? (
+          <p class="m0 small muted">No operator has reset this account's authenticator app.</p>
+        ) : (
+          <ul class="m0 small">
+            {resets.map((reset) => (
+              <li>
+                {fmtDate(reset.at)} by {reset.actorLabel}: {authenticatorResetLabel(reset.reason)}
+              </li>
+            ))}
+          </ul>
+        )}
+      </div> : null}
       <div class="card card-pad" style="margin-top:14px" id="demo-workspace">
         <div class="card-title">Demo workspace</div>
         <p class="small muted">
           Builds {DEMO_WORKSPACE}, owned by this account, the way the product would have written it:
           three connected agents on three machines, published rules and knowledge, two machines'
-          environment snapshots that disagree, a finished assignment, a solved problem, a handoff and
-          an assignment waiting, and an open question. For a reviewer or a demonstration. Only for an
-          account with no workspace yet.
+          environment snapshots that disagree, a solved problem, a handoff, and two Native Work items:
+          one delivered and waiting for this account's decision, one assigned and held by an open
+          question. For a reviewer or a demonstration. Only for an account with no workspace yet.
         </p>
         {workspaceRows.length > 0 ? (
           <p class="muted">This account already belongs to a workspace, so it gets no demo.</p>
@@ -3581,9 +3904,63 @@ adminRoutes.post('/admin/users/:id/review-access/off', async (c) => {
   // review door is not recorded, so every browser goes: this is a demo account.
   if (account.isTest) return back('Use the Test account controls, not review access.');
   await db.update(users).set({ reviewAccessUntil: null }).where(eq(users.id, id));
-  await db.delete(webSessions).where(eq(webSessions.userId, id));
+  await invalidateAllSessions(db, id);
   logLine({ evt: 'admin', a: 'review_access_off', u: actor.username, target: account.username });
   return back(`${account.username} signs in with an emailed code again, and every browser was signed out.`, true);
+});
+
+/**
+ * How recent the operator's own sign-in must be to reset somebody's
+ * authenticator: the window Account asks of a person with no password. A
+ * borrowed or forgotten operator cookie is how a second factor gets removed by
+ * somebody who should not, and a fresh sign-in is what such a cookie cannot be.
+ */
+const OPERATOR_RECENT_SIGN_IN_MS = 10 * 60_000;
+export const OPERATOR_SIGN_IN_AGAIN =
+  'Sign in again to reset an authenticator app: it needs your own sign-in from the last 10 minutes.';
+
+adminRoutes.post('/admin/users/:id/authenticator/reset', async (c) => {
+  const actor = c.get('user')!;
+  const env = c.get('env');
+  const db = c.get('db');
+  const id = c.req.param('id');
+  if (!UUID_RE.test(id)) return c.notFound();
+  const back = (msg: string, ok = false) =>
+    c.redirect(`/admin/users/${id}?${ok ? 'ok' : 'error'}=${encodeURIComponent(msg)}#authenticator`);
+  const account = (await db.select().from(users).where(eq(users.id, id)).limit(1))[0];
+  if (!account) return c.notFound();
+  const body = await c.req.parseBody();
+  const reason = AUTHENTICATOR_RESET_REASONS.find((r) => r === body.reason);
+  if (!reason) return back('Choose why the authenticator app is being reset.');
+  if (typeof body.confirm !== 'string' || body.confirm.trim() !== account.username) {
+    return back('Type the username exactly to confirm the reset.');
+  }
+  const signedInAt = await currentSessionCreatedAt(c);
+  if (!signedInAt || Date.now() - signedInAt.getTime() > OPERATOR_RECENT_SIGN_IN_MS) {
+    return back(OPERATOR_SIGN_IN_AGAIN);
+  }
+  // Recorded on the transaction that removes the app: no reset without its row.
+  const removed = await removeAuthenticator(db, account, 'operator', (tx) =>
+    recordAuthenticatorReset(tx, { subjectId: account.id, actorId: actor.id, actorLabel: actor.username, reason }),
+  );
+  if (!removed) return back(`${account.username} has no authenticator app on.`);
+  // The recovery path assumes every live session, and every sign-in waiting
+  // at the code step, may be the problem.
+  await invalidateAllSessions(db, id);
+  logLine({ evt: 'admin', a: 'authenticator_reset', u: actor.username, target: account.username, reason });
+  if (account.email) {
+    void sendMail(env, {
+      to: account.email,
+      ...authenticatorNoticeEmail('authenticator_reset_by_operator', {
+        baseUrl: env.baseUrl,
+        supportEmail: env.supportEmail,
+      }),
+    });
+  }
+  return back(
+    `${account.username}'s authenticator app was removed, every browser was signed out and the account was mailed.`,
+    true,
+  );
 });
 
 /**

@@ -43,6 +43,10 @@ export const CRITICAL_AUDIT_ACTIONS = [
   'integration_connected',
   'integration_disconnected',
   'integration_scope_changed',
+  'execution_enabled',
+  'execution_disabled',
+  'execution_dispatched',
+  'execution_cancelled',
 ] as const;
 export type CriticalAuditAction = (typeof CRITICAL_AUDIT_ACTIONS)[number];
 
@@ -96,6 +100,18 @@ export interface SecurityHooks {
     input: { userId: string; teamId: string; projectId: string | null },
   ) => Promise<boolean>;
   accountDeleted?: (db: Db, userId: string) => Promise<void>;
+  /**
+   * A sign-in that stopped for an authenticator code has just finished: the
+   * browser session `sessionId` now exists for `userId`. A composition that
+   * parked something on the challenge (an organization sign-in proof) moves it
+   * onto the new session here. Nothing in core depends on it.
+   */
+  signInCompleted?: (db: Db, input: SignInCompletion) => Promise<void>;
+}
+export interface SignInCompletion {
+  challengeId: string;
+  sessionId: string;
+  userId: string;
 }
 const context = new AsyncLocalStorage<{ hooks: SecurityHooks; principal?: SecurityPrincipal }>();
 export const withSecurityHooks = <T>(hooks: SecurityHooks, fn: () => T): T =>
@@ -106,6 +122,12 @@ export const criticalAudit = async (db: Db, event: CriticalAuditEvent) => {
 export const setSecurityPrincipal = (principal: SecurityPrincipal) => {
   const state = context.getStore();
   if (state) state.principal = principal;
+};
+/** Background execution rechecks the original actor through the same composition. */
+export const currentSecurityPrincipal = () => context.getStore()?.principal;
+export const withSecurityPrincipal = <T>(principal: SecurityPrincipal, fn: () => T): T => {
+  const state = context.getStore();
+  return state ? context.run({ hooks: state.hooks, principal }, fn) : fn();
 };
 export const membershipUser = (userId: string) =>
   and(
@@ -138,4 +160,7 @@ export const notificationAllowed = async (
 ) => (await context.getStore()?.hooks.notificationAllowed?.(db, input)) ?? true;
 export const accountDeleted = async (db: Db, userId: string) => {
   await context.getStore()?.hooks.accountDeleted?.(db, userId);
+};
+export const signInCompleted = async (db: Db, input: SignInCompletion) => {
+  await context.getStore()?.hooks.signInCompleted?.(db, input);
 };

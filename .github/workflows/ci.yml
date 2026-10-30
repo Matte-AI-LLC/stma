@@ -35,10 +35,21 @@ jobs:
       - run: npm test
       - run: npm run human-lab:check
       - run: npm run machine-lab:check
+      # The ledger hygiene rule asks whether each tier's newest pass is an ancestor of HEAD,
+      # which a one-commit checkout cannot answer (the test skips itself there). Fetch the
+      # history so it runs here instead of only on somebody's full clone.
+      - if: hashFiles('acceptance/owed.test.mjs') != ''
+        run: |
+          if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then git fetch --no-tags --unshallow origin; fi
       # The private acceptance map: which change owes a two-device round, and that the
       # real-agent lab still loads and still types the guide's own sentences.
       - if: hashFiles('acceptance/owed.test.mjs') != ''
         run: node --test acceptance/owed.test.mjs acceptance/agent-lab/lab.test.mjs
+      # Pure configuration, evidence and verdict checks only; never call a model in CI.
+      - if: hashFiles('acceptance/agent-worker/api-support.test.ts') != ''
+        run: |
+          npx tsc -p acceptance/agent-worker/tsconfig.json
+          npx tsx --test acceptance/agent-worker/api-support.test.ts
       # The public mirror's allowlist and scan, on every change rather than first
       # at the tag: v0.19.1's mirror was refused for one test comment after npm and
       # production had already shipped. The script is not in the public tree, so

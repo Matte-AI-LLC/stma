@@ -4,6 +4,7 @@ import type { Db } from '../db';
 import { agentInstallations, agentRuns, debugSessions, handoffs, projects, workClaims } from '../db/schema';
 import { assignableAgents, type AssignableAgent } from './assignments';
 import { RELEASED_CLAIM } from './agents';
+import { contactTimeOf } from './connectionState';
 
 /**
  * Who has which agent, and what each one is doing.
@@ -17,6 +18,8 @@ import { RELEASED_CLAIM } from './agents';
  */
 export interface RosterEntry {
   agent: AssignableAgent;
+  /** The last request the credential made, or null when only its registration is recorded. */
+  lastContactAt: Date | null;
   /** How far the agent's credential reaches: this is what "connected to a project" means. */
   reach: 'project' | 'workspace';
   /** The project its credential is bound to, when it is bound to one. */
@@ -32,9 +35,23 @@ export interface RosterEntry {
     holding: number;
   } | null;
   /** Work dispatched to it, or accepted by it, that is not finished. */
-  work: { sessionId: string; title: string; state: string; kind: string; projectId: string | null }[];
+  work: RosterWork[];
   /** The newest run it ended. */
   last: { runId: string; name: string | null; status: string; endedAt: Date | null; project: { slug: string; name: string } | null } | null;
+}
+
+/** One unfinished piece of work beside an agent, with the times its record carries. */
+export interface RosterWork {
+  sessionId: string;
+  title: string;
+  state: string;
+  kind: string;
+  projectId: string | null;
+  createdAt: Date;
+  acceptedAt: Date | null;
+  resumedAt: Date | null;
+  completedAt: Date | null;
+  updatedAt: Date;
 }
 
 const PENDING = ['offered', 'accepted', 'in_progress', 'needs_attention'];
@@ -95,6 +112,12 @@ export async function agentRoster(
     holding.set(claim.runId, (holding.get(claim.runId) ?? 0) + 1);
   }
 
+  const createdRows = await db
+    .select({ id: agentInstallations.id, createdAt: agentInstallations.createdAt })
+    .from(agentInstallations)
+    .where(inArray(agentInstallations.id, ids));
+  const createdBy = new Map(createdRows.map((row) => [row.id, row.createdAt]));
+
   const endedRows = await db
     .select()
     .from(agentRuns)
@@ -116,6 +139,11 @@ export async function agentRoster(
       sessionId: handoffs.sessionId,
       state: handoffs.state,
       kind: handoffs.kind,
+      createdAt: handoffs.createdAt,
+      acceptedAt: handoffs.acceptedAt,
+      resumedAt: handoffs.resumedAt,
+      completedAt: handoffs.completedAt,
+      updatedAt: handoffs.updatedAt,
       target: handoffs.targetInstallationId,
       acceptor: handoffs.installationId,
       title: debugSessions.title,
@@ -139,6 +167,9 @@ export async function agentRoster(
     const last = lastBy.get(agent.installationId);
     return {
       agent,
+      lastContactAt: createdBy.has(agent.installationId)
+        ? contactTimeOf({ lastSeenAt: agent.lastSeenAt, createdAt: createdBy.get(agent.installationId)! })
+        : null,
       reach: agent.projectId ? 'project' : 'workspace',
       boundProject: named(agent.projectId),
       live: live
@@ -154,7 +185,18 @@ export async function agentRoster(
         : null,
       work: workRows
         .filter((row) => row.target === agent.installationId || row.acceptor === agent.installationId)
-        .map((row) => ({ sessionId: row.sessionId, title: row.title, state: row.state, kind: row.kind, projectId: row.projectId })),
+        .map((row) => ({
+          sessionId: row.sessionId,
+          title: row.title,
+          state: row.state,
+          kind: row.kind,
+          projectId: row.projectId,
+          createdAt: row.createdAt,
+          acceptedAt: row.acceptedAt,
+          resumedAt: row.resumedAt,
+          completedAt: row.completedAt,
+          updatedAt: row.updatedAt,
+        })),
       last: last
         ? {
             runId: last.id,

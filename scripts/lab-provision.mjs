@@ -6,72 +6,86 @@
 
 import { base, form, jar, labIdentity, mask, mintToken, output } from './lab-common.mjs';
 
-const { team, email, password } = labIdentity();
-mask(password);
-const stamp = team.replace(/^lab-/, '');
+// The body runs inside one function so that a failure ends the process by
+// setting the exit code instead of throwing at the top level. fetch keeps
+// keep-alive sockets open, and Node on Windows aborts with 0xC0000409 when an
+// uncaught exception tears the process down while they are still open; an
+// ordinary exit code of 1 lets the handles close first.
+async function provision() {
+  const { team, email, password } = labIdentity();
+  mask(password);
+  const stamp = team.replace(/^lab-/, '');
 
-const session = jar();
+  const session = jar();
 
-const signup = await form(session, '/auth/local/signup', { email, password });
-if (signup.status !== 302) {
-  throw new Error(
-    `signup failed (${signup.status}) — staging needs SIGNUPS_OPEN=1: ${await signup.text()}`,
-  );
-}
+  const signup = await form(session, '/auth/local/signup', { email, password });
+  if (signup.status !== 302) {
+    throw new Error(
+      `signup failed (${signup.status}); staging needs SIGNUPS_OPEN=1: ${await signup.text()}`,
+    );
+  }
 
-const created = await form(session, '/app/teams', { name: `Lab ${stamp}` });
-if (created.status !== 302) throw new Error(`team create failed: ${created.status}`);
+  const created = await form(session, '/app/teams', { name: `Lab ${stamp}` });
+  if (created.status !== 302) throw new Error(`team create failed: ${created.status}`);
 
-// Hosted workspaces begin on Free, where governance is deliberately unavailable.
-// Exercise the same explicit, no-card evaluation action a real owner uses; never
-// mutate the stored plan or add a lab-only entitlement bypass.
-const evaluation = await form(session, `/app/teams/${team}/evaluation`, {});
-if (evaluation.status !== 303) {
-  throw new Error(
-    `Team evaluation failed (${evaluation.status}): ${await evaluation.text()}`,
-  );
-}
+  // Hosted workspaces begin on Free, where governance is deliberately unavailable.
+  // Exercise the same explicit, no-card evaluation action a real owner uses; never
+  // mutate the stored plan or add a lab-only entitlement bypass.
+  const evaluation = await form(session, `/app/teams/${team}/evaluation`, {});
+  if (evaluation.status !== 303) {
+    throw new Error(
+      `Team evaluation failed (${evaluation.status}): ${await evaluation.text()}`,
+    );
+  }
 
-const token = await mintToken(session, 'lab-bootstrap');
+  const token = await mintToken(session, 'lab-bootstrap');
 
-const api = async (path, body) => {
-  const res = await fetch(base + path, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
-    body: JSON.stringify(body),
+  const api = async (path, body) => {
+    const res = await fetch(base + path, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(`${path} -> ${res.status} ${await res.text()}`);
+    return res.json();
+  };
+
+  await api('/api/control/policies', {
+    team,
+    project: 'payments-api',
+    document: {
+      guidance: ['Keep migrations backwards compatible.'],
+      permissions: { deny: ['read secret values'], requireApproval: ['production changes'] },
+      requiredChecks: ['npm test'],
+      protectedPaths: ['db/migrations/**'],
+      environment: { requiredEnvVarNames: ['PATH'], runtimes: { node: '22.14.0' } },
+    },
   });
-  if (!res.ok) throw new Error(`${path} -> ${res.status} ${await res.text()}`);
-  return res.json();
-};
 
-await api('/api/control/policies', {
-  team,
-  project: 'payments-api',
-  document: {
-    guidance: ['Keep migrations backwards compatible.'],
-    permissions: { deny: ['read secret values'], requireApproval: ['production changes'] },
-    requiredChecks: ['npm test'],
-    protectedPaths: ['db/migrations/**'],
-    environment: { requiredEnvVarNames: ['PATH'], runtimes: { node: '22.14.0' } },
-  },
-});
+  // A hash no runner can reproduce: preflight must react to the lockfile it
+  // records, and stay quiet about the ones it does not.
+  await api('/api/control/environment-baselines', {
+    team,
+    project: 'payments-api',
+    snapshot: {
+      os: { platform: 'linux', arch: 'x64' },
+      runtimes: { node: '22.14.0' },
+      packageManagers: { npm: '11.0.0' },
+      lockfiles: [{ path: 'package-lock.json', hash: 'baseline0000000000000000000000000000lab' }],
+      envVarNames: ['PATH', 'HOME'],
+      git: { branch: 'main', sha: 'lab-baseline', dirtyFiles: [] },
+      timezone: 'Europe/Istanbul',
+    },
+  });
 
-// A hash no runner can reproduce: preflight must react to the lockfile it
-// records, and stay quiet about the ones it does not.
-await api('/api/control/environment-baselines', {
-  team,
-  project: 'payments-api',
-  snapshot: {
-    os: { platform: 'linux', arch: 'x64' },
-    runtimes: { node: '22.14.0' },
-    packageManagers: { npm: '11.0.0' },
-    lockfiles: [{ path: 'package-lock.json', hash: 'baseline0000000000000000000000000000lab' }],
-    envVarNames: ['PATH', 'HOME'],
-    git: { branch: 'main', sha: 'lab-baseline', dirtyFiles: [] },
-    timezone: 'Europe/Istanbul',
-  },
-});
+  output('team', team);
 
-output('team', team);
+  console.log(`provisioned team ${team} for ${email}`);
+}
 
-console.log(`provisioned team ${team} for ${email}`);
+try {
+  await provision();
+} catch (error) {
+  console.error(error instanceof Error ? error.stack ?? error.message : error);
+  process.exitCode = 1;
+}

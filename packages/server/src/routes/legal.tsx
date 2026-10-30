@@ -36,7 +36,10 @@ export const legalRoutes = new Hono<AppEnv>();
  * that promised less is not a material change either.
  */
 const TERMS_EFFECTIVE = '26 September 2026';
-const PRIVACY_EFFECTIVE = '24 September 2026';
+// Moved on 22 October 2026 for authenticator apps: a new kind of stored data
+// (an encrypted secret and hashed recovery codes) and a new cookie (`mfa`).
+// The owner confirms or adjusts the date when the change is reviewed.
+const PRIVACY_EFFECTIVE = '22 October 2026';
 const SUPPORT = 'support@stma.ai';
 const PRIVACY = 'gdpr@matteai.com';
 /**
@@ -374,8 +377,11 @@ const termsSections = (): Section[] => [
           anyway, write to <Mail to={SECURITY} /> and we will remove it.
         </P>
         <P head="What we do not do with it.">
-          We do not sell Customer Content, use it for advertising, send it to any AI model provider
-          or use it to train AI models.
+          We do not sell Customer Content, use it for advertising, send it from the Service to an AI
+          model provider or use it to train AI models. If you explicitly enable managed local
+          execution, the assigned task and its context are sent by the local Claude Code runtime on
+          your machine directly to the provider account you configure. That provider handles the
+          request under its own terms and privacy policy; STMA does not proxy model requests.
         </P>
         <P head="Removal.">
           We may remove content, or suspend access to it, if we reasonably believe it breaks these
@@ -936,7 +942,10 @@ const privacySections = (): Section[] => [
             browser sends (its user-agent string), the IP address it last came from and when, which
             we show you on your Account page; one-time sign-in and reset codes, stored as hashes;
             and counts of failed sign-in attempts, kept against a hash of the email address rather
-            than the address.
+            than the address. If you add an authenticator app, the secret it shares with us, stored
+            encrypted, the time of the last code it accepted, and your recovery codes, stored only
+            as hashes. If our staff reset that app for you, a record of when, which staff account
+            did it and which of a fixed set of reasons applied.
           </li>
           <li>
             <b>Workspace data:</b> workspace names, memberships and roles, invitations (with the
@@ -1027,8 +1036,11 @@ const privacySections = (): Section[] => [
           </li>
           <li>
             <b>Data for sale or for AI training.</b> We do not sell personal data or share it for
-            advertising, and we do not send workspace content to any AI model provider or use it to
-            train AI models.
+            advertising, send workspace content from the Service to any AI model provider, or use it
+            to train AI models. Managed local execution is separately opt-in: its local runtime
+            sends the assigned task and context from your machine directly to the provider account
+            you configure, under that provider's terms and privacy policy. STMA does not proxy those
+            model requests.
           </li>
         </List>
         <P>
@@ -1229,6 +1241,10 @@ const privacySections = (): Section[] => [
               'Until you sign out or end them, and at most 30 days after sign-in',
             ],
             ['One-time sign-in and reset codes', 'Valid for 10 minutes; deleted an hour after they expire'],
+            [
+              'Records that our staff reset your authenticator app',
+              'Not removed by age, within a cap on the number of entries; once your account is deleted they no longer name you',
+            ],
             ['Invitations and agent connection codes', 'Deleted 30 days after they expire'],
             [
               'Agent connections',
@@ -1306,7 +1322,9 @@ const privacySections = (): Section[] => [
           </li>
           <li>
             Sign-in is protected with emailed codes and a throttle on failed attempts that tells the
-            account holder, and you can see and end your browser sessions.
+            account holder, and you can see and end your browser sessions. You can add an
+            authenticator app; its secret is encrypted with AES-256-GCM and never stored without
+            encryption, and its recovery codes are stored only as hashes.
           </li>
           <li>
             Common credential formats are redacted from messages, attachments, error records and
@@ -1404,6 +1422,11 @@ const privacySections = (): Section[] => [
             ],
             [<code>pending</code>, 'Remembers which sign-in code you are entering', '25 minutes'],
             [<code>reset</code>, 'Remembers which password reset code you are entering', '25 minutes'],
+            [
+              <code>mfa</code>,
+              'Remembers which sign-in you are completing with your authenticator app',
+              '10 minutes',
+            ],
             [
               <code>oauth</code>,
               'Protects a sign-in with GitHub while it is in progress, where that is offered',

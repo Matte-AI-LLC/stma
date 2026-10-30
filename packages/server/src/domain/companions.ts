@@ -411,6 +411,31 @@ export async function adapterListensFor(
   return Boolean(row);
 }
 
+/**
+ * The agent a local adapter listens for, read back under the rules
+ * `adapterListensFor` reads the same edge with (a live adapter, one person's
+ * on both sides, the agent not revoked), or undefined for any other row. What
+ * "this agent" means when the run in hand is an adapter's: the agent and every
+ * adapter listening for it, not the adapter alone.
+ */
+export async function agentListenedForBy(db: Db, installationId: string): Promise<string | undefined> {
+  const [row] = await db
+    .select({ id: companionInstallations.id })
+    .from(agentInstallations)
+    .innerJoin(companionInstallations, eq(companionInstallations.id, agentInstallations.companionOf))
+    .where(
+      and(
+        eq(agentInstallations.id, installationId),
+        isAdapterSql,
+        isNull(agentInstallations.revokedAt),
+        eq(agentInstallations.userId, companionInstallations.userId),
+        isNull(companionInstallations.revokedAt),
+      ),
+    )
+    .limit(1);
+  return row?.id;
+}
+
 /** The live agent this installation listens for — what the news endpoint asks on behalf of. */
 export async function liveCompanion(db: Db, userId: string, companionId: string | null | undefined) {
   if (!companionId) return undefined;

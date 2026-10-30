@@ -77,12 +77,94 @@ account with an email address, everything is switched on and nothing is billed. 
 self-host — the self-host path needs no
 invitation and is not a reduced product.
 
-STMA does not wake a sleeping agent. MCP is client-initiated: the server cannot start local commands
-or inspect repository files, and receives local data only when the client chooses to send it in a
-tool call. Ask the second agent to read and reply, then ask the first to check. After that first
-result, add repository context, other people or work tracking only when needed. The
+STMA does not wake a sleeping machine or an ordinary coding client. MCP is client-initiated: the
+server cannot start arbitrary local commands or inspect repository files. An explicitly enabled
+managed target can poll for an assigned job while its foreground worker is running; it does not
+install an OS service or survive a closed terminal. Ask the second agent to read and reply, then ask
+the first to check. After that first result, add repository context, other people or work tracking
+only when needed. The
 [in-app guide](https://stma.ai/docs#quickstart) explains each optional next step; use
 `/docs#quickstart` on your own deployment for its correct MCP address.
+
+## Client support
+
+What each kind of client can do with STMA, from what the code implements. The last column says
+whether a real client of that kind has been driven through STMA on the current release; where it
+says no, the feature is implemented and has not been re-verified there.
+
+| Client | MCP tools | Local hooks | File-tool guard | Tested with the real client |
+| --- | --- | --- | --- | --- |
+| Claude Code | yes | yes | yes, for Edit, Write, MultiEdit and NotebookEdit | yes |
+| Codex | yes | yes, after you trust them at `/hooks` | yes, for `apply_patch` | not on the current release |
+| Cursor | yes | lifecycle events only | no | no |
+| Any other MCP client | yes | no | no | no, protocol tests only |
+
+A client connected by MCP alone is warned and told about collisions by the tools it calls, and
+nothing stops its edits. The optional managed worker is currently a Claude Code foreground worker
+using the fixed `claude-print-v1` runtime and `restricted-files-v1` permission profile. Its
+file-tool limits are not an OS sandbox: they do not isolate code from the same OS user's files or
+credentials. It does not enable shell, Git, tests, subagents, web access, waking a laptop, or cloud
+fallback. Prompt-required operations stop as `needs_input`. The fixed local runtime's API-key
+execution path passed controlled runs on Windows and macOS. This does not verify `stma worker`
+CLI configuration/start or interactive enrollment, Native Work delivery, or active-process
+cancellation. Ordinary-agent T2 and the two-device T3 lab are separate flows and do not broaden
+managed-worker coverage. The existing client test column describes regular client integration,
+not the worker runtime.
+
+### Managed local worker
+
+Use a dedicated Git checkout bound to the intended project's repository. Install the standalone
+CLI containing the worker commands:
+
+```
+npm install -g @matteai/stma@0.21.0
+```
+
+From the project's **Agent connections** page, create a Claude Code connect command and run it in
+the dedicated checkout. Then run `stma adapter status` there and note the profile ID for this
+project; it supplies the worker's separate STMA authentication. Set the provider API key in the
+local environment variable you will name with `--api-key-env`; do not put the key in the command
+line. Use a native Claude Code executable version 2.1.278 or newer in the 2.1 series. From the
+same checkout, configure the worker:
+
+```
+stma worker configure --server HTTPS_ORIGIN --runtime-executable "ABSOLUTE_PATH_TO_NATIVE_CLAUDE" --api-key-env ANTHROPIC_API_KEY --max-runtime-seconds 300 --max-turns 10 --dedicated --profile PROFILE_ID
+```
+
+Configuration registers a disabled target. Open the printed enable URL (or **Agent connections**)
+and have the installation owner review and enable it. Then run `stma worker status` and
+`stma worker doctor`, and start the foreground poller with `stma worker start`. In your MCP client,
+call `list_execution_targets` to find the ready target's `target_id`. Create or assign work as
+usual, then explicitly call `dispatch_work` with that `target_id`, the assignment's `session_id`,
+and a fresh `request_id`. Assignment alone does not start a worker. Poll `get_execution` with the
+returned `execution_id` to see whether the job started and its reported state. Use
+`cancel_execution` to request cancellation; check the resulting state because a request does not
+prove the process stopped.
+
+The worker verifies API-key authentication in an isolated configuration directory; subscription
+login is not accepted. It follows the assignment's current state, and unavailable required Native
+Work commands or evidence require a human step. Those prompt instructions are not an added write
+guard. Overlapping lifecycle hooks wait up to 10 seconds for the lock owner; timeout or lost
+ownership fails closed, and hooks do not evict an existing lock automatically.
+
+While the worker is running, `stma worker pause` stops new claims, `stma worker resume` resumes
+polling, `stma worker stop` requests the current process to stop, and `stma worker disable`
+disables the target. An uncertain stop quarantines that checkout for human recovery. The timeout
+and requested CLI turn limit are operational controls, not a guaranteed dollar cap; provider-
+reported turn counts may differ, and STMA does not measure every BYO provider charge. The worker
+has one active job at a time and is not an OS service; its process must remain open. See the
+[managed execution tool reference](https://stma.ai/docs#tools-execution) for tool parameters and
+states.
+
+For a source checkout, build from the STMA monorepo root with `npm run build --prefix packages/cli`,
+then prefix worker commands with `node "PATH_TO_STMA_REPO/packages/cli/dist/index.js"`. Do not use
+the `npm run cli` TypeScript development shortcut; worker configuration requires the built CLI.
+
+Empty queue polls
+back off from 5 seconds to 30 seconds with bounded jitter. Ordinary MCP clients see the 49-tool catalog;
+attempt-scoped worker credentials see only their 18 shared allowed tools. This omits
+unavailable catalog schemas from the worker's model context; request authorization
+remains independently enforced.
 
 ## Beyond the first reply
 
@@ -92,7 +174,7 @@ workspace, and a project-only connection is accepted only for that exact pair. W
 keeps its MCP entry (Codex user configuration, a Claude Code checkout) decides which local tasks
 load it, never the server-side project grant. Plans also belong to workspaces, not accounts; one person can have
 different roles in several workspaces on different plans.
-**Needs attention** collects bounded handoffs, overlap events and missing policy reports.
+**Needs attention** lists live scope overlaps, waiting handoffs and policy hash drift with the project, run, person when known and one next step, says how much it read, and never offers an approve or start control.
 Management tools live under **Rules set here** and **Workspace settings** in the workspace rail.
 A handoff needs explicit `update_handoff`
 accept/resume/complete actions; a chat reply cannot silently clear it.
@@ -102,6 +184,9 @@ prove compliance, and `completed` does not prove CI passed. Delivery `.md` downl
 schema-v2 setup IDs; `record_delivery_receipt` validates scope, mode and hashes but never treats an
 agent report as human approval. Repositories supports exact project bindings and read-only GitHub
 workflow verification. Single-workflow success is not all required checks.
+Native Work evidence also labels each report's current, stale, unavailable, superseded or withdrawn
+validity separately from its assertion. Reading back an unfinished provider run preserves the last
+completed observation; it cannot establish a new passing check.
 
 Run readiness is advisory: approvals, change budgets, duplicate work and overlapping claims are
 warnings an agent and its human must act on, not a technical lock. Immutable `start`, `delivery` and
@@ -117,6 +202,12 @@ set `STMA_INTEGRATION_REQUIRE_ENCRYPTION=1` to refuse unencrypted new writes. Ro
 versions while writing the active version. For PostgreSQL, run
 `npx tsx scripts/rotate-integration-secrets.ts` for a read-only dry run. Applying requires `--apply`
 and `--confirm-database=<exact name>`, a backup, and all old key versions. No credentials are printed.
+Authenticator-app secrets are sealed with the same keyring under their own associated data and are
+never stored unencrypted, whatever `STMA_INTEGRATION_REQUIRE_ENCRYPTION` says: without keys the
+server does not offer authenticator apps. The rotation script re-seals them with the integration
+credentials; the per-row re-seal is covered by the test suite, the script's PostgreSQL statements
+are not, so run the dry run first and check that the key counts it prints move after `--apply`. Losing the key leaves enrolled people with their recovery codes or an operator reset,
+so back the key up separately from the database and never generate a new one in its place.
 
 Activity/event age limits and row caps differ from snapshot/session retention. “No age expiry”
 is not unlimited history. User-submitted messages/attachments may contain code or secrets; the
@@ -141,9 +232,10 @@ cross-scope drift.
 - **Debug sessions** — topic-based rooms where agents exchange typed messages (question,
   hypothesis, info-request, resolution) asynchronously, with humans in the loop.
 - **Plain MCP over HTTP** — works with any MCP-capable agent (Claude Code, Cursor, ...). No local
-  daemon, no NAT issues; everything is persisted server-side so teammates never need to be online
-  at the same time. Calls originate from the client: STMA cannot wake an agent, execute a local
-  command or read repository files by itself.
+  daemon or inbound port is needed for ordinary MCP use. An explicitly enabled local worker can
+  poll for assigned work while its foreground process runs; it does not wake the machine, create an
+  OS service, execute arbitrary shell commands or read repository files outside its fixed tool
+  profile.
 - **Live Agent Map** — active runs are attributed to a human, client, team, project, task, branch
   and leased work scope. Overlapping writes are surfaced before agents silently invalidate each
   other's work.
@@ -161,7 +253,7 @@ cross-scope drift.
 Public beta. This section documents the current source contract; a capability is not available on
 a deployment until that build is released and its environment-specific gates pass. Highlights:
 
-- **37 MCP tools** over a stateless Streamable HTTP endpoint: identity & onboarding (`whoami`,
+- **49 MCP tools** over a stateless Streamable HTTP endpoint: identity & onboarding (`whoami`,
   `list_teammates`, `create_invite`, `onboard_repo`, `list_projects`), snapshots & diff
   (`get_snapshot_checklist`, `push_snapshot`, `get_snapshot`, `compare_env`), debug sessions
   (`open_session`, `list_sessions`, `get_session`, `post_message`, `resolve_session`, `inbox`,
@@ -170,7 +262,11 @@ a deployment until that build is released and its environment-specific gates pas
   `handoff_work`, `assign_work`, `list_issues`, `list_clickup_tasks`, `get_evidence`,
   `launch_check`, `update_handoff`, `record_delivery_receipt`). The **Knowledge Hub group** is
   `get_knowledge_context`, `report_knowledge_receipt`, `search_knowledge`, `get_knowledge`, and
-  `propose_knowledge`.
+  `propose_knowledge`. The **Native Work group** is `list_work`, `get_work`, `create_work`,
+  `update_work`, `submit_work`, `record_work_evidence`, `get_work_context` and `get_work_changes`.
+  The execution group is `list_execution_targets`, `dispatch_work`, `get_execution` and
+  `cancel_execution`: dispatch requires an explicitly enabled local target; an offline worker leaves
+  the job queued. Existing `assign_work` records an assignment and never starts execution.
 - **The fleet layer is reachable from MCP alone.** Runs, work claims, conflict warnings, policy
   pull and environment preflight no longer require the CLI and native hooks. A current connection
   binds one scoped credential to one durable agent installation; legacy PATs retain their
@@ -266,6 +362,29 @@ a deployment until that build is released and its environment-specific gates pas
   Peer-authored branch-handoff `next_steps` that mention credentials are accepted only in that explicit
   source-machine/non-secret-outcome form; instructions to provision, copy or use a credential on
   the receiver are refused before the handoff is created or the source run releases its claims.
+- **Native Work** (`/app/teams/<slug>/projects/<project>/work`, 2026-10-23): a durable work item in a
+  project that outlives the agents, runs, sessions and trackers that touch it, and needs none of
+  them. It has a key such as `WORK-12`, a contract that is a new immutable revision whenever it
+  changes, acceptance criteria that each name the evidence they need, and an owner and an acceptor
+  who are people, both needed before it is ready. Assignments, runs and handoffs link to it, pinned to the revision they were given,
+  and a revision that moved under them is refused with `CONTRACT_CHANGED` instead of being relabelled.
+  A delivery is an immutable set of exact artifacts (a full commit, a versioned document, a file
+  digest); evidence is labelled with whose word it is, and readiness is computed per criterion with
+  unknown, stale and unreachable evidence never counted as a pass.
+  Only a person, in the console, accepts or sends work back, against the exact evidence shown, and no agent connection can.
+  Every write takes a request id, and a change to an existing item the version read, so a retry
+  is one change and a stale form cannot overwrite anything. A project's Work page has tabs for what
+  is yours, waiting for a decision, blocked, ready, in progress, in review and all of it, and
+  the assignments and handoffs dispatched there (a draft, accepted or cancelled item is under All); `get_work_context` returns a short
+  package inside a byte budget; `get_work_changes` returns what entered, changed in and left a
+  filter since a signed cursor. A work item can start from, or reference, a GitHub issue that STMA
+  only reads. An analyst is the client you already use, reading with the read tools and answering
+  "what is waiting for my decision?", "which delivery's evidence is stale?" and "which dependency
+  stopped this work?" with a work or evidence pointer, the time read and what the connection could
+  not see; a connection limited to one project sees no count, key or title of another. Work sends
+  no "waiting for you" email yet, writes to no tracker, and has no separate read-only credential. It is included on
+  every plan; the hosted service caps a project at 5,000 work items, 200 deliveries per item and
+  500 evidence rows per delivery as a safety limit.
 - **Knowledge Hub** (`/app/teams/<slug>/knowledge`): versioned decisions, domain facts, procedures,
   references and known solutions with workspace or selected-project audiences. Agents and owners
   may create immutable drafts; only a workspace owner publishes, supersedes, archives or withdraws
@@ -500,7 +619,14 @@ a deployment until that build is released and its environment-specific gates pas
   in the agent map and on the run's own page (`/app/teams/<workspace>/runs/<run>`), which keeps it
   after the run leaves the map and says where each line came from (reported by the agent, observed
   by STMA, observed by the provider), with **Copy as Markdown** for a pull request. Nothing posts
-  it anywhere, and it is evidence, not permission to merge.
+  it anywhere, and it is evidence, not permission to merge. The page and its Markdown are sections
+  by source, carry the run, checkpoint and full commit beside the project's repository, say why a
+  provider line is empty (nothing connected, the connection's last check failed, a result for an
+  older commit only, which is never carried, or nothing yet), list where the work was handed over
+  with the receiver's accept and resume times, and give the full policy and Knowledge receipts,
+  which are not compliance or approval. **Copy for a pull request** is a short block; both say the
+  link opens for workspace members only. Text somebody else wrote is redacted and escaped, so a
+  pasted pack cannot form a link, image, HTML, heading or mention.
 - **The receiver sees what was handed over.** A handoff's thread shows the commit the receiver
   must be on, the tests the sender reported there and what a connected provider observed at that
   exact commit, each labelled with whose word it is, and links to the evidence of the run the work
@@ -704,10 +830,14 @@ inviting its second human; current member count is not a checkout prerequisite.
 
 | Plan | Price | Human limit | Hosted service |
 | --- | --- | --- | --- |
-| Cloud Free | $0 | 1 | snapshots from 2 devices per 30 days, 90-day history, 3 handoffs/30 days, read-only fleet |
-| Solo | $9/month or $90/year | exactly 1 | unlimited agents/devices/handoffs, governance, 1-year history |
+| Cloud Free | $0 | 1 | snapshots from 2 devices per 30 days, 90-day history, 3 handoffs/30 days, read-only fleet, run evidence and Markdown export |
+| Solo | $9/month or $90/year | exactly 1 | unlimited agents/devices/handoffs, governance, 1-year history, run evidence and Markdown export |
 | Team | $49/month or $490/year includes 5; then $12/month or $120/year per human | 2–50 | full collaboration, evidence, integrations and history |
 | Enterprise | from $15K/year, annual contract | contract | operator-provisioned identity and limited audit capabilities; exact support and rollout agreed separately |
+
+Every plan reads and exports the evidence of runs its members can already see: the run page, its
+Markdown, the map's inspector and `get_evidence` answer one decision, and a downgrade removes none
+of it. Enterprise audit, identity enforcement and retention are separate from it.
 
 Cloud Free's device ceiling counts the device labels one person pushed environment snapshots under
 in the last 30 days. A third is refused before anything is stored, the reply names the two that
@@ -746,6 +876,19 @@ remain agent reports beside provider facts, never a fabricated approval. See [Pr
   a 6-digit code mailed to the account (10 minutes, single use, 5 attempts, 3 sends per 15
   minutes). Changing a password needs the current password *plus* a fresh code, signs out
   other browsers and emails a notice.
+- **Authenticator app (TOTP)**: optional, per account, from Account. It works with any standard
+  authenticator app (SHA-1, 6 digits, 30 seconds; a QR code and a manual key). Setting it up
+  needs the current password, or a sign-in from the last 10 minutes for an account without one,
+  and it turns on only after the app's first valid code. From then on every browser sign-in path
+  (password, emailed code, GitHub, organization single sign-on, review access, dev login) asks for
+  its code, the emailed code is not sent instead, and `AUTH_2FA` does not turn it off. Ten
+  single-use recovery codes cover a lost phone; past those, an operator resets it from
+  `/admin/users/:id`, which needs the operator's own sign-in from the last 10 minutes and records
+  each reset on that page (when, by whom, why). A password reset by email keeps it on, agent connections are not changed by
+  it (except in an organization that requires an authenticator app, where connections approved
+  before a change to it must be approved again), and the terminal invite door refuses an account
+  that has one. It is offered only where
+  `STMA_INTEGRATION_KEYS` is configured, because the secret is never stored unencrypted.
 - **Confirming and correcting the address**: signup mails a confirmation code and does not block on
   it, and **every signed-in page** carries a band saying the address is unconfirmed until somebody
   enters one — a page you have to go looking for is not a notice, and not blocking is only
@@ -1048,21 +1191,35 @@ by STMA. The consent page suggests the checkout folder as the agent name. Older 
 should be updated before continuing. Client UI
 names can change; the protocol boundary is the stable MCP address and browser consent page.
 
-**The Claude app** (Claude on the web, desktop, phone or in Cowork) connects the same way, as a
-connector: add `{BASE_URL}/mcp` under Claude's connectors, or follow **Add STMA to Claude** in the
-guide (`/docs#claude-app`), which opens Claude's own Add custom connector dialog with the address
-filled in for you to confirm. Claude detects **Sign in now** and **Register automatically**; keep
-both. The consent page asks for no machine, because one connection serves every Claude app on the
-account, and proposes Personal access so it can answer across your workspaces. It is your console,
-not an agent in a checkout: nobody can assign it work, it installs nothing, and Claude asks you
-before each write it makes, since every tool that writes is marked destructive. Claude Code in a
-checkout that has its own entry for the same address uses that entry, which hides the connector.
+There are two ways in, and one account can use both. The first is **the Claude app console**:
+Claude on the web, desktop, phone or in Cowork, connected as a connector. Add `{BASE_URL}/mcp` under
+Claude's connectors, or follow **Add STMA to Claude** in the guide (`/docs#claude-app`) or on the
+workspace's Agent connections page (`#claude-app`), which opens Claude's own Add custom connector
+dialog with the address filled in for you to confirm. Claude detects **Sign in now** and **Register
+automatically**; keep both. The consent page asks for no machine, because one connection serves every
+Claude app on the account, and proposes Personal access so it can answer across your workspaces; it
+says when you already have a live Claude app connection. The console is not an agent in a checkout:
+nobody can assign it work, it installs no hooks and has no file guard, the Test card marks a first
+exchange that included it as proving less, and Claude asks you before each write it makes, since every tool that
+writes is marked destructive. The second is **a coding agent in a checkout**: Claude Code, Codex or
+Cursor connected to a project with `stma connect` (`#connect` on the same page), which installs its
+hooks and can be assigned work. Claude Code in a checkout that has its own entry for the same address
+uses that entry, which hides the connector.
 
 The OAuth connection is MCP-only. It does not install git hooks, file guards, runtimes or repository
 files. Those local capabilities require a separately packaged, visibly approved adapter. A client
 that cannot complete OAuth may open **Legacy setup prompt (compatibility)**. That fallback retains
 the older 30-minute single-use envelope and model-mediated Connector v2 path below; it is not the
 recommended onboarding experience.
+
+Agent connections describes each connection as five separate facts instead of one status:
+**authorization** (revoked, setup expired, awaiting client, authorized, legacy and unverified, or sign
+in again), **local adapter** (paired, installed by `stma connect`, or none reported), **last contact**
+(the newest authenticated request, run heartbeat or OAuth token issue, with its source), **task** (what
+the agent's own run last reported) and **next step** (one command or click that exists). Each has the
+time it was observed. STMA records requests that arrive with a credential; it has no process heartbeat
+and cannot read your checkout, so whether hooks are on disk and whether the client is open are shown as
+unknown, and a connection is never called online, idle or running.
 
 ### Legacy connector fallback
 
@@ -1223,7 +1380,7 @@ Three things are worth knowing before you turn the number up.
 | `RESEND_API_KEY` | no | Resend API key for account emails (sign-in codes, password reset). Without it nothing is sent: mail stays in an in-process outbox, the log names only its kind and never a code, and email 2FA defaults off |
 | `MAIL_FROM` | no | Sender address (default `STMA <noreply@stma.ai>`). **Its domain must be verified with your mail provider**, or every message is refused and nothing says so on a page: sign-in codes and password resets simply stop arriving. A configured key proves an account, never a verified domain, so the server prints this address at boot and `/admin/ops` carries a Mail card with the provider's own refusal |
 | `ADMIN_USERNAMES` / `ADMIN_EMAILS` | no | Comma-separated operator lists. Unset → `/admin` (incl. `/admin/usage`) is a plain 404. An address counts only once the account has **confirmed** it (Account → Send me a code), and a new account can never take a listed username — so list a username the operator already holds, or an address they can read |
-| `AUTH_2FA` | no | `1` forces email sign-in codes on, `0` off. Default: on when `RESEND_API_KEY` is set. Also gates password-change confirmation and self-service reset |
+| `AUTH_2FA` | no | `1` forces email sign-in codes on, `0` off. Default: on when `RESEND_API_KEY` is set. Also gates password-change confirmation and self-service reset. Does not turn off an authenticator app an account has enabled. |
 | `ADMIN_EMAILS` | no | Comma-separated operator addresses for `/admin`; works alongside `ADMIN_USERNAMES`. **Only a confirmed address counts**: signing up with a listed address is not being the operator. Needs a mail transport, since confirming means entering a code sent to it; without one, use `ADMIN_USERNAMES` |
 | `AUTH_LOCAL` | no | Local username+password accounts (default on; `0` disables) |
 | `SIGNUPS_OPEN` | no | `0` closes new local account registration, except for somebody opening a live invitation |

@@ -21,12 +21,21 @@ import {
   setPendingChallenge,
 } from '../auth/codes';
 import {
-  createSession,
   destroySession,
   findDevUser,
   invalidateAllSessions,
   sanitizeNext,
 } from '../auth/session';
+import {
+  AUTHENTICATOR_PAGE,
+  cancelSecondFactor,
+  clearSecondFactorCookie,
+  completeSecondFactor,
+  MFA_CHALLENGE_MINUTES,
+  pendingSecondFactor,
+  startSignIn,
+} from '../auth/signIn';
+import { hasActiveAuthenticator } from '../auth/secondFactor';
 import { accessCodeRequired, cohortOf, matchAccessCode } from '../auth/accessCodes';
 import {
   LOGIN_FAIL_WINDOW_MS,
@@ -444,7 +453,9 @@ authRoutes.post('/auth/local/signup', async (c) => {
     logLine({ evt: 'auth', a: 'signup_fail', em: maskEmail(email), why: 'taken' });
     return back(taken);
   }
-  await createSession(c, user.id);
+  // A new account has no authenticator, so this is always a session; it goes
+  // through the one door anyway, so no path writes a session on its own.
+  await startSignIn(c, user.id, { method: 'signup', next });
   /**
    * Prove the address, starting now, without standing in the way.
    *
@@ -582,19 +593,42 @@ authRoutes.post('/auth/local/login', async (c) => {
       // password was being checked. An old password must not open a new session.
       const [current] = await tx.select().from(users).where(eq(users.id, user.id)).limit(1).for('update');
       if (!current?.isTest || current.passwordHash !== user.passwordHash || !(await testAccountAvailable(tx as unknown as Db, current))) return false;
+      // A test identity cannot add an authenticator (Account refuses it), so
+      // one that somehow has one is refused rather than given a challenge.
+      if (await hasActiveAuthenticator(tx as unknown as Db, current.id)) return false;
       const remainingDays = (current.reviewAccessUntil!.getTime() - Date.now()) / 86_400_000;
-      await createSession(c, current.id, Math.min(REVIEW_SESSION_DAYS, remainingDays), tx as unknown as Db);
+      await startSignIn(c, current.id, {
+        method: 'test',
+        next,
+        sessionDays: Math.min(REVIEW_SESSION_DAYS, remainingDays),
+        db: tx as unknown as Db,
+      });
       return true;
     });
     if (!signedIn) return fail(TEST_ACCOUNT_UNAVAILABLE);
     logLine({ evt: 'auth', a: 'test_login', u: user.username });
     return c.redirect(next);
   }
+  // An authenticator app replaces every other second step, and comes before
+  // all of them: before review access, which only ever skipped the EMAILED
+  // code, and before `AUTH_2FA`, which decides whether codes are emailed and
+  // never whether somebody's own authenticator is asked for. No emailed code
+  // is offered beside it, because a mailbox must not stand in for the phone.
+  if (await hasActiveAuthenticator(db, user.id)) {
+    const started = await startSignIn(c, user.id, {
+      method: 'password',
+      next,
+      // A reviewer's session stays as short as review access makes it.
+      sessionDays: env.twoFactor && reviewAccessActive(user) ? REVIEW_SESSION_DAYS : undefined,
+    });
+    return c.redirect(started.kind === 'challenge' ? started.redirect : next);
+  }
   // An account an operator opened for a directory reviewer, who has the
   // password and not the mailbox (`lib/reviewAccess.ts`). Everything above
   // still ran, the throttle included; the address is told instead of asked.
   if (env.twoFactor && reviewAccessActive(user)) {
-    await createSession(c, user.id, REVIEW_SESSION_DAYS);
+    const started = await startSignIn(c, user.id, { method: 'review', next, sessionDays: REVIEW_SESSION_DAYS });
+    if (started.kind === 'challenge') return c.redirect(started.redirect);
     logLine({ evt: 'auth', a: 'review_login', u: user.username });
     if (user.email) {
       void sendMail(env, { to: user.email, ...reviewSignInEmail(env.baseUrl, reviewAccessLastDay(user.reviewAccessUntil!)) });
@@ -602,7 +636,8 @@ authRoutes.post('/auth/local/login', async (c) => {
     return c.redirect(next);
   }
   if (env.twoFactor) return startLoginChallenge(c, user, next);
-  await createSession(c, user.id);
+  const started = await startSignIn(c, user.id, { method: 'password', next });
+  if (started.kind === 'challenge') return c.redirect(started.redirect);
   logLine({ evt: 'auth', a: 'login', u: user.username });
   return c.redirect(next);
 });
@@ -711,7 +746,10 @@ authRoutes.post('/auth/local/verify', async (c) => {
   const result = await checkChallenge(db, id, 'login', code);
   if (result.status === 'ok') {
     clearPendingChallenge(c, 'login');
-    await createSession(c, result.userId);
+    // An authenticator added from another browser while this code was on its
+    // way still has to be asked for.
+    const started = await startSignIn(c, result.userId, { method: 'email_code', next });
+    if (started.kind === 'challenge') return c.redirect(started.redirect);
     const rows = await db
       .select({ username: users.username })
       .from(users)
@@ -753,6 +791,108 @@ authRoutes.post('/auth/local/resend', async (c) => {
   const user = rows[0];
   if (!user?.email) return expired();
   return startLoginChallenge(c, user, next, 'A new code is on its way.');
+});
+
+// ------------------------------------------------------------ authenticator app
+
+/**
+ * The step an account with an authenticator app takes after proving who it is,
+ * whichever way it did. Reachable only with a live `mfa` cookie, and it names no
+ * account: the code page of one person looks exactly like the code page of
+ * anybody else.
+ */
+const AuthenticatorPage = ({ error }: { error?: string }) => (
+  <html lang="en">
+    <Head title="Authenticator code" />
+    <body>
+      <div class="auth-wrap">
+        <div class="auth-card">
+          <a class="auth-home" href="/" aria-label="STMA home">
+            <Logo lg />
+          </a>
+          <div>
+            <h1>Enter your authenticator code</h1>
+            <p class="lede">
+              Open the authenticator app on your phone and enter the 6-digit code it shows for
+              STMA. Lost the phone? Enter one of your recovery codes instead.
+            </p>
+          </div>
+          {error ? (
+            <div class="banner banner-error">
+              <span class="ic">!</span>
+              <span>{error}</span>
+            </div>
+          ) : null}
+          <form class="authform wide" method="post" action="/auth/mfa/verify">
+            <div class="field">
+              <label for="mfa-code">Code</label>
+              <input
+                class="in"
+                id="mfa-code"
+                type="text"
+                name="code"
+                autocomplete="one-time-code"
+                autocapitalize="off"
+                spellcheck={false}
+                maxlength={32}
+                placeholder="000000"
+                required
+              />
+              <span class="help">The code changes every 30 seconds. A recovery code works once.</span>
+            </div>
+            <button class="btn btn-primary" style="width:100%;height:44px" type="submit">
+              Sign in
+            </button>
+          </form>
+          <form class="m0" method="post" action="/auth/mfa/cancel" style="text-align:center">
+            <button class="linklike" type="submit">
+              Cancel and start over
+            </button>
+          </form>
+          <p class="finenote">
+            This step expires {MFA_CHALLENGE_MINUTES} minutes after you started signing in. Code not
+            accepted, or no phone and no recovery codes? <a href="/help#signin">See what to do</a>.
+          </p>
+        </div>
+      </div>
+    </body>
+  </html>
+);
+
+authRoutes.get(AUTHENTICATOR_PAGE, async (c) => {
+  c.header('Cache-Control', 'no-store');
+  if (!(await pendingSecondFactor(c))) {
+    clearSecondFactorCookie(c);
+    return c.redirect(
+      `/login?error=${encodeURIComponent('Your sign-in attempt expired. Sign in again.')}`,
+    );
+  }
+  return c.html(<AuthenticatorPage error={c.req.query('error')} />);
+});
+
+authRoutes.post('/auth/mfa/verify', async (c) => {
+  const body = await c.req.parseBody();
+  const code = typeof body.code === 'string' ? body.code.trim().slice(0, 64) : '';
+  const result = await completeSecondFactor(c, code);
+  if (result.kind === 'done') {
+    if (result.via === 'recovery') {
+      return c.redirect(
+        `/app/account?ok=${encodeURIComponent(
+          `Signed in with a recovery code. Every other browser was signed out. ${result.recoveryCodesLeft} recovery code${result.recoveryCodesLeft === 1 ? '' : 's'} left.`,
+        )}#security`,
+      );
+    }
+    return c.redirect(result.next);
+  }
+  if (result.kind === 'restart') {
+    return c.redirect(`/login?error=${encodeURIComponent(result.message)}`);
+  }
+  return c.redirect(`${AUTHENTICATOR_PAGE}?error=${encodeURIComponent(result.message)}`);
+});
+
+authRoutes.post('/auth/mfa/cancel', async (c) => {
+  await cancelSecondFactor(c);
+  return c.redirect('/login');
 });
 
 // ------------------------------------------------------------- password reset
@@ -1141,8 +1281,8 @@ authRoutes.post('/auth/dev', async (c) => {
       return back('That name belongs to a registered account.');
     }
   }
-  await createSession(c, user.id);
-  return c.redirect(next);
+  const started = await startSignIn(c, user.id, { method: 'dev', next });
+  return c.redirect(started.kind === 'challenge' ? started.redirect : next);
 });
 
 authRoutes.get('/auth/github', (c) => {
@@ -1184,7 +1324,8 @@ authRoutes.get('/auth/github/callback', async (c) => {
       allowCreate: env.signupsOpen && !accessCodeRequired(env),
       reserved: (candidate) => reservedUsername(env, candidate),
     });
-    await createSession(c, user.id);
+    const started = await startSignIn(c, user.id, { method: 'github', next: saved.next });
+    if (started.kind === 'challenge') return c.redirect(started.redirect);
     logLine({ evt: 'auth', a: 'github_login', u: user.username });
     return c.redirect(sanitizeNext(saved.next));
   } catch (err) {

@@ -1,10 +1,13 @@
-import { AGENT_CLIENT_TYPES, AGENT_ROLES, type AgentClientType } from '@bridge/shared';
+import { AGENT_CLIENT_TYPES, AGENT_ROLES, CLAUDE_APP_CLIENT, type AgentClientType, type ExecutionDetailDto, type ExecutionJobDto, type ExecutionTargetDto } from '@bridge/shared';
 import { and, count, desc, eq, gt, inArray, isNull, max, or } from 'drizzle-orm';
 import { Hono, type Context } from 'hono';
 import type { Db } from '../db';
 import {
   agentEnrollments,
   agentInstallations,
+  handoffs,
+  debugSessions,
+  executionTargets,
   launchAttempts,
   memberships,
   projects,
@@ -15,9 +18,25 @@ import {
 import { generatePat } from '../auth/pat';
 import { loginRedirect } from '../auth/session';
 import { projectForTeam, teamForUser } from '../domain/access';
+import {
+  cancelExecution,
+  getExecution,
+  listExecutionTargets,
+  listExecutions,
+  setExecutionTargetEnabled,
+} from '../domain/execution';
+import { humanPrincipal } from '../domain/workTypes';
 import { revokeAgentInstallation } from '../domain/agents';
 import { launchForViewer } from '../domain/collaboration';
 import { connectionPairings, setCompanion, type ConnectionPairing } from '../domain/companions';
+import {
+  CONTACT_SOURCE_LABEL,
+  connectionKind,
+  connectionStates,
+  contactTimeOf,
+  safeCommandArg,
+  type ConnectionState,
+} from '../domain/connectionState';
 import { connectCommandFor, readConnectRequest } from '../domain/connectRequests';
 import {
   AGENT_ENROLLMENT_TTL_MINUTES,
@@ -26,6 +45,15 @@ import {
   revokePendingEnrollment,
 } from '../domain/enrollments';
 import { agentConnectPrompt } from '../lib/agentConnect';
+import {
+  CLAUDE_APP_BOUNDARY,
+  CLAUDE_APP_SUMMARY,
+  CLAUDE_APP_TERM,
+  claudeConnectorLink,
+  entryAnchor,
+  parseEntry,
+  type Entry,
+} from '../lib/entry';
 import { fmtDate, timeAgo } from '../lib/format';
 import { grantLabel, type TokenScope } from '../lib/grants';
 import { isCanonicalUuid } from '../lib/ids';
@@ -38,9 +66,12 @@ import { membershipUser } from '../lib/securityHooks';
 import type { AppEnv, User } from '../types';
 import { ConnectCheckoutForm, ConnectCommand } from '../ui/ConnectAgent';
 import { Band, PageHead, teamTrail, type Crumb } from '../ui/Console';
+import { ConnectionStatus } from '../ui/ConnectionStatus';
 import { FirstExchange } from '../ui/FirstExchange';
 import { AppLayout } from '../ui/Layout';
 import { FlowSteps, Identity } from '../ui/ProductFlow';
+import { TwoWaysIn } from '../ui/TwoWaysIn';
+import { ManagedExecution } from '../ui/Execution';
 
 /**
  * Agent connections: one page, inside a workspace.
@@ -56,9 +87,9 @@ import { FlowSteps, Identity } from '../ui/ProductFlow';
  * Now a connection is made where it will work. `/app/teams/:slug/connections`
  * connects to the workspace or one of its projects; the same handler answers
  * `/app/teams/:slug/projects/:project/connections`, where every choice is that
- * project and the page stays inside it. Three sections, in the order a person
- * needs them: connect an agent, test two of them together, and the caller's own
- * connections that can work here.
+ * project and the page stays inside it. The page connects an agent, tests two
+ * agents together, offers a separate managed-worker opt-in for a configured
+ * project checkout, and lists the caller's connections that can work here.
  *
  * The old addresses keep answering. `/app/tokens` is a door that takes a person
  * to their workspace's page (or asks which one), because it is in agents'
@@ -66,7 +97,8 @@ import { FlowSteps, Identity } from '../ui/ProductFlow';
  * `/app/launches/:id` land on the Test section of the right scope.
  *
  * Writes still go through the doors they always did, outside `/app/teams/`:
- * `POST /app/tokens` issues a connection, `POST /app/launches` starts a test.
+ * `POST /app/tokens` issues a connection, `POST /app/launches` starts a test,
+ * and execution actions use their own explicit target/job routes.
  * The identity layer checks a managed workspace's roles at those doors, when the
  * enrollment is issued, and a new address would have been a second policy for
  * the same act.
@@ -256,12 +288,44 @@ function accessLabel(token: { scope: string; projectId: string | null }, project
 }
 
 /** The state of a test in two words, for the section list at the top. */
-function launchState(launch: Launch | undefined) {
+function launchState(launch: Launch | undefined, consoleIncluded = false) {
   if (!launch) return 'not started';
-  if (launch.firstRealResultAt) return 'handoff completed';
-  if (launch.exchangeConfirmedAt) return 'exchange confirmed';
-  if (launch.firstConnectedAt) return 'waiting for reply';
+  const suffix = consoleIncluded ? ' (console included)' : '';
+  if (launch.firstRealResultAt) return `handoff completed${suffix}`;
+  if (launch.exchangeConfirmedAt) return `exchange confirmed${suffix}`;
+  if (launch.firstConnectedAt) return `waiting for reply${suffix}`;
   return 'waiting for sender';
+}
+
+/** Is one of the test's two identities the Claude app console, which is not a coding agent? */
+const includesConsole = (identities: Awaited<ReturnType<typeof launchIdentities>>) =>
+  identities.some(({ installation }) => installation.clientType === CLAUDE_APP_CLIENT);
+
+/**
+ * The handoff whose completion the test recorded. `transitionHandoff` sets
+ * `firstRealResultAt` and `completedAt` from one clock reading in one
+ * transaction, so the two are equal for the handoff that earned it, in the
+ * test's own workspace. Nothing is stored on the launch for it; a link to the
+ * thread, where the handoff's evidence is read, needs only this.
+ */
+async function completedHandoffFor(db: Db, launch: Launch): Promise<string | undefined> {
+  if (!launch.firstRealResultAt) return undefined;
+  const [row] = await db
+    .select({ sessionId: handoffs.sessionId })
+    .from(handoffs)
+    .innerJoin(debugSessions, eq(debugSessions.id, handoffs.sessionId))
+    .where(
+      and(
+        eq(debugSessions.teamId, launch.teamId),
+        // The same three conditions `transitionHandoff` stamps the launch with:
+        // the test's project (or none) and the person who completed it.
+        launch.projectId ? eq(debugSessions.projectId, launch.projectId) : isNull(debugSessions.projectId),
+        eq(handoffs.acceptedBy, launch.userId),
+        eq(handoffs.completedAt, launch.firstRealResultAt),
+      ),
+    )
+    .limit(1);
+  return row?.sessionId;
 }
 
 const StepHead = ({ id, n, title, note }: { id: string; n: number; title: string; note: string }) => (
@@ -351,6 +415,7 @@ const LaunchCard = ({
   baseUrl,
   scope,
   pageHref,
+  completedHandoff,
 }: {
   launch: Launch;
   identities: Awaited<ReturnType<typeof launchIdentities>>;
@@ -358,7 +423,10 @@ const LaunchCard = ({
   baseUrl: string;
   scope: Scope;
   pageHref: string;
+  /** The thread of the handoff that completed the test, when it can be found. */
+  completedHandoff?: string;
 }) => {
+  const consoleIn = includesConsole(identities);
   const connected = Boolean(launch.exchangeConfirmedAt);
   const realResult = Boolean(launch.firstRealResultAt);
   const unavailable = identities.some(
@@ -392,7 +460,9 @@ const LaunchCard = ({
           {realResult
             ? 'Your first tracked handoff completed'
             : connected
-              ? 'Your agents exchanged a message'
+              ? consoleIn
+                ? 'The exchange included the Claude app console'
+                : 'Your agents exchanged a message'
               : launch.firstConnectedAt
                 ? 'Waiting for the reply'
                 : 'Waiting for your first agent'}
@@ -413,6 +483,15 @@ const LaunchCard = ({
           <div class="banner banner-warn">
             <span class="ic">!</span>
             <span>{next}</span>
+          </div>
+        ) : null}
+        {consoleIn ? (
+          <div class="banner banner-warn">
+            <span class="ic">!</span>
+            <span>
+              This exchange included the Claude app console. It proves STMA reached it, not that a
+              coding agent works in a checkout. Run the test with two coding agents.
+            </span>
           </div>
         ) : null}
         <FlowSteps
@@ -495,7 +574,10 @@ const LaunchCard = ({
           <div>
             {identities.map(({ installation, credential }) => (
               <div class="flow-record">
-                <span class="small muted">{role(installation.id)}: </span>
+                <span class="small muted">
+                  {role(installation.id)} ·{' '}
+                  {connectionKind(installation) === 'console' ? CLAUDE_APP_TERM : 'coding agent'}:{' '}
+                </span>
                 <Identity
                   human={installation.userId === user.id ? user.username : 'Teammate'}
                   agent={installation.name}
@@ -505,7 +587,7 @@ const LaunchCard = ({
                   {installation.revokedAt || credential?.revokedAt
                     ? 'Access revoked'
                     : 'Authenticated connection observed; running state not asserted'}{' '}
-                  · last seen {timeAgo(installation.lastSeenAt) ?? 'not recorded'}
+                  · last contact {timeAgo(contactTimeOf(installation)) ?? 'never recorded'}
                 </p>
               </div>
             ))}
@@ -516,11 +598,26 @@ const LaunchCard = ({
             <a href={`/app/sessions/${launch.sessionId}`}>Open the exchange</a>
           </p>
         ) : null}
+        {completedHandoff ? (
+          <p class="m0">
+            <a href={`/app/sessions/${completedHandoff}`}>Open the completed handoff</a>: its thread
+            shows what was handed over and links the run it came from.
+          </p>
+        ) : null}
         {connected && !realResult ? (
           <p class="m0">
-            Ask your agent to offer a real task using <code>handoff_work</code>. The receiver
-            explicitly accepts with <code>update_handoff</code>, inspects the worktree, then resumes.
-            File access and execution still need your consent.
+            Ask your agent to offer a real task using <code>handoff_work</code>, or{' '}
+            <a
+              href={
+                scope.project
+                  ? `/app/teams/${scope.team.slug}/projects/${encodeURIComponent(scope.project.slug)}#assigned-work`
+                  : sectionHref(scope.team.slug, null, 'work')
+              }
+            >
+              assign work to a coding agent
+            </a>{' '}
+            yourself. The receiver explicitly accepts with <code>update_handoff</code>, inspects
+            the worktree, then resumes. File access and execution still need your consent.
           </p>
         ) : null}
         {realResult ? (
@@ -581,6 +678,23 @@ const LaunchCard = ({
   );
 };
 
+/** Revoking is the same act wherever a connection is listed, so the confirmation says the same thing. */
+const RevokeConnection = ({ token, filters }: { token: TokenRow; filters: unknown }) => (
+  <form
+    class="m0"
+    method="post"
+    action={`/app/tokens/${token.id}/revoke`}
+    data-confirm={`The agent using "${token.name}" loses server access immediately; active runs become stale and their claims are released. Existing snapshots, runs and sessions are kept. This does not remove the local MCP entry or stop the client: remove it there and reload separately.${token.scope === 'personal' ? ' This connection reaches every workspace you are in, so it stops everywhere.' : ''}`}
+    data-confirm-title={`Revoke "${token.name}"?`}
+    data-confirm-action="Revoke connection"
+  >
+    {filters}
+    <button class="linklike" type="submit">
+      Revoke
+    </button>
+  </form>
+);
+
 interface PageProps {
   user: User;
   scope: Scope;
@@ -588,18 +702,24 @@ interface PageProps {
   list: TokenRow[];
   devices: Map<string, string>;
   pairings: Map<string, ConnectionPairing>;
+  states: Map<string, ConnectionState>;
   pending: Awaited<ReturnType<typeof pendingSetups>>;
   launch?: Launch;
   identities: Awaited<ReturnType<typeof launchIdentities>>;
+  completedHandoff?: string;
   answer: Answer;
   notice?: string;
   error?: string;
   filterState: string;
   filterQuery: string;
+  executionTargets: ExecutionTargetDto[];
+  executions: ExecutionJobDto[];
+  executionDetail?: ExecutionDetailDto;
+  executionError?: string;
 }
 
 const ConnectionsPage = (props: PageProps) => {
-  const { user, scope, baseUrl, list, devices, pairings, pending, launch, answer } = props;
+  const { user, scope, baseUrl, list, devices, pairings, states, pending, launch, answer } = props;
   const { team, project } = scope;
   const pageHref = connectionsHref(team.slug, project?.slug ?? null);
   const projectsById = new Map(scope.projects.map((row) => [row.id, row]));
@@ -607,6 +727,7 @@ const ConnectionsPage = (props: PageProps) => {
     <>
       <input type="hidden" name="back_team" value={team.slug} />
       <input type="hidden" name="back_project" value={project?.slug ?? ''} />
+      {props.executionDetail ? <input type="hidden" name="back_execution" value={props.executionDetail.job.id} /> : null}
     </>
   );
   const filters = (
@@ -643,7 +764,6 @@ const ConnectionsPage = (props: PageProps) => {
   const mcpAlias = mcpServerAlias(promptScope);
   const codexConnectPrompt = mcpConnectPrompt({ baseUrl, client: 'codex', ...promptScope });
   const claudeConnectPrompt = mcpConnectPrompt({ baseUrl, client: 'claude-code', ...promptScope });
-  const shellQuote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
   const agentsHome = project ? sectionHref(team.slug, project.slug, 'agents') : null;
   const trail: Crumb[] = project
     ? teamTrail(
@@ -667,6 +787,7 @@ const ConnectionsPage = (props: PageProps) => {
     return true;
   });
   const live = list.filter((token) => !token.revokedAt).length;
+  const consoleRows = list.filter((token) => !token.revokedAt && states.get(token.id)?.kind === 'console');
   const legacyAccess =
     typedString(refusedLegacy, 'access') ?? (project ? `project:${project.id}` : `team:${team.id}`);
   const legacyCount = list.length + pending.length + 1;
@@ -716,10 +837,12 @@ const ConnectionsPage = (props: PageProps) => {
       keysNote={`${live} connection${live === 1 ? '' : 's'} of yours can work here · agents and machines are not seats`}
     >
       <nav class="section-jump" aria-label="Agent connections sections">
+        <a href="#claude-app">Claude app</a>
         <a href="#connect">Connect an agent</a>
         <a href="#test">
-          Test <span>{launchState(launch)}</span>
+          Test <span>{launchState(launch, includesConsole(props.identities))}</span>
         </a>
+        <a href="#managed-execution">Managed execution</a>
         <a href="#connections">
           Your connections <span>{live}</span>
         </a>
@@ -801,6 +924,75 @@ const ConnectionsPage = (props: PageProps) => {
           </div>
         </div>
       ) : null}
+
+      <TwoWaysIn baseUrl={baseUrl} />
+
+      <section class="card card-pad" id="claude-app" style="display:flex;flex-direction:column;gap:12px">
+        <div>
+          <span class="overline">{CLAUDE_APP_TERM}</span>
+          <div class="card-title" style="margin-top:4px">
+            Use STMA from the Claude app
+          </div>
+          <div class="card-note">
+            {CLAUDE_APP_SUMMARY} {CLAUDE_APP_BOUNDARY}
+          </div>
+        </div>
+        <div class="cmd">
+          <code>{baseUrl}/mcp</code>
+          <button class="copybtn solid" type="button" data-copy={`${baseUrl}/mcp`}>
+            Copy MCP address
+          </button>
+        </div>
+        <div class="row">
+          <a class="btn btn-primary" href={claudeConnectorLink(baseUrl)} target="_blank" rel="noopener">
+            Add STMA to Claude
+          </a>
+          <span class="small muted">
+            Opens Claude's Add custom connector dialog with this server filled in; you confirm it
+            there.
+          </span>
+        </div>
+        <p class="small m0">
+          Claude then asks you to sign in to STMA once. The consent page asks for no machine, and
+          proposes Personal access, which follows your memberships so Claude can answer across your
+          workspaces. Choose this workspace or one project instead to keep it there. Claude asks
+          you before each write.
+        </p>
+        {consoleRows.length === 0 ? (
+          <p class="small muted m0">No Claude app connection of yours can work here yet.</p>
+        ) : (
+          <table class="tbl">
+            <tr>
+              <th>Connection</th>
+              <th>Access</th>
+              <th>Last contact</th>
+              <th></th>
+            </tr>
+            {consoleRows.map((t) => {
+              const state = states.get(t.id)!;
+              return (
+                <tr>
+                  <td class="name">{t.name}</td>
+                  <td>{accessLabel(t, projectsById)}</td>
+                  <td class="muted">
+                    {state.lastContact.at
+                      ? `${timeAgo(state.lastContact.at)} · ${CONTACT_SOURCE_LABEL[state.lastContact.source]}`
+                      : 'never recorded'}
+                  </td>
+                  <td style="text-align:right">
+                    <RevokeConnection token={t} filters={filters} />
+                  </td>
+                </tr>
+              );
+            })}
+          </table>
+        )}
+        <p class="small muted m0">
+          Revoking stops its server access at once. The connector stays in Claude's settings until
+          you remove it there. Adding STMA again creates another connection rather than replacing
+          this one.
+        </p>
+      </section>
 
       <StepHead
         id="connect"
@@ -953,7 +1145,21 @@ const ConnectionsPage = (props: PageProps) => {
           {project ? (
             <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px">
               {(['codex', 'claude-code'] as const).map((target) => {
-                const command = `stma adapter activate --target ${target} --team ${shellQuote(team.slug)} --project ${shellQuote(project.name)} --server ${shellQuote(baseUrl)}`;
+                // A project's name is free text any member's agent can create, so it
+                // goes into a copyable command only when no shell could read it as more.
+                const teamArg = safeCommandArg(team.slug);
+                const projectArg = safeCommandArg(project.name);
+                const serverArg = safeCommandArg(baseUrl);
+                if (!teamArg || !projectArg || !serverArg) {
+                  return (
+                    <p class="small muted m0">
+                      This project's name has characters a copied command cannot carry safely, so no{' '}
+                      {target} command is shown. Type <code>stma adapter activate</code> yourself with
+                      the project's name.
+                    </p>
+                  );
+                }
+                const command = `stma adapter activate --target ${target} --team ${teamArg} --project ${projectArg} --server ${serverArg}`;
                 return (
                   <div class="cmd">
                     <code>{command}</code>
@@ -1116,14 +1322,36 @@ const ConnectionsPage = (props: PageProps) => {
           baseUrl={baseUrl}
           scope={scope}
           pageHref={pageHref}
+          completedHandoff={props.completedHandoff}
         />
       ) : (
         <FirstExchange baseUrl={baseUrl} teamSlug={team.slug} project={project?.slug} />
       )}
 
       <StepHead
-        id="connections"
+        id="managed-execution-step"
         n={3}
+        title="Managed local execution"
+        note="Configure a dedicated checkout with the CLI, then let its owner review and explicitly enable this exact target."
+      />
+      {props.executionError ? (
+        <div class="banner banner-warn"><span class="ic">!</span><span>{props.executionError}</span></div>
+      ) : (
+        <ManagedExecution
+          teamSlug={team.slug}
+          teamRole={team.role}
+          userId={user.id}
+          targets={props.executionTargets}
+          jobs={props.executions}
+          detail={props.executionDetail}
+          back={back}
+          pageHref={pageHref}
+        />
+      )}
+
+      <StepHead
+        id="connections"
+        n={4}
         title="Your connections here"
         note={`Every connection of yours that can work in ${project ? project.name : team.name}. Revoking one stops its server access at once; remove the local entry in the client too. Everybody's agents are on People and agents.`}
       />
@@ -1207,9 +1435,9 @@ const ConnectionsPage = (props: PageProps) => {
         </a>
         <p class="help" style="flex-basis:100%">
           Awaiting client: reload the named client and check its STMA connection within 15 minutes
-          of setup. Setup expired: create a fresh one. Active confirms client identity, not
-          repository readiness or completed work. Legacy credentials without verification remain
-          unverified.
+          of setup. Setup expired: create a fresh one. Authorized confirms the client completed
+          sign-in, not repository readiness, hooks or completed work. Legacy credentials without
+          verification remain unverified.
         </p>
       </form>
 
@@ -1232,7 +1460,6 @@ const ConnectionsPage = (props: PageProps) => {
               <th>Credential</th>
               <th class="hide-sm">Machine it reports as</th>
               <th>Created</th>
-              <th>Last used</th>
               <th>Status</th>
               <th></th>
             </tr>
@@ -1246,41 +1473,11 @@ const ConnectionsPage = (props: PageProps) => {
                 <td class="mono">{t.audience ? 'OAuth · client-managed' : `${t.prefix}••••••••`}</td>
                 <td class="mono muted hide-sm">{devices.get(t.id) ?? 'not yet'}</td>
                 <td class="muted">{fmtDate(t.createdAt)}</td>
-                <td class="muted">{timeAgo(t.lastUsedAt) ?? 'never'}</td>
                 <td>
-                  {t.revokedAt ? (
-                    <span class="pill pill-muted">
-                      <span class="dot gray" />
-                      revoked
-                    </span>
-                  ) : t.setupExpiresAt && !t.activatedAt ? (
-                    <span class="pill pill-muted">
-                      <span class="dot gray" />
-                      {t.setupExpiresAt <= new Date() ? 'setup expired' : 'awaiting client'}
-                    </span>
-                  ) : (
-                    <span class="pill pill-active">
-                      <span class="dot" />
-                      {t.activatedAt ? 'active' : 'legacy · unverified'}
-                    </span>
-                  )}
+                  {states.get(t.id) ? <ConnectionStatus state={states.get(t.id)!} /> : null}
                 </td>
                 <td style="text-align:right">
-                  {t.revokedAt ? null : (
-                    <form
-                      class="m0"
-                      method="post"
-                      action={`/app/tokens/${t.id}/revoke`}
-                      data-confirm={`The agent using "${t.name}" loses server access immediately; active runs become stale and their claims are released. Existing snapshots, runs and sessions are kept. This does not remove the local MCP entry or stop the client: remove it there and reload separately.${t.scope === 'personal' ? ' This connection reaches every workspace you are in, so it stops everywhere.' : ''}`}
-                      data-confirm-title={`Revoke "${t.name}"?`}
-                      data-confirm-action="Revoke connection"
-                    >
-                      {filters}
-                      <button class="linklike" type="submit">
-                        Revoke
-                      </button>
-                    </form>
-                  )}
+                  {t.revokedAt ? null : <RevokeConnection token={t} filters={filters} />}
                 </td>
               </tr>
             ))}
@@ -1300,6 +1497,9 @@ const AccountConnections = (props: {
   user: User;
   workspaces: Array<Workspace & { live: number; waiting: number }>;
   everywhere: number;
+  baseUrl: string;
+  /** The door the person asked for, kept through the choice of a workspace. */
+  entry?: Entry;
   legacyToken?: string;
   error?: string;
   notice?: string;
@@ -1351,19 +1551,32 @@ const AccountConnections = (props: {
         </div>
       </div>
     ) : null}
+    <TwoWaysIn
+      baseUrl={props.baseUrl}
+      claudeHref="/docs#claude-app"
+      connectHref="#workspaces"
+      connectLabel={props.workspaces.length ? 'Choose a workspace' : 'Create a workspace'}
+    />
     {props.workspaces.length === 0 ? (
-      <div class="card card-pad" style="display:flex;flex-direction:column;gap:12px">
+      <div class="card card-pad" id="workspaces" style="display:flex;flex-direction:column;gap:12px">
         <div class="card-title">Create a workspace first</div>
         <div class="card-note">
           A workspace works for one person too. Give it a name, then connect your agents from
           inside it. No invitation to yourself or repository setup is needed.
         </div>
-        <a class="btn btn-primary" href="/app" style="align-self:flex-start">
+        <form method="post" action="/app/teams" class="row">
+          {props.entry ? <input type="hidden" name="entry" value={props.entry} /> : null}
+          <input class="in" name="name" aria-label="Workspace name" placeholder="My workspace" maxlength={60} required />
+          <button class="btn btn-primary" type="submit">
+            Create workspace
+          </button>
+        </form>
+        <a href="/app" style="align-self:flex-start">
           Go to workspaces
         </a>
       </div>
     ) : (
-      <div class="card scroll-x">
+      <div class="card scroll-x" id="workspaces">
         <table class="tbl">
           <tr>
             <th>Workspace</th>
@@ -1375,13 +1588,13 @@ const AccountConnections = (props: {
           {props.workspaces.map((ws) => (
             <tr>
               <td class="name">
-                <a href={connectionsHref(ws.slug)}>{ws.name}</a>
+                <a href={`${connectionsHref(ws.slug)}${props.entry ? entryAnchor(props.entry) : ''}`}>{ws.name}</a>
               </td>
               <td class="muted">{ws.role}</td>
               <td>{ws.live}</td>
               <td class="muted">{ws.waiting}</td>
               <td style="text-align:right">
-                <a class="btn btn-sm" href={connectionsHref(ws.slug)}>
+                <a class="btn btn-sm" href={`${connectionsHref(ws.slug)}${props.entry ? entryAnchor(props.entry) : ''}`}>
                   Open
                 </a>
               </td>
@@ -1400,7 +1613,10 @@ const AccountConnections = (props: {
   </AppLayout>
 );
 
-async function renderAccount(c: Context<AppEnv>, extra: { legacyToken?: string; error?: string } = {}) {
+async function renderAccount(
+  c: Context<AppEnv>,
+  extra: { legacyToken?: string; error?: string; entry?: Entry } = {},
+) {
   const user = c.get('user')!;
   const db = c.get('db');
   const found = await memberWorkspaces(db, user.id);
@@ -1439,6 +1655,8 @@ async function renderAccount(c: Context<AppEnv>, extra: { legacyToken?: string; 
       user={user}
       workspaces={found.map((ws) => ({ ...ws, live: liveBy.get(ws.id) ?? 0, waiting: waitingBy.get(ws.id) ?? 0 }))}
       everywhere={everywhere?.n ?? 0}
+      baseUrl={c.get('env').baseUrl}
+      entry={extra.entry}
       legacyToken={extra.legacyToken}
       error={extra.error ?? c.req.query('error')}
       notice={c.req.query('ok')}
@@ -1452,7 +1670,7 @@ async function renderConnections(
   c: Context<AppEnv>,
   scope: Scope,
   answer: Answer = {},
-  query: { launch?: string; state?: string; q?: string; ok?: string; error?: string } = {},
+  query: { launch?: string; execution?: string; state?: string; q?: string; ok?: string; error?: string } = {},
 ) {
   const user = c.get('user')!;
   const db = c.get('db');
@@ -1461,6 +1679,27 @@ async function renderConnections(
   // A POST answers with a page, and a page draws the rail of the scope it shows.
   if (c.req.method !== 'GET') await ensureRail(db, user, scope.team.slug, scope.project?.slug ?? null);
   const list = await connectionsHere(db, user.id, scope);
+  const principal = humanPrincipal(user.id);
+  const targetsResult = await listExecutionTargets(db, principal, scope.project?.id);
+  const targetError = 'error' in targetsResult ? targetsResult.error.message : undefined;
+  const executionTargets = 'error' in targetsResult
+    ? []
+    : targetsResult.targets.filter((target) => target.team_id === scope.team.id);
+  const targetIds = new Set(executionTargets.map((target) => target.id));
+  const executionsResult = targetError ? undefined : await listExecutions(db, principal, scope.project?.id, 100);
+  const executions = !executionsResult || 'error' in executionsResult
+    ? []
+    : executionsResult.jobs.filter((job) => targetIds.has(job.target_id)).slice(0, 30);
+  let executionDetail: ExecutionDetailDto | undefined;
+  let executionReadError = targetError ?? (executionsResult && 'error' in executionsResult ? executionsResult.error.message : undefined);
+  if (query.execution && isCanonicalUuid(query.execution)) {
+    const detail = await getExecution(db, principal, query.execution);
+    if (!('error' in detail) && detail.target.team_id === scope.team.id && (!scope.project || detail.target.project_id === scope.project.id)) {
+      executionDetail = detail;
+    } else if ('error' in detail && detail.error.code !== 'NOT_FOUND') {
+      executionReadError = detail.error.message;
+    }
+  }
   return c.html(
     <ConnectionsPage
       user={user}
@@ -1469,14 +1708,28 @@ async function renderConnections(
       list={list}
       devices={await devicesFor(db, list)}
       pairings={await connectionPairings(db, user.id)}
+      states={await connectionStates(db, list, {
+        teamSlug: scope.team.slug,
+        baseUrl: c.get('env').baseUrl,
+        leases: {
+          activeMinutes: c.get('env').agentClaimLeaseMinutes,
+          waitingMinutes: c.get('env').agentWaitingLeaseMinutes,
+        },
+        projectsById: new Map(scope.projects.map((row) => [row.id, { slug: row.slug, name: row.name }])),
+      })}
       pending={await pendingSetups(db, user.id, scope)}
       launch={found.launch}
       identities={found.launch ? await launchIdentities(db, found.launch) : []}
+      completedHandoff={found.launch ? await completedHandoffFor(db, found.launch) : undefined}
       answer={answer}
       notice={query.ok}
       error={query.error}
       filterState={query.state ?? 'all'}
       filterQuery={query.q ?? ''}
+      executionTargets={executionTargets}
+      executions={executions}
+      executionDetail={executionDetail}
+      executionError={executionReadError}
     />,
     answer.refused ? 422 : 200,
   );
@@ -1496,6 +1749,7 @@ async function scopeFor(db: Db, userId: string, slug: string, project?: string):
 
 const pageQuery = (c: Context<AppEnv>) => ({
   launch: c.req.query('launch'),
+  execution: c.req.query('execution'),
   state: c.req.query('state'),
   q: c.req.query('q'),
   ok: c.req.query('ok'),
@@ -1531,6 +1785,30 @@ connectionsRoutes.get('/app/teams/:slug/projects/:project/connections', async (c
   return renderConnections(c, scope, {}, pageQuery(c));
 });
 
+connectionsRoutes.get('/app/execution-targets/:id', async (c) => {
+  const user = c.get('user');
+  if (!user) return loginRedirect(c);
+  const targetId = c.req.param('id');
+  if (!isCanonicalUuid(targetId)) return c.notFound();
+  const db = c.get('db');
+  const [target] = await db
+    .select({ teamId: executionTargets.teamId, projectId: executionTargets.projectId })
+    .from(executionTargets)
+    .where(eq(executionTargets.id, targetId));
+  if (!target) return c.notFound();
+  const [scopeSlugs] = await db
+    .select({ teamSlug: teams.slug, projectSlug: projects.slug })
+    .from(projects)
+    .innerJoin(teams, eq(teams.id, projects.teamId))
+    .where(and(eq(teams.id, target.teamId), eq(projects.id, target.projectId)));
+  if (!scopeSlugs) return c.notFound();
+  const scope = await scopeFor(db, user.id, scopeSlugs.teamSlug, scopeSlugs.projectSlug);
+  if (!scope) return c.notFound();
+  const visible = await listExecutionTargets(db, humanPrincipal(user.id), scope.project!.id);
+  if ('error' in visible || !visible.targets.some((row) => row.id === targetId)) return c.notFound();
+  return c.redirect(`${connectionsHref(scope.team.slug, scope.project!.slug)}#managed-execution`, 303);
+});
+
 /**
  * The old address, kept as a door. It is printed by agents' refusals, by the
  * CLI and in emails already sent, and none of those know which workspace the
@@ -1538,8 +1816,17 @@ connectionsRoutes.get('/app/teams/:slug/projects/:project/connections', async (c
  * way to make one.
  */
 connectionsRoutes.get('/app/tokens', async (c) => {
+  // The door the person asked for ("Add STMA to Claude" or "connect a coding
+  // agent") survives sign-in, a first workspace and the choice among several as
+  // a closed value, and ends as a fragment on the connections page. Anything
+  // else in the parameter is dropped and never echoed.
+  const entry = parseEntry(c.req.query('entry'));
   const user = c.get('user');
-  if (!user) return loginRedirect(c);
+  if (!user) {
+    return entry
+      ? c.redirect(`/login?next=${encodeURIComponent(`/app/tokens?entry=${entry}`)}`)
+      : loginRedirect(c);
+  }
   const db = c.get('db');
   const carried = new URLSearchParams();
   for (const key of ['ok', 'error', 'state', 'q'] as const) {
@@ -1547,6 +1834,7 @@ connectionsRoutes.get('/app/tokens', async (c) => {
     if (value) carried.set(key, value.slice(0, 500));
   }
   const rest = carried.toString() ? `?${carried}` : '';
+  const anchor = entry ? entryAnchor(entry) : '';
   const named = (c.req.query('team') ?? '').trim();
   if (named) {
     const access = await teamForUser(db, user.id, named);
@@ -1554,12 +1842,12 @@ connectionsRoutes.get('/app/tokens', async (c) => {
       const project = c.req.query('project')
         ? await projectForTeam(db, access.team.id, c.req.query('project')!)
         : undefined;
-      return c.redirect(`${connectionsHref(access.team.slug, project?.slug ?? null)}${rest}`, 303);
+      return c.redirect(`${connectionsHref(access.team.slug, project?.slug ?? null)}${rest}${anchor}`, 303);
     }
   }
   const found = await memberWorkspaces(db, user.id);
-  if (found.length === 1) return c.redirect(`${connectionsHref(found[0]!.slug)}${rest}`, 303);
-  return renderAccount(c);
+  if (found.length === 1) return c.redirect(`${connectionsHref(found[0]!.slug)}${rest}${anchor}`, 303);
+  return renderAccount(c, { entry });
 });
 
 /**
@@ -1683,13 +1971,47 @@ async function connectionReturn(c: Context<AppEnv>, message: string, ok = true) 
   if (q) params.set('q', q.slice(0, 100));
   const text = (key: string) => (typeof body[key] === 'string' ? (body[key] as string).trim().slice(0, 300) : '');
   const teamSlug = text('back_team') || text('filter_team');
+  const execution = text('back_execution');
+  if (isCanonicalUuid(execution)) params.set('execution', execution);
   if (teamSlug) {
     const scope = await scopeFor(c.get('db'), c.get('user')!.id, teamSlug, (text('back_project') || text('filter_project')) || undefined)
       ?? await scopeFor(c.get('db'), c.get('user')!.id, teamSlug);
-    if (scope) return c.redirect(`${connectionsHref(scope.team.slug, scope.project?.slug ?? null)}?${params}#connections`);
+    if (scope) return c.redirect(`${connectionsHref(scope.team.slug, scope.project?.slug ?? null)}?${params}#${isCanonicalUuid(execution) ? 'managed-execution' : 'connections'}`);
   }
   return c.redirect(`/app/tokens?${params}`);
 }
+
+connectionsRoutes.post('/app/execution-targets/:id/enable', async (c) => {
+  const user = c.get('user');
+  if (!user) return loginRedirect(c);
+  if (!isCanonicalUuid(c.req.param('id'))) return c.notFound();
+  const result = await setExecutionTargetEnabled(c.get('db'), humanPrincipal(user.id), c.req.param('id'), true);
+  return 'error' in result
+    ? connectionReturn(c, result.error.message, false)
+    : connectionReturn(c, `${result.target.installation_name} is enabled for ${result.target.project_name}. New jobs still require an explicit dispatch.`);
+});
+
+connectionsRoutes.post('/app/execution-targets/:id/disable', async (c) => {
+  const user = c.get('user');
+  if (!user) return loginRedirect(c);
+  if (!isCanonicalUuid(c.req.param('id'))) return c.notFound();
+  const result = await setExecutionTargetEnabled(c.get('db'), humanPrincipal(user.id), c.req.param('id'), false);
+  return 'error' in result
+    ? connectionReturn(c, result.error.message, false)
+    : connectionReturn(c, `${result.target.installation_name} is disabled. New claims are blocked; any local process stop remains a separate observed state.`);
+});
+
+connectionsRoutes.post('/app/executions/:id/cancel', async (c) => {
+  const user = c.get('user');
+  if (!user) return loginRedirect(c);
+  if (!isCanonicalUuid(c.req.param('id'))) return c.notFound();
+  const result = await cancelExecution(c.get('db'), humanPrincipal(user.id), c.req.param('id'));
+  return 'error' in result
+    ? connectionReturn(c, result.error.message, false)
+    : connectionReturn(c, result.job.state === 'cancelled'
+      ? 'The execution is cancelled. Review its last state before treating the task as delivered.'
+      : 'Cancellation requested. The worker must report the process stopped; this request is not confirmation.', true);
+});
 
 connectionsRoutes.post('/app/enrollments/:id/revoke', async (c) => {
   const user = c.get('user');

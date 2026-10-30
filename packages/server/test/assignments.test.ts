@@ -2060,7 +2060,7 @@ it('cancels from the project page, says so there, and stops calling finished wor
 
   const listed = await projectPage();
   expect(listed).toContain('Assigned work');
-  expect(listed).toContain('waiting for the agent');
+  expect(listed).toContain('sent, not yet accepted');
   expect(listed).toContain(`action="/app/sessions/${session}/handoff/cancel"`);
   // Dispatched work is not a debug thread: assigning opened no "open session".
   expect(openSessions(listed)).toBe(before);
@@ -2117,7 +2117,7 @@ it('shows a project its agents, and a workspace who has which agent and what eac
   // Work given to an agent stands beside it, with where it stands.
   // Beside an agent the kind is plain, so the thread's "Assignment: " prefix is dropped.
   expect(row(inProject, 'codex-a')).toContain('>PD-71 Waiting</a>');
-  expect(row(inProject, 'codex-a')).toContain('waiting for the agent');
+  expect(row(inProject, 'codex-a')).toContain('sent, not yet accepted');
   // A local adapter is a checkout's ears, not an agent.
   expect(inProject).not.toContain('<div class="name">lead-codex-local</div>');
 
@@ -2313,8 +2313,11 @@ it('gives a person their own page: their agents, runs, work and trail', async ()
   expect(page).toContain('<div class="card-title">Runs</div>');
   expect(page).toContain('PD-90 Person page');
   expect(page).toContain(`href="/app/agents?run=${run.data.runId}&amp;team=parcel-desk&amp;project=parcel-desk-api"`);
-  // Work, with which direction it went.
-  expect(page).toContain('<div class="card-title">Work</div>');
+  // Dispatched work, with which direction it went. Not "Work": the rail's Work
+  // is the workspace's work items, and this card is the assignment ledger.
+  expect(page).toContain('<div class="card-title">Dispatched work</div>');
+  expect(page).not.toContain('<div class="card-title">Work</div>');
+  expect(page).toContain('All dispatched');
   expect(page).toContain('PD-91 For the page');
   expect(page).toContain('assigned to codex-a');
   // The trail, read through Activity's own reader, with the way to the full log.

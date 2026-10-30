@@ -13,7 +13,7 @@ import {
 import { fingerprintJson } from '../lib/canonical';
 import { resolveProjectForWrite } from '../lib/projects';
 import { projectForTeam, teamForUser } from './access';
-import { runForOwner } from './agents';
+import { rotatedAnswer, runForOwner } from './agents';
 import { effectiveLimits } from '../lib/entitlements';
 import { criticalAudit } from '../lib/securityHooks';
 
@@ -240,6 +240,11 @@ export async function recordPolicyReceipt(
 ) {
   const found = await runForOwner(db, runId, userId);
   if (!found) return undefined;
+  // A run a rotation closed answers with its successor, as every other run
+  // door does. Written here, the receipt landed on a completed run while the
+  // live run carrying the work kept the copy made at rotation, and Governance
+  // judged the live run on a hash its checkout no longer ran.
+  if (found.run.rotatedToRunId) return rotatedAnswer(db, runId, found.run.rotatedToRunId);
   const existing = await db
     .select({ expectedHash: policyReceipts.expectedHash })
     .from(policyReceipts)

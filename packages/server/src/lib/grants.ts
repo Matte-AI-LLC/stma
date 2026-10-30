@@ -1,16 +1,18 @@
 import { and, eq } from 'drizzle-orm';
 import { isCanonicalUuid } from './ids';
 import type { Db } from '../db';
-import { agentRuns, debugSessions, projects } from '../db/schema';
+import { agentRuns, debugSessions, executionJobs, executionTargets, projects, workItems } from '../db/schema';
 import { projectForTeam } from '../domain/access';
 import { adapterListensFor } from '../domain/companions';
 import { authorizeSecurity } from './securityHooks';
+import { guardExecutionTool, managedResourceRefusal, type ExecutionGrant } from './executionSecurity';
 
 export const TOKEN_SCOPES = ['personal', 'team', 'project'] as const;
 export type TokenScope = (typeof TOKEN_SCOPES)[number];
 
 /** The server-resolved authority attached to one PAT-authenticated request. */
 export interface AgentGrant {
+  execution?: ExecutionGrant;
   tokenId: string;
   scope: TokenScope;
   teamId: string | null;
@@ -90,6 +92,22 @@ const unownedRunError = (grant: AgentGrant, runId: string) =>
   'to pair that adapter with this agent on Agent connections — a paired agent may update, finish ' +
   'and hand off its adapter\'s run. Otherwise start_run and use the run id it returns.';
 
+/**
+ * A work item outside this credential's scope, or one that does not exist, in
+ * the exact words the tool answers for a work id that does not exist. Not the
+ * scope sentence: naming the scope would tell the caller the id is real, and a
+ * Work id that is real somewhere it cannot read must read as one that is real
+ * nowhere. The run and assignment tools answer a missing work in their own
+ * text; the Work tools in their JSON error. `work-mcp.test.ts` holds each
+ * spelling to its tool.
+ */
+const WORK_NOT_VISIBLE = 'No work with that id is visible to this principal.';
+function workNotVisible(tool: string): string {
+  if (tool === 'start_run') return `NOT_FOUND: ${WORK_NOT_VISIBLE}`;
+  if (tool === 'assign_work') return `NOT_FOUND: ${WORK_NOT_VISIBLE} Nothing was written.`;
+  return JSON.stringify({ error: { code: 'NOT_FOUND', message: WORK_NOT_VISIBLE, retryable: false } });
+}
+
 async function matchesGrantedProject(db: Db, grant: AgentGrant, value: unknown): Promise<boolean> {
   if (grant.scope !== 'project' || typeof value !== 'string' || !grant.teamId) return true;
   const found = await projectForTeam(db, grant.teamId, value);
@@ -112,6 +130,24 @@ export async function guardMcpToolCall(
 ): Promise<string | null> {
   const denied = await authorizeSecurity(db, 'tool', { ...args, tool });
   if (denied) return denied;
+  // Preserve the boundary's existing malformed-id contract before execution
+  // fencing resolves any indirect resource or reports an authority mismatch.
+  for (const field of ['session_id', 'run_id', 'work_id', 'project_id', 'target_id', 'execution_id'] as const) {
+    if (args[field] !== undefined && !isCanonicalUuid(args[field])) return idError(field, args[field]);
+  }
+  const executionDenied = await guardExecutionTool(db, grant, tool, args);
+  if (executionDenied) return executionDenied;
+  for (const field of ['project_id', 'target_id', 'execution_id'] as const) {
+    const value = args[field];
+    if (value === undefined) continue;
+    if (!isCanonicalUuid(value)) return idError(field, value);
+    const row = field === 'project_id'
+      ? (await db.select({ teamId: projects.teamId, projectId: projects.id }).from(projects).where(eq(projects.id, value)))[0]
+      : field === 'target_id'
+      ? (await db.select({ teamId: executionTargets.teamId, projectId: executionTargets.projectId }).from(executionTargets).where(eq(executionTargets.id, value)))[0]
+      : (await db.select({ teamId: executionTargets.teamId, projectId: executionTargets.projectId }).from(executionJobs).innerJoin(executionTargets, eq(executionTargets.id, executionJobs.targetId)).where(eq(executionJobs.id, value)))[0];
+    if (!row || !grantAllowsProject(grant, row.teamId, row.projectId)) return 'No execution resource is visible to this credential.';
+  }
   if (grant.scope !== 'personal') {
     if (!grant.teamId || !grant.teamSlug) return scopeError(grant, 'any team');
 
@@ -199,6 +235,27 @@ export async function guardMcpToolCall(
     }
   }
 
+  // A work item is read like a run: only the canonical spelling, and only
+  // inside the credential's team and project. For a scoped credential a work
+  // that does not exist is refused here too, in the same words: this runs
+  // before the SDK validates the arguments and before the tool's own checks,
+  // so an id out of reach answered here and a made-up one left to the tool
+  // would part on any wrong second argument (`key` beside `work_id`, a missing
+  // `expected_spec_revision`, a malformed version), and the one that charges
+  // the day's allowance would part from the one that does not. A personal
+  // credential reaches every workspace of its person, so it sends both to the
+  // tool, which validates first and judges access after, the same for both.
+  const workId = args.work_id;
+  if (workId !== undefined && !isCanonicalUuid(workId)) return idError('work_id', workId);
+  if (typeof workId === 'string' && grant.scope !== 'personal') {
+    const [row] = await db
+      .select({ teamId: workItems.teamId, projectId: workItems.projectId })
+      .from(workItems)
+      .where(eq(workItems.id, workId.toLowerCase()))
+      .limit(1);
+    if (!row || !grantAllowsProject(grant, row.teamId, row.projectId)) return workNotVisible(tool);
+  }
+
   return null;
 }
 
@@ -224,6 +281,8 @@ export async function guardRunGrantScope(
   runId: string,
 ): Promise<string | null> {
   if (!isCanonicalUuid(runId)) return idError('run', runId);
+  const executionDenied = await managedResourceRefusal(db, grant, { runId });
+  if (executionDenied) return executionDenied;
   if (grant.scope === 'personal' && !grant.installationId) return null;
   const rows = await db
     .select({

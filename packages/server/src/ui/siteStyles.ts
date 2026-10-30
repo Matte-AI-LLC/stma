@@ -17,7 +17,7 @@
  * The keys live here because the rules are generated from them; `Landing.tsx`
  * renders one input per tab and `visuals.test.ts` fails if a tab has no rule.
  */
-export const LX_TAB_KEYS = ['rules', 'handoff', 'assign', 'env', 'evidence', 'ledger'] as const;
+export const LX_TAB_KEYS = ['rules', 'handoff', 'assign', 'work', 'worker', 'env', 'evidence', 'ledger'] as const;
 
 export const siteCss = /* css */ `/* ---------- the page: dark, and the shared frame drawn to match ---------- */
 html:has(body.lx) { background: #0f1214; }
@@ -318,6 +318,8 @@ ${LX_TAB_KEYS.map((k) => `
 .lx-ev .src { font: 500 10px/1 var(--mono); letter-spacing: .06em; padding: 4px 6px; border-radius: 4px; color: #6e7278; border: 1px solid #e2e2dd; }
 .lx-ev .src.obs { color: #00734a; border-color: #c3e6d5; background: #e9f6ef; }
 .lx-doc-f { padding: 12px 24px 18px; font: 400 12px/1.5 var(--sans); color: #8a8f94; }
+.lx-doc a { color: #00734a; }
+.lx-work .v { overflow-wrap: anywhere; }
 .lx-led-h { display: flex; justify-content: space-between; gap: 12px; padding: 14px 22px; border-bottom: 1px solid #e6e6e1; background: #f7f7f5; font: 500 10px/1 var(--sans); letter-spacing: .1em; text-transform: uppercase; color: #8a8f94; }
 .lx-led { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr)); }
 .lx-led-a, .lx-led-b { padding: 22px 24px; }
@@ -459,6 +461,8 @@ ${LX_TAB_KEYS.map((k) => `
   .lx-reply { margin-left: 0; }
   .lx-diff { grid-template-columns: 100px 70px minmax(0, 1fr); }
   .lx-ev { grid-template-columns: 88px minmax(0, 1fr) auto; gap: 8px; }
+  .lx-work .lx-ev { grid-template-columns: minmax(0, 1fr) auto; }
+  .lx-work .v { grid-column: 1 / -1; grid-row: 2; }
   .lx-doc-h, .lx-doc-rows, .lx-doc-f { padding-left: 16px; padding-right: 16px; }
   .lx-led-a, .lx-led-b { padding: 18px 16px; }
   .lx-led-a { border-right: 0; border-bottom: 1px solid #e6e6e1; }

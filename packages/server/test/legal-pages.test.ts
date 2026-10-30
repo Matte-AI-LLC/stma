@@ -58,8 +58,9 @@ it('serves both documents to a stranger, with the addresses a person writes to',
       // Each document carries its own date. Both were revised on 24 September
       // 2026: the Privacy Policy for emailed invitations, and both for the
       // support address moving to support@stma.ai. The Terms again on 26
-      // September, for a description that no longer calls a checkpoint verified.
-      expect(html).toContain(route === '/terms' ? 'Effective 26 September 2026' : 'Effective 24 September 2026');
+      // September, for a description that no longer calls a checkpoint verified,
+      // and the Privacy Policy on 22 October, for authenticator apps.
+      expect(html).toContain(route === '/terms' ? 'Effective 26 September 2026' : 'Effective 22 October 2026');
       expect(html).not.toContain('verified git checkpoint');
       // Data protection and everything else go to different mailboxes, and both
       // are in both documents: somebody reading one must not have to find the

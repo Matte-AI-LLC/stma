@@ -6,6 +6,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { eq } from 'drizzle-orm';
 import { agentInstallations, oauthRefreshTokens, teams } from '../src/db/schema';
 import { assignableAgents } from '../src/domain/assignments';
+import { claudeConnectorLink } from '../src/lib/entry';
 import { loadEnv } from '../src/env';
 import { REFRESH_REPLAY_GRACE_MS } from '../src/routes/oauth';
 import { startServer, type StartedServer } from '../src/server';
@@ -257,6 +258,21 @@ describe('the Claude app connects as a console, not an agent', () => {
     expect(byName.get('list_issues')).toMatchObject({ readOnlyHint: true, openWorldHint: true });
     expect(byName.get('assign_work')).toMatchObject({ readOnlyHint: false, destructiveHint: true, openWorldHint: true });
     expect(byName.get('update_run')).toMatchObject({ readOnlyHint: false, destructiveHint: true, openWorldHint: false });
+    // Native Work: the readers run without asking; every write is replayed by its
+    // request id, and update_work's assign notifies the owner of the agent it names.
+    for (const reader of ['list_work', 'get_work', 'get_work_context', 'get_work_changes']) {
+      expect(byName.get(reader), reader).toMatchObject({ readOnlyHint: true, openWorldHint: false });
+    }
+    for (const writer of ['create_work', 'submit_work', 'record_work_evidence']) {
+      expect(byName.get(writer), writer).toMatchObject({ readOnlyHint: false, destructiveHint: true, openWorldHint: false, idempotentHint: true });
+    }
+    expect(byName.get('update_work')).toMatchObject({ readOnlyHint: false, destructiveHint: true, openWorldHint: true, idempotentHint: true });
+    for (const reader of ['list_execution_targets', 'get_execution']) {
+      expect(byName.get(reader), reader).toMatchObject({ readOnlyHint: true, openWorldHint: false });
+    }
+    for (const writer of ['dispatch_work', 'cancel_execution']) {
+      expect(byName.get(writer), writer).toMatchObject({ readOnlyHint: false, destructiveHint: true, openWorldHint: true, idempotentHint: true });
+    }
 
     // The directory review asks a tool description to say what the tool returns,
     // not to direct the assistant ("Read it BEFORE you create a branch"). It named
@@ -282,7 +298,6 @@ describe('the Claude app connects as a console, not an agent', () => {
       'finish_run',
       'list_active_agents',
       'check_environment',
-      'get_evidence',
       'assign_work',
       'handoff_work',
     ]);
@@ -298,6 +313,15 @@ describe('the Claude app connects as a console, not an agent', () => {
     expect(factual.get('get_workflow')).toMatch(/^Returns the team's published workflow for a project/);
     expect(factual.get('get_policy')).toMatch(/^Returns the effective policy/);
     expect(factual.get('inbox')).toMatch(/^Returns work waiting to be picked up/);
+    expect(factual.get('get_evidence')).toMatch(/^Returns the merge-readiness pack for one run/);
+    // The Work tools were written as descriptions from the start, and none takes a body.
+    for (const name of ['list_work', 'get_work', 'create_work', 'update_work', 'submit_work', 'record_work_evidence', 'get_work_context', 'get_work_changes']) {
+      expect(factual.get(name), name).toMatch(/^Returns /);
+    }
+    // An agent in the 2026-10-21 lab believed nothing stops a content rule.
+    expect(factual.get('get_policy')).toContain(
+      'in a checkout where STMA hooks run the file-tool guard stops an edit that would add it',
+    );
 
     const init = await initialize(token.access_token);
     expect(init.body.result.serverInfo).toMatchObject({ name: 'stma', title: 'STMA' });
@@ -332,6 +356,10 @@ describe('the Claude app connects as a console, not an agent', () => {
     expect(agent).not.toContain('From a chat');
     expect(chat).toContain('From a chat');
     expect(chat).not.toMatch(/never look for it on disk|Do not install/);
+    // A checkpoint is the sender's report; resume checks the receiver's checkout against it.
+    expect(agent).toContain('resume checks your checkout against the Git checkpoint the sender reported');
+    expect(chat).toContain("resume checks the receiver's checkout against the Git checkpoint the sender reported");
+    for (const paragraph of [agent, chat]) expect(paragraph).not.toMatch(/verified Git checkpoint/i);
   });
 });
 
@@ -345,6 +373,12 @@ describe('the guide', () => {
     expect(params.get('modal')).toBe('add-custom-connector');
     expect(params.get('connectorName')).toBe('STMA');
     expect(params.get('connectorUrl')).toMatch(/^https?:\/\/[^/]+\/mcp$/);
+    // One source for the link, so the guide and the Agent connections page cannot differ.
+    expect(link).toBe(claudeConnectorLink(srv.url));
+    // The section is named for both doors and says what the console is not.
+    expect(html).toContain('Two ways in: the Claude app and a coding agent');
+    expect(html.replace(/<[^>]+>/g, ' ')).toContain('not an agent in a checkout');
+    expect(html.replace(/<[^>]+>/g, ' ')).toContain('installs no hooks');
   });
 });
 

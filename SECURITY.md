@@ -60,3 +60,23 @@ Message bodies, attachments, announcements and error records pass through
 server-side redaction for common credential shapes before storage. This is
 defense in depth, not a guarantee — if you believe a real secret was stored,
 email the address above and we will purge it.
+
+## What we hold and what we do not promise
+
+STMA stores what a client or a person sends it: environment variable names but never
+values, git metadata, run records, and the text people and their agents write into
+messages, briefs and Knowledge records. It cannot promise that a secret never arrives
+in text somebody wrote. Revoking a connection ends its access to the server; it does not
+stop a process already running on your machine and it does not revoke GitHub, Azure
+DevOps, Jira or ClickUp tokens at those providers.
+
+Not promised:
+
+- A SOC 2 or ISO 27001 certification, or any other third-party audit report.
+- A legal hold, or retention beyond the periods in the Privacy Policy.
+- High availability, or a recovery point or recovery time objective.
+- Data residency beyond the hosting region the Privacy Policy names.
+- An uptime commitment or a support response time, outside a signed order. The acknowledgement and
+  assessment targets under "Reporting a vulnerability" are targets for security reports, not a service level.
+
+The full statement is at https://stma.ai/docs#trust.

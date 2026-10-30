@@ -17,24 +17,29 @@ import {
   invites,
   memberships,
   messages,
+  mfaChallenges,
   policyBundles,
   policyReceipts,
   projects,
   readState,
+  recoveryCodes,
   snapshots,
   teams,
   tokens,
+  userAuthenticators,
   users,
   webSessions,
   workClaims,
 } from '../db/schema';
 import { accessCodeRequired } from '../auth/accessCodes';
 import {
+  currentSessionCreatedAt,
   currentSessionId,
   destroySession,
   invalidateAllSessions,
   invalidateOtherSessions,
   loginRedirect,
+  markSessionMfa,
   revokeSession,
   sanitizeNext,
   sessionHandle,
@@ -42,6 +47,20 @@ import {
   type BrowserSession,
 } from '../auth/session';
 import { checkUserCode, CODE_TTL_MINUTES, issueAuthCode } from '../auth/codes';
+import {
+  authenticatorStatus,
+  beginEnrollment,
+  confirmEnrollment,
+  factorLockedMessage,
+  regenerateRecoveryCodes,
+  removeAuthenticator,
+  verifySecondFactor,
+  type AuthenticatorStatus,
+} from '../auth/secondFactor';
+import { FACTOR_KEY_UNAVAILABLE, MALFORMED_FACTOR, WRONG_FACTOR } from '../auth/signIn';
+import { qrSvg } from '../auth/totp';
+import { AUTH_SECRETS_UNAVAILABLE, authSecretsAvailable } from '../lib/secretStore';
+import { AuthenticatorCard, EnrollPage, RecoveryCodesPage } from '../ui/Authenticator';
 import { hashPassword, randomCode, randomHex, verifyPassword } from '../lib/crypto';
 import {
   DEFAULT_DEVICE,
@@ -60,6 +79,8 @@ import {
   recordMembershipChanges,
 } from '../lib/memberships';
 import {
+  authenticatorLockedEmail,
+  authenticatorNoticeEmail,
   emailChangeCodeEmail,
   emailChangedNotice,
   emailVerifyCodeEmail,
@@ -127,6 +148,8 @@ import { REVIEW_ACCOUNT_LOCKED, reviewAccessActive, reviewAccessLastDay } from '
 import { TEST_ACCOUNT_LOCKED } from '../lib/testAccounts';
 import { ensureRail, workspaceCounters } from '../lib/rail';
 import { connectionsHref } from '../lib/scope';
+import { entryAnchor, parseEntry } from '../lib/entry';
+import { TwoWaysIn } from '../ui/TwoWaysIn';
 import { slugify } from '../lib/slug';
 import { track } from '../lib/track';
 import type { Env } from '../env';
@@ -141,7 +164,7 @@ import { Mail } from '../ui/Mail';
 export const dashboardRoutes = new Hono<AppEnv>();
 
 dashboardRoutes.use('/app/account/*', async (c, next) => {
-  if (c.req.method === 'POST' && c.get('user')?.isTest && /^\/app\/account\/(email|password|delete)(?:\/|$)/.test(c.req.path)) {
+  if (c.req.method === 'POST' && c.get('user')?.isTest && /^\/app\/account\/(email|password|delete|security)(?:\/|$)/.test(c.req.path)) {
     return c.redirect(`/app/account?error=${encodeURIComponent(TEST_ACCOUNT_LOCKED)}`);
   }
   await next();
@@ -591,6 +614,14 @@ dashboardRoutes.get('/app', async (c) => {
   const draftName = c.req.query('name');
   const draftTag = c.req.query('tag');
   const draftWebhook = c.req.query('webhook_url');
+  // The door a person asked for ("Add STMA to Claude" or "connect a coding
+  // agent"), kept as a closed value. With a workspace already, /app/tokens is
+  // the door that takes them to its connections page; with none, the new
+  // workspace form carries it so the first workspace ends there.
+  const entry = parseEntry(c.req.query('entry'));
+  if (entry && rows.length > 0 && !error && !draftName && !draftTag && !draftWebhook) {
+    return c.redirect(`/app/tokens?entry=${entry}`, 303);
+  }
 
   return c.html(
     <AppLayout user={user} active="teams" title="Workspaces">
@@ -624,9 +655,12 @@ dashboardRoutes.get('/app', async (c) => {
               Create the workspace, then invite them from <b>Members and invites</b>. Joining
               somebody else's? Open the invitation they sent you.
             </p>
-            <button class="btn btn-primary" type="button" data-open-dialog="#new-team">
-              New workspace
-            </button>
+            <TwoWaysIn
+              baseUrl={c.get('env').baseUrl}
+              claudeHref="/docs#claude-app"
+              connectDialog="#new-team"
+              connectLabel="New workspace, then connect a coding agent"
+            />
           </div>
         </div>
       ) : (
@@ -637,7 +671,7 @@ dashboardRoutes.get('/app', async (c) => {
               <th>Role</th>
               <th>Projects</th>
               <th title="Agent runs that are live right now">Working now</th>
-              <th title="Assigned or handed-over work nobody has finished">Work open</th>
+              <th title="Assigned or handed-over work nobody has finished">Dispatched open</th>
               <th title="Open sessions holding a message you have not read">Unread</th>
               <th class="hide-sm">Last snapshot</th>
               <th></th>
@@ -705,6 +739,7 @@ dashboardRoutes.get('/app', async (c) => {
           Members can see each other's shared runs, snapshots and sessions.
         </p>
         <form method="post" action="/app/teams">
+          {entry ? <input type="hidden" name="entry" value={entry} /> : null}
           <Field
             id="team-name"
             label="Workspace name"
@@ -793,11 +828,14 @@ dashboardRoutes.post('/app/teams', async (c) => {
   const name = str('name', 200);
   const tag = str('tag', 60);
   const webhookUrl = str('webhook_url', 500);
+  // Closed set: the door the person came through, never a destination.
+  const entry = parseEntry(body.entry);
 
   // Every rejection hands the form back, because the alternative is retyping
   // three fields to fix one of them.
   const reject = (message: string) => {
     const back = new URLSearchParams({ error: message });
+    if (entry) back.set('entry', entry);
     if (name) back.set('name', name);
     if (tag) back.set('tag', tag);
     if (webhookUrl) back.set('webhook_url', webhookUrl);
@@ -861,7 +899,12 @@ dashboardRoutes.post('/app/teams', async (c) => {
   // Claude had nowhere to finish connecting. Only that one address is honoured,
   // so the field cannot turn this form into a redirect to anywhere else.
   const next = typeof body.next === 'string' ? sanitizeNext(body.next, '') : '';
-  return c.redirect(next.startsWith('/oauth/authorize?') ? next : `/app/teams/${team.slug}`);
+  if (next.startsWith('/oauth/authorize?')) return c.redirect(next);
+  // The two doors end on the connections page, at the section for the one the
+  // person came through; the fragment is one of two fixed strings.
+  return c.redirect(
+    entry ? `${connectionsHref(team.slug)}${entryAnchor(entry)}` : `/app/teams/${team.slug}`,
+  );
 });
 
 async function renderTeamPage(c: Context<AppEnv>, refused?: InviteRefusal) {
@@ -3615,10 +3658,12 @@ const AccountPage = (props: {
   plans?: WorkspacePlans;
   beta: boolean;
   pendingEmail?: string;
+  /** Absent for a test identity, which has no authenticator of its own. */
+  security?: { status: AuthenticatorStatus; keysAvailable: boolean; passwordless: boolean; recentSignIn: boolean };
   error?: string;
   notice?: string;
 }) => {
-  const { user, confirmByEmail, support, sessions, plans, beta, pendingEmail, error, notice } = props;
+  const { user, confirmByEmail, support, sessions, plans, beta, pendingEmail, security, error, notice } = props;
   const unconfirmed = confirmByEmail && Boolean(user.email) && !user.emailVerifiedAt;
   const codeWaiting = unconfirmed ? user.verifyCodeExpiresAt : undefined;
   return (
@@ -3839,6 +3884,8 @@ const AccountPage = (props: {
         </div>
       ) : null}
 
+      {security ? <AuthenticatorCard {...security} /> : null}
+
       {/*
        * "Signed out everywhere" was a claim with no screen behind it. Somebody
        * who suspects their account has been taken over needs to see where it is
@@ -3969,6 +4016,16 @@ dashboardRoutes.get('/app/account', async (c) => {
       // Only ever an address this account just asked to move to, and only for
       // as long as the code lives; it names the form, it authorizes nothing.
       pendingEmail={isEmail(pending) ? pending : undefined}
+      security={
+        user.isTest
+          ? undefined
+          : {
+              status: await authenticatorStatus(c.get('db'), user.id),
+              keysAvailable: authSecretsAvailable(),
+              passwordless: !hasPassword(user),
+              recentSignIn: await recentSignIn(c),
+            }
+      }
       error={c.req.query('error')}
       notice={c.req.query('ok')}
     />,
@@ -4288,6 +4345,222 @@ dashboardRoutes.post('/app/account/password', async (c) => {
   return back('Password updated. Other browser sessions were signed out.', true);
 });
 
+// ---------------------------------------------------------- authenticator app
+
+/** How recent a sign-in stands in for a password, for accounts that have none. */
+const RECENT_SIGN_IN_MS = 10 * 60_000;
+const SIGN_IN_AGAIN =
+  'Sign in again to do this. Without a password, a sign-in from the last 10 minutes is what proves it is you.';
+
+/** A password this server can check. An organization-only account carries a marker, not a hash. */
+const hasPassword = (user: User): boolean => Boolean(user.passwordHash?.startsWith('scrypt:'));
+
+async function recentSignIn(c: Context<AppEnv>): Promise<boolean> {
+  const at = await currentSessionCreatedAt(c);
+  return Boolean(at && Date.now() - at.getTime() <= RECENT_SIGN_IN_MS);
+}
+
+/**
+ * Proof that the person at this browser is the account holder, not somebody
+ * holding a borrowed cookie: the current password where there is one (with the
+ * sign-in throttle it shares), otherwise a sign-in from the last ten minutes,
+ * which a stolen old cookie cannot satisfy. Never an emailed code: that would
+ * make the mailbox enough again.
+ */
+async function strongReauth(
+  c: Context<AppEnv>,
+  user: User,
+  password: unknown,
+): Promise<{ ok: true } | { ok: false; message: string }> {
+  if (hasPassword(user)) return checkAccountPassword(c, user, typeof password === 'string' ? password : '');
+  return (await recentSignIn(c)) ? { ok: true } : { ok: false, message: SIGN_IN_AGAIN };
+}
+
+/**
+ * A current code from the app, or a recovery code, for the changes that need both.
+ *
+ * A recovery code spent here means what it means at sign-in, that the phone
+ * may be gone, so it has the same consequences: every other browser is signed
+ * out and the address is told. Without that, spending one here would be the
+ * quiet way to use a recovery code.
+ */
+async function accountFactor(
+  c: Context<AppEnv>,
+  user: User,
+  code: unknown,
+): Promise<{ ok: true; via: 'totp' | 'recovery' } | { ok: false; message: string }> {
+  const env = c.get('env');
+  const checked = await verifySecondFactor(c.get('db'), user, typeof code === 'string' ? code.slice(0, 64) : '');
+  switch (checked.status) {
+    case 'ok':
+      if (checked.via === 'recovery') {
+        await invalidateOtherSessions(c, user.id);
+        if (user.email) {
+          void sendMail(env, {
+            to: user.email,
+            ...authenticatorNoticeEmail('recovery_code_used', {
+              ...noticeFor(c),
+              codesLeft: checked.recoveryCodesLeft,
+              usedOn: 'account',
+            }),
+          });
+        }
+      }
+      return { ok: true, via: checked.via };
+    case 'locked':
+      if (checked.justLocked && user.email) {
+        void sendMail(env, {
+          to: user.email,
+          ...authenticatorLockedEmail(env.baseUrl, checked.resetAt, 'browser', { hasPassword: hasPassword(user) }),
+        });
+      }
+      return { ok: false, message: factorLockedMessage(checked.resetAt) };
+    case 'key_unavailable':
+      return { ok: false, message: FACTOR_KEY_UNAVAILABLE };
+    case 'malformed':
+      return { ok: false, message: MALFORMED_FACTOR };
+    case 'not_enabled':
+      return { ok: false, message: 'No authenticator app is on for this account.' };
+    default:
+      return { ok: false, message: WRONG_FACTOR };
+  }
+}
+
+/**
+ * A reviewer was handed this account's password for a while; adding or
+ * removing its second factor is the owner's call, not theirs, for the same
+ * reason the address and deletion are locked.
+ */
+const REVIEW_SECURITY_LOCKED =
+  'While review access runs, this account cannot add or remove an authenticator app. The operator who set it can end it early.';
+
+const securityBack = (c: Context<AppEnv>, msg: string, ok = false) =>
+  c.redirect(`/app/account?${ok ? 'ok' : 'error'}=${encodeURIComponent(msg)}#security`);
+
+const noticeFor = (c: Context<AppEnv>) => ({
+  baseUrl: c.get('env').baseUrl,
+  supportEmail: c.get('env').supportEmail,
+  browser: c.req.header('user-agent'),
+});
+
+dashboardRoutes.post('/app/account/security/start', async (c) => {
+  const user = c.get('user');
+  if (!user) return loginRedirect(c);
+  if (reviewAccessActive(user)) return securityBack(c, REVIEW_SECURITY_LOCKED);
+  const body = await c.req.parseBody();
+  const proved = await strongReauth(c, user, body.current_password);
+  if (!proved.ok) return securityBack(c, proved.message);
+  const begun = await beginEnrollment(c.get('db'), user);
+  if (!begun.ok) {
+    return securityBack(
+      c,
+      begun.reason === 'no_key' ? AUTH_SECRETS_UNAVAILABLE : 'An authenticator app is already on for this account.',
+    );
+  }
+  c.header('Cache-Control', 'private, no-store');
+  return c.html(<EnrollPage user={user} secret={begun.secret} uri={begun.uri} qr={qrSvg(begun.uri)} />);
+});
+
+dashboardRoutes.post('/app/account/security/confirm', async (c) => {
+  const user = c.get('user');
+  if (!user) return loginRedirect(c);
+  if (reviewAccessActive(user)) return securityBack(c, REVIEW_SECURITY_LOCKED);
+  const env = c.get('env');
+  const body = await c.req.parseBody();
+  const code = typeof body.code === 'string' ? body.code.slice(0, 32) : '';
+  const result = await confirmEnrollment(c.get('db'), user, code);
+  c.header('Cache-Control', 'private, no-store');
+  if (!result.ok) {
+    if (result.reason === 'wrong' || result.reason === 'malformed') {
+      return c.html(
+        <EnrollPage user={user} error="That code did not match. Enter the code your app shows now." />,
+        422,
+      );
+    }
+    if (result.reason === 'locked') {
+      if (result.justLocked && user.email) {
+        void sendMail(env, {
+          to: user.email,
+          ...authenticatorLockedEmail(env.baseUrl, result.resetAt, 'browser', { hasPassword: hasPassword(user) }),
+        });
+      }
+      return securityBack(c, factorLockedMessage(result.resetAt));
+    }
+    if (result.reason === 'key_unavailable') return securityBack(c, AUTH_SECRETS_UNAVAILABLE);
+    return securityBack(c, 'That setup expired or was replaced. Start again.');
+  }
+  // This browser just proved the app works, so it stands on the new factor;
+  // every other one is signed out, because it did not.
+  await markSessionMfa(c, true);
+  await invalidateOtherSessions(c, user.id);
+  if (user.email) {
+    void sendMail(env, { to: user.email, ...authenticatorNoticeEmail('authenticator_enabled', noticeFor(c)) });
+  }
+  return c.html(
+    <RecoveryCodesPage
+      user={user}
+      codes={result.recoveryCodes}
+      title="Authenticator app is on"
+      lead="Signing in now asks for a code from your app. Every other browser was signed out."
+    />,
+  );
+});
+
+dashboardRoutes.post('/app/account/security/recovery-codes', async (c) => {
+  const user = c.get('user');
+  if (!user) return loginRedirect(c);
+  if (reviewAccessActive(user)) return securityBack(c, REVIEW_SECURITY_LOCKED);
+  const env = c.get('env');
+  const body = await c.req.parseBody();
+  const proved = await strongReauth(c, user, body.current_password);
+  if (!proved.ok) return securityBack(c, proved.message);
+  const factor = await accountFactor(c, user, body.code);
+  if (!factor.ok) return securityBack(c, factor.message);
+  // This browser just completed the factor. If it did so with a recovery code,
+  // the account's second-factor change time moved, and without this the
+  // session would read as older than the change it made itself (an
+  // organization that requires an authenticator compares the two). The other
+  // browsers were signed out by `accountFactor` in that case.
+  await markSessionMfa(c, true);
+  const codes = await regenerateRecoveryCodes(c.get('db'), user);
+  if (!codes) return securityBack(c, 'No authenticator app is on for this account.');
+  if (user.email) {
+    void sendMail(env, { to: user.email, ...authenticatorNoticeEmail('recovery_codes_regenerated', noticeFor(c)) });
+  }
+  c.header('Cache-Control', 'private, no-store');
+  return c.html(
+    <RecoveryCodesPage
+      user={user}
+      codes={codes}
+      title="New recovery codes"
+      lead="Your previous recovery codes no longer work."
+    />,
+  );
+});
+
+dashboardRoutes.post('/app/account/security/disable', async (c) => {
+  const user = c.get('user');
+  if (!user) return loginRedirect(c);
+  if (reviewAccessActive(user)) return securityBack(c, REVIEW_SECURITY_LOCKED);
+  const env = c.get('env');
+  const body = await c.req.parseBody();
+  const proved = await strongReauth(c, user, body.current_password);
+  if (!proved.ok) return securityBack(c, proved.message);
+  const factor = await accountFactor(c, user, body.code);
+  if (!factor.ok) return securityBack(c, factor.message);
+  await removeAuthenticator(c.get('db'), user, 'self');
+  await markSessionMfa(c, false);
+  await invalidateOtherSessions(c, user.id);
+  if (user.email) {
+    void sendMail(env, { to: user.email, ...authenticatorNoticeEmail('authenticator_disabled', noticeFor(c)) });
+  }
+  return securityBack(
+    c,
+    'The authenticator app is off and its recovery codes no longer work. Every other browser was signed out.',
+    true,
+  );
+});
+
 dashboardRoutes.post('/app/account/delete', async (c) => {
   const user = c.get('user');
   if (!user) return loginRedirect(c);
@@ -4335,6 +4608,11 @@ dashboardRoutes.post('/app/account/delete', async (c) => {
   // keeps every authored row and page join intact.
   await db.transaction(async (tx) => {
     await tx.delete(webSessions).where(eq(webSessions.userId, user.id));
+    // The sealed authenticator secret and the recovery-code digests go with
+    // the account: a scrubbed row keeps nothing that could sign anybody in.
+    await tx.delete(userAuthenticators).where(eq(userAuthenticators.userId, user.id));
+    await tx.delete(recoveryCodes).where(eq(recoveryCodes.userId, user.id));
+    await tx.delete(mfaChallenges).where(eq(mfaChallenges.userId, user.id));
     await tx
       .update(tokens)
       .set({ revokedAt: new Date() })

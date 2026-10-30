@@ -526,6 +526,86 @@ export function helpSections(
             </>
           ),
         },
+        {
+          quotes: [
+            {
+              text: 'That code did not work. Enter the current 6-digit code from your authenticator app, or one of your recovery codes.',
+              from: 'server/src/auth/signIn.ts',
+            },
+          ],
+          where: 'Browser · authenticator code',
+          means: (
+            <>
+              A code from the app is accepted for about thirty seconds either side of the moment it
+              is shown, and only once. The usual cause is a phone whose clock has drifted, or a code
+              that was already used to sign in a moment ago, which is refused without counting
+              against you. After five wrong codes the code step is refused until the time the page
+              names, at most fifteen minutes away, whichever browser they came from, and the address
+              is told. Resetting the password does not lift that wait: the codes came after the
+              password was accepted, so the mail says to change it if they were not yours.
+            </>
+          ),
+          todo: (
+            <>
+              Turn on automatic date and time on the phone, wait for the next code and enter that
+              one. An emailed code is never offered instead: with an authenticator app on, the
+              phone or a recovery code is how you sign in.
+            </>
+          ),
+        },
+        {
+          symptom: <>You have lost the phone with your authenticator app, or it was reset.</>,
+          quotes: [
+            {
+              text: 'Lost the phone? Enter one of your recovery codes instead.',
+              from: 'server/src/routes/auth.tsx',
+            },
+          ],
+          where: 'Browser · authenticator code',
+          means: (
+            <>
+              The ten recovery codes shown when you turned the app on each sign you in once. Using
+              one signs every other browser out and emails your address, because it usually means a
+              phone was lost.
+            </>
+          ),
+          todo: (
+            <>
+              Enter a recovery code on the code page, then open Account and make new recovery codes
+              or move the authenticator to your new phone. With no phone and no recovery codes left,
+              write to support from the address on the account: an operator can reset the
+              authenticator after checking it is you, and resetting your password does not.
+            </>
+          ),
+        },
+        {
+          quotes: [
+            {
+              text: 'Authenticator apps need an encryption key on this server. Ask the operator to set STMA_INTEGRATION_KEYS.',
+              from: 'server/src/lib/secretStore.ts',
+            },
+            {
+              text: 'This server cannot check authenticator codes right now. Sign in with one of your recovery codes instead.',
+              from: 'server/src/auth/signIn.ts',
+            },
+          ],
+          where: 'Console · Account, or browser · authenticator code',
+          means: (
+            <>
+              An authenticator secret is only ever stored encrypted, with the same key the server
+              uses for integration credentials. A server with no key offers no authenticator apps.
+              A server that had one and lost it cannot check codes until the key is back, and
+              recovery codes, which do not need it, still work.
+            </>
+          ),
+          todo: (
+            <>
+              Use a recovery code to sign in. If you run the server, restore the key version it was
+              configured with (<code>STMA_INTEGRATION_KEYS</code> and{' '}
+              <code>STMA_INTEGRATION_ACTIVE_KEY</code>); never generate a new one in its place.
+            </>
+          ),
+        },
       ],
     },
 
@@ -974,6 +1054,38 @@ export function helpSections(
         {
           quotes: [
             {
+              text: 'It is not an agent in a checkout: it installs no hooks, has no file guard, and nobody can assign it work.',
+              find: 'It is not an agent in a checkout: it installs no hooks, has no file guard, and nobody can assign it work.',
+              from: 'server/src/lib/entry.ts',
+            },
+          ],
+          symptom: (
+            <>
+              You added STMA in the Claude app, and now Claude Code in your checkout is not an agent
+              there, or the Claude app shows up on Agent connections but cannot be given work.
+            </>
+          ),
+          where: 'Browser · Agent connections',
+          means: (
+            <>
+              They are two doors. The Claude app connection is a console you talk to from Claude on
+              the web, desktop or phone; it installs nothing in a checkout, so it starts no runs,
+              has no hooks and is nobody's assignee. A coding agent in a checkout is the other
+              door, and one account can use both.
+            </>
+          ),
+          todo: (
+            <>
+              For the checkout, open <b>Agent connections</b> in the workspace and run the{' '}
+              <code>stma connect</code> command it shows in a terminal at the checkout root. The
+              first test between two agents is meant for two coding agents; the Claude app is a
+              console, and the Test card marks an exchange that included it as proving less.
+            </>
+          ),
+        },
+        {
+          quotes: [
+            {
               text: 'STMA stopped this file edit: coordination_unavailable. Resolve the connection, scope or conflict with your human; do not bypass it through a shell or another tool.',
               find: 'Resolve the connection, scope or conflict with your human; do not bypass it through a shell or another tool.',
               from: 'cli/src/index.ts',
@@ -1348,6 +1460,370 @@ export function helpSections(
               Use a name from the list the reply gives. For a shared name, add{' '}
               <code>device</code> with the machine label, or <code>to</code> with the owner's
               username, as the reply asks.
+            </>
+          ),
+        },
+      ],
+    },
+
+    {
+      id: 'work',
+      title: 'Work items',
+      blurb: 'Stale versions, contract changes, decisions, stale evidence and tracker fields',
+      console: true,
+      intro: (
+        <>
+          Every refusal on a work item is a code and a sentence, on the console, over MCP and over REST,
+          and a refused command writes nothing, so the same <code>request_id</code> can be sent again
+          once it is corrected. The guide's <a href="/docs#work">Work</a> section explains the model.
+        </>
+      ),
+      entries: [
+        {
+          quotes: [
+            {
+              text: 'The work is at version 7; this command expected 5. Read it again and send a new command.',
+              find: '. Read it again and send a new command.',
+              from: 'server/src/domain/work.ts',
+            },
+            {
+              text: 'This work changed since you opened the page: it is now at version 7.',
+              find: 'This work changed since you opened the page: it is now at version ',
+              from: 'server/src/routes/work.tsx',
+            },
+          ],
+          where: 'Console · Agent · VERSION_CONFLICT',
+          means: (
+            <>
+              Somebody or something changed the work after you read it: another person, an agent, a
+              provider observation of the delivered commit. Every change names the version it was made
+              from, so a stale form or a stale agent can never overwrite what happened in between.
+            </>
+          ),
+          todo: (
+            <>
+              In the console the page comes back with what you typed and the current version filled
+              in; read what changed and send it again. An agent reads the work again and sends a new
+              command with the <code>current_version</code> the error names.
+            </>
+          ),
+        },
+        {
+          quotes: [
+            {
+              text: 'This request_id was already used for a different command. Retry the original unchanged, or use a new request_id for new work.',
+              find: 'Retry the original unchanged, or use a new request_id for new work.',
+              from: 'server/src/domain/work.ts',
+            },
+          ],
+          where: 'Agent · REQUEST_ID_REUSED',
+          means: (
+            <>
+              A request id names one command. Sent again unchanged it is answered as a replay and
+              changes nothing, on MCP and REST alike; sent with anything different it is refused, so a
+              retry can never quietly become another change.
+            </>
+          ),
+          todo: <>Resend the original exactly, or generate a new <code>request_id</code> for a new command.</>,
+        },
+        {
+          quotes: [
+            {
+              text: 'No work with that id is visible to this principal.',
+              from: 'server/src/domain/work.ts',
+            },
+          ],
+          where: 'Agent · NOT_FOUND',
+          means: (
+            <>
+              Either there is no such work item, or this connection or this account cannot see it. The
+              answer is the same on purpose: a work item you cannot reach does not exist for you, and
+              the sentence never says which. In the console the same work item opens{' '}
+              <b>Page not found</b>, for the same reason.
+            </>
+          ),
+          todo: (
+            <>
+              Check the id, and the project: a connection scoped to one project cannot read another
+              project's work. A person needs to be a member of the workspace; the connection's reach is
+              on <a href="/app/tokens">Agent connections</a>.
+            </>
+          ),
+        },
+        {
+          quotes: [
+            {
+              text: 'The contract is not complete yet; it is missing: owner, acceptor.',
+              find: 'The contract is not complete yet; it is missing: ',
+              from: 'server/src/domain/work.ts',
+            },
+            {
+              text: 'Ready work must stay complete; this change leaves it without: contract.goal.',
+              find: 'Ready work must stay complete; this change leaves it without: ',
+              from: 'server/src/domain/work.ts',
+            },
+          ],
+          where: 'Console · Agent · CONTRACT_INCOMPLETE',
+          means: (
+            <>
+              Work can be ready only with an owner, an acceptor, a goal, at least one criterion and an
+              artifact kind, and ready work must stay that way. The sentence lists what is missing, by
+              the names the API uses.
+            </>
+          ),
+          todo: <>Fill in the listed fields, or move the work back to draft first.</>,
+        },
+        {
+          quotes: [
+            {
+              text: 'WORK-12 is at contract revision 3; this assignment expected revision 2.',
+              find: 'expected revision ',
+              from: 'server/src/domain/workLinks.ts',
+            },
+            {
+              text: 'CONTRACT_CHANGED: this assignment was made for WORK-12 at contract revision 2, and the contract is now at revision 3. Do not start it on the old contract: ask whoever sent it to cancel this assignment and assign the work again at revision 3.',
+              find: 'Do not start it on the old contract: ask whoever sent it to cancel this ',
+              from: 'server/src/domain/workLinks.ts',
+            },
+          ],
+          where: 'Console · Agent · CONTRACT_CHANGED',
+          means: (
+            <>
+              An assignment and a run are pinned to the contract revision they were given, and the
+              contract changed since. STMA never relabels an old brief as the new contract, so the agent
+              is told not to start it.
+            </>
+          ),
+          todo: (
+            <>
+              The sender cancels the old assignment and assigns the work again at the current revision;
+              the agent reads the work first. A run already working on the old revision is named in the
+              change and is not stopped.
+            </>
+          ),
+        },
+        {
+          quotes: [
+            {
+              text: 'run_rotated: run 3f2a… was closed by a controlled rotation when this agent took work on another contract, and run 9c1d… replaced it. Use run_id 9c1d… from now on; do not start another run.',
+              find: ' from now on; do not start another run.',
+              from: 'server/src/domain/agents.ts',
+            },
+          ],
+          where: 'Agent · hook output',
+          means: (
+            <>
+              When an agent accepted work, STMA closed the run its hooks had open and linked a new one
+              to the work, so the run answers to the contract it is being judged against. The old run
+              id now points at its successor.
+            </>
+          ),
+          todo: (
+            <>
+              Use the run id the message names; a current hook adopts it by itself. A runtime pinned
+              before rotations is answered for the new run in place of the old one, so its session keeps
+              one run; <code>stma adapter repair --pin-runtime --apply</code> brings it up to date.
+            </>
+          ),
+        },
+        {
+          quotes: [
+            {
+              text: 'INVALID_TRANSITION: Run 9c1d… of this agent is already linked to WORK-5; nothing was started. Send run_id 9c1d… in every call for this work; do not start another run.',
+              find: '; do not start another run.',
+              from: 'server/src/domain/workLinks.ts',
+            },
+          ],
+          where: 'Agent · start_run',
+          means: (
+            <>
+              The agent already has a live run linked to this work, usually because accepting the
+              assignment moved its run onto the work, and a second run beside it would collide with its
+              own. Nothing was started.
+            </>
+          ),
+          todo: (
+            <>
+              Use the run id the message names for everything about this work. A run for parallel
+              attempts in separate worktrees is started with one <code>attempt_group</code> on both.
+            </>
+          ),
+        },
+        {
+          quotes: [
+            {
+              text: 'Accepting needs every required criterion to pass against this delivery and nothing blocking the work.',
+              from: 'server/src/domain/workAcceptance.ts',
+            },
+            {
+              text: 'The evidence changed after it was shown. Read it again and decide on what is there now.',
+              from: 'server/src/domain/workAcceptance.ts',
+            },
+          ],
+          where: 'Console · INVALID_TRANSITION · EVIDENCE_STALE',
+          means: (
+            <>
+              A decision is made on the exact snapshot you looked at. A criterion that is unknown,
+              failing or stale, or a blocker, stops an accept, and the refusal lists them. If a provider
+              observation or a new delivery landed while you read, the decision is refused rather than
+              applied to evidence you did not see.
+            </>
+          ),
+          todo: (
+            <>
+              Reload the work and decide on what is there now. If a criterion cannot pass, ask for
+              changes and name it. Unknown is never a pass: a criterion that asks for a provider
+              observation passes only when a connected repository and a matching workflow exist.
+            </>
+          ),
+        },
+        {
+          quotes: [
+            {
+              text: "Only the work's acceptor, or a workspace owner giving a reason, records a decision.",
+              from: 'server/src/domain/workAcceptance.ts',
+            },
+            {
+              text: 'Only a person signed in to the console records a decision. No agent, token or API credential can accept or request changes.',
+              from: 'server/src/domain/workAcceptance.ts',
+            },
+            { text: 'An agent may change only its own draft.', from: 'server/src/domain/work.ts' },
+          ],
+          where: 'Console · Agent · FORBIDDEN',
+          means: (
+            <>
+              Accepting is a person's act, by the acceptor or by a workspace owner who says why they
+              decide instead. No agent connection can do it, not even a person's own token. An agent
+              also changes only a draft it filed itself.
+            </>
+          ),
+          todo: (
+            <>
+              Ask the acceptor, or name a different acceptor on the work. An agent that needs a change
+              to a contract it does not own records a blocker of kind <code>contract_change_request</code>.
+            </>
+          ),
+        },
+        {
+          quotes: [
+            { text: 'Archived work is read-only.', from: 'server/src/domain/work.ts' },
+            {
+              text: 'Work in accepted is reopened, not moved.',
+              find: ' is reopened, not moved.',
+              from: 'server/src/domain/work.ts',
+            },
+            {
+              text: 'Work in draft cannot move to in_review.',
+              find: ' cannot move to ',
+              from: 'server/src/domain/work.ts',
+            },
+            {
+              text: 'The current delivery already has a decision; in review needs a new delivery.',
+              from: 'server/src/domain/work.ts',
+            },
+          ],
+          where: 'Console · Agent · INVALID_TRANSITION',
+          means: (
+            <>
+              The state machine does not allow that move from where the work is. Accepted and cancelled
+              work is reopened with a reason, not moved; archived work is read-only until it is
+              reopened; work that was sent back goes to review again only with a new delivery.
+            </>
+          ),
+          todo: <>Read the <code>next_action</code> in the answer: it names the move that is allowed.</>,
+        },
+        {
+          quotes: [
+            {
+              text: 'contract.title is owned by GitHub issue acme/api#42 while it is this work\'s source of truth.',
+              find: " while it is this work's source of truth.",
+              from: 'server/src/domain/workExternal.ts',
+            },
+            {
+              text: 'GitHub did not return that issue: it does not exist, or the connection cannot read it.',
+              from: 'server/src/domain/workExternal.ts',
+            },
+            {
+              text: 'The GitHub connection was removed while the issue was being read.',
+              from: 'server/src/domain/workExternal.ts',
+            },
+          ],
+          where: 'Console · FIELD_OWNED_EXTERNALLY · SOURCE_UNAVAILABLE',
+          means: (
+            <>
+              When a GitHub issue is a work item's source of truth, it owns the title and the goal; a
+              change here would be overwritten, so it is refused. A source that cannot be read leaves
+              the last copy on the page, marked unavailable, and the command is refused rather than
+              guessed. STMA only reads from GitHub: it never writes back.
+            </>
+          ),
+          todo: (
+            <>
+              Change the issue on GitHub and read it again from the work, or convert the record to a
+              reference to own the fields here. If the connection was removed, detach the record and
+              attach it again once the repository is connected.
+            </>
+          ),
+        },
+        {
+          quotes: [
+            {
+              text: 'This cursor was not issued by this server, or it was altered.',
+              from: 'server/src/domain/workChanges.ts',
+            },
+            {
+              text: 'This snapshot was kept for 10 minutes and has expired.',
+              find: ' minutes and has expired.',
+              from: 'server/src/domain/workChanges.ts',
+            },
+            {
+              text: 'This filter matches 600 work items; a snapshot holds at most 500.',
+              find: ' work items; a snapshot holds at most ',
+              from: 'server/src/domain/workChanges.ts',
+            },
+          ],
+          where: 'Agent · CURSOR_INVALIDATED · CURSOR_EXPIRED · LIMIT_EXCEEDED',
+          means: (
+            <>
+              A cursor from <code>get_work_changes</code> belongs to one project, one filter and one
+              connection, and a snapshot is kept for ten minutes. A changed filter, another connection or
+              a lapse starts again from a fresh snapshot, so nothing from an old reach leaks into a new
+              one. A filter that matches more than 500 items must be narrowed.
+            </>
+          ),
+          todo: (
+            <>
+              Call again without a cursor, and narrow the filter with a view, states, an owner or a
+              label.
+            </>
+          ),
+        },
+        {
+          quotes: [
+            {
+              text: 'WORK-3 cannot depend on WORK-5: WORK-5 already depends on WORK-3 (WORK-5 -> WORK-3), so the new dependency would make a cycle.',
+              find: ', so the new dependency would make a cycle.',
+              from: 'server/src/domain/workGraph.ts',
+            },
+            {
+              text: 'This project holds 5000 work items; at most 5000 are kept per project on the hosted service.',
+              find: ' are kept per project on the hosted service.',
+              from: 'server/src/domain/work.ts',
+            },
+          ],
+          where: 'Console · Agent · INVALID_INPUT · LIMIT_EXCEEDED',
+          means: (
+            <>
+              A dependency that would make two work items wait for each other is refused with the path
+              that closes the cycle. Hosted workspaces also keep at most 5,000 work items per project,
+              200 deliveries per work item and 500 evidence rows per delivery; these are safety limits,
+              not plan features, and an answer names the number used and the limit.
+            </>
+          ),
+          todo: (
+            <>
+              Remove the dependency that closes the loop. Nothing deletes a work item, so a project at the
+              limit takes new work in another project, or write to support.
             </>
           ),
         },
@@ -1786,9 +2262,9 @@ export function helpSections(
           where: 'Agent · MCP reply',
           means: (
             <>
-              The workspace's plan does not include that capability. The agent map stays readable on
-              every plan; starting runs, policy, preflight and evidence packs come with the plans the
-              reply names.
+              The workspace's plan does not include that capability. The agent map and a run's
+              evidence stay readable and exportable on every plan; starting runs, policy and
+              preflight come with the plans the reply names.
             </>
           ),
           todo: <>Tell the human who owns the workspace; the plan is theirs to change, not the agent's to work around.</>,
@@ -2153,6 +2629,47 @@ const expectedNotes = (): { claim: string; body: unknown }[] => [
       <>
         It is the client's permission mode: the same hook text walked straight through in one
         session's auto-approve mode and stopped to ask in another's default mode.
+      </>
+    ),
+  },
+  {
+    claim: '“Ready for review” is not accepted.',
+    body: (
+      <>
+        It means every required criterion passes against a delivery for the current contract
+        revision. Accepting is a person's decision in the console, recorded against that exact
+        evidence; no agent connection can make it, and a result an agent reported about itself never
+        satisfies a criterion that asks for a provider or a person.
+      </>
+    ),
+  },
+  {
+    claim: 'A closed GitHub issue does not accept the work, and accepting does not close the issue.',
+    body: (
+      <>
+        STMA reads the issue and never writes to it. A work item tied to an issue follows it only as
+        far as the owner chose: as a reference beside the work, as the owner of its title and goal, or
+        as a one-time copy.
+      </>
+    ),
+  },
+  {
+    claim: 'Cancelling work does not stop an agent that is running.',
+    body: (
+      <>
+        It closes the work item and says which assignments and runs were still linked. STMA cannot stop
+        a process on somebody's machine; tell the agent, or revoke its connection.
+      </>
+    ),
+  },
+  {
+    claim: 'Work can show as blocked with no blocker recorded.',
+    body: (
+      <>
+        Two things block work without a row anybody wrote: a dependency on work that is not accepted
+        at the required revision with evidence that has not moved, and a missing acceptor. Both are
+        read each time the work is shown, with their reasons, and clear on their own when they stop
+        being true.
       </>
     ),
   },

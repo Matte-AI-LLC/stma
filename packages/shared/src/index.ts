@@ -54,3 +54,6 @@ export * from './fingerprint';
 export * from './delivery';
 export * from './knowledge';
 export * from './checkpoints';
+export * from './work';
+export * from './execution';
+export * from './repositoryIdentity';

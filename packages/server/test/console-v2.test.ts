@@ -468,7 +468,7 @@ it('answers "is anything happening anywhere" from the list of workspaces, not fr
   expect(accountRail).not.toContain('href="/app/agents"');
   expect(accountRail).not.toContain('href="/app/sessions"');
   expect(accountRail).not.toContain('href="/app/handoffs"');
-  for (const column of ['Working now', 'Work open', 'Unread']) expect(home.html).toContain(`>${column}</th>`);
+  for (const column of ['Working now', 'Dispatched open', 'Unread']) expect(home.html).toContain(`>${column}</th>`);
   // v2-team has live runs from the tests above: the number is a link into its own map.
   const row = /<tr><td><div class="cellrow">(?:(?!<\/tr>).)*?\/app\/teams\/v2-team"(?:(?!<\/tr>).)*<\/tr>/s.exec(home.html)?.[0] ?? '';
   expect(row).toMatch(/<a href="\/app\/agents\?team=v2-team">[1-9]\d*<\/a>/);

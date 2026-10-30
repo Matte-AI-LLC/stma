@@ -159,6 +159,27 @@ describe("a run's evidence outlives the map", () => {
     expect(page).toContain('data-copy="## STMA evidence: PD-27');
     expect(page).toContain(handoff.title);
     expect(page).not.toContain('client_report ·');
+    // The review pack (2026-10-22): the run and its commit named in full, the
+    // short block for a pull request, and who can open the link.
+    expect(page).toContain('Copy for a pull request');
+    expect(page).toContain(checkpoint.runId);
+    expect(page).toContain('Only members of the Parcel Desk workspace can open this run&#39;s link.');
+    expect(page).toContain('Handover');
+    expect(page).toContain('Observed by the provider');
+    expect(page).toContain('Policy and Knowledge');
+    // The whole-pack summary has its own card, as in the Markdown, and is not
+    // printed under the provider's heading, where it would read as its word.
+    const provider = page.slice(
+      page.indexOf('<div class="card-title">Observed by the provider</div>'),
+      page.indexOf('<div class="card-title">Still open</div>'),
+    );
+    expect(page.indexOf('<div class="card-title">Still open</div>')).toBeGreaterThan(
+      page.indexOf('<div class="card-title">Observed by the provider</div>'),
+    );
+    expect(provider).not.toMatch(/Needs attention first|Nothing failing, but unconfirmed|No recorded failure in the checks shown/);
+    expect(page).toMatch(
+      /<div class="card-title">Still open<\/div><span class="muted small">(Needs attention first|Nothing failing, but unconfirmed|No recorded failure in the checks shown)/,
+    );
 
     const markdown = await get(lead, `${href}/evidence.md`);
     expect(markdown.status).toBe(200);
@@ -174,6 +195,13 @@ describe("a run's evidence outlives the map", () => {
     // A check nobody answered is not "reported by the agent", whatever its source would have been.
     expect(text).toContain('**Environment** (unconfirmed, not reported by the agent)');
     expect(text).toContain('Informational evidence, not authorization to merge or deploy.');
+    expect(text).toContain('### Observed by the provider');
+    expect(text).toContain('### Handover');
+    expect(text).toContain(`Run \`${checkpoint.runId}\``);
+    expect(text).toContain(checkpoint.commitSha);
+    // The demo's handoff names the run's tested checkpoint, so it is listed with its receiver.
+    expect(text).toContain('Receiver:');
+    expect(text).toContain('Run page: ');
   });
 
   it("is nobody else's, and answers only the canonical spelling of its id", async () => {

@@ -297,12 +297,14 @@ const Break = ({ children }: { children?: Child }) => (
   </div>
 );
 
-/* ---- the six exchanges ---- */
+/* ---- the feature exchanges ---- */
 
 const TABS: { key: string; title: string; desc: string }[] = [
   { key: 'rules', title: 'Team rules', desc: 'Published once and served to every run. With hooks, a forbidden edit is stopped at the file tool.' },
   { key: 'handoff', title: 'Handoffs', desc: 'Before a usage limit ends a session, the work moves to another agent at the exact commit.' },
   { key: 'assign', title: 'Assign work', desc: 'Give a task to a named agent from the browser, or from another agent.' },
+  { key: 'work', title: 'Native Work', desc: 'Keep the goal, acceptance criteria and delivery evidence together. No external tracker required.' },
+  { key: 'worker', title: 'Local worker', desc: 'Explicitly dispatch an assignment to your enabled Claude Code worker, without opening another agent chat.' },
   { key: 'env', title: 'Environment drift', desc: "Preflight compares the machine with the project's baseline before the first edit." },
   { key: 'evidence', title: 'Evidence', desc: 'One page per run, with what the agent reported kept apart from what was observed.' },
   { key: 'ledger', title: 'Savings ledger', desc: 'What STMA prevented, next to what your team confirmed it prevented.' },
@@ -362,6 +364,51 @@ const TabPanel = ({ k }: { k: string }) => {
         <Break>desktop · desktop-agent</Break>
         <You>read your STMA inbox and do what is assigned to you</You>
         <Say>One assignment from laptop-agent: the filter change. Starting on it now.</Say>
+      </Session>
+    );
+  if (k === 'work')
+    return (
+      <div class="lx-doc lx-work">
+        <div class="lx-doc-h">
+          <div>
+            <span class="lx-doc-k">NATIVE WORK · IN REVIEW</span>
+            <div class="lx-doc-t">WORK-12 Explain payment retries</div>
+            <div class="lx-doc-m">payments-api · owner: Ada · acceptor: Jonas</div>
+          </div>
+        </div>
+        <div class="lx-doc-rows">
+          <div class="lx-ev"><span class="l">Goal</span><span class="v">Help support explain when a failed payment is retried.</span><span class="src">CONTRACT</span></div>
+          <div class="lx-ev"><span class="l">Criterion</span><span class="v">Include retry timing and an example, checked by a person.</span><span class="src">CONTRACT</span></div>
+          <div class="lx-ev"><span class="l">Delivery</span><span class="v mono">payment-retries.md · version 2</span><span class="src">AGENT</span></div>
+          <div class="lx-ev"><span class="l">Evidence</span><span class="v">Timing and example included, reported by the agent.</span><span class="src">AGENT</span></div>
+          <div class="lx-ev"><span class="l">Human review</span><span class="v">Jonas still needs to check the criterion and decide whether to accept.</span><span class="src">PENDING</span></div>
+        </div>
+        <div class="lx-doc-f">
+          Create work in STMA, assign it to an agent, then review its delivery against the agreed criteria.
+          An agent report does not replace a person's acceptance. Jira and other trackers are optional.{' '}
+          <a href="/docs#work">See the Native Work guide →</a>
+        </div>
+      </div>
+    );
+  if (k === 'worker')
+    return (
+      <Session who="desktop-agent" meta="local Claude Code · opt-in worker">
+        <You>Run the assigned documentation change on my desktop worker</You>
+        <Call>list_execution_targets</Call>
+        <Reply tone="ok">
+          desktop-agent · payments-api · <span class="hl">Ready</span>. Registered for a dedicated checkout,
+          enabled by its owner, with the foreground worker running.
+        </Reply>
+        <Call>dispatch_work → desktop-agent · existing assignment</Call>
+        <Reply tone="note">Queued. Assignment alone starts nothing; this separate request asks the local worker to run it.</Reply>
+        <Call>get_execution</Call>
+        <Reply tone="ok">Running · the worker observed the Claude Code session.</Reply>
+        <Say>I'll make the scoped file edits. Commands and tests need a human step; the delivery still needs review.</Say>
+        <Say>
+          Keep the machine awake and the worker running in the foreground. Use your own local provider API key;
+          model usage is billed to your provider account.{' '}
+          <a href="/docs#tools-execution">Set up managed local execution →</a>
+        </Say>
       </Session>
     );
   if (k === 'env')
@@ -485,12 +532,12 @@ const SECURITY: { title: string; body: string }[] = [
     body: 'Snapshots carry environment variable names and presence. Values and file contents stay on the machine.',
   },
   {
-    title: 'Nothing runs remotely',
-    body: 'The server cannot start a process on your machine or read your files. Agents call it; it never calls them.',
+    title: 'Local execution is opt-in',
+    body: 'An ordinary MCP connection starts no local process. A separately configured worker can start Claude Code only after its owner enables the target and work is explicitly dispatched. The worker runs locally in the foreground.',
   },
   {
     title: 'Scoped, revocable connections',
-    body: 'Each agent is approved for one project or workspace, on a credential you revoke in one click.',
+    body: 'Each agent is approved for one project, one workspace or, if you choose Personal, every workspace your account can reach. You revoke the credential in one click.',
   },
   {
     title: "A teammate's text is data",
@@ -710,12 +757,13 @@ export const Landing = ({ site, baseUrl }: { site: SiteInfo; baseUrl: string }) 
               <div class="container lx-howgrid">
                 <div>
                   <span class="lx-ov">How it works</span>
-                  <h2 class="lx-h2 sm">Connect once. Then every run reports in.</h2>
+                  <h2 class="lx-h2 sm">Two ways in, one account.</h2>
                   <ol class="lx-steps">
                     <li>
                       <span class="n">01</span>
                       <span>
-                        <b>Add one address.</b> Paste the MCP address into Claude Code, Codex or Cursor.
+                        <b>Add one address.</b> Paste the MCP address into Claude Code, Codex or Cursor, or add it as a connector in
+                        the Claude app.
                       </span>
                     </li>
                     <li>
@@ -728,8 +776,8 @@ export const Landing = ({ site, baseUrl }: { site: SiteInfo; baseUrl: string }) 
                     <li>
                       <span class="n">03</span>
                       <span>
-                        <b>Work as usual.</b> Runs appear on the map, with collisions, rules and waiting work answered as
-                        they go.
+                        <b>Work as usual.</b> With the hooks from stma connect, runs appear on the map, with collisions, rules and
+                        waiting work answered as they go. The Claude app is your console, not an agent.
                       </span>
                     </li>
                   </ol>
@@ -858,10 +906,11 @@ export const Landing = ({ site, baseUrl }: { site: SiteInfo; baseUrl: string }) 
                   </div>
                   <p>
                     {beta
-                      ? `${betaDoor} Every feature is on and no card is asked for. `
+                      ? `${betaDoor} STMA features are included with no STMA fees or card required. Local workers still require owner opt-in. `
                       : 'The console, the MCP server, email notifications and integrations, operated for you. '}
                     Updates, backups kept for 30 days and support by email. There is no uptime commitment outside
-                    a signed order. Plans are priced by the people, never by the agents.
+                    a signed order. Plans are priced by the people, never by the agents. Model provider usage is billed
+                    separately to your own provider account.
                   </p>
                   {site.hosted || site.teaser ? (
                     <a class={`btn btn-lg${door ? ' btn-primary' : ''}`} href={door ? door.href : '/login'}>

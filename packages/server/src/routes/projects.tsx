@@ -12,6 +12,7 @@ import type { Db } from '../db';
 import {
   activity,
   agentInstallations,
+  agentRuns,
   debugSessions,
   deliveryFlows,
   environmentBaselines,
@@ -31,6 +32,7 @@ import {
   type AssignmentDraft,
 } from '../domain/assignments';
 import { agentsHeardIn } from '../domain/companions';
+import { WORK_NOT_OBSERVED, WORK_STATE_LABEL, describeWork, runNamedFor } from '../domain/connectionState';
 import {
   briefWithTicket,
   JIRA_PICK_NOTE,
@@ -61,6 +63,7 @@ import { Band, Field, Lead, PageHead, teamTrail, Vr } from '../ui/Console';
 import { AppLayout } from '../ui/Layout';
 import { runHref } from './runs';
 import { ProjectCreateBar } from '../ui/ProjectCreate';
+import { WorkSteps } from '../ui/ConnectionStatus';
 
 /**
  * The project, as a place.
@@ -83,15 +86,6 @@ const RUNS_SHOWN = 6;
 const SESSIONS_SHOWN = 5;
 /** Dispatched work shown on the project it was dispatched from; the full ledger is /app/handoffs. */
 const ASSIGNED_SHOWN = 8;
-const HANDOFF_STAGE: Record<string, string> = {
-  offered: 'waiting for the agent',
-  accepted: 'accepted',
-  in_progress: 'in progress',
-  completed: 'completed — reported',
-  cancelled: 'cancelled',
-  declined: 'declined',
-  needs_attention: 'needs attention',
-};
 const TRAIL_SHOWN = 8;
 const WEEK = 7 * 24 * 60 * 60 * 1000;
 
@@ -494,6 +488,42 @@ projectsRoutes.get('/app/teams/:slug/projects/:project', async (c) => {
     .where(eq(debugSessions.projectId, project.id))
     .orderBy(desc(handoffs.createdAt))
     .limit(ASSIGNED_SHOWN);
+  // The recorded life of each piece of dispatched work, from events only: the
+  // handoff's own times, a run opened for it, and what the agent's run said. Whether
+  // the prompt hook announced an assignment is not recorded, so it is said as such.
+  const dispatchedTargets = [
+    ...new Set(dispatched.map((row) => row.offer.targetInstallationId).filter((id): id is string => Boolean(id))),
+  ];
+  const runNamed = await runNamedFor(db, dispatched.map((row) => row.offer.sessionId));
+  const heard = await agentsHeardIn(db, dispatchedTargets, team.id, project.id);
+  const holders = [
+    ...new Set(
+      dispatched
+        .map((row) => row.offer.installationId ?? row.offer.targetInstallationId)
+        .filter((id): id is string => Boolean(id)),
+    ),
+  ];
+  const holderRuns = holders.length
+    ? await db
+        .select({ installationId: agentRuns.installationId, status: agentRuns.status, lastHeartbeatAt: agentRuns.lastHeartbeatAt })
+        .from(agentRuns)
+        .where(
+          and(
+            inArray(agentRuns.installationId, holders),
+            eq(agentRuns.projectId, project.id),
+            inArray(agentRuns.status, ['starting', 'active', 'waiting', 'blocked']),
+          ),
+        )
+        .orderBy(desc(agentRuns.lastHeartbeatAt))
+    : [];
+  const lifecycle = (row: (typeof dispatched)[number]) =>
+    describeWork({
+      handoff: row.offer,
+      runNamedAt: runNamed.get(row.offer.sessionId) ?? null,
+      agentRun: holderRuns.find((run) => run.installationId === (row.offer.installationId ?? row.offer.targetInstallationId)) ?? null,
+      waitingLeaseMinutes: c.get('env').agentWaitingLeaseMinutes,
+      hookWillAnnounce: row.offer.targetInstallationId ? heard.has(row.offer.targetInstallationId) : undefined,
+    });
   /** `?team=…&project=…`: how the agent map opens in this scope — it has no address of its own under a project. */
   const inProject = `?team=${encodeURIComponent(team.slug)}&project=${encodeURIComponent(project.slug)}`;
   /** One of this project's sections, at its own address. */
@@ -854,7 +884,9 @@ projectsRoutes.get('/app/teams/:slug/projects/:project', async (c) => {
                 <button class="btn btn-sm" type="button" data-open-dialog="#assign-work">
                   Assign work
                 </button>
-                <a class="btn btn-sm" href={section('work')}>
+                {/* The project's Work address is the native list since Native Work;
+                    the assignment and handoff ledger is its dispatched tab. */}
+                <a class="btn btn-sm" href={`${section('work')}?tab=dispatched`}>
                   All handoffs
                 </a>
               </div>
@@ -877,18 +909,22 @@ projectsRoutes.get('/app/teams/:slug/projects/:project', async (c) => {
                         {row.offer.kind === 'assignment' ? 'assigned to' : 'handed to'} {whom(row)} ·{' '}
                         {timeAgo(row.offer.createdAt) ?? 'just now'}
                       </div>
+                      <WorkSteps work={lifecycle(row)} />
                     </div>
                     <div style="display:flex;gap:8px;align-items:center">
                       <span class={`pill ${live ? 'pill-active' : 'pill-muted'}`}>
-                        {HANDOFF_STAGE[row.offer.state] ?? row.offer.state}
+                        {WORK_STATE_LABEL[row.offer.state] ?? row.offer.state}
                       </span>
                       {live && row.offer.offeredBy === user.id ? (
-                        <form method="post" action={`/app/sessions/${row.offer.sessionId}/handoff/cancel`}>
+                        <form
+                          method="post"
+                          action={`/app/sessions/${row.offer.sessionId}/handoff/cancel`}
+                          data-confirm={`Cancel “${row.title}”? ${whom(row)} will not be told about it. This does not stop work an agent already started.`}
+                        >
                           <input type="hidden" name="return_to" value="project" />
                           <button
                             class="btn btn-sm"
                             type="submit"
-                            data-confirm={`Cancel “${row.title}”? ${whom(row)} will not be told about it. This does not stop work an agent already started.`}
                           >
                             Cancel
                           </button>
@@ -899,6 +935,7 @@ projectsRoutes.get('/app/teams/:slug/projects/:project', async (c) => {
                 );
               })
             )}
+            {dispatched.length > 0 ? <p class="card-pad small muted m0">{WORK_NOT_OBSERVED}</p> : null}
           </div>
 
           <div class="card">

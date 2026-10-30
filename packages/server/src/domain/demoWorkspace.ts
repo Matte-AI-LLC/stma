@@ -8,7 +8,9 @@
  * workspace somebody can ask real questions of: three agents on three
  * machines, published rules, reference knowledge, the environment difference
  * between two machines, a finished piece of work, a problem solved before, a
- * handoff and an assignment waiting, and a question still open.
+ * handoff and an assignment waiting, and a question still open. Two of those
+ * pieces of work are Native Work items: one delivered and waiting for its
+ * owner's decision, one assigned and held by an open question.
  *
  * Like the agent lab's past (`acceptance/agent-lab/past.mjs`), nothing here is
  * inserted into a table by hand. The agents' part goes through `/mcp`, under
@@ -26,7 +28,6 @@
  * (they are who the reviewer's Claude can give work to) and nobody holds a
  * token for them afterwards.
  */
-import { randomUUID } from 'node:crypto';
 import { parseContentRule, policyDocumentSchema, snapshotSchema, type PolicyDocument } from '@bridge/shared';
 import { eq } from 'drizzle-orm';
 import type { Db } from '../db';
@@ -35,16 +36,18 @@ import type { Env } from '../env';
 import type { AppLifecycleHooks } from '../extensions';
 import { randomCode, randomHex } from '../lib/crypto';
 import { logLine } from '../lib/log';
-import { recordMembershipChange } from '../lib/memberships';
+import { appendMembershipChange } from '../lib/memberships';
 import { findOrCreateProject } from '../lib/projects';
 import { slugify } from '../lib/slug';
-import { assignableAgents, handoffAllowance, writeAssignment, type AssignmentDraft } from './assignments';
+import { DEMO_ROUTE } from './activation';
 import { saveDeliveryFlow } from './delivery';
 import { createAgentEnrollment, redeemAgentEnrollment } from './enrollments';
 import { setEnvironmentBaseline } from './environments';
 import { FLOW_TEMPLATES } from './flowTemplates';
 import { hostedKnowledgeCapacityLimits, proposeKnowledge, publishKnowledge } from './knowledge';
 import { publishPolicy } from './policies';
+import { createWork, updateWork } from './work';
+import { humanPrincipal, type WorkCommandOutcome, type WorkResult } from './workTypes';
 
 export const DEMO_WORKSPACE = 'Parcel Desk';
 export const DEMO_PROJECT = 'parcel-desk';
@@ -146,7 +149,16 @@ function demoSnapshots(now: Date) {
   };
 }
 
-/** Work the lead gave out. The first is done; the last is still waiting for its agent. */
+/**
+ * Work the lead gave out, each as a Native Work item the lead files, makes ready
+ * and assigns, so the assignment carries the contract revision it was given
+ * against. The first is done and delivered, and waits for the lead's decision;
+ * the last is still waiting for its agent, held by an open question.
+ *
+ * The first criterion of each asks for a person's check beside the agent's
+ * report, so the demo shows the line STMA draws: a delivered, tested piece of
+ * work is not accepted work until somebody looks.
+ */
 export const DEMO_ASSIGNMENTS = [
   {
     key: 'eta',
@@ -154,6 +166,16 @@ export const DEMO_ASSIGNMENTS = [
     to: 'mac',
     brief: 'Carrier ETAs are rounded down to the half hour, so a parcel due at 14:29 shows 14:00. Round to the nearest minute and keep the backend tests green.',
     steps: ['Read the project rules from STMA first', 'Fix and test', 'Report back'],
+    nonGoals: 'Changing how ETAs are fetched from the carrier.',
+    paths: ['src/carrier.mjs', 'test/carrier.test.mjs'],
+    criteria: [
+      {
+        id: 'rounds',
+        text: 'A parcel due at 14:29 shows 14:29 in the parcel list, not 14:00.',
+        evidence_kinds: ['agent_report', 'human_check'],
+      },
+      { id: 'tests', text: 'The backend tests pass.', evidence_kinds: ['agent_report'] },
+    ],
   },
   {
     key: 'csv',
@@ -161,14 +183,42 @@ export const DEMO_ASSIGNMENTS = [
     to: 'laptop',
     brief: 'Operations wants to download the filtered parcel list as CSV for the carrier reconciliation. One button above the table; the export follows the filters on screen.',
     steps: ['Read the project rules from STMA first', 'Add the export and a test', 'Open a pull request'],
+    nonGoals: 'Exporting anything other than the parcel list.',
+    paths: ['src/parcels/**', 'public/**'],
+    criteria: [
+      {
+        id: 'filters',
+        text: 'The exported file holds exactly the rows the filters on screen show.',
+        evidence_kinds: ['agent_report', 'human_check'],
+      },
+      { id: 'tests', text: 'A test covers the export.', evidence_kinds: ['agent_report'] },
+    ],
   },
 ] as const;
+
+/** The commit the finished piece of work was delivered at: the agent's word, on a host nobody owns. */
+const DELIVERED = '7d6e5f4a3b2c1d0e9f8a7b6c5d4e3f2a1b0c9d8e';
 
 const REQUEST = {
   etaRun: 'd3a1b2c4-0018-4a5b-8c6d-0e1f2a3b4c5d',
   labelRun: 'd3a1b2c4-0027-4a5b-8c6d-0e1f2a3b4c5d',
   handoff: 'd3a1b2c4-1027-4a5b-8c6d-0e1f2a3b4c5d',
   checkpoint: 'd3a1b2c4-2027-4a5b-8c6d-0e1f2a3b4c5d',
+  /** Per piece of work: filed, made ready, assigned, then delivered or blocked. */
+  work: {
+    eta: {
+      create: 'd3a1b2c4-3018-4a5b-8c6d-0e1f2a3b4c5d',
+      ready: 'd3a1b2c4-4018-4a5b-8c6d-0e1f2a3b4c5d',
+      assign: 'd3a1b2c4-5018-4a5b-8c6d-0e1f2a3b4c5d',
+      submit: 'd3a1b2c4-6018-4a5b-8c6d-0e1f2a3b4c5d',
+    },
+    csv: {
+      create: 'd3a1b2c4-3031-4a5b-8c6d-0e1f2a3b4c5d',
+      ready: 'd3a1b2c4-4031-4a5b-8c6d-0e1f2a3b4c5d',
+      assign: 'd3a1b2c4-5031-4a5b-8c6d-0e1f2a3b4c5d',
+      blocker: 'd3a1b2c4-6031-4a5b-8c6d-0e1f2a3b4c5d',
+    },
+  },
 };
 
 export interface DemoWorkspaceResult {
@@ -196,6 +246,12 @@ export async function demoWorkspaceRefusal(db: Db, accountId: string): Promise<s
 }
 
 class DemoStepFailed extends Error {}
+
+/** A Native Work command's answer, or the step that stops the demo with the reason STMA gave. */
+function settled(result: WorkResult<WorkCommandOutcome>, step: string): WorkCommandOutcome {
+  if ('error' in result && result.error) throw new DemoStepFailed(`${step}: ${(result.error as { message: string }).message}`);
+  return result as WorkCommandOutcome;
+}
 
 let rpcId = 1;
 
@@ -251,26 +307,32 @@ export async function seedDemoWorkspace(input: DemoInput): Promise<DemoWorkspace
   let slug = slugify(DEMO_WORKSPACE);
   const taken = await db.select({ id: teams.id }).from(teams).where(eq(teams.slug, slug)).limit(1);
   if (taken.length > 0) slug = `${slug}-${randomHex(2)}`;
-  const team = (
-    await db
-      .insert(teams)
-      .values({ name: DEMO_WORKSPACE, slug, createdBy: account.id, inboundToken: randomCode(16) })
-      .returning()
-  )[0]!;
-  await db.insert(memberships).values({ teamId: team.id, userId: account.id, role: 'owner' });
-  await recordMembershipChange(db, {
-    teamId: team.id,
-    teamSlug: team.slug,
-    action: 'added',
-    subjectId: account.id,
-    subjectLabel: account.username,
-    previousRole: null,
-    nextRole: 'owner',
-    source: 'operator',
-    route: 'POST /admin/users/:id/demo-workspace',
-    actorId: operator.id,
-    actorLabel: operator.username,
-    detail: 'created the demo workspace',
+  // One transaction, and the operator record is appended inside it rather than
+  // swallowed: the activation cohorts leave the demo out by this very row, so a
+  // demo whose row was lost would be counted as a real customer in every number.
+  const team = await db.transaction(async (tx) => {
+    const created = (
+      await tx
+        .insert(teams)
+        .values({ name: DEMO_WORKSPACE, slug, createdBy: account.id, inboundToken: randomCode(16) })
+        .returning()
+    )[0]!;
+    await tx.insert(memberships).values({ teamId: created.id, userId: account.id, role: 'owner' });
+    await appendMembershipChange(tx as unknown as Db, {
+      teamId: created.id,
+      teamSlug: created.slug,
+      action: 'added',
+      subjectId: account.id,
+      subjectLabel: account.username,
+      previousRole: null,
+      nextRole: 'owner',
+      source: 'operator',
+      route: DEMO_ROUTE,
+      actorId: operator.id,
+      actorLabel: operator.username,
+      detail: 'created the demo workspace',
+    });
+    return created;
   });
   await input.lifecycle.teamMemberCountChanged?.({ db, teamId: team.id });
   const made = { id: team.id, slug: team.slug, name: team.name };
@@ -365,44 +427,108 @@ export async function seedDemoWorkspace(input: DemoInput): Promise<DemoWorkspace
     );
     if ('error' in baseline) throw new DemoStepFailed(baseline.error ?? 'the baseline was not recorded');
 
-    // Work the lead gave out, as the project page's Assign work form gives it.
-    const agents = await assignableAgents(db, team.id);
-    const assigned = new Map<string, string>();
+    // Work the lead gave out. Each is a Native Work item the lead files, makes
+    // ready and assigns through the same function the console's forms call, so
+    // the assignment is pinned to the contract revision it was given against.
+    const lead = humanPrincipal(account.id);
+    const filed = new Map<string, { workId: string; version: string }>();
     for (const work of DEMO_ASSIGNMENTS) {
-      const allowance = await handoffAllowance(db, env, team);
-      if ('error' in allowance) throw new DemoStepFailed(allowance.error);
-      const agent = agents.find((candidate) => candidate.installationId === installations.get(work.to));
-      if (!agent) throw new DemoStepFailed(`${via(work.to)} is not offered as an agent to give work to`);
-      const draft: AssignmentDraft = {
-        team: { id: team.id, slug: team.slug },
-        project: { id: project.id, name: project.name, repositoryIdentity: project.repositoryIdentity },
-        agent,
-        assignedBy: { id: account.id, username: account.username, tokenId: null, via: null },
-        task: work.task,
-        brief: work.brief,
-        steps: [...work.steps],
-        branch: null,
-        scope: [],
-      };
-      const created = await db.transaction(async (tx) =>
-        writeAssignment(tx as unknown as Db, env, draft, { sessionId: randomUUID(), handoffId: randomUUID() }),
+      const plan = REQUEST.work[work.key];
+      const created = settled(
+        await createWork(
+          db,
+          lead,
+          {
+            request_id: plan.create,
+            project: project.id,
+            contract: {
+              title: work.task,
+              goal: work.brief,
+              non_goals: work.nonGoals,
+              scope: { paths: [...work.paths] },
+              risk_tier: 'low',
+              artifact_kind: 'code',
+            },
+            criteria: work.criteria.map((criterion) => ({
+              id: criterion.id,
+              text: criterion.text,
+              required: true,
+              evidence_kinds: [...criterion.evidence_kinds],
+            })),
+            owner: account.username,
+            acceptor: account.username,
+          },
+          { teamId: team.id, hosted: env.hosted },
+        ),
+        `${work.task} was not filed as work`,
       );
-      assigned.set(work.key, created.sessionId);
+      const ready = settled(
+        await updateWork(
+          db,
+          lead,
+          {
+            request_id: plan.ready,
+            work_id: created.work_id,
+            expected_version: created.version,
+            operation: 'transition',
+            payload: { to: 'ready' },
+          },
+          { env },
+        ),
+        `${work.task} was not made ready`,
+      );
+      const assigned = settled(
+        await updateWork(
+          db,
+          lead,
+          {
+            request_id: plan.assign,
+            work_id: created.work_id,
+            expected_version: ready.version,
+            operation: 'assign',
+            payload: {
+              to_agent: via(work.to),
+              device: DEMO_AGENTS.find((agent) => agent.key === work.to)!.device,
+              expected_spec_revision: 1,
+              brief: work.brief,
+              next_steps: [...work.steps],
+            },
+          },
+          { env },
+        ),
+        `${work.task} was not assigned`,
+      );
+      const sessionId = String(assigned.session_id);
+      filed.set(work.key, { workId: created.work_id, version: assigned.version });
       if (work.key === 'eta') {
-        // Done: accepted, worked in a run of its own, completed and closed.
+        // Done: the agent starts the run the assignment names, which links it to
+        // the work at the revision it was given, accepts, works, completes,
+        // delivers the commit with its own report and closes the run.
         const run = await call(origin, as('mac'), 'start_run', {
+          ...(assigned.start_with as Record<string, unknown>),
           request_id: REQUEST.etaRun,
-          repository_identity: DEMO_REPOSITORY,
-          task: work.task,
           intent: 'Round carrier ETAs to the nearest minute.',
           head_sha: HEAD,
           scope: [{ type: 'path', key: 'src/carrier.mjs', access: 'write' }],
-          agent: via('mac'),
         });
         await confirmPolicy(origin, as('mac'), run);
         for (const action of ['accept', 'resume', 'complete']) {
-          await call(origin, as('mac'), 'update_handoff', { session_id: created.sessionId, action, run_id: run.runId });
+          await call(origin, as('mac'), 'update_handoff', { session_id: sessionId, action, run_id: run.runId });
         }
+        const current = await call(origin, as('mac'), 'get_work', { work_id: created.work_id });
+        await call(origin, as('mac'), 'submit_work', {
+          request_id: REQUEST.work.eta.submit,
+          work_id: created.work_id,
+          expected_version: String(current.version),
+          spec_revision: 1,
+          run_id: run.runId,
+          artifacts: [{ kind: 'code', repository_identity: DEMO_REPOSITORY, commit_sha: DELIVERED, branch: 'pd-18-eta-rounding' }],
+          evidence: [
+            { criterion_id: 'rounds', assertion: 'pass', source_kind: 'agent_report', source_ref: 'test/carrier.test.mjs', excerpt: 'A parcel due at 14:29 now renders 14:29.' },
+            { criterion_id: 'tests', assertion: 'pass', source_kind: 'agent_report', source_ref: 'npm test', excerpt: '41 passed' },
+          ],
+          note: 'PD-18: ETAs round to the nearest minute; backend tests pass.',
+        });
         await call(origin, as('mac'), 'finish_run', {
           run_id: run.runId,
           status: 'completed',
@@ -467,10 +593,34 @@ export async function seedDemoWorkspace(input: DemoInput): Promise<DemoWorkspace
     });
 
     // A question still open, which is what a thread with replies is for.
-    await call(origin, as('laptop'), 'open_session', {
+    const question = await call(origin, as('laptop'), 'open_session', {
       title: 'Should the CSV export include cancelled parcels?',
       body: 'PD-31 says the export follows the filters on screen, and the default filter hides cancelled parcels. Carrier reconciliation might need them anyway. Which one do we want?',
     });
+    // The question holds PD-31: the lead records it as a blocker on the work,
+    // owned by the person who has to answer, so the work says why it is not moving.
+    const csv = filed.get('csv')!;
+    settled(
+      await updateWork(
+        db,
+        lead,
+        {
+          request_id: REQUEST.work.csv.blocker,
+          work_id: csv.workId,
+          expected_version: csv.version,
+          operation: 'set_blocker',
+          payload: {
+            kind: 'decision',
+            reason: 'Whether the export includes cancelled parcels is not decided, and the contract says it follows the filters on screen.',
+            next_action: 'Answer the open thread "Should the CSV export include cancelled parcels?"',
+            owner: account.username,
+            source_ref: `session:${String(question.sessionId)}`,
+          },
+        },
+        { env },
+      ),
+      'The open question was not recorded as a blocker on PD-31',
+    );
 
     logLine({
       evt: 'admin',
@@ -478,7 +628,7 @@ export async function seedDemoWorkspace(input: DemoInput): Promise<DemoWorkspace
       u: operator.username,
       target: account.username,
       team: team.slug,
-      assignments: assigned.size,
+      assignments: filed.size,
     });
     return { team: made, agents: DEMO_AGENTS.map((agent) => `${agent.name} on ${agent.device}`) };
   } catch (error) {

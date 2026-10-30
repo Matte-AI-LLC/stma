@@ -8,7 +8,7 @@
  * demo whose rows exist and whose tools answer "nothing yet" fails a review
  * just the same.
  */
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -189,7 +189,10 @@ describe('the demo workspace', () => {
     ).text();
     expect(projectPage).toContain('2 of 2 recent runs confirmed it');
     expect(projectPage).not.toContain('No baseline recorded');
-    expect(projectPage).toContain('PD-31 Add CSV export to the parcel list');
+    // The assignment names the work by its key: its thread's title is the
+    // subject of its owner's email, which carries no title somebody wrote.
+    expect(projectPage).toMatch(/>Assignment: WORK-\d+</);
+    expect(projectPage).not.toContain('Assignment: WORK-2: PD-31');
 
     const claude = await connectClaude(reviewer);
 
@@ -199,7 +202,11 @@ describe('the demo workspace', () => {
 
     // "What is waiting for my agents?"
     const inbox = await ask(claude, 'inbox', { team: team!.slug });
-    expect(inbox).toContain('PD-31 Add CSV export to the parcel list');
+    expect(inbox).toContain('Assignment: WORK-2');
+    // The work's own title, PD-31 the setup text names, is read from the work.
+    expect(await ask(claude, 'list_work', { team: team!.slug, project: 'parcel-desk' })).toContain(
+      'PD-31 Add CSV export to the parcel list',
+    );
     expect(inbox).toContain('PD-27');
     expect(inbox).toContain('Should the CSV export include cancelled parcels?');
     expect(inbox).not.toContain('PD-18');
@@ -243,12 +250,17 @@ describe('the demo workspace', () => {
    * instructions the directory listing gives the reviewer, step for step. Two tools
    * cannot succeed on this demo, because they read trackers it has not
    * connected, and are held to naming the tracker rather than failing
-   * generically. Three answer once the reviewer has done what the instructions
+   * generically, and two Native Work tools (a delivery and its evidence) are
+   * open only to an agent linked to the work, which the Claude app cannot be,
+   * and are held to saying so. Three answer once the reviewer has done what the instructions
    * say, and before that each says what is missing: `launch_check` takes an id
    * the Test on a workspace's Agent connections page issues, `record_delivery_receipt` a setup pack the
    * Delivery page issues, and `update_handoff` accepts work only as the agent
    * it is addressed to, while the reviewer can cancel an assignment of their
-   * own.
+   * own. The four managed-execution tools are also covered: this fixture has no
+   * managed target or execution history, so listing succeeds empty while dispatch,
+   * status and cancellation must say which prerequisite is missing. The demo does
+   * not create a fake target or ask the reviewer to configure a local worker.
    */
   it('answers every tool from the reviewer\'s Claude, or says what is missing', async () => {
     const reviewer = await devLogin('demo-tools');
@@ -369,6 +381,55 @@ describe('the demo workspace', () => {
       device: 'desktop',
     });
 
+    // Native Work: the reviewer's Claude files a draft of its own, reads it back
+    // every way there is and changes it. A delivery and evidence are open only to
+    // an agent linked to the work by an assignment or a run, which the Claude app
+    // cannot be (it takes no assignments), so those two say so.
+    const filed = await works('create_work', {
+      team: t,
+      project: 'parcel-desk',
+      request_id: 'e4b1c2d3-4040-4a5b-8c6d-0e1f2a3b4c5d',
+      contract: { title: 'Review walkthrough notes', goal: 'Write down what the review tried.', artifact_kind: 'document' },
+      criteria: [{ text: 'The notes name every tool the review called.' }],
+    });
+    expect(filed.key, JSON.stringify(filed).slice(0, 300)).toMatch(/^WORK-\d+$/);
+    await works('list_work', { team: t, project: 'parcel-desk' });
+    await works('get_work', { work_id: filed.work_id });
+    await works('get_work_context', { work_id: filed.work_id });
+    await works('get_work_changes', { team: t, project: 'parcel-desk' });
+    const patched = await works('update_work', {
+      request_id: 'e4b1c2d3-5040-4a5b-8c6d-0e1f2a3b4c5d',
+      work_id: filed.work_id,
+      expected_version: filed.version,
+      operation: 'patch',
+      payload: { coordination: { priority: 'high' } },
+    });
+    await refuses(
+      'submit_work',
+      {
+        request_id: 'e4b1c2d3-6040-4a5b-8c6d-0e1f2a3b4c5d',
+        work_id: filed.work_id,
+        expected_version: patched.version,
+        spec_revision: 1,
+        artifacts: [{ kind: 'document', uri: 'https://docs.example.com/review-notes', version_id: 'v1' }],
+      },
+      /linked|ready/i,
+    );
+    await refuses(
+      'record_work_evidence',
+      {
+        request_id: 'e4b1c2d3-7040-4a5b-8c6d-0e1f2a3b4c5d',
+        work_id: filed.work_id,
+        expected_version: patched.version,
+        delivery_id: 'e4b1c2d3-8040-4a5b-8c6d-0e1f2a3b4c5d',
+        criterion_id: 'c1',
+        assertion: 'pass',
+        source_kind: 'agent_report',
+        source_ref: 'review notes',
+      },
+      /linked|delivery/i,
+    );
+
     await refuses('list_issues', { team: t }, /GitHub/);
     await refuses('list_clickup_tasks', { team: t, project: 'parcel-desk' }, /ClickUp/);
     await refuses('launch_check', { launch_id: 'e4b1c2d3-3040-4a5b-8c6d-0e1f2a3b4c5d', action: 'status' }, /launch/i);
@@ -390,6 +451,20 @@ describe('the demo workspace', () => {
       /setup/i,
     );
     await refuses('update_handoff', { session_id: handedOver!.sessionId, action: 'accept' }, /claude-code/);
+
+    // The demo has no managed execution target or job history. Listing that
+    // prerequisite succeeds with an empty result; the other calls use canonical
+    // but nonexistent IDs and must explain why the requested operation is unavailable.
+    const targets = await works('list_execution_targets');
+    expect(targets.targets).toEqual([]);
+    await refuses(
+      'dispatch_work',
+      { target_id: randomUUID(), session_id: randomUUID(), request_id: randomUUID() },
+      /No execution resource is visible to this credential/i,
+    );
+    const missingExecutionId = randomUUID();
+    await refuses('get_execution', { execution_id: missingExecutionId }, /No execution resource is visible to this credential/i);
+    await refuses('cancel_execution', { execution_id: missingExecutionId }, /No execution resource is visible to this credential/i);
 
     // The instructions open /setup, which lands on the Test of the workspace's Agent
     // connections page; "Launch my agents" there issues a launch, and the page that
@@ -425,7 +500,15 @@ describe('the demo workspace', () => {
     await works('record_delivery_receipt', { receipt: JSON.parse(receipt!) });
 
     expect([...new Set([...answered, ...refused])].sort()).toEqual(names);
-    expect(names.filter((name) => !answered.has(name))).toEqual(['list_clickup_tasks', 'list_issues']);
+    expect(names.filter((name) => !answered.has(name))).toEqual([
+      'cancel_execution',
+      'dispatch_work',
+      'get_execution',
+      'list_clickup_tasks',
+      'list_issues',
+      'record_work_evidence',
+      'submit_work',
+    ]);
   }, 180_000);
 
   it('is only an account\'s first workspace, and only an operator builds it', async () => {

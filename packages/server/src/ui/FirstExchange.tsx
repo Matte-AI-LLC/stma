@@ -1,3 +1,5 @@
+import { CONSOLE_NOT_SECOND_AGENT } from '../lib/entry';
+
 /**
  * The test before a first launch exists: two agents, one server-observed exchange.
  *
@@ -67,7 +69,8 @@ export function FirstExchange(props: {
           )}
           A teammate signs in with their own account. Your credential is never shared. STMA does
           not wake a sleeping agent; open the second client and give it the reply check. Two
-          installation identities do not prove two physical devices or completed work.
+          installation identities do not prove two physical devices or completed work.{' '}
+          {CONSOLE_NOT_SECOND_AGENT}
         </p>
       </div>
     </section>

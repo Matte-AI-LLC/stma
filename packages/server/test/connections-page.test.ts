@@ -89,11 +89,25 @@ it('puts one Agent connections page in the workspace, and none in the account', 
   expect(links.filter((label) => label === 'Agent connections')).toHaveLength(1);
   expect(links).not.toContain('Connect & test');
   expect(links).not.toContain('Connect &amp; test');
-  // Three sections, in the order a person needs them.
-  const order = ['<h2>Connect an agent</h2>', '<h2>Test two agents together</h2>', '<h2>Your connections here</h2>'];
+  // Setup, test, explicit execution opt-in, then connection management.
+  const order = [
+    '<h2>Connect an agent</h2>',
+    '<h2>Test two agents together</h2>',
+    '<h2>Managed local execution</h2>',
+    '<h2>Your connections here</h2>',
+  ];
   const at = order.map((heading) => page.indexOf(heading));
   expect(at.every((index) => index > 0)).toBe(true);
   expect([...at].sort((a, b) => a - b)).toEqual(at);
+  // Two doors, named once, with the Claude app console beside the coding agent.
+  expect(page).toContain('id="two-ways-in"');
+  expect(page).toContain('<a href="#claude-app">Claude app</a>');
+  expect(page).toContain('<a href="#managed-execution">Managed execution</a>');
+  expect(page).toContain('No managed target configured for this scope');
+  expect(page).toContain('This is not an OS sandbox.');
+  expect(page).not.toContain('Enable after reviewing this target');
+  expect(page.indexOf('id="two-ways-in"')).toBeLessThan(page.indexOf('<h2>Connect an agent</h2>'));
+  expect(page.indexOf('id="claude-app"')).toBeLessThan(page.indexOf('<h2>Connect an agent</h2>'));
   // Only this workspace and its projects, and nothing that reaches every workspace.
   expect(page).toContain(`value="project:${alphaProject}"`);
   expect(page).not.toContain('value="personal"');
@@ -132,6 +146,10 @@ it('keeps every choice on the project when the page is opened inside it', async 
   expect(page).toContain('Back to alpha-api agents');
   expect(page).toContain(`<input type="hidden" name="access" value="project:${alphaProject}"/>`);
   expect(page).toContain('stma adapter activate --target codex');
+  // The doors are drawn inside the project too, with the project's own anchors.
+  expect(page).toContain('id="two-ways-in"');
+  expect(page).toContain('href="#connect"');
+  expect(page).toContain('id="claude-app"');
   // The legacy prompt offers this project or the whole workspace, nothing further.
   expect(page.match(/<option value="(?:team|project):/g)).toHaveLength(2);
 

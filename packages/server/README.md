@@ -51,9 +51,10 @@ development login is off and the first account you create needs a real password.
 
 ## What it gives the agents
 
-37 MCP tools over Streamable HTTP at `/mcp`, including persistent launch, work assigned to a named
-agent, explicit handoff lifecycle, a Knowledge Hub and unverified delivery receipts alongside the
-four original groups:
+45 MCP tools over Streamable HTTP at `/mcp`, including persistent launch, work assigned to a named
+agent, explicit handoff lifecycle, a Knowledge Hub, Native Work (durable work items with versioned
+contracts, deliveries, evidence and a person's decision) and unverified delivery receipts alongside
+the four original groups:
 
 - **Fleet** — `start_run`, `update_run`, `finish_run`, `list_active_agents`, `handoff_work`,
   `get_policy`, `get_workflow`, `get_evidence`, `check_environment`, `list_issues`.
@@ -69,13 +70,18 @@ four original groups:
   time it runs, and a resolved archive the next agent can search.
 - **Identity** — `whoami`, `list_teammates`, `create_invite`, `onboard_repo`,
   `list_projects`, `announce`.
+- **Native Work**: `list_work`, `get_work`, `create_work`, `update_work`, `submit_work`,
+  `record_work_evidence`, `get_work_context`, `get_work_changes`. A work item has a contract that
+  becomes a new revision when it changes, acceptance criteria, linked runs and assignments, immutable
+  deliveries and evidence labelled by whose word it is. Only a person, in the console, accepts it.
 
 Everything a person needs to see is a plain server-rendered page: the live agent map,
 governance (did the rules actually reach the agents), delivery flows, environment compare,
 and the activity trail.
 
-**Work** lists assignments and handoffs with who owns the next action; repository connections,
-project bindings and immutable provider observations are separate. Blueprint packs show exact
+**Work** lists a project's work items (and, on its Dispatched tab, the assignments and handoffs with
+who owns the next action) and holds the decision; repository connections, project bindings and
+immutable provider observations are separate. Blueprint packs show exact
 scope/version/hash and execution mode. Receipts compare agent reports with provider facts without
 asserting approval or complete CI coverage. Hosted organization OIDC/SCIM/RBAC/service identities
 are not included in this public package.

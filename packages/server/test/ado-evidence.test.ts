@@ -62,7 +62,6 @@ it.each([
 it.each([
   ['completed', 'partiallySucceeded', 'failure'],
   ['completed', 'failed', 'failure'],
-  ['inProgress', 'succeeded', 'unknown'],
   ['completed', 'canceled', 'unknown'],
 ])('keeps %s/%s as %s', async (status, result, expected) => {
   const id = 100 + adoCase++;
@@ -71,6 +70,17 @@ it.each([
   expect((await server.db.select().from(providerObservations).where(eq(providerObservations.subjectId, `build:${id}`)))[0]!.state).toBe(expected);
 });
 let adoCase = 0;
+
+it.each(['notStarted', 'inProgress', 'postponed'])('does not record an unfinished %s build over the last completed observation', async (status) => {
+  const id = 200 + adoCase++;
+  adoOutbox.seedBuild(id, wireBuild(id, { lastChangedDate: new Date(Date.now() - 20_000).toISOString() }));
+  expect(await observeAdoBuild(server.db, env, teamId, bindingId, id)).toHaveProperty('recorded', true);
+  adoOutbox.seedBuild(id, wireBuild(id, { status, result: undefined }));
+  expect(await observeAdoBuild(server.db, env, teamId, bindingId, id)).toMatchObject({ recorded: false, reason: 'not_completed' });
+  const rows = await server.db.select().from(providerObservations).where(eq(providerObservations.subjectId, `build:${id}`));
+  expect(rows).toHaveLength(1);
+  expect(rows[0]!.state).toBe('success');
+});
 
 it('rejects cross-workspace binding access before making a provider request', async () => {
   expect(await observeAdoBuild(server.db, env, randomUUID(), bindingId, 12)).toHaveProperty('reason', 'repository_not_verified');

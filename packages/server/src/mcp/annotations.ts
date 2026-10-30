@@ -84,6 +84,21 @@ export const TOOL_ANNOTATIONS: Readonly<Record<string, ToolHints>> = {
   get_knowledge: read(),
   report_knowledge_receipt: write(),
   propose_knowledge: write(),
+  // native work: every write is replayed by its request id, and `assign` (an
+  // update_work operation) notifies the owner of the agent it names
+  list_work: read(),
+  get_work: read(),
+  get_work_context: read(),
+  get_work_changes: read(),
+  create_work: write(false, true),
+  update_work: write(true, true),
+  submit_work: write(false, true),
+  record_work_evidence: write(false, true),
+  // Managed execution reads metadata; dispatch/cancel affect a local runtime.
+  list_execution_targets: read(),
+  dispatch_work: write(true, true),
+  get_execution: read(),
+  cancel_execution: write(true, true),
 };
 
 /**
@@ -91,7 +106,7 @@ export const TOOL_ANNOTATIONS: Readonly<Record<string, ToolHints>> = {
  * refuse to register without one. Called once, right after the server is made,
  * so the core, fleet and Knowledge modules need not remember it.
  */
-export function requireAnnotations(server: McpServer): void {
+export function requireAnnotations(server: McpServer, allowedNames?: ReadonlySet<string>): void {
   const register = server.registerTool.bind(server) as (
     name: string,
     config: { title?: string; annotations?: Record<string, unknown> },
@@ -103,6 +118,10 @@ export function requireAnnotations(server: McpServer): void {
       throw new Error(`MCP tool "${name}" has no entry in mcp/annotations.ts. Say what it does to the world before it can register.`);
     }
     if (!config.title) throw new Error(`MCP tool "${name}" has no title.`);
-    return register(name, { ...config, annotations: { title: config.title, ...hints, ...config.annotations } }, callback);
+    const tool = register(name, { ...config, annotations: { title: config.title, ...hints, ...config.annotations } }, callback);
+    // Attempt credentials need only their closed catalog in model context.
+    // SDK discovery filtering supplements, and never replaces, request authorization.
+    if (allowedNames && !allowedNames.has(name)) tool.disable();
+    return tool;
   }) as McpServer['registerTool'];
 }

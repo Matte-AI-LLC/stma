@@ -18,6 +18,15 @@ const buildSchema = z.object({
   result: z.string().optional(),
   deleted: z.boolean().optional(),
   lastChangedDate: z.string().datetime({ offset: true }),
+  // The pipeline's name, the stable thing a criterion names; `build:<id>` is
+  // one run of it. Optional and never a reason to refuse the build: a missing
+  // or malformed definition only means no criterion can match it by name. Its
+  // id tells two pipelines apart that share a name in different folders.
+  definition: z
+    .object({ id: z.number().int().nonnegative().optional().catch(undefined), name: z.string().optional() })
+    .passthrough()
+    .optional()
+    .catch(undefined),
 });
 
 /** Webhooks are hints. Only the configured provider's read-back supplies evidence. */
@@ -49,14 +58,17 @@ export async function observeAdoBuild(db: Db, env: Env, teamId: string, bindingI
       parsed.data.repository.id !== found.binding.repositoryId)
     return { recorded: false, reason: 'provider_identity_mismatch' };
   const build = parsed.data;
-  const state = build.status !== 'completed' ? 'unknown'
-    : build.result === 'succeeded' ? 'success'
+  // Only a completed build can replace the previous completed observation.
+  if (build.status !== 'completed') return { recorded: false, reason: 'not_completed' };
+  const state = build.result === 'succeeded' ? 'success'
       : ['failed', 'partiallySucceeded'].includes(build.result ?? '') ? 'failure' : 'unknown';
   return recordProviderObservation(db, teamId, 'azure-devops', {
     bindingId: found.binding.id,
     repositoryId: build.repository.id,
     deliveryId: `ado-read:build:${build.id}:${build.lastChangedDate}`,
     subjectId: `build:${build.id}`,
+    subjectName: build.definition?.name,
+    subjectDefinition: build.definition?.id,
     commitSha: build.sourceVersion,
     kind: 'workflow', state, attempt: 1,
     observedAt: build.lastChangedDate,

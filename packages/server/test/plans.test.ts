@@ -3,7 +3,8 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { and, eq } from 'drizzle-orm';
 import { afterAll, beforeAll, expect, it } from 'vitest';
-import { projects, snapshots, teams } from '../src/db/schema';
+import { randomUUID } from 'node:crypto';
+import { agentInstallations, agentRuns, projects, snapshots, teams, users } from '../src/db/schema';
 import { loadEnv } from '../src/env';
 import { DAY_MS } from '../src/lib/counters';
 import { DEVICE_WINDOW_DAYS, deviceAllowance, insertFromNewDevice } from '../src/lib/devices';
@@ -130,6 +131,29 @@ it('shows a free team the fleet without letting it claim ground', async () => {
   // visible. Closing it entirely would hide the product being sold.
   const map = await call(hostedSrv, 'list_active_agents', { team: 'thrifty' }, freeToken);
   expect(map.isError, map.text).toBe(false);
+});
+
+it("reads a free team its own run's evidence, though it cannot start a run", async () => {
+  // Basic run evidence is on every plan since 2026-10-22: a run made while a
+  // workspace was paid stays readable after it is not.
+  const [owner] = await hostedSrv.db.select().from(users).where(eq(users.username, 'thrifty'));
+  const [team] = await hostedSrv.db.select().from(teams).where(eq(teams.slug, 'thrifty'));
+  const [installation] = await hostedSrv.db
+    .insert(agentInstallations)
+    .values({ userId: owner!.id, name: 'thrifty-agent', deviceLabel: 'laptop', deviceFingerprint: randomUUID() })
+    .returning();
+  const [run] = await hostedSrv.db
+    .insert(agentRuns)
+    // Ended days ago, so the map (presence) has let it go and its empty state
+    // below is still the one a free team with nothing live sees.
+    .values({ installationId: installation!.id, teamId: team!.id, status: 'completed', endedAt: new Date(Date.now() - 3 * DAY_MS), lastHeartbeatAt: new Date(Date.now() - 3 * DAY_MS) })
+    .returning();
+  const evidence = await call(hostedSrv, 'get_evidence', { run_id: run!.id }, freeToken);
+  expect(evidence.isError, evidence.text).toBe(false);
+  expect(JSON.parse(evidence.text).run.id).toBe(run!.id);
+  // Another team's token is still refused.
+  const theirs = await call(hostedSrv, 'get_evidence', { run_id: run!.id }, paidToken);
+  expect(theirs.isError).toBe(true);
 });
 
 it('keeps policy and preflight behind the same line', async () => {
@@ -275,6 +299,8 @@ it('never meters an instance somebody runs themselves', async () => {
   // defaults and would inherit every limit meant for the hosted free tier.
   const started = await call(ownSrv, 'start_run', { team: 'homelab', task: 'HOME-1' }, ownToken);
   expect(started.isError, started.text).toBe(false);
+  const evidence = await call(ownSrv, 'get_evidence', { run_id: JSON.parse(started.text).runId }, ownToken);
+  expect(evidence.isError, evidence.text).toBe(false);
   const policy = await call(ownSrv, 'get_policy', { team: 'homelab' }, ownToken);
   expect(policy.isError, policy.text).toBe(false);
   for (let i = 0; i < 5; i++) {

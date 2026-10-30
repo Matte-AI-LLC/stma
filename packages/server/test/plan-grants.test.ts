@@ -491,10 +491,15 @@ describe('the beta ledger measures a workspace against the plan it lands on', ()
     expect(row(plain.id).landsOn).toBe('free');
     expect(row(plain.id).grant).toBeNull();
     expect(row(plain.id).ceilings.find((c) => c.key === 'members')!.limit).toBe(PLANS.free.maxMembers);
+    // Free reads run evidence since 2026-10-22, so the flip closes no evidence either.
+    expect(row(plain.id).features.find((f) => f.key === 'evidence')!.state).toBe('kept');
 
     const page = await (await get('/admin/beta', admin)).text();
     expect(page).toContain('data-lands-on="team"');
     expect(page).toContain('Given a plan');
     expect(page).not.toContain('Distance to the free ceilings');
+    // The card note says what the rows say: evidence is kept, never a `?`.
+    expect(page).toContain('Run evidence is on every plan, so its square reads kept on every row');
+    expect(page).not.toContain('cannot be answered from stored rows for any workspace');
   });
 });

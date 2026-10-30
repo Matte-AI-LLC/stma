@@ -1,4 +1,4 @@
-import { eq, inArray, lt, sql } from 'drizzle-orm';
+import { and, eq, gt, inArray, lt, sql } from 'drizzle-orm';
 import { rowsAffected, type Db } from '../db';
 import { rateCounters } from '../db/schema';
 
@@ -21,6 +21,8 @@ export interface CounterHit {
   resetAt: Date;
   /** True when this hit pushed the counter past `max`. */
   exceeded: boolean;
+  /** The row this hit landed on, for `releaseCounterHit`. */
+  key: string;
 }
 
 export async function hitCounter(
@@ -44,7 +46,24 @@ export async function hitCounter(
     })
     .returning({ count: rateCounters.count });
   const count = rows[0]?.count ?? by;
-  return { count, resetAt, exceeded: count > max };
+  return { count, resetAt, exceeded: count > max, key };
+}
+
+/**
+ * Give one hit back, in the window it was taken in.
+ *
+ * For a counter spent before the outcome is known, so that parallel requests
+ * cannot all read a count below the limit and then act: the attempt is counted
+ * first, and an attempt that turned out not to be the thing being limited (a
+ * right code, a server fault) is returned here. The update names the exact row
+ * the hit went to, so a window that closed in between gives nothing to the
+ * next one, and the count never goes below zero.
+ */
+export async function releaseCounterHit(db: Db, hit: Pick<CounterHit, 'key'>): Promise<void> {
+  await db
+    .update(rateCounters)
+    .set({ count: sql`${rateCounters.count} - 1` })
+    .where(and(eq(rateCounters.key, hit.key), gt(rateCounters.count, 0)));
 }
 
 /**

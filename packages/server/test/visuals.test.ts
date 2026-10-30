@@ -231,7 +231,8 @@ it('keeps idle agent identities visible and lets only their owner disable them d
   expect(before).toContain('Agent inventory');
   expect(before).toContain('ada-reviewer-idle');
   expect(before).toContain('Registered; no run yet');
-  expect(before).toContain('>idle</span>');
+  expect(before).toContain('>no active run</span>');
+  expect(before).not.toContain('>idle<');
   const inventory = before.slice(before.indexOf('Agent inventory'));
   expect(inventory.indexOf('ada-claude')).toBeLessThan(inventory.indexOf('ada-reviewer-idle'));
   expect(inventory.indexOf('bo-cursor')).toBeLessThan(inventory.indexOf('ada-reviewer-idle'));
@@ -606,6 +607,8 @@ it('highlights the rail item you are actually on', async () => {
     ['/app/agents?team=pictures', 'Agent map'],
     ['/app/sessions?team=pictures', 'Sessions'],
     ['/app/handoffs?team=pictures', 'Work'],
+    // The workspace form of Work is the queue, and it lights the same entry.
+    ['/app/teams/pictures/work', 'Work'],
     ['/app/teams/pictures?tab=people', 'Members and invites'],
     ['/app/notifications', 'Notifications'],
     ['/app/sessions', 'All workspaces'],

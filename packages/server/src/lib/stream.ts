@@ -49,7 +49,8 @@ export type ChangeKind =
   | 'session'
   | 'activity'
   | 'policy'
-  | 'announcement';
+  | 'announcement'
+  | 'work';
 
 const CHANGE_KINDS: readonly string[] = [
   'run',
@@ -59,6 +60,7 @@ const CHANGE_KINDS: readonly string[] = [
   'activity',
   'policy',
   'announcement',
+  'work',
 ];
 
 /** The PostgreSQL channel every replica of one deployment listens on. */

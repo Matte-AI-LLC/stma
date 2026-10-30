@@ -1,19 +1,28 @@
-import { and, desc, eq } from 'drizzle-orm';
+import { and, eq } from 'drizzle-orm';
 import { Hono } from 'hono';
 import { loginRedirect } from '../auth/session';
 import type { Db } from '../db';
-import { agentRuns, debugSessions, handoffs, projects, runCheckpoints } from '../db/schema';
+import { agentRuns, projects } from '../db/schema';
 import { teamForUser } from '../domain/access';
 import { evidenceForRun } from '../domain/evidence';
-import { evidenceMarkdown } from '../domain/evidenceSummary';
+import { evidenceMarkdown, evidencePullRequestBlock, membersOnly } from '../domain/evidenceSummary';
 import { eventsForRun } from '../domain/fleetReaders';
+import { EVIDENCE_NOT_INCLUDED, evidenceAllowed } from '../lib/entitlements';
 import { isCanonicalUuid } from '../lib/ids';
 import { ensureRail } from '../lib/rail';
 import { sectionHref } from '../lib/scope';
 import { timeAgo } from '../lib/format';
 import type { AppEnv } from '../types';
 import { PageHead, teamTrail, type Crumb } from '../ui/Console';
-import { DeliveredCommit, EvidenceChecks, EvidenceNext } from '../ui/Evidence';
+import {
+  DeliveredCommit,
+  EvidenceChecks,
+  EvidenceNext,
+  Handovers,
+  PolicyKnowledge,
+  ProviderFacts,
+  ReviewIdentity,
+} from '../ui/Evidence';
 import { AppLayout } from '../ui/Layout';
 
 /**
@@ -32,8 +41,9 @@ import { AppLayout } from '../ui/Layout';
  * the address sits under the workspace (`/app/teams/:slug/…`), so membership —
  * and, in an organization-managed workspace, the identity layer's role check,
  * which resolves the workspace from that same prefix — decides who reads it.
- * "Copy as Markdown" is how a member takes it to a pull request; nothing here
- * posts anywhere.
+ * "Copy as Markdown" and "Copy for a pull request" are how a member takes it
+ * to a pull request, and the page says only workspace members can open the
+ * link; nothing here posts anywhere.
  */
 export const runsRoutes = new Hono<AppEnv>();
 
@@ -52,24 +62,9 @@ async function runForMember(db: Db, slug: string, runId: string, userId: string)
   return row ? { access, ...row } : undefined;
 }
 
-/** The threads this run's checkpoints were handed over in. */
-async function handedOverIn(db: Db, runId: string) {
-  return db
-    .select({
-      sessionId: handoffs.sessionId,
-      kind: handoffs.kind,
-      state: handoffs.state,
-      title: debugSessions.title,
-      createdAt: handoffs.createdAt,
-      commitSha: runCheckpoints.commitSha,
-    })
-    .from(handoffs)
-    .innerJoin(runCheckpoints, eq(runCheckpoints.id, handoffs.checkpointId))
-    .innerJoin(debugSessions, eq(debugSessions.id, handoffs.sessionId))
-    .where(eq(runCheckpoints.runId, runId))
-    .orderBy(desc(handoffs.createdAt))
-    .limit(10);
-}
+// The sentence lives beside `evidenceAllowed`, so the hosted composition's
+// organization project console prints it without importing a route module.
+export { EVIDENCE_NOT_INCLUDED } from '../lib/entitlements';
 
 export const runHref = (team: string, runId: string) => `/app/teams/${team}/runs/${runId}`;
 
@@ -81,11 +76,27 @@ runsRoutes.get('/app/teams/:slug/runs/:id', async (c) => {
   if (!found) return c.notFound();
   const { access, run } = found;
   await ensureRail(db, user, access.team.slug, found.projectSlug ?? null);
+  // One decision for every door: this page, its Markdown, the map's inspector
+  // and get_evidence all read the same request-local entitlement. 402 rather
+  // than 404, as on Governance: the run is the member's to know about, and a
+  // page without its checks would read as a pass.
+  if (!(await evidenceAllowed(db, access.team, c.get('env').hosted))) {
+    return c.html(
+      <AppLayout user={user} active="agents" title="Run evidence">
+        <div class="card card-pad joincard">
+          <h2 class="title m0">Run evidence</h2>
+          <p class="m0 sub">{EVIDENCE_NOT_INCLUDED}</p>
+        </div>
+      </AppLayout>,
+      402,
+    );
+  }
   const pack = await evidenceForRun(db, run.id, user.id);
   if ('error' in pack) return c.notFound();
-  const [trail, handovers] = await Promise.all([eventsForRun(db, run.id, 20), handedOverIn(db, run.id)]);
+  const trail = await eventsForRun(db, run.id, 20);
   const self = `${c.get('env').baseUrl}${runHref(access.team.slug, run.id)}`;
   const markdown = evidenceMarkdown(pack, { url: self });
+  const pullRequest = evidencePullRequestBlock(pack, { url: self });
   const title = pack.run.task ?? pack.run.intent ?? 'Untitled run';
   const live = ['starting', 'active', 'waiting', 'blocked'].includes(run.status);
   const steps: Crumb[] = found.projectSlug
@@ -110,6 +121,9 @@ runsRoutes.get('/app/teams/:slug/runs/:id', async (c) => {
             <button class="btn btn-sm btn-primary" type="button" data-copy={markdown}>
               Copy as Markdown
             </button>
+            <button class="btn btn-sm" type="button" data-copy={pullRequest}>
+              Copy for a pull request
+            </button>
             <a class="btn btn-sm" href={`${runHref(access.team.slug, run.id)}/evidence.md`}>
               Download .md
             </a>
@@ -125,39 +139,55 @@ runsRoutes.get('/app/teams/:slug/runs/:id', async (c) => {
         }
       />
       <p class="small muted" style="max-width:var(--measure)">
-        {pack.verdict} Each line says where it came from: what the agent reported, what STMA
+        {pack.verdict} Each section says whose word it is: what the agent reported, what STMA
         observed, and what a connected provider observed at the exact commit. Copy as Markdown
-        keeps those words, so a pull request gets the same answer this page gives.
+        keeps those words, so a pull request gets the same answer this page gives; Copy for a
+        pull request is the short version.
       </p>
+      <p class="small muted" style="max-width:var(--measure)">{membersOnly(access.team.name)}</p>
       <div class="grid2">
         <div class="col">
+          <div class="card card-pad" style="display:flex;flex-direction:column;gap:10px">
+            <div class="card-title">Identity</div>
+            <ReviewIdentity pack={pack} />
+          </div>
           <div class="card card-pad" style="display:flex;flex-direction:column;gap:10px">
             <div class="card-title">Delivered commit</div>
             <DeliveredCommit pack={pack} />
           </div>
           <div class="card card-pad" style="display:flex;flex-direction:column;gap:10px">
-            <div class="card-title">Checks</div>
-            <EvidenceChecks pack={pack} />
+            <div class="card-title">Reported by the agent</div>
+            <EvidenceChecks pack={pack} only="client_report" />
+          </div>
+          <div class="card card-pad" style="display:flex;flex-direction:column;gap:10px">
+            <div class="card-title">Observed by STMA</div>
+            {pack.checks.some((check) => check.source === 'stma_observation') ? (
+              <EvidenceChecks pack={pack} only="stma_observation" />
+            ) : (
+              <p class="small muted m0">Nothing in this pack is STMA's own observation.</p>
+            )}
+          </div>
+          <div class="card card-pad" style="display:flex;flex-direction:column;gap:10px">
+            <div class="card-title">Observed by the provider</div>
+            <ProviderFacts pack={pack} />
+            <EvidenceChecks pack={pack} only="provider_observation" />
+          </div>
+          {/* Its own card, as in the Markdown: this summary reads every check,
+              whoever's word it is, so under the provider's heading it would
+              read as the provider's. */}
+          <div class="card card-pad" style="display:flex;flex-direction:column;gap:10px">
+            <div class="card-title">Still open</div>
             <EvidenceNext pack={pack} />
           </div>
         </div>
         <div class="col">
           <div class="card card-pad" style="display:flex;flex-direction:column;gap:10px">
-            <div class="card-title">Handed over</div>
-            {handovers.length === 0 ? (
-              <p class="small muted m0">This run's checkpoints were not handed over to anybody.</p>
-            ) : (
-              handovers.map((row) => (
-                <p class="small m0">
-                  <a href={`/app/sessions/${row.sessionId}`}>{row.title}</a>
-                  <span class="muted">
-                    {' '}
-                    · {row.kind} at <span class="mono">{row.commitSha.slice(0, 12)}</span> · {row.state.replace('_', ' ')} ·{' '}
-                    {timeAgo(row.createdAt)}
-                  </span>
-                </p>
-              ))
-            )}
+            <div class="card-title">Handover</div>
+            <Handovers pack={pack} />
+          </div>
+          <div class="card card-pad" style="display:flex;flex-direction:column;gap:10px">
+            <div class="card-title">Policy and Knowledge</div>
+            <PolicyKnowledge pack={pack} />
           </div>
           <div class="card card-pad" style="display:flex;flex-direction:column;gap:10px">
             <div class="card-title">Scope it declared</div>
@@ -170,6 +200,8 @@ runsRoutes.get('/app/teams/:slug/runs/:id', async (c) => {
                   <span class="muted">
                     {' '}
                     · {claim.type} · {claim.access ?? 'write'}
+                    {'movedTo' in claim ? ` · moved to run ${claim.movedTo.slice(0, 8)} when this run was closed for other work` : ''}
+                    {'carriedFrom' in claim && claim.carriedFrom ? ` · carried from run ${claim.carriedFrom.slice(0, 8)}, which declared it` : ''}
                   </span>
                 </p>
               ))
@@ -201,6 +233,10 @@ runsRoutes.get('/app/teams/:slug/runs/:id/evidence.md', async (c) => {
   const db = c.get('db');
   const found = await runForMember(db, c.req.param('slug'), c.req.param('id'), user.id);
   if (!found) return c.notFound();
+  if (!(await evidenceAllowed(db, found.access.team, c.get('env').hosted))) {
+    c.header('cache-control', 'private, no-store');
+    return c.text(EVIDENCE_NOT_INCLUDED, 402);
+  }
   const pack = await evidenceForRun(db, found.run.id, user.id);
   if ('error' in pack) return c.notFound();
   const markdown = evidenceMarkdown(pack, {

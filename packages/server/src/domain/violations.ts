@@ -2,7 +2,7 @@ import { parseContentRules } from '@bridge/shared';
 import { and, desc, eq } from 'drizzle-orm';
 import type { Db } from '../db';
 import { agentEvents, agentInstallations, agentRuns, projects, teams, users } from '../db/schema';
-import { addAgentEvent, runForOwner } from './agents';
+import { addAgentEvent, rotatedAnswer, runForOwner } from './agents';
 import { companionInstallations } from './companions';
 import { effectivePolicy } from './policies';
 
@@ -54,7 +54,13 @@ export async function recordPolicyViolation(
   input: ViolationInput,
 ) {
   const found = await runForOwner(db, runId, userId);
-  if (!found || found.installation.revokedAt || !LIVE.includes(found.run.status)) return undefined;
+  if (!found || found.installation.revokedAt) return undefined;
+  // A run a rotation closed answers with its successor, as every run door
+  // does, so the route can record what landed on the run that now holds the
+  // session: a runtime pinned before rotations reports its end-of-run scan on
+  // the run it started, and it would otherwise be lost.
+  if (found.run.rotatedToRunId) return rotatedAnswer(db, runId, found.run.rotatedToRunId);
+  if (!LIVE.includes(found.run.status)) return undefined;
   const [team] = await db.select().from(teams).where(eq(teams.id, found.run.teamId)).limit(1);
   if (!team) return undefined;
   const policy = await effectivePolicy(db, userId, {

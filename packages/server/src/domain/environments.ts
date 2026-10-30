@@ -17,7 +17,7 @@ import { fingerprintJson } from '../lib/canonical';
 import { resolveProjectForWrite } from '../lib/projects';
 import { projectForTeam, teamForUser } from './access';
 import { effectiveLimits } from '../lib/entitlements';
-import { runForOwner } from './agents';
+import { rotatedAnswer, runForOwner } from './agents';
 import { effectivePolicy } from './policies';
 
 export async function setEnvironmentBaseline(
@@ -89,6 +89,11 @@ export async function environmentPreflight(
     if (owned.run.teamId !== access.team.id || owned.run.projectId !== project.id) {
       return { error: 'Agent run does not belong to this team/project.' } as const;
     }
+    // A run a rotation closed answers with its successor, as every other run
+    // door does. Recorded here, the fingerprint and the check landed on the
+    // completed run for the rest of the session, while the successor, the run
+    // that carries the work and its delivery, read "no preflight".
+    if (owned.run.rotatedToRunId) return rotatedAnswer(db, input.runId, owned.run.rotatedToRunId);
     await db
       .update(agentRuns)
       .set({ environmentFingerprint: fingerprint })

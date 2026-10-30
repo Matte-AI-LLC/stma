@@ -1,4 +1,5 @@
 import { membershipUser } from './securityHooks';
+import { awaitingDecisionCount } from './workQueue';
 import { ACTIVE_AGENT_RUN_STATUSES } from '@bridge/shared';
 import { and, count, desc, eq, gt, inArray, isNotNull, isNull, ne, or, sql } from 'drizzle-orm';
 import type { Db } from '../db';
@@ -30,6 +31,12 @@ export interface RailCounts {
   runs: number;
   sessions: number;
   drift: number;
+  /**
+   * Work in review that is waiting for this person's decision: they are its
+   * acceptor, the delivery has no decision yet. Scoped like the other badges,
+   * and defined once in `lib/workQueue.ts` beside the list it must agree with.
+   */
+  work: number;
   /** Team the rail's team-scoped links point at: the only one, or the newest. */
   team: string | null;
   /** Your role in that team — the rail is also where you check your own authority. */
@@ -131,6 +138,7 @@ export const EMPTY_RAIL: RailCounts = {
   runs: 0,
   sessions: 0,
   drift: 0,
+  work: 0,
   team: null,
   role: null,
   teams: 0,
@@ -229,6 +237,11 @@ export async function railFor(
       ),
     );
 
+  const awaiting = await awaitingDecisionCount(db, userId, {
+    teamIds: scope === 'account' ? ids : [current.id],
+    projectId: project?.id,
+  });
+
   // Runs in the current team whose agent reported a policy hash other than the
   // one the server served. Governance is team-scoped, so its badge must count
   // the same scope as the page behind it.
@@ -260,6 +273,7 @@ export async function railFor(
     runs: runs[0]?.n ?? 0,
     sessions: Number(unread[0]?.n ?? 0),
     drift: drift[0]?.n ?? 0,
+    work: awaiting,
     team: current.slug,
     role: current.role,
     teams: mine.length,

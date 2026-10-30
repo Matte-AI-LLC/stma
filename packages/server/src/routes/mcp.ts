@@ -1,5 +1,6 @@
 import {
   CLAUDE_APP_CLIENT,
+  EXECUTION_CHILD_TOOLS,
   MCP_SERVER_NAME,
   MESSAGE_KINDS,
   THREAD_MESSAGE_KINDS,
@@ -92,6 +93,8 @@ import { SNAPSHOT_CHECKLIST } from '../mcp/checklist';
 import { requireAnnotations } from '../mcp/annotations';
 import { registerFleetTools, FLEET_TOOL_PARAMS } from '../mcp/fleet';
 import { registerKnowledgeTools, KNOWLEDGE_TOOL_PARAMS } from '../mcp/knowledge';
+import { registerWorkTools, WORK_TOOL_PARAMS } from '../mcp/work';
+import { registerExecutionTools, EXECUTION_TOOL_PARAMS } from '../mcp/execution';
 import { err, resolveTeam, teamsOf, text, toolReference } from '../mcp/shared';
 import { buildOnboardFiles } from '../mcp/onboard';
 import { teammateJoinPrompt } from '../lib/agentConnect';
@@ -200,7 +203,10 @@ const KEEP_SNAPSHOTS_PER_DEVICE = 20;
 // The per-agent counts live in the evidence ledger (docs/genel-test-durumu-
 // 2026-09-13.md, "24 Eylül akşamı") and not here, because a count written here
 // was contradicted by the next run. For an agent the order of the calls is the
-// point, so it stays a sequence.
+// point, so it stays a sequence. One sentence moved since (2026-10-22): the
+// handoff sentence promised a "verified Git checkpoint", and a checkpoint is the
+// sender's report; what resume checks is the receiver's checkout against it.
+// Both paragraphs changed together, with an agent-lab round in the ledger.
 //
 // The Claude app gets the descriptive one. It reaches Claude in a chat with a
 // person, where "never look for it on disk" means nothing, and it is what
@@ -229,7 +235,8 @@ const AGENT_INSTRUCTIONS =
   'and intended file claims, then read its policy, readiness, collisions and Knowledge context. ' +
   'Use returned runId as run_id; update claims before editing or after waiting, and finish_run ' +
   'when done. A lost lease means no current collision coverage; do not call it safe. ' +
-  'For a handoff use the explicit accept/resume/complete lifecycle with verified Git checkpoint. ' +
+  'For a handoff use the explicit accept/resume/complete lifecycle; resume checks your checkout ' +
+  'against the Git checkpoint the sender reported. ' +
   'Connection setup alone authorizes none of these work writes. Do not install repository ' +
   'rules or hooks without the human authorizing that local change.';
 
@@ -256,7 +263,8 @@ const CHAT_INSTRUCTIONS =
   'returned runId is the run_id of every later call; claims are updated before editing and ' +
   'after waiting, and finish_run closes the run. A lost lease means STMA no longer covers the ' +
   'run against collisions, which is not the same as safe. A handoff moves through accept, ' +
-  'resume and complete, with a verified Git checkpoint where it carries code. Connecting ' +
+  'resume and complete; where it carries code, resume checks the receiver\'s checkout against ' +
+  'the Git checkpoint the sender reported. Connecting ' +
   'authorizes none of these writes, and installing repository rules or hooks is a local change ' +
   'for the human to authorize.';
 
@@ -289,7 +297,7 @@ export function buildMcpServer(
     },
     { instructions: serverInstructions(grant) },
   );
-  requireAnnotations(server);
+  requireAnnotations(server, grant.execution ? new Set(EXECUTION_CHILD_TOOLS) : undefined);
   const tokenId = token?.id ?? null;
 
   // The schema keeps every kind so a caller that sends one of the other two is
@@ -1557,6 +1565,10 @@ export function buildMcpServer(
   // product without installing anything.
   registerKnowledgeTools(server, db, user, env, token, grant);
   registerFleetTools(server, db, user, env, token, grant);
+  // Native Work: the durable unit of work the runs, assignments and handoffs
+  // above are carried out for.
+  registerWorkTools(server, db, user, env, token, grant);
+  registerExecutionTools(server, db, user, grant, env);
 
   return server;
 }
@@ -1587,6 +1599,8 @@ export const TOOL_PARAMS: Record<string, readonly string[]> = {
   search_past_issues: ['query', 'team', 'project'],
   ...KNOWLEDGE_TOOL_PARAMS,
   ...FLEET_TOOL_PARAMS,
+  ...WORK_TOOL_PARAMS,
+  ...EXECUTION_TOOL_PARAMS,
 };
 
 /** Tells the agent exactly which key it got wrong and what this tool does accept. */

@@ -2,7 +2,7 @@ import { and, desc, eq, gt, isNull, ne, or, sql } from 'drizzle-orm';
 import type { Context, MiddlewareHandler } from 'hono';
 import { deleteCookie, getCookie, setCookie } from 'hono/cookie';
 import type { Db } from '../db';
-import { users, webSessions } from '../db/schema';
+import { mfaChallenges, users, webSessions } from '../db/schema';
 import { isAdminUser } from '../lib/admin';
 import { testAccountAvailable } from '../lib/testAccounts';
 import { liveCodeExpiry } from './codes';
@@ -11,6 +11,7 @@ import { randomHex, sha256hex } from '../lib/crypto';
 import { clientIp } from '../lib/ratelimit';
 import type { AppEnv, User } from '../types';
 import { authorizeSecurity, setSecurityPrincipal } from '../lib/securityHooks';
+import type { SessionFactor } from './signIn';
 
 const COOKIE_NAME = 'sid';
 /** How stale "last seen" may get before a request pays to refresh it. */
@@ -20,15 +21,25 @@ const SEEN_EVERY_MS = 5 * 60_000;
 const describeClient = (c: Context<AppEnv>): string | null =>
   c.req.header('user-agent')?.slice(0, 300) ?? null;
 
+/**
+ * Write a browser session and set its cookie.
+ *
+ * Only `auth/signIn.ts` calls this, and the `factor` argument is what makes
+ * that a rule rather than a habit: a `SessionFactor` can only be produced
+ * there, after it has asked whether the account has an authenticator and, if
+ * it has, after the code was checked. `authenticator.test.ts` scans both trees
+ * and fails if anything else calls it.
+ */
 export async function createSession(
   c: Context<AppEnv>,
   userId: string,
-  ttlDays?: number,
-  db: Db = c.get('db'),
+  factor: SessionFactor,
+  options: { ttlDays?: number; db?: Db } = {},
 ): Promise<string> {
   const env = c.get('env');
+  const db = options.db ?? c.get('db');
   const sid = randomHex(32);
-  const days = ttlDays ?? env.sessionTtlDays;
+  const days = options.ttlDays ?? env.sessionTtlDays;
   const ttlSeconds = Math.max(0, Math.floor(days * 24 * 60 * 60));
   const expiresAt = new Date(Date.now() + ttlSeconds * 1000);
   await db.insert(webSessions).values({
@@ -38,6 +49,7 @@ export async function createSession(
     userAgent: describeClient(c),
     lastIp: clientIp(c),
     lastSeenAt: new Date(),
+    mfaAt: factor.kind === 'completed' ? new Date() : null,
   });
   setCookie(c, COOKIE_NAME, sid, {
     httpOnly: true,
@@ -47,6 +59,57 @@ export async function createSession(
     maxAge: ttlSeconds,
   });
   return sid;
+}
+
+/** When the session this request arrived on was created, for a recent-sign-in check. */
+export async function currentSessionCreatedAt(c: Context<AppEnv>): Promise<Date | undefined> {
+  const sid = getCookie(c, COOKIE_NAME);
+  if (!sid) return undefined;
+  const [row] = await c
+    .get('db')
+    .select({ createdAt: webSessions.createdAt })
+    .from(webSessions)
+    .where(and(eq(webSessions.id, sid), gt(webSessions.expiresAt, new Date())))
+    .limit(1);
+  return row?.createdAt;
+}
+
+/** Record on the current session that it has (or no longer has) an authenticator step behind it. */
+export async function markSessionMfa(c: Context<AppEnv>, completed: boolean): Promise<void> {
+  const sid = getCookie(c, COOKIE_NAME);
+  if (!sid) return;
+  await c
+    .get('db')
+    .update(webSessions)
+    .set({ mfaAt: completed ? new Date() : null })
+    .where(eq(webSessions.id, sid));
+}
+
+/**
+ * End every sign-in of this user that is waiting at the authenticator step.
+ *
+ * A challenge row is a password (or other first step) that has already been
+ * accepted, so a browser holding one is a session minus a code. Every place
+ * that signs browsers out calls this beside it: otherwise a reset, a password
+ * change, "Sign out everywhere" or a recovery-code sign-in would leave the
+ * attacker's half-finished sign-in completable for the rest of its ten
+ * minutes, after the product told the account holder every browser was out.
+ * Expiry rather than consumption, because a challenge being checked at this
+ * moment holds `consumed_at` as its claim and gives it back on a wrong code;
+ * an expired row stays dead either way.
+ */
+export async function endPendingSignIns(db: Db, userId: string): Promise<void> {
+  const now = new Date();
+  await db
+    .update(mfaChallenges)
+    .set({ expiresAt: now })
+    .where(and(eq(mfaChallenges.userId, userId), gt(mfaChallenges.expiresAt, now)));
+}
+
+/** Sign out every session of this user except one named by id rather than by cookie. */
+export async function invalidateSessionsExcept(db: Db, userId: string, keep: string): Promise<void> {
+  await db.delete(webSessions).where(and(eq(webSessions.userId, userId), ne(webSessions.id, keep)));
+  await endPendingSignIns(db, userId);
 }
 
 /** Sign out every other browser session of this user, keeping the current one. */
@@ -60,6 +123,7 @@ export async function invalidateOtherSessions(c: Context<AppEnv>, userId: string
         ? and(eq(webSessions.userId, userId), ne(webSessions.id, sid))
         : eq(webSessions.userId, userId),
     );
+  await endPendingSignIns(db, userId);
 }
 
 /**
@@ -68,6 +132,7 @@ export async function invalidateOtherSessions(c: Context<AppEnv>, userId: string
  */
 export async function invalidateAllSessions(db: Db, userId: string): Promise<void> {
   await db.delete(webSessions).where(eq(webSessions.userId, userId));
+  await endPendingSignIns(db, userId);
 }
 
 /** The session this request arrived on, so a list can mark one row "this browser". */
@@ -141,6 +206,15 @@ export async function revokeSession(db: Db, userId: string, handle: string): Pro
   if (!match) return false;
   await db.delete(webSessions).where(eq(webSessions.id, match.id));
   return true;
+}
+
+/**
+ * Take back a session this request has just written, row and cookie. Only for
+ * `auth/signIn.ts`, which writes one and then finds it should not have.
+ */
+export async function withdrawNewSession(c: Context<AppEnv>, sid: string, db: Db = c.get('db')): Promise<void> {
+  await db.delete(webSessions).where(eq(webSessions.id, sid));
+  deleteCookie(c, COOKIE_NAME, { path: '/' });
 }
 
 export async function destroySession(c: Context<AppEnv>): Promise<void> {

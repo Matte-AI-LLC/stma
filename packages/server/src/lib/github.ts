@@ -39,7 +39,7 @@ export async function readGithubRepository(env: Env, config: GithubConfig) {
 
 /** One workflow is one fact, not the repository's entire required-check verdict. */
 export async function readGithubWorkflow(env: Env, config: GithubConfig, runId: number) {
-  return request<{ id: number; head_sha: string; run_attempt: number; updated_at: string; conclusion: string | null; repository: { id: number } }>(env, config, 'GET', `/repos/${config.repo}/actions/runs/${runId}`);
+  return request<{ id: number; name?: string; workflow_id?: number; head_sha: string; run_attempt: number; updated_at: string; status: string; conclusion: string | null; repository: { id: number } }>(env, config, 'GET', `/repos/${config.repo}/actions/runs/${runId}`);
 }
 
 export interface GithubIssue {
@@ -49,6 +49,12 @@ export interface GithubIssue {
   labels: string[];
   updatedAt: string;
   body?: string;
+  /** GitHub's own open or closed. A closed issue is a remote fact, never an STMA decision. */
+  state?: 'open' | 'closed';
+  /** Logins, for display: a remote assignee is never an STMA owner or acceptor. */
+  assignees?: string[];
+  /** The issues endpoint answers pull requests too; a work item never follows one. */
+  pullRequest?: boolean;
 }
 
 export type GithubResult<T> = { ok: true; value: T } | { ok: false; error: string };
@@ -227,8 +233,10 @@ interface RawIssue {
   html_url: string;
   updated_at: string;
   body?: string | null;
+  state?: string;
   pull_request?: unknown;
   labels?: Array<{ name?: string } | string>;
+  assignees?: Array<{ login?: string }> | null;
 }
 
 /** The inverse of `toIssue`, for the memory transport's canned answers. */
@@ -239,6 +247,9 @@ const toRaw = (issue: GithubIssue): RawIssue => ({
   updated_at: issue.updatedAt,
   body: issue.body ?? null,
   labels: issue.labels,
+  ...(issue.state ? { state: issue.state } : {}),
+  ...(issue.assignees ? { assignees: issue.assignees.map((login) => ({ login })) } : {}),
+  ...(issue.pullRequest ? { pull_request: { url: `${issue.url}.diff` } } : {}),
 });
 
 const toIssue = (raw: RawIssue): GithubIssue => ({
@@ -248,6 +259,11 @@ const toIssue = (raw: RawIssue): GithubIssue => ({
   updatedAt: raw.updated_at,
   body: raw.body ?? undefined,
   labels: (raw.labels ?? []).map((l) => (typeof l === 'string' ? l : (l.name ?? ''))).filter(Boolean),
+  ...(raw.state === 'open' || raw.state === 'closed' ? { state: raw.state } : {}),
+  ...(Array.isArray(raw.assignees)
+    ? { assignees: raw.assignees.map((a) => a?.login ?? '').filter(Boolean) }
+    : {}),
+  ...(raw.pull_request ? { pullRequest: true } : {}),
 });
 
 /**

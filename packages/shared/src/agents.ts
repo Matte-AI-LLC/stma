@@ -164,6 +164,15 @@ export const startAgentRunSchema = z.object({
    * useless exactly where it was busiest.
    */
   attemptGroup: z.string().trim().min(1).max(120).optional(),
+  /**
+   * The Native Work item this run is for, and the contract revision the caller
+   * read before starting. Both or neither: a run pinned to a work without the
+   * revision it was read at could start on a contract nobody showed it. The
+   * domain refuses one without the other, so this stays a plain object that
+   * older callers can extend.
+   */
+  workId: z.string().uuid().optional(),
+  expectedSpecRevision: z.number().int().positive().optional(),
 });
 
 export const heartbeatAgentRunSchema = z.object({

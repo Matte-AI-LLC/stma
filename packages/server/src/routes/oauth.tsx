@@ -1,6 +1,6 @@
 import { AGENT_ROLES, CLAUDE_APP_CLIENT, type AgentClientType, type AgentRole } from '@bridge/shared';
 import { createHash } from 'node:crypto';
-import { and, eq, gt, inArray, isNull } from 'drizzle-orm';
+import { and, count, eq, gt, inArray, isNull } from 'drizzle-orm';
 import { Hono } from 'hono';
 import type { Context } from 'hono';
 import { agentEnrollments, agentInstallations, memberships, oauthAuthorizationCodes, oauthClients, oauthRefreshTokens, projects, teams, tokens, users } from '../db/schema';
@@ -14,6 +14,7 @@ import { randomHex, sha256hex } from '../lib/crypto';
 import { normalizeDeviceLabel } from '../lib/devices';
 import type { TokenScope } from '../lib/grants';
 import { logLine } from '../lib/log';
+import { CLAUDE_APP_BOUNDARY } from '../lib/entry';
 import { claudeCheckoutAgentName } from '../lib/mcpConnectPrompt';
 import { authorizeSecurity, membershipUser, SecurityRefusal, setSecurityPrincipal } from '../lib/securityHooks';
 import { AppLayout } from '../ui/Layout';
@@ -282,6 +283,23 @@ function clientTypeFor(client: RegisteredClient): AgentClientType {
   return 'generic';
 }
 
+/** The caller's Claude app connections that still work: installed, with a credential not revoked. */
+async function liveClaudeAppCount(db: Db, userId: string): Promise<number> {
+  const [row] = await db
+    .select({ n: count() })
+    .from(agentInstallations)
+    .innerJoin(tokens, eq(tokens.id, agentInstallations.tokenId))
+    .where(
+      and(
+        eq(agentInstallations.userId, userId),
+        eq(agentInstallations.clientType, CLAUDE_APP_CLIENT),
+        isNull(agentInstallations.revokedAt),
+        isNull(tokens.revokedAt),
+      ),
+    );
+  return row?.n ?? 0;
+}
+
 /**
  * The consent screen. A function because the POST draws it too: a pairing that
  * cannot hold is answered on the form the human is looking at, with what they
@@ -305,6 +323,10 @@ async function consentPage(
   // one checkout: no machine to name, and Personal is the scope a chat that is
   // asked "what are my agents doing" needs. Project only stays one click away.
   const hostedClaude = inferredClient === CLAUDE_APP_CLIENT;
+  // Adding the Claude app twice makes two installations. That is allowed, since a
+  // person may use two Claude accounts or want a narrower second connection, but
+  // it is said here, where it is chosen, with the count and where to revoke.
+  const existingConsoles = hostedClaude ? await liveClaudeAppCount(c.get('db'), user.id) : 0;
   // A per-checkout Claude Code server name carries the checkout folder; offer it
   // as the default so two agents on one machine do not both arrive as "claude-code-agent".
   const checkoutName = inferredClient === 'claude-code' ? claudeCheckoutAgentName(client.clientName) : undefined;
@@ -357,11 +379,23 @@ async function consentPage(
           </p>
           {hostedClaude ? (
             <p class="muted" style="margin:8px 0 0">
-              This is the Claude app: one connection for your account on the web, desktop and
-              phone. Claude can read your workspaces and, when you ask, write for you, and it asks
-              you before each write unless you change that in Claude. It is your console, so it is
-              not offered as an agent to give work to.
+              This is the Claude app console: one connection for your account on the web, desktop
+              and phone. Claude can read your workspaces and, when you ask, write for you, and it
+              asks you before each write unless you change that in Claude. {CLAUDE_APP_BOUNDARY} To
+              connect Claude Code or Codex in a checkout, use <code>stma connect</code> from Agent
+              connections.
             </p>
+          ) : null}
+          {hostedClaude && existingConsoles > 0 ? (
+            <div class="banner banner-info" style="margin-top:10px">
+              <span class="ic">i</span>
+              <span>
+                You already have {existingConsoles} live Claude app{' '}
+                {existingConsoles === 1 ? 'connection' : 'connections'}. Allowing this adds another
+                rather than replacing it. You can revoke the old one on{' '}
+                <a href="/app/tokens">Agent connections</a>.
+              </span>
+            </div>
           ) : null}
         </div>
         {entered.error ? (

@@ -88,7 +88,7 @@ export const clientJs = `(function () {
   try {
     var path = window.location.pathname;
     if ((path.indexOf('/app') === 0 || path.indexOf('/admin') === 0) && window.history && history.replaceState) {
-      var once = ['ok', 'error', 'err', 'notice', 'assign_error', 'assigned', 'cancelled', 'handoff', 'checkout', 'change'];
+      var once = ['ok', 'error', 'err', 'notice', 'assign_error', 'assigned', 'cancelled', 'handoff', 'checkout', 'change', 'deactivated', 'revoked'];
       var here = new URL(window.location.href);
       var had = false;
       once.forEach(function (key) {

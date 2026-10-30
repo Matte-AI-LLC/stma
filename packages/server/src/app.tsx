@@ -21,6 +21,8 @@ import { apiRoutes } from './routes/api';
 import { authRoutes } from './routes/auth';
 import { compareRoutes } from './routes/compare';
 import { controlRoutes } from './routes/control';
+import { workApiRoutes } from './routes/workApi';
+import { executionRoutes } from './routes/execution';
 import { docsRoutes } from './routes/docs';
 import { helpRoutes } from './routes/help';
 import { legalRoutes } from './routes/legal';
@@ -39,6 +41,7 @@ import { policyEditorRoutes } from './routes/policyEditor';
 import { projectsRoutes } from './routes/projects';
 import { rosterRoutes } from './routes/roster';
 import { sessionsRoutes } from './routes/sessions';
+import { workRoutes } from './routes/work';
 import { streamRoutes } from './routes/stream';
 import type { AppEnv } from './types';
 import {
@@ -303,6 +306,8 @@ export function createApp(
   app.route('/', authRoutes);
   app.route('/', apiRoutes);
   app.route('/', controlRoutes);
+  app.route('/', workApiRoutes);
+  app.route('/', executionRoutes);
   app.route('/', docsRoutes);
   app.route('/', helpRoutes);
   app.route('/', legalRoutes);
@@ -312,6 +317,9 @@ export function createApp(
   app.route('/', attentionRoutes);
   app.route('/', runsRoutes);
   app.route('/', mcpRoutes);
+  // Before the sessions routes: a project's /work is the native list now, and the old
+  // assignment ledger is its dispatched tab (routes/work.tsx renders it through sessions).
+  app.route('/', workRoutes);
   app.route('/', sessionsRoutes);
   app.route('/', streamRoutes);
   app.route('/', notificationsRoutes);

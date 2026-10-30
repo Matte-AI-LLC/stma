@@ -1,4 +1,4 @@
-import { and, eq, inArray, isNull, lt, notInArray, or, type SQL } from 'drizzle-orm';
+import { and, count, desc, eq, inArray, isNull, lt, notInArray, or, sql, type SQL } from 'drizzle-orm';
 import { rowsAffected, type Db } from '../db';
 import {
   activity,
@@ -11,13 +11,17 @@ import {
   errorEvents,
   invites,
   loadSamples,
+  mfaChallenges,
   notificationQueue,
   oauthAuthorizationCodes,
   oauthClients,
   oauthRefreshTokens,
   snapshots,
   teams,
+  userAuthenticators,
   webSessions,
+  workContextReads,
+  workSnapshots,
 } from '../db/schema';
 import { PLANS, PLAN_IDS, planName, type PlanId } from './entitlements';
 import { grantedOrOwnPlanSql } from './planGrants';
@@ -26,6 +30,7 @@ import { markStaleAgentRuns, trimAgentEvents } from '../domain/agents';
 import { trimEnvironmentChecks } from '../domain/environments';
 import { trimCeilingChanges } from './ceilings';
 import { trimMembershipChanges } from './memberships';
+import { trimAuthenticatorResets } from './authenticatorResets';
 import { trimErrorEvents } from './errors';
 import { startLoadHistory, trimLoadSamples } from './loadHistory';
 import { sweepCounters } from './counters';
@@ -125,6 +130,25 @@ const SWEEP_INTERVAL = 6 * 60 * 60 * 1000;
 const PRESENCE_SWEEP_INTERVAL = 60 * 1000;
 const NOTIFY_SWEEP_INTERVAL = 30 * 1000;
 
+/** The newest Work context reads kept; the measurement needs a window, not a history. */
+export const WORK_CONTEXT_READS_CAP = 50_000;
+
+/**
+ * Keep the newest `cap` context reads, oldest first out. The cut is strictly
+ * older than the oldest row worth keeping, so rows sharing that instant are
+ * kept together rather than split by row order (the load-sample trim's rule).
+ */
+export async function trimWorkContextReads(db: Db, cap = WORK_CONTEXT_READS_CAP): Promise<number> {
+  const keep = Math.max(1, cap);
+  const total = Number((await db.select({ n: count() }).from(workContextReads))[0]?.n ?? 0);
+  if (total <= keep) return 0;
+  await db.execute(
+    sql`delete from ${workContextReads} where ${workContextReads.createdAt} < (select ${workContextReads.createdAt} from ${workContextReads} order by ${desc(workContextReads.createdAt)} limit 1 offset ${keep - 1})`,
+  );
+  const left = Number((await db.select({ n: count() }).from(workContextReads))[0]?.n ?? 0);
+  return total - left;
+}
+
 export async function runCleanupOnce(db: Db, env: Env): Promise<void> {
   const now = new Date();
   /** Deleted-row tallies for the sweep log line; only non-zero entries are logged. */
@@ -133,6 +157,22 @@ export async function runCleanupOnce(db: Db, env: Env): Promise<void> {
   // Email codes: an hour past expiry, so the per-user send window (which counts
   // consumed and expired rows alike) is never shortened by the sweep.
   await db.delete(authCodes).where(lt(authCodes.expiresAt, new Date(now.getTime() - HOUR)));
+  // Authenticator sign-in steps nobody finished, and enrollments nobody
+  // confirmed, an hour past their end: the second still holds a sealed secret
+  // that was never turned on. An enabled authenticator has no expiry here.
+  counts.mfaChallenges = rowsAffected(
+    await db.delete(mfaChallenges).where(lt(mfaChallenges.expiresAt, new Date(now.getTime() - HOUR))),
+  );
+  counts.pendingAuthenticators = rowsAffected(
+    await db
+      .delete(userAuthenticators)
+      .where(
+        and(
+          isNull(userAuthenticators.enabledAt),
+          lt(userAuthenticators.pendingExpiresAt, new Date(now.getTime() - HOUR)),
+        ),
+      ),
+  );
   await db.delete(invites).where(lt(invites.expiresAt, new Date(now.getTime() - 30 * DAY)));
   // The raw enrollment secret was never stored, but old hashes and activation
   // envelopes have no operational value after a short audit window.
@@ -216,6 +256,9 @@ export async function runCleanupOnce(db: Db, env: Env): Promise<void> {
   // "why can this person not get in any more" is asked long after the fact.
   // The cap is higher because membership churn genuinely is.
   counts.membershipChangesCapped = await trimMembershipChanges(db);
+  // Operator resets of an authenticator app: the same rule again, for the
+  // question "who removed this person's second factor", asked after the fact.
+  counts.authenticatorResetsCapped = await trimAuthenticatorResets(db);
   // Preflight verdicts describe a machine at a moment, so they age out with the
   // snapshots they compare against — and, like the error log, a burst between
   // sweeps is caught by a row cap (per team, so a busy team evicts only itself).
@@ -273,6 +316,12 @@ export async function runCleanupOnce(db: Db, env: Env): Promise<void> {
   // Closed rate-limit and quota windows carry no information. Missing a sweep
   // costs disk, never correctness: an expired key is simply never read again.
   counts.counters = await sweepCounters(db);
+  // A Work delta snapshot answers its later pages for ten minutes and then
+  // refuses them itself (CURSOR_EXPIRED), so an expired one is only disk.
+  counts.workSnapshots = rowsAffected(await db.delete(workSnapshots).where(lt(workSnapshots.expiresAt, now)));
+  // How many bytes of Work context each read served: a measurement, kept as a
+  // rolling window of the newest rows. No work table is swept by age.
+  counts.workContextReadsCapped = await trimWorkContextReads(db);
 
   const swept = Object.entries(counts).filter(([, n]) => n > 0);
   if (swept.length > 0) logLine({ evt: 'cleanup', ...Object.fromEntries(swept) });

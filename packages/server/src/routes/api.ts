@@ -6,6 +6,7 @@ import type { Context } from 'hono';
 import { invites, messages, repositoryBindings, teams, tokens, users } from '../db/schema';
 import { z } from 'zod/v3';
 import { generatePat, mcpAuth } from '../auth/pat';
+import { hasActiveAuthenticator } from '../auth/secondFactor';
 import {
   clearLoginFailures,
   LOGIN_FAIL_WINDOW_MS,
@@ -297,6 +298,19 @@ apiRoutes.post('/api/invites/redeem', async (c) => {
     if (gate.locked) {
       logLine({ evt: 'auth', a: 'redeem_locked', em: maskEmail(email) });
       return c.json({ error: lockedMessage(gate.resetAt) }, 429);
+    }
+    // The one place a password alone turned into a credential. An account with
+    // an authenticator app proves itself in a browser, where the code is asked
+    // for; this door has no field for one and is not given one. The password
+    // is not checked at all, so this cannot be used to test it, and the check
+    // is paid for anyway so the answer takes as long either way.
+    if (await hasActiveAuthenticator(db, existingUser.id)) {
+      await burnPasswordCheck(password);
+      logLine({ evt: 'auth', a: 'redeem_fail', u: existingUser.username, why: 'authenticator' });
+      return c.json(
+        { error: 'this account uses an authenticator app: open the invitation in a browser to join' },
+        409,
+      );
     }
     if (!(await verifyPassword(password, existingUser.passwordHash))) {
       const failed = await recordLoginFailure(db, email);
@@ -594,6 +608,7 @@ apiRoutes.post('/api/hooks/github/:token', async (c) => {
     };
     workflow_run?: {
       id?: number;
+      workflow_id?: number;
       run_attempt?: number;
       head_sha?: string;
       updated_at?: string;
@@ -656,8 +671,21 @@ apiRoutes.post('/api/hooks/github/:token', async (c) => {
     if (p.action !== 'completed') return c.json({ ok: true, ignored: `workflow_run.${p.action}` });
     const wr = p.workflow_run;
     const conclusion = wr?.conclusion;
-    // Cancelled and skipped runs say nothing about the change.
-    if (!wr?.head_branch || (conclusion !== 'success' && conclusion !== 'failure')) {
+    const decisive = conclusion === 'success' || conclusion === 'failure';
+    // The provider fact is recorded for every completed run, whatever it
+    // concluded: a rerun that timed out, was cancelled or never started is the
+    // run's current attempt, and left out, an earlier attempt's pass would go on
+    // deciding a Work criterion while GitHub shows the check failed. Anything
+    // but success or failure is `unknown`, which is never a pass, the word the
+    // read-back door on Repository connections records for the same run.
+    // `name` is the workflow's, stable across runs: what a Work criterion names;
+    // `workflow_id` tells two workflow files that share that name apart.
+    if (wr) {
+      await recordProviderObservation(c.get('db'), team.id, 'github', { repositoryId: p.repository?.id?.toString(), deliveryId: c.req.header('x-github-delivery'), subjectId: wr.id ? `workflow:${wr.id}` : undefined, subjectName: wr.name, subjectDefinition: wr.workflow_id?.toString(), commitSha: wr.head_sha, kind: 'workflow', state: decisive ? conclusion : 'unknown', attempt: wr.run_attempt, observedAt: wr.updated_at });
+    }
+    // Cancelled and skipped runs say nothing about the change, so a run's CI
+    // verdict stays the last decisive one.
+    if (!wr?.head_branch || !decisive) {
       return c.json({ ok: true, ignored: `workflow_run.${conclusion ?? 'unknown'}` });
     }
     const outcome = await recordRunOutcome(c.get('db'), team.id, {
@@ -665,7 +693,6 @@ apiRoutes.post('/api/hooks/github/:token', async (c) => {
       repoName: p.repository?.full_name ?? p.repository?.name,
       ci: { conclusion, workflow: wr.name },
     });
-    await recordProviderObservation(c.get('db'), team.id, 'github', { repositoryId: p.repository?.id?.toString(), deliveryId: c.req.header('x-github-delivery'), subjectId: wr.id ? `workflow:${wr.id}` : undefined, commitSha: wr.head_sha, kind: 'workflow', state: conclusion, attempt: wr.run_attempt, observedAt: wr.updated_at });
     return c.json({ ok: true, linked: outcome.linked });
   }
 

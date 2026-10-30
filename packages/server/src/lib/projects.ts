@@ -8,82 +8,8 @@ import { slugify } from './slug';
 type Team = typeof teams.$inferSelect;
 export type Project = typeof projects.$inferSelect;
 
-const REMOTE_PROTOCOLS = new Set([
-  'git:',
-  'git+http:',
-  'git+https:',
-  'git+ssh:',
-  'http:',
-  'https:',
-  'ssh:',
-]);
-
-function normalizeRepositoryPath(raw: string): string {
-  return raw
-    .replaceAll('\\', '/')
-    .replace(/^\/+|\/+$/g, '')
-    .replace(/\/{2,}/g, '/')
-    .replace(/\.git$/i, '')
-    .replace(/\/+$/g, '')
-    .toLowerCase();
-}
-
-function urlRepositoryIdentity(raw: string): string | null {
-  try {
-    const url = new URL(raw);
-    if (!REMOTE_PROTOCOLS.has(url.protocol)) return null;
-    const path = normalizeRepositoryPath(url.pathname);
-    if (!url.hostname || !path) return null;
-    // URL already removes standard HTTP(S) ports. Do the equivalent for the
-    // standard SSH port so ssh://host:22/x and git@host:x are aliases.
-    const port = url.protocol === 'ssh:' && url.port === '22' ? '' : url.port;
-    return `${url.hostname.toLowerCase()}${port ? `:${port}` : ''}/${path}`;
-  } catch {
-    return null;
-  }
-}
-
-function scpRepositoryIdentity(raw: string): string | null {
-  // Do not mistake a Windows drive path for git's user@host:path spelling.
-  if (/^[a-z]:[\\/]/i.test(raw)) return null;
-  // An identity this module already produced for a remote on its own port —
-  // host:port/path, no scheme, no user — must come back unchanged. Read as scp
-  // syntax it would turn the port into a directory (host/8443/path), and a
-  // stored identity would stop matching the remote it was made from: every run
-  // start in a project bound to such a remote was refused as the wrong
-  // repository. A real scp path whose first directory is all digits and that
-  // names no user is the rarer reading, and it still converges with itself.
-  const ported = /^(\[[^\]]+\]|[^@:/\s]+):(\d{1,5})\/(.+)$/.exec(raw);
-  if (ported) {
-    const portedPath = normalizeRepositoryPath(ported[3]!);
-    return portedPath ? `${ported[1]!.toLowerCase()}:${ported[2]}/${portedPath}` : null;
-  }
-  const match = /^(?:[^@/\s]+@)?(\[[^\]]+\]|[^:/\s]+):(.+)$/.exec(raw);
-  if (!match) return null;
-  const path = normalizeRepositoryPath(match[2]!);
-  return path ? `${match[1]!.toLowerCase()}/${path}` : null;
-}
-
-/**
- * Stable repository identity used by legacy project resolution.
- *
- * Network remotes retain host/owner/repository while transport-only spelling
- * differences disappear. Thus HTTPS, SSH URL and SCP syntax for one remote
- * converge, but github.com/acme/api and github.com/other/api never collapse to
- * the same basename. A hostless owner/repository value retains both segments.
- * A historical bare value such as `api` deliberately stays `api`: without a
- * verified provider binding there is no evidence that it belongs to any one
- * host or owner, so existing evidence is never silently relabelled.
- */
-export function canonicalRepositoryIdentity(raw: string): string {
-  const value = raw.trim();
-  if (!value) return value;
-  return (
-    urlRepositoryIdentity(value) ??
-    scpRepositoryIdentity(value) ??
-    normalizeRepositoryPath(value)
-  );
-}
+import { canonicalRepositoryIdentity, normalizeRepositoryPath, urlRepositoryIdentity, scpRepositoryIdentity } from '@bridge/shared';
+export { canonicalRepositoryIdentity } from '@bridge/shared';
 
 /** Compatibility name used by snapshot matching; it is repository identity. */
 export const canonicalProjectName = canonicalRepositoryIdentity;
@@ -165,6 +91,14 @@ interface ProjectWriteOptions {
    * discovery is disabled.
    */
   fixedProjectId?: string | null;
+  /**
+   * What fixed the project, when it was not the credential: a run started for
+   * a work item lands in the work's own project. A checkout of another
+   * repository is refused either way; only the sentence differs, because a
+   * personal or team credential is bound to nothing and telling its agent to
+   * reconnect the checkout sends its human after the wrong thing.
+   */
+  fixedBy?: 'credential' | 'work';
 }
 
 /**
@@ -211,7 +145,13 @@ export async function resolveProjectForWriteInTransaction(
     if (
       options.repositoryIdentity !== undefined && project.repositoryIdentity &&
       canonicalRepositoryIdentity(options.repositoryIdentity) !== canonicalRepositoryIdentity(project.repositoryIdentity)
-    ) return { error: 'Repository identity does not match the credential-bound project. Connect this checkout to its own project before starting work.' };
+    )
+      return {
+        error:
+          options.fixedBy === 'work'
+            ? `Repository identity does not match the project this work item is filed in, which is bound to ${canonicalRepositoryIdentity(project.repositoryIdentity)}. Start the run for this work from a checkout of that repository.`
+            : 'Repository identity does not match the credential-bound project. Connect this checkout to its own project before starting work.',
+      };
     return { project, created: false };
   }
   return findOrCreateProjectInTransaction(
@@ -245,7 +185,11 @@ export async function findOrCreateProjectInTransaction(
       : name.trim();
   const baseSlug = slugify(displayName);
   // A shared workspace lock makes the project ceiling hold for concurrent agents.
-  await db.select({ id: teams.id }).from(teams).where(eq(teams.id, team.id)).for('update');
+  // `no key update` serializes those exactly as `update` did, and leaves the
+  // foreign-key check of a row inserted under a Work lock (every Work event
+  // names its workspace) free to proceed: a run start holds this lock while it
+  // waits for a Work lock, so `update` here would close the circle.
+  await db.select({ id: teams.id }).from(teams).where(eq(teams.id, team.id)).for('no key update');
   const existing = await db
     .select()
     .from(projects)

@@ -8,6 +8,7 @@ import {
   workForPerson,
   type RosterEntry,
 } from '../domain/roster';
+import { WORK_STATE_LABEL, describeWork, runNamedFor } from '../domain/connectionState';
 import { historyRetentionNote } from '../lib/cleanup';
 import { grantedOrOwnPlan } from '../lib/planGrants';
 import { fmtDate, timeAgo } from '../lib/format';
@@ -15,6 +16,7 @@ import { pageWindow, slicePage } from '../lib/pagination';
 import { connectionsHref, personSessionsHref } from '../lib/scope';
 import type { AppEnv } from '../types';
 import { PageHead, teamTrail } from '../ui/Console';
+import { WorkSteps } from '../ui/ConnectionStatus';
 import { AppLayout } from '../ui/Layout';
 import { runHref } from './runs';
 import { Pager } from '../ui/Pager';
@@ -43,15 +45,6 @@ const ENDED: Record<string, string> = { completed: 'finished', failed: 'failed',
 /** The thread title carries the kind as a prefix; beside an agent the kind is already plain. */
 const workTitle = (title: string) => title.replace(/^(Assignment|Handoff):\s*/i, '');
 
-const STATE: Record<string, string> = {
-  offered: 'waiting for the agent',
-  accepted: 'accepted',
-  in_progress: 'in progress',
-  needs_attention: 'needs attention',
-  completed: 'completed — reported',
-  cancelled: 'cancelled',
-  declined: 'declined',
-};
 
 /** A person's page shows a slice of the trail and links to the page that owns it. */
 const TRAIL_SHOWN = 20;
@@ -63,12 +56,15 @@ const Row = ({
   team,
   here,
   showOwner,
+  runNamed,
 }: {
   entry: RosterEntry;
   team: string;
   /** The project this page is inside, when it is inside one. */
   here?: { id: string; slug: string };
   showOwner: boolean;
+  /** When a run was named for each session's work: what ties an agent's run to it. */
+  runNamed: Map<string, Date>;
 }) => {
   const { agent, live, last } = entry;
   const scoped = (run: string, project?: { slug: string } | null) =>
@@ -114,17 +110,40 @@ const Row = ({
             </div>
           </>
         ) : (
-          <span class="muted">idle</span>
+          <span
+            class="muted"
+            title="STMA has no live run from this agent. It cannot see whether the client is open."
+          >
+            no run reported
+          </span>
         )}
       </td>
       <td>
         {entry.work.length === 0 ? (
-          <span class="muted">—</span>
+          <span class="muted">none</span>
         ) : (
-          entry.work.slice(0, 3).map((work) => (
+          entry.work.slice(0, 3).map((work, index) => (
             <div>
               <a href={`/app/sessions/${work.sessionId}`}>{workTitle(work.title)}</a>{' '}
-              <span class="small muted">{STATE[work.state] ?? work.state}</span>
+              <span class="small muted">{WORK_STATE_LABEL[work.state] ?? work.state}</span>
+              {index === 0 ? (
+                <WorkSteps
+                  work={describeWork({
+                    handoff: {
+                      kind: work.kind,
+                      state: work.state,
+                      createdAt: work.createdAt,
+                      acceptedAt: work.acceptedAt,
+                      resumedAt: work.resumedAt,
+                      completedAt: work.completedAt,
+                      updatedAt: work.updatedAt,
+                    },
+                    runNamedAt: runNamed.get(work.sessionId) ?? null,
+                    agentRun: live ? { status: live.status, lastHeartbeatAt: live.lastHeartbeatAt } : null,
+                    hookWillAnnounce: undefined,
+                  })}
+                />
+              ) : null}
             </div>
           ))
         )}
@@ -143,7 +162,9 @@ const Row = ({
           <span class="muted">nothing yet</span>
         )}
       </td>
-      <td class="mono">{timeAgo(agent.lastSeenAt)}</td>
+      <td class="mono" title="The last request or run heartbeat this agent's credential made. It does not show that the client is open.">
+        {timeAgo(entry.lastContactAt) ?? 'never recorded'}
+      </td>
     </tr>
   );
 };
@@ -156,7 +177,9 @@ const Head = ({ project }: { project: boolean }) => (
       <th>Now</th>
       <th>Work given to it</th>
       <th>{project ? 'Last finished here' : 'Last finished'}</th>
-      <th>Last seen</th>
+      <th title="The last authenticated request or run heartbeat from this agent. Not proof that its client is open.">
+        Last contact
+      </th>
     </tr>
   </thead>
 );
@@ -176,6 +199,7 @@ rosterRoutes.get('/app/teams/:slug/projects/:project/agents', async (c) => {
   const project = await projectForTeam(db, team.id, decodeURIComponent(c.req.param('project')));
   if (!project) return c.notFound();
   const entries = await agentRoster(db, team.id, { projectId: project.id });
+  const runNamed = await runNamedFor(db, entries.flatMap((entry) => entry.work.map((w) => w.sessionId)));
   const working = entries.filter((entry) => entry.live && entry.live.project?.id === project.id).length;
   const inScope = `?team=${encodeURIComponent(team.slug)}&project=${encodeURIComponent(project.slug)}`;
   const home = `/app/teams/${team.slug}/projects/${encodeURIComponent(project.slug)}`;
@@ -232,7 +256,7 @@ rosterRoutes.get('/app/teams/:slug/projects/:project/agents', async (c) => {
             <Head project />
             <tbody>
               {entries.map((entry) => (
-                <Row entry={entry} team={team.slug} here={project} showOwner />
+                <Row entry={entry} team={team.slug} here={project} showOwner runNamed={runNamed} />
               ))}
             </tbody>
           </table>
@@ -250,6 +274,7 @@ rosterRoutes.get('/app/teams/:slug/agents', async (c) => {
   if (!access) return c.notFound();
   const { team } = access;
   const entries = await agentRoster(db, team.id);
+  const runNamed = await runNamedFor(db, entries.flatMap((entry) => entry.work.map((w) => w.sessionId)));
   const people = rosterByPerson(entries);
   const working = entries.filter((entry) => entry.live).length;
   return c.html(
@@ -320,7 +345,7 @@ rosterRoutes.get('/app/teams/:slug/agents', async (c) => {
               <Head project={false} />
               <tbody>
                 {person.entries.map((entry) => (
-                  <Row entry={entry} team={team.slug} showOwner={false} />
+                  <Row entry={entry} team={team.slug} showOwner={false} runNamed={runNamed} />
                 ))}
               </tbody>
             </table>
@@ -363,6 +388,7 @@ rosterRoutes.get('/app/teams/:slug/people/:username', async (c) => {
 
   const home = `/app/teams/${team.slug}/people/${encodeURIComponent(person.username)}`;
   const entries = (await agentRoster(db, team.id)).filter((entry) => entry.agent.ownerId === person.id);
+  const runNamed = await runNamedFor(db, entries.flatMap((entry) => entry.work.map((w) => w.sessionId)));
   const runs = await runsForPerson(db, team.id, person.id);
   const work = await workForPerson(
     db,
@@ -441,7 +467,7 @@ rosterRoutes.get('/app/teams/:slug/people/:username', async (c) => {
             <Head project={false} />
             <tbody>
               {entries.map((entry) => (
-                <Row entry={entry} team={team.slug} showOwner={false} />
+                <Row entry={entry} team={team.slug} showOwner={false} runNamed={runNamed} />
               ))}
             </tbody>
           </table>
@@ -516,14 +542,17 @@ rosterRoutes.get('/app/teams/:slug/people/:username', async (c) => {
       <div class="card scroll-x" style="margin:16px">
         <div class="card-head">
           <div>
-            <div class="card-title">Work</div>
+            {/* Dispatched, not Work: since Native Work the rail's Work is the
+                workspace's work items, and this card and its link are the
+                assignment and handoff ledger. */}
+            <div class="card-title">Dispatched work</div>
             <div class="card-note">
               Assignments and handoffs {person.username} sent, or that were given to them and their
               agents. Completion is an agent's report.
             </div>
           </div>
           <a class="btn btn-sm" href={`/app/handoffs?team=${encodeURIComponent(team.slug)}`}>
-            All work
+            All dispatched
           </a>
         </div>
         {work.length === 0 ? (
@@ -558,7 +587,7 @@ rosterRoutes.get('/app/teams/:slug/people/:username', async (c) => {
                     <span
                       class={`pill ${['completed', 'cancelled', 'declined'].includes(item.state) ? 'pill-muted' : 'pill-active'}`}
                     >
-                      {STATE[item.state] ?? item.state}
+                      {WORK_STATE_LABEL[item.state] ?? item.state}
                     </span>
                   </td>
                   <td class="muted">{timeAgo(item.updatedAt)}</td>

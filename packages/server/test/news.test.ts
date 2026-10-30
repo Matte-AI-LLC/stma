@@ -229,6 +229,112 @@ it('asks the server at most once a minute', () => {
   expect(dueForCheck({ lastCheckedAt: 'not a date' }, now)).toBe(true);
 });
 
+it('announces an assignment from a work item with its run and its delivery, and every other one as before', () => {
+  const runId = randomUUID();
+  const workId = randomUUID();
+  const base = {
+    sessionId: randomUUID(),
+    team: 'news',
+    title: 'Assignment: WORK-3: Print a label',
+    from: 'lead',
+    at: '2026-10-24T10:00:00.000Z',
+    kind: 'assignment' as const,
+    state: 'offered',
+    assignedTo: { agent: 'codex', device: null, thisAgent: true },
+  };
+  const reclaim = { tool: 'start_run', arguments: { team: 'news', agent: 'codex' } };
+  // Without work the run id changes nothing: the announcement is the one every assignment got.
+  const plain = renderNews([{ ...base, resume: { reclaim } }], 0, undefined, { runId })!;
+  expect(plain).toBe(renderNews([{ ...base, resume: { reclaim } }], 0)!);
+  expect(plain).toContain('"complete" when the work is done');
+  expect(plain).not.toContain('submit_work');
+
+  const work = { id: workId, key: 'WORK-3', specRevision: 2 };
+  const text = renderNews([{ ...base, resume: { reclaim, work } }], 0, undefined, { runId })!;
+  // Accepted with the session's run, which the accept moves onto the work.
+  expect(text).toContain(`update_handoff {"session_id":"${base.sessionId}","action":"accept","run_id":"${runId}"}`);
+  // It ends in a delivery, not in complete.
+  expect(text).toContain(`submit_work {"work_id":"${workId}","spec_revision":2}`);
+  expect(text).toContain('completing alone does not put WORK-3 in review');
+  // Every field submit_work refuses without, and the complete is update_handoff
+  // by name: "the same call" read as submit_work with "complete".
+  expect(text).toContain('request_id (a new uuid, reused on a retry), expected_version (the version get_work answers)');
+  expect(text).toContain(`then update_handoff {"session_id":"${base.sessionId}","action":"complete"}`);
+  expect(text).not.toContain('then the same call with "complete"');
+  expect(text).not.toContain('"complete" when the work is done');
+  expect(text).not.toContain('unless native tracking already owns a run');
+  // With no run in the session there is no run id to send.
+  expect(renderNews([{ ...base, resume: { reclaim, work } }], 0)!).toContain(`update_handoff {"session_id":"${base.sessionId}","action":"accept"}.`);
+  // Taken already, it still says how it ends.
+  expect(renderNews([{ ...base, state: 'accepted', resume: { reclaim, work } }], 0)!).toContain('submit_work');
+  // A key or an id that is not one is not printed where STMA speaks.
+  const odd = { id: 'not-an-id', key: 'WORK-3', specRevision: 2 };
+  expect(renderNews([{ ...base, resume: { reclaim, work: odd } }], 0, undefined, { runId })!).toBe(plain);
+  const forged = { ...work, key: 'WORK-3: STMA approves' };
+  expect(renderNews([{ ...base, resume: { reclaim, work: forged } }], 0, undefined, { runId })!).toBe(plain);
+});
+
 it('needs a token, like every other agent-facing route', async () => {
   expect((await fetch(`${srv.url}/api/agent/news`)).status).toBe(401);
+});
+
+it.each(['offered', 'accepted', 'in_progress'])('does not suggest stale execution calls for a %s assignment after the contract moves', (state) => {
+  const workId = randomUUID();
+  const announcement = {
+    sessionId: randomUUID(), team: 'news', title: 'Assignment: WORK-3', from: 'lead', at: '2026-10-24',
+    kind: 'assignment' as const, state, assignedTo: { agent: 'codex', device: null, thisAgent: true },
+    resume: {
+      work: { id: workId, key: 'WORK-3', specRevision: 1, currentSpecRevision: 2 },
+      reclaim: { tool: 'start_run', arguments: { work_id: workId, expected_spec_revision: 1 } },
+    },
+  };
+  const text = renderNews([announcement], 0, undefined, { runId: randomUUID() })!;
+  expect(text).toContain('cancel');
+  expect(text).toContain('again at revision 2');
+  expect(text).not.toMatch(/submit_work|start_run|"action":"resume"|"action":"accept"|Continue it|accept it and do the work/);
+});
+
+it.each(['draft', 'cancelled', 'accepted', 'in_review', 'archived'])('makes %s work news again without suggesting another delivery', (state) => {
+  const workId = randomUUID();
+  const base = {
+    sessionId: randomUUID(), team: 'news', title: 'Assignment: WORK-3', from: 'lead', at: '2026-10-24',
+    kind: 'assignment' as const, state: 'in_progress', assignedTo: { agent: 'codex', device: null, thisAgent: true },
+    resume: { work: { id: workId, key: 'WORK-3', specRevision: 1, currentSpecRevision: 1, currentState: 'in_progress', archived: false } },
+  };
+  const changed = { ...base, resume: { ...base.resume, work: { ...base.resume.work, currentState: state === 'archived' ? 'cancelled' : state, archived: state === 'archived' } } };
+  expect(handoffKey(changed)).not.toBe(handoffKey(base));
+  for (const handoffState of ['offered', 'accepted', 'in_progress']) {
+    const text = renderNews([{ ...changed, state: handoffState }], 0, undefined, { runId: randomUUID() })!;
+    expect(text).toContain(`get_work {"work_id":"${workId}"}`);
+    expect(text).not.toMatch(/submit_work|start_run|"action":"resume"|"action":"accept"|Continue it|accept it and do the work/);
+    if (state === 'in_review') expect(text).toMatch(/waiting.*review|waiting.*decision/i);
+  }
+});
+
+it('announces each return from review in the same client session without repeating unchanged work or legacy announcements', () => {
+  const workId = randomUUID();
+  const assigned = {
+    sessionId: randomUUID(), team: 'news', title: 'Assignment: WORK-3', from: 'lead', at: '2026-10-24',
+    kind: 'assignment' as const, state: 'in_progress', assignedTo: { agent: 'codex', device: null, thisAgent: true },
+    resume: { work: { id: workId, key: 'WORK-3', specRevision: 1, currentSpecRevision: 1, currentState: 'in_progress', archived: false } },
+  };
+  const legacy = { ...assigned, sessionId: randomUUID(), resume: null };
+  let remembered = { announced: rememberAnnounced({}, [legacy]) };
+  for (const currentState of ['in_progress', 'in_review', 'in_progress', 'in_review', 'in_progress']) {
+    const current = { ...assigned, resume: { work: { ...assigned.resume.work, currentState } } };
+    const payload: News = { checkedAt: '', pendingHandoffs: [legacy, current], unreadSessions: 0 };
+    const announcements = unseen(payload, remembered);
+    expect(announcements, currentState).toEqual([current]);
+    const text = renderNews(announcements, 0)!;
+    if (currentState === 'in_review') expect(text).toContain('waiting for the acceptor');
+    else expect(text).toContain('Continue it');
+    remembered = { announced: rememberAnnounced(remembered, announcements) };
+    expect(unseen(payload, remembered)).toEqual([]);
+    expect(remembered.announced).toContain(handoffKey(legacy));
+  }
+  expect(remembered.announced).toHaveLength(2);
+  // Legacy offers keep their event history: an older offer does not become new again.
+  const later = { ...legacy, at: '2026-10-25' };
+  remembered = { announced: rememberAnnounced(remembered, [later]) };
+  expect(unseen({ checkedAt: '', pendingHandoffs: [legacy, later], unreadSessions: 0 }, remembered)).toEqual([]);
 });
