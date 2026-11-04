@@ -17,7 +17,16 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
+  layout:
+    runs-on: ubuntu-latest
+    outputs:
+      export_required: ${{ steps.layout.outputs.export_required }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: layout
+        run: node scripts/ci-status.mjs layout
+
+  core:
     # macOS/Windows live in the nightly/manual cross-platform workflow.
     runs-on: ubuntu-latest
     steps:
@@ -50,14 +59,54 @@ jobs:
         run: |
           npx tsc -p acceptance/agent-worker/tsconfig.json
           npx tsx --test acceptance/agent-worker/api-support.test.ts acceptance/agent-worker/codex-support.test.ts acceptance/agent-worker/codex-native-containment.test.ts acceptance/agent-worker/codex-fixture.test.ts acceptance/agent-worker/codex-proxy.test.ts acceptance/agent-worker/codex-lifecycle.test.ts acceptance/agent-worker/codex-native-exit.test.ts acceptance/agent-worker/codex-process.test.ts acceptance/agent-worker/codex-native-exec.test.ts acceptance/agent-worker/codex-native-mcp.test.ts
-      # The public mirror's allowlist and scan, on every change rather than first
-      # at the tag: v0.19.1's mirror was refused for one test comment after npm and
-      # production had already shipped. The script is not in the public tree, so
-      # the public repository skips this step.
-      - if: hashFiles('scripts/public-tree.mjs') != ''
-        run: node scripts/public-tree.mjs "$RUNNER_TEMP/public-tree"
+      - run: node --test scripts/ci-status.test.mjs
       - if: hashFiles('ee/package-lock.json') != ''
         run: npm test --prefix ee
       - run: npm run build
       - if: hashFiles('ee/package-lock.json') != ''
         run: npm run build --prefix ee && npm run smoke:bundle --prefix ee
+
+  public-source:
+    needs: layout
+    if: needs.layout.outputs.export_required == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - name: Export and scan the exact checked-out commit
+        run: |
+          node scripts/public-tree.mjs "$RUNNER_TEMP/public-tree"
+          test ! -e "$RUNNER_TEMP/public-tree/ee"
+          test ! -e "$RUNNER_TEMP/public-tree/acceptance"
+          test ! -e "$RUNNER_TEMP/public-tree/scripts/public-tree.mjs"
+      - name: Test the exported source in isolation
+        working-directory: ${{ runner.temp }}/public-tree
+        run: |
+          # A mirror checkout has Git metadata; keep it local to this disposable tree.
+          git init -q
+          git add -A
+          git -c user.name='CI' -c user.email='ci@example.invalid' commit -qm 'Public source fixture'
+          npm ci
+          npm run typecheck
+          npm test
+          npm run human-lab:check
+          npm run machine-lab:check
+          node --test scripts/ci-status.test.mjs
+          npm run build
+
+  test:
+    if: always()
+    needs: [layout, core, public-source]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Require all applicable checks
+        env:
+          LAYOUT_RESULT: ${{ needs.layout.result }}
+          CORE_RESULT: ${{ needs.core.result }}
+          PUBLIC_RESULT: ${{ needs['public-source'].result }}
+          EXPORT_REQUIRED: ${{ needs.layout.outputs.export_required }}
+        run: node scripts/ci-status.mjs aggregate

@@ -1175,30 +1175,19 @@ describe('what the guide and the flows say about the doors', () => {
     await step(lead, created.work_id, 'transition', { to: 'cancelled', reason: 'Not needed after the carrier change.' });
     const stored = await srv.db.select().from(workEvents).where(eq(workEvents.workId, created.work_id));
     expect(stored.some((event) => (event.payload as { reason?: unknown }).reason === 'Not needed after the carrier change.')).toBe(true);
-    // An operator answering a data request reads the flows and the inventory:
-    // both must name work_events as a place this text lives.
+    // The public flows must name work_events as a place this text lives.
     expect(flows).not.toContain('by id and wire field name, never a body');
     expect(flows).toContain('but they do carry the reason a person or an agent wrote');
-    const inventory = readFileSync(path.join(root, 'docs/veri-envanteri.md'), 'utf8');
-    expect(inventory).not.toContain('`work_events` yalnız kimlik ve alan adı taşır');
-    expect(inventory).toContain('değişikliğin kendisi için yazılan gerekçeyi taşır');
   });
 
   it('says which provider facts move a decision and an acceptance, as the code does', async () => {
-    // Since W04 only a fact a criterion reads moves the epoch; the guide, the
-    // flows and the internal status pages said every fact did.
+    // Since W04 only a fact a criterion reads moves the epoch.
     const guide = unescapeHtml(await page('/docs', leadCookie));
     expect(guide).not.toContain('If a provider fact or a new delivery landed while they read');
     expect(guide).toContain('A fact for a workflow no criterion names changes nothing');
     expect(guide).toContain('a rerun of the accepted check passing again changes nothing');
     expect(flows).toContain('a fact no criterion reads moves nothing');
     expect(flows).toContain('A fact that agrees with the acceptance, a rerun of the accepted check\n   passing again, moves nothing.');
-    for (const file of ['CLAUDE.md', 'ROADMAP.md', 'docs/durum.md']) {
-      const text = readFileSync(path.join(root, file), 'utf8').replace(/\r\n/g, '\n');
-      expect(text, file).not.toContain('restricting it to facts a selector names is the open change');
-      expect(text, file).not.toContain('Any workflow fact on a delivered commit moves the');
-      expect(text, file).not.toContain("düşen her workflow gerçeği epoch'u ve sürümü oynatıyor");
-    }
   });
 
   it('documents the real hosted work limit remedy and the unredacted delivery and artifact notes', async () => {

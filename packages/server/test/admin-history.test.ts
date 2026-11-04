@@ -482,11 +482,10 @@ describe('ceiling history', () => {
  * is why this test walks the directory instead of importing anything from it.
  */
 const here = path.dirname(fileURLToPath(import.meta.url));
-/** `ee/` is scanned when present and simply absent from the public tree. */
-const roots = [
-  path.join(here, '..', 'src'),
-  path.join(here, '..', '..', '..', 'ee', 'src'),
-].filter((dir) => existsSync(dir));
+const repo = path.resolve(here, '../../..');
+const eeRoot = path.join(repo, 'ee');
+const hasEe = existsSync(eeRoot);
+const roots = [path.join(here, '..', 'src'), ...(hasEe ? [path.join(eeRoot, 'src')] : [])];
 
 const sources = (dir: string): string[] =>
   readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
@@ -497,7 +496,6 @@ const sources = (dir: string): string[] =>
 
 describe('nothing but lib/ceilings writes teams.plan', () => {
   it('finds the plan column written in exactly one file', () => {
-    expect(roots.length).toBeGreaterThan(0);
     // Both spellings a writer could use: the query builder, and raw SQL through
     // `db.execute`. An INSERT is deliberately not matched — a workspace created
     // on a plan is not a ceiling that moved — and neither is `drizzle/`, where a
@@ -881,13 +879,15 @@ describe('membership history', () => {
    */
   it('pins every file that writes memberships, and what it owes', () => {
     const writers = new Map<string, string>([
-      ['invites.ts', 'invite redemption — records on the transaction'],
-      ['dashboard.tsx', 'create, leave, role, remove, team delete, account delete — records all but the team delete, which it could not outlive'],
-      ['admin.tsx', 'operator add, role, remove — records all three'],
-      ['demoWorkspace.ts', "the operator's demo workspace, owned by the account — records the owner row"],
-      ['routes.tsx', 'EE assignWorkspace — records when the core role moves'],
-      ['store.ts', 'EE deactivateMember — records one row per workspace, one group'],
+      ['packages/server/src/domain/invites.ts', 'invite redemption — records on the transaction'],
+      ['packages/server/src/routes/dashboard.tsx', 'create, leave, role, remove, team delete, account delete — records all but the team delete, which it could not outlive'],
+      ['packages/server/src/routes/admin.tsx', 'operator add, role, remove — records all three'],
+      ['packages/server/src/domain/demoWorkspace.ts', "the operator's demo workspace, owned by the account — records the owner row"],
     ]);
+    if (hasEe) {
+      writers.set('ee/src/identity/routes.tsx', 'EE assignWorkspace — records when the core role moves');
+      writers.set('ee/src/identity/store.ts', 'EE deactivateMember — records one row per workspace, one group');
+    }
     const statements = [
       /\.(insert|update|delete)\(\s*memberships\s*\)/,
       /(insert\s+into|update|delete\s+from)\s+memberships\b/i,
@@ -898,7 +898,7 @@ describe('membership history', () => {
         const source = readFileSync(file, 'utf8');
         return statements.some((re) => re.test(source));
       })
-      .map((file) => path.basename(file))
+      .map((file) => path.relative(repo, file).split(path.sep).join('/'))
       .sort();
     expect(found).toEqual([...writers.keys()].sort());
   });
