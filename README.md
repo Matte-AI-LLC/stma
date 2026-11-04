@@ -166,6 +166,38 @@ attempt-scoped worker credentials see only their 18 shared allowed tools. This o
 unavailable catalog schemas from the worker's model context; request authorization
 remains independently enforced.
 
+The experimental Windows Codex read-only profile additionally requires the complete CLI 0.166.0
+native package with its matching sandbox helpers and manifest, a separately
+provisioned isolated elevated sandbox, and an explicit model selected with
+`--runtime codex-read-only-v1 --model MODEL_ID --max-turns 1`. The model id is stored locally and
+passed on every launch; `status` and `doctor` report the requested model, not provider confirmation.
+The worker explicitly requests the provider's standard service tier; this does not impose a spending cap.
+Use a dedicated checkout without `.codex` and a separate approved project credential in
+`STMA_TOKEN` with `STMA_URL`; ordinary `stma connect` installs hooks this profile refuses. Keep
+the isolated home free of `config.toml` and `hooks.json`. Before every launch the worker proves
+selected credential reads and writes are denied. Other host files may remain readable. The child
+can call only `whoami`, `get_work` and `get_work_context`; its report never delivers or accepts work.
+Its prompt permits local read-only offline commands to inspect the dedicated checkout and carry out
+read-only assignment steps, within existing sandbox permissions. STMA MCP access remains limited
+to scoped read-only tools. Generic
+instructions about assignment lifecycle are reference text, and the supervisor owns run tracking.
+The child cannot accept, resume or complete assignments or change Work or handoff state. This clarification
+does not grant additional file or network access.
+Two consecutive controlled Windows GPT-6 Sol read-only analysis runs passed with process cleanup.
+A separate active-cancellation
+check passed its fail-closed checks: the process stopped and its child credential was revoked, but
+the execution remained `dispatch_unknown`, with the target quarantined and owner lock retained; no
+completed run or delivery was recorded. This scoped result does not establish ordinary Codex
+connect, OAuth or credential-store acceptance, live OS service-worker operation, customer
+acceptance or production acceptance.
+Model choice and the configured runtime limit do not impose a dollar or token cap.
+Windows Codex execution requests have a separate launch-size limit; oversized requests are refused
+before that execution's launcher starts. This is not a model-usage limit.
+This isolated-home profile requires a dedicated Windows host or VM: Codex sandbox setup rotates
+machine-wide sandbox-account passwords and can invalidate another Codex home's credentials.
+`worker doctor` withholds its setup command when it detects another known sandbox home. That
+check cannot discover every custom home, and STMA never performs provisioning automatically.
+
 ## Beyond the first reply
 
 The console calls teams **workspaces**; API fields and `/app/teams/...` URLs stay compatible.
@@ -378,13 +410,18 @@ a deployment until that build is released and its environment-specific gates pas
   the assignments and handoffs dispatched there (a draft, accepted or cancelled item is under All); `get_work_context` returns a short
   package inside a byte budget; `get_work_changes` returns what entered, changed in and left a
   filter since a signed cursor. A work item can start from, or reference, a GitHub issue that STMA
-  only reads. An analyst is the client you already use, reading with the read tools and answering
+  only reads. Your MCP analyst can use a project-scoped credential with a closed read-only tool
+  catalog. The separate, private managed analyst requires an operator-configured Azure profile;
+  after setup, a workspace owner can enable it and a person can request a
+  bounded report. Provider usage is billed separately and the request quota is not a dollar cap.
+  Both kinds of analyst report sources and limitations; neither accepts work or verifies provider
+  evidence. An analyst answers
   "what is waiting for my decision?", "which delivery's evidence is stale?" and "which dependency
   stopped this work?" with a work or evidence pointer, the time read and what the connection could
   not see; a connection limited to one project sees no count, key or title of another. Work sends
-  no "waiting for you" email yet, writes to no tracker, and has no separate read-only credential. It is included on
-  every plan; the hosted service caps a project at 5,000 work items, 200 deliveries per item and
-  500 evidence rows per delivery as a safety limit.
+  no "waiting for you" email yet and writes to no tracker. It is included on every plan; the hosted
+  service caps a project at 5,000 work items, 200 deliveries per item and 500 evidence rows per
+  delivery as a safety limit.
 - **Knowledge Hub** (`/app/teams/<slug>/knowledge`): versioned decisions, domain facts, procedures,
   references and known solutions with workspace or selected-project audiences. Agents and owners
   may create immutable drafts; only a workspace owner publishes, supersedes, archives or withdraws

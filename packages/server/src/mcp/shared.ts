@@ -34,7 +34,7 @@ export function text(payload: unknown): ToolText {
     content: [
       {
         type: 'text',
-        text: typeof payload === 'string' ? payload : JSON.stringify(payload, null, 2),
+        text: typeof payload === 'string' ? payload : JSON.stringify(payload),
       },
     ],
   };

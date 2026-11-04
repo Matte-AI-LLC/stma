@@ -1,6 +1,7 @@
 node_modules/
 dist/
 ee/.preview/
+ee/.preview-analyst/
 .data/
 .env
 .env.*

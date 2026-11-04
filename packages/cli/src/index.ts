@@ -2745,15 +2745,25 @@ Commands:
   stma version [--server]   this CLI's version, and optionally the server's
 
 Managed local worker (built CLI, from a canonical dedicated Git checkout):
-  stma worker configure --server HTTPS_ORIGIN --runtime-executable ABSOLUTE_CLAUDE_PATH
+  stma worker configure --server HTTPS_ORIGIN --runtime-executable ABSOLUTE_RUNTIME_PATH
                         --api-key-env ENV_NAME --dedicated
+                        [--runtime claude-print-v1|codex-read-only-v1]
+                        [--model MODEL_ID] (required for Codex; stored per checkout)
                         [--max-runtime-seconds N] [--max-turns N] [--profile ID]
-             Registers a disabled claude-print-v1 target. Use a provider API-key env var;
+             Registers a disabled target. Experimental Codex read-only requires Windows,
+             the complete native CLI 0.166.0 package and separate elevated sandbox setup; it has not completed
+             end-to-end acceptance. One outer turn is not a tool-call or token limit.
+             status/doctor show requested model selection, not provider confirmation.
+             Use a provider API-key env var;
              the selected STMA CLI profile supplies separate worker authentication.
              The installation owner must review and enable the target in Agent connections.
   stma worker <start|status|doctor|pause|resume|stop|disable>
              The worker runs in this foreground process. It accepts API-key auth only;
              subscription login is not used.
+  stma worker service-install --apply   install a per-user login service (opt in)
+  stma worker <service-status|service-start|service-stop|service-uninstall>
+             A service requires credentials already available in its login environment.
+             It does not wake the machine. Stop requests graceful worker shutdown.
 `);
 }
 

@@ -78,10 +78,33 @@ describe('managed worker launch boundary', () => {
     expect(JSON.parse(response.stdout).hookSpecificOutput.permissionDecision).toBe('deny');
     expect(existsSync(marker)).toBe(true);
     if (mode === 'marker-before' || mode === 'lock-timeout' || mode === 'state-unsafe') expect(existsSync(requested)).toBe(false);
+    if (mode === 'marker-before' || mode === 'marker-during') expect(readWorkerJson<any>(stateFile).guardRefusal).toEqual({ tool: 'Write', stage: mode === 'marker-before' ? 'run_state' : 'completion' });
     if (mode === 'lock-replaced' || mode === 'lock-timeout') {
       expect(readWorkerJson(lockFile)).toEqual({ owner: 'another-owner' });
       expect(readWorkerJson(stateFile)).toEqual({ runId, started: true });
     }
+  });
+  it.each(['outside-path', 'request-refused', 'response-refused', 'unknown-tool'] as const)('records only the first fixed guard refusal for %s without granting write authority', (mode) => {
+    const root = canonicalCheckout(temporary()); const stateDir = temporary(); const sessionId = randomUUID(); const runId = randomUUID();
+    const contextFile = path.join(stateDir, 'context.json'); const stateFile = path.join(stateDir, 'hook-state.json');
+    const privateMarker = 'synthetic-private-guard-marker';
+    writeWorkerJson(contextFile, { schema: 1, checkout: root, server: 'https://example.invalid', token: privateMarker, sessionId, installationId: randomUUID(), attemptId: randomUUID(), startCall: {}, repositoryIdentity: 'example.invalid/fixture', branch: 'main' });
+    writeWorkerJson(stateFile, { runId, started: true });
+    const hookModule = pathToFileURL(fileURLToPath(new URL('../../cli/src/workerHook.ts', import.meta.url))).href;
+    const fixture = path.join(stateDir, 'guard-diagnostic.mts');
+    writeFileSync(fixture, `import {runWorkerHook} from ${JSON.stringify(hookModule)};globalThis.fetch=async()=>({ok:${mode !== 'request-refused'},json:async()=>({ok:true,allowed:false,runId:'${runId}',coverage:'installed_file_tool_hook_only',contentRules:[]})});await runWorkerHook('guard');`);
+    const tool = mode === 'unknown-tool' ? privateMarker : 'Write';
+    const file = mode === 'outside-path' ? path.join(root, '..', privateMarker) : path.join(root, 'safe.txt');
+    const invoke = (toolName: string, filePath: string) => spawnSync(process.execPath, ['--import', pathToFileURL(createRequire(import.meta.url).resolve('tsx')).href, fixture], { cwd: root, env: { ...process.env, STMA_WORKER_CONTEXT: contextFile }, input: JSON.stringify({ session_id: sessionId, cwd: root, tool_name: toolName, tool_input: { file_path: filePath, content: privateMarker } }), encoding: 'utf8', windowsHide: true, timeout: 10_000 });
+    const response = invoke(tool, file);
+    expect(response.status).toBe(0); expect(JSON.parse(response.stdout).hookSpecificOutput.permissionDecision).toBe('deny');
+    const expected = { tool: mode === 'unknown-tool' ? 'unknown' : 'Write', stage: mode === 'outside-path' || mode === 'unknown-tool' ? 'file_claims' : mode === 'request-refused' ? 'guard_request' : 'guard_response' };
+    expect(readWorkerJson<any>(stateFile).guardRefusal).toEqual(expected);
+    const second = invoke('Write', path.join(root, '..', 'another-outside-path'));
+    expect(second.status).toBe(0); expect(readWorkerJson<any>(stateFile).guardRefusal).toEqual(expected);
+    expect(readWorkerJson<any>(stateFile).denied).toBe(true);
+    for (const forbidden of [privateMarker, file, root]) expect(readFileSync(stateFile, 'utf8')).not.toContain(forbidden);
+    expect(existsSync(path.join(root, 'safe.txt'))).toBe(false);
   });
   it('supplies minimal assignment lifecycle calls and preserves Native Work delivery requirements', () => {
     const sessionId = randomUUID(); const workId = randomUUID();

@@ -13,6 +13,7 @@ export type TokenScope = (typeof TOKEN_SCOPES)[number];
 /** The server-resolved authority attached to one PAT-authenticated request. */
 export interface AgentGrant {
   execution?: ExecutionGrant;
+  accessMode?: 'standard' | 'analyst';
   tokenId: string;
   scope: TokenScope;
   teamId: string | null;
@@ -114,6 +115,9 @@ async function matchesGrantedProject(db: Db, grant: AgentGrant, value: unknown):
   return found?.id === grant.projectId;
 }
 
+/** Explicit capability catalog; annotations are descriptive, not authorization. */
+export const ANALYST_TOOLS = new Set(['whoami', 'list_projects', 'list_work', 'get_work', 'get_work_context']);
+
 /**
  * Fail-closed scope check at the one MCP boundary every tool call crosses.
  *
@@ -128,6 +132,7 @@ export async function guardMcpToolCall(
   args: Record<string, unknown>,
   accepted: readonly string[],
 ): Promise<string | null> {
+  if (grant.accessMode === 'analyst' && !ANALYST_TOOLS.has(tool)) return 'This read-only analyst credential cannot call that tool. Nothing was written.';
   const denied = await authorizeSecurity(db, 'tool', { ...args, tool });
   if (denied) return denied;
   // Preserve the boundary's existing malformed-id contract before execution

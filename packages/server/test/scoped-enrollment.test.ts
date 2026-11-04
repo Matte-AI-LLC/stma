@@ -855,3 +855,59 @@ it('can join a human and bind their first team agent in the same invite redempti
   });
   expect(who.teams.map((team: { slug: string }) => team.slug)).toEqual(['one-prompt-team']);
 });
+
+it('issues a project analyst credential with a closed read catalog and immediate revocation', async () => {
+  const owner = await devLogin('analyst-credential-owner');
+  await createTeam(owner, 'Analyst Credential Lab');
+  const bootstrap = await legacyToken(owner, 'analyst-bootstrap');
+  for (const repo of ['alpha', 'beta']) {
+    expect((await callTool(bootstrap, 'push_snapshot', {
+      team: 'analyst-credential-lab', repo, device: 'bootstrap',
+      snapshot: { os: { platform: 'darwin', arch: 'arm64' } },
+    })).isError).toBeFalsy();
+  }
+  const [team] = await srv.db.select().from(teams).where(eq(teams.slug, 'analyst-credential-lab'));
+  const [alpha] = await srv.db.select().from(projectRows).where(and(eq(projectRows.teamId, team!.id), eq(projectRows.name, 'alpha')));
+  const response = await form(owner, '/app/tokens', { mode: 'analyst', name: 'analyst', back_team: team!.slug, analyst_project: alpha!.id });
+  expect(response.headers.get('cache-control')).toContain('no-store');
+  const token = /stma_[0-9a-f]{40}/.exec(await response.text())?.[0];
+  expect(token).toBeTruthy();
+  const list = await fetch(`${srv.url}/mcp`, { method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json', accept: 'application/json, text/event-stream' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }) });
+  const catalog = (await list.json() as any).result.tools.map((t: any) => t.name).sort();
+  expect(catalog).toEqual(['get_work', 'get_work_context', 'list_projects', 'list_work', 'whoami']);
+  expect(parsed(await callTool(token!, 'list_projects')).projects.map((p: any) => p.name)).toEqual(['alpha']);
+  expect((await callTool(token!, 'list_work', { project: 'beta' })).isError).toBe(true);
+  expect((await callTool(token!, 'push_snapshot', { team: team!.slug, repo: 'alpha', device: 'x', snapshot: {} })).isError).toBe(true);
+  const batch = await fetch(`${srv.url}/mcp`, { method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json', accept: 'application/json, text/event-stream' }, body: JSON.stringify([
+    { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'whoami', arguments: {} } },
+    { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'create_work', arguments: {} } },
+  ]) });
+  const batchResult = await batch.json() as any;
+  expect(batchResult[0].result.isError).toBe(true);
+  expect(batchResult[0].result.content[0].text).toMatch(/read-only analyst/);
+  const rest = await fetch(`${srv.url}/api/control/runs`, { method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, body: '{}' });
+  expect(rest.status).toBe(403);
+  const [row] = await srv.db.select().from(tokens).where(eq(tokens.name, 'analyst'));
+  await form(owner, `/app/tokens/${row!.id}/revoke`, { back_team: team!.slug });
+  const revoked = await fetch(`${srv.url}/mcp`, { method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, body: '{}' });
+  expect(revoked.status).toBe(401);
+});
+
+it('bounds legacy session reads on request and reports omitted records', async () => {
+  const owner = await devLogin('bounded-session-owner');
+  await createTeam(owner, 'Bounded Session Lab');
+  const token = await legacyToken(owner, 'bounded-reader');
+  const opened = parsed(await callTool(token, 'open_session', { team: 'bounded-session-lab', repo: 'alpha', title: 'Bounded thread', body: 'first observation' }));
+  expect((await callTool(token, 'post_message', { session_id: opened.sessionId, body: 'second observation' })).isError).toBeFalsy();
+  const limited = parsed(await callTool(token, 'get_session', { session_id: opened.sessionId, max_messages: 1 }));
+  expect(limited.messages).toHaveLength(1);
+  expect(limited.messages[0].body).toBe('second observation');
+  expect(limited.truncated).toMatch(/older ones/);
+  const complete = parsed(await callTool(token, 'get_session', { session_id: opened.sessionId }));
+  expect(complete.messages).toHaveLength(2);
+  expect(complete.truncated).toBeUndefined();
+  await callTool(token, 'open_session', { team: 'bounded-session-lab', repo: 'alpha', title: 'Another thread' });
+  const list = parsed(await callTool(token, 'list_sessions', { team: 'bounded-session-lab', project: 'alpha', limit: 1 }));
+  expect(list.sessions).toHaveLength(1);
+  expect(list.truncated).toMatch(/most recent sessions/);
+});

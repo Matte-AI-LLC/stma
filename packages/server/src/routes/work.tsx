@@ -493,6 +493,7 @@ workRoutes.get(PATH, async (c) => {
   const ok = c.req.query('ok');
   return c.html(
     <WorkListPage
+      managedAnalyst={c.get('capabilities').managedAnalyst}
       user={f.user}
       team={f.team}
       project={f.project}

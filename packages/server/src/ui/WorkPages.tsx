@@ -467,6 +467,7 @@ export interface RowExtras {
 }
 
 export interface WorkListProps {
+  managedAnalyst?: boolean;
   user: User;
   team: { slug: string; name: string };
   project: { slug: string; name: string };
@@ -510,6 +511,7 @@ export const WorkListPage = (p: WorkListProps) => {
               <a class="btn" href={`${base}/export.json`}>
                 Export JSON
               </a>
+              {p.managedAnalyst && <a class="btn" href={base.replace(/\/work$/, '/analyst')}>Analyze work</a>}
             </>
           }
         />

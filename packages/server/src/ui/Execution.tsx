@@ -48,7 +48,7 @@ const TargetCard = ({
 }) => {
   const canEnable = target.owner_id === userId && !target.enabled && !target.quarantined;
   const canDisable = target.enabled && (target.owner_id === userId || workspaceOwner);
-  const exact = `Enable the configured target "${target.installation_name}"?\nProject: ${target.project_name}\nCheckout: ${target.checkout_path}\nRuntime: ${target.runtime} ${target.runtime_version}\nPermission profile: ${target.permission_profile}\nLimits: ${target.max_runtime_seconds} seconds, requested CLI turn limit ${target.max_turns}, one job at a time.\nThe worker runs as this OS user and receives the explicitly selected API credential. This is not an OS sandbox. The foreground worker does not wake the machine or use cloud fallback.`;
+  const exact = `Enable the configured target "${target.installation_name}"?\nProject: ${target.project_name}\nCheckout: ${target.checkout_path}\nRuntime: ${target.runtime} ${target.runtime_version}\nPermission profile: ${target.permission_profile}\nLimits: ${target.max_runtime_seconds} seconds, ${target.max_turns} outer turn(s), one job at a time.\nThe worker runs as this OS user and receives the explicitly selected API credential. ${target.runtime === 'codex-read-only-v1' ? 'Codex uses a read-only sandbox with protected credential paths; other host files may be readable. It has no hard tool-call or token ceiling.' : 'The Claude file-tool profile is not an OS sandbox.'} An optional user service is installed separately; it does not wake the machine.`;
   return (
     <article class="card card-pad" data-execution-target={target.id} style="display:flex;flex-direction:column;gap:12px;min-width:0;overflow-wrap:anywhere">
       <div class="row" style="justify-content:space-between;align-items:flex-start;flex-wrap:wrap">
@@ -85,7 +85,7 @@ const TargetCard = ({
       )}
       <p class="small muted m0">
         Readiness requires a recent worker heartbeat. An ordinary MCP connection does not make this target ready.
-        This foreground worker runs as the same OS user, without an OS sandbox, and starts no service or machine wake-up.
+        Workers run as the same OS user. An optional user service is installed separately and does not wake the machine.
       </p>
     </article>
   );
@@ -126,11 +126,11 @@ export const ManagedExecution = ({
         The timeout and requested CLI turn limit are operational controls, not a guaranteed dollar cap; provider-reported turn counts may differ. STMA does not measure every BYO provider charge.
       </p>
       <p class="m0 small muted" style="margin-top:8px">
-        Current support is Claude Code <code>claude-print-v1</code> with <code>restricted-files-v1</code>:
-        scoped Read/Edit/Write/Glob/Grep plus project STMA MCP/hooks; no shell, Git, tests, subagents or web.
-        Permission-required operations end as <code>needs_input</code> when stopping is verified; uncertain stops quarantine the checkout.
-        The same OS user can access its other files and credentials.
-        This is not an OS sandbox. The worker runs in the foreground only, with no service, machine wake-up or cloud fallback.
+        Claude Code <code>claude-print-v1</code> uses <code>restricted-files-v1</code>: scoped file tools and STMA hooks,
+        without shell, Git or tests. This is not an OS sandbox. Experimental Windows Codex uses a read-only
+        sandbox and separate child credential, but can read other host files and has not completed end-to-end
+        acceptance. Its one outer turn is not a tool-call or token limit. Permission-required
+        operations end as <code>needs_input</code> when stopping is verified; uncertain stops quarantine the checkout.
       </p>
     </div>
     {targets.length ? (

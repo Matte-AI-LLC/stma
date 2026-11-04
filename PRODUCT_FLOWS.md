@@ -1506,6 +1506,41 @@ MCP clients see 49 tools; attempt-scoped worker credentials see only their
 18 shared allowed tools, omitting the other schemas from the worker's model context while keeping
 request authorization in force.
 
+The experimental `codex-read-only-v1` runtime is Windows-only, pins Codex CLI 0.166.0 and requires
+the complete native package with its matching adjacent sandbox helpers and separately provisioned
+elevated sandbox support. Configuration requires an explicit `--model` id,
+stored locally and passed to every invocation. Status reports that requested id separately from
+any provider-confirmed evidence. Codex execution explicitly requests the provider's standard
+service tier; it is not a cost limit. The isolated home cannot contain local config/hooks and the
+dedicated checkout cannot contain `.codex`; ordinary Codex connect is therefore a separate flow.
+A project token supplied explicitly through the worker's environment is supported. Its child
+credential can read only the assigned Work through `whoami`, `get_work` and `get_work_context`.
+The supervisor starts and finishes its run and posts a bounded report, without completing the
+handoff or submitting delivery. Its prompt permits local read-only offline commands to inspect the
+dedicated checkout and carry out read-only assignment steps within existing sandbox permissions.
+STMA MCP access remains limited to scoped read-only tools. Generic instructions about assignment
+lifecycle are reference text, run tracking belongs
+to the supervisor, and the child cannot accept, resume or complete assignments or change Work or
+handoff state. This clarification grants no additional file or network access. Runtime and one outer
+turn are not token, tool-call or dollar caps.
+Windows Codex launch requests are separately size-bounded. An oversized request is refused before
+the execution's launcher starts; a launch refusal does not represent a completed model run.
+Codex shell commands do not inherit the worker's environment. STMA explicitly supplies the
+validated Windows `SystemRoot` needed by native runtimes, excluding provider and STMA credentials.
+An active cancellation can preserve `dispatch_unknown` and quarantine even after the owned process
+exits; revoked authority cannot be presented as a successfully finished run.
+The isolated-home profile requires a dedicated Windows host or VM because upstream provisioning
+rotates machine-wide sandbox-account passwords. `doctor` omits setup instructions when it detects
+another known Codex sandbox home; it does not provision, read credentials or prove no other home
+exists.
+Two consecutive controlled Windows GPT-6 Sol read-only analysis runs passed with process cleanup.
+A separate active-cancellation
+check passed its fail-closed checks: the process stopped and its child credential was revoked, but
+the execution remained `dispatch_unknown`, with the target quarantined and owner lock retained; no
+completed run or delivery was recorded. This does not establish ordinary Codex connect, OAuth or
+credential-store acceptance, live OS service-worker operation, customer acceptance or production
+acceptance.
+
 For managed assignments, the prompt directs the agent to read the exact assignment session using
 `get_session` and follow its state: `offered` means accept then resume; `accepted` means resume;
 `needs_attention` means resolve any blocker within the profile before resuming, or ask a human;
@@ -2051,9 +2086,13 @@ Review questions:
   `dispatch_work` request to an explicitly enabled target creates execution. "Sent", "accepted" and
   "started" are separate recorded facts, and the console never says an agent is running when only an
   assignment or ordinary agent heartbeat is recorded.
-- An analyst reading work from the user's own MCP client uses an ordinary connection. There is no
-  read-only credential: the tools that write are on the same connection, and the Claude apps ask
-  before each of them.
+- A user's MCP analyst can use a project-scoped core analyst credential, whose closed catalog
+  permits only `whoami`, `list_projects`, `list_work`, `get_work` and `get_work_context`; write
+  tools and REST are refused. Where the private managed analyst is configured, a workspace owner
+  enables a project profile and a person requests each analysis.
+  It sends at most ten recent work items with bounded, potentially partial context to the selected
+  Azure model. Provider usage is billed separately, and the request quota is not a dollar cap.
+  Reports cite source pointers and limitations; they do not accept work or verify a provider run.
 - A delivery is its submitter's report, a decision is a person's, and a provider observation covers
   one workflow on one exact commit. None of them is a proof that the work is correct or safe to merge.
 - Announcements and the member directory are team-level coordination surfaces visible to project

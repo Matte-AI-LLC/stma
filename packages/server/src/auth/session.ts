@@ -278,7 +278,7 @@ export const sessionUser: MiddlewareHandler<AppEnv> = async (c, next) => {
           : undefined;
       // Only for pages that draw the rail. An API or MCP request must not pay
       // four counts for chrome it never renders.
-      if (c.req.method === 'GET' && !c.req.path.startsWith('/api')) {
+      if (c.req.method === 'GET' && !c.req.path.startsWith('/api') && !/^\/app\/teams\/[^/]+\/projects\/[^/]+\/analyst(?:\/|$)/.test(c.req.path)) {
         // A team page is authoritative about the rail's current team. Without
         // this hint, a multi-team user always saw their newest team in the rail
         // and every scoped link quietly jumped away from the page they were on.

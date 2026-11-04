@@ -332,7 +332,10 @@ it('runs the full flow: login → team → invite → join → token → MCP', a
     params: { name: 'list_teammates', arguments: {} },
   });
   const tmText2 = ((await tmRes2.json()) as any).result.content[0].text as string;
-  expect(tmText2).not.toContain('"lastSnapshotAt": null');
+  expect(JSON.parse(tmText2).members).toEqual(expect.arrayContaining([
+    expect.objectContaining({ username: 'alice', lastSnapshotAt: expect.any(String) }),
+    expect.objectContaining({ username: 'bob', lastSnapshotAt: expect.any(String) }),
+  ]));
 
   // --- M3: debug sessions, inbox, resolve, archive ---
 
@@ -365,7 +368,9 @@ it('runs the full flow: login → team → invite → join → token → MCP', a
   );
   const inboxBText = ((await inboxB.json()) as any).result.content[0].text as string;
   expect(inboxBText).toContain('Migrations fail locally');
-  expect(inboxBText).toContain('"unread": 1');
+  expect(JSON.parse(inboxBText).unreadSessions).toEqual([
+    expect.objectContaining({ sessionId, unread: 1 }),
+  ]);
 
   // Bob reads the thread: secrets redacted, untrusted notice present, marks read
   const getB = await rpc(
@@ -418,7 +423,9 @@ it('runs the full flow: login → team → invite → join → token → MCP', a
     method: 'tools/call',
     params: { name: 'inbox', arguments: {} },
   });
-  expect(((await inboxA.json()) as any).result.content[0].text).toContain('"unread": 1');
+  expect(JSON.parse(((await inboxA.json()) as any).result.content[0].text).unreadSessions).toEqual([
+    expect.objectContaining({ sessionId, unread: 1 }),
+  ]);
 
   const webList = await fetch(`${srv.url}/app/sessions`, { headers: alice.header() });
   const webListHtml = await webList.text();

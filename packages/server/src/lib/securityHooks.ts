@@ -83,6 +83,7 @@ export interface SecurityHooks {
     operation: string,
     args?: Record<string, unknown>,
   ) => Promise<string | null>;
+  analystCredentialIssued?: (db: Db, input: { userId: string; teamId: string; projectId: string; tokenId: string }, principal?: SecurityPrincipal) => Promise<EnrollmentCredentialMetadata | void>;
   enrollmentIssued?: (
     db: Db,
     id: string,
@@ -145,6 +146,8 @@ export const authorizeSecurity = async (
     : null;
 };
 export class SecurityRefusal extends Error {}
+export const analystCredentialIssued = async (db: Db, input: { userId: string; teamId: string; projectId: string; tokenId: string }) =>
+  (await context.getStore()?.hooks.analystCredentialIssued?.(db, input, context.getStore()?.principal)) ?? { expiresAt: null };
 export const enrollmentIssued = async (db: Db, id: string, input: CreateAgentEnrollmentInput) => {
   await context.getStore()?.hooks.enrollmentIssued?.(db, id, input, context.getStore()?.principal);
 };

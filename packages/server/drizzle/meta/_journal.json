@@ -407,6 +407,20 @@
       "when": 1792859412315,
       "tag": "0058_execution_deferred_references",
       "breakpoints": true
+    },
+    {
+      "idx": 59,
+      "version": "7",
+      "when": 1792859412316,
+      "tag": "0059_analyst_credentials",
+      "breakpoints": true
+    },
+    {
+      "idx": 60,
+      "version": "7",
+      "when": 1792859412317,
+      "tag": "0060_execution_child_grants",
+      "breakpoints": true
     }
   ]
 }

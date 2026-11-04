@@ -59,8 +59,8 @@ it('serves both documents to a stranger, with the addresses a person writes to',
       // 2026: the Privacy Policy for emailed invitations, and both for the
       // support address moving to support@stma.ai. The Terms again on 26
       // September, for a description that no longer calls a checkpoint verified,
-      // and the Privacy Policy on 22 October, for authenticator apps.
-      expect(html).toContain(route === '/terms' ? 'Effective 26 September 2026' : 'Effective 22 October 2026');
+      // and both documents on 2 November for the hosted analyst data flow.
+      expect(html).toContain('Effective 2 November 2026');
       expect(html).not.toContain('verified git checkpoint');
       // Data protection and everything else go to different mailboxes, and both
       // are in both documents: somebody reading one must not have to find the
@@ -151,9 +151,15 @@ it('states the promises the product actually keeps', async () => {
   expect(privacy).toContain('90 days on the free plan');
   expect(privacy).toContain('30 days');
   expect(privacy).toContain('redact');
+  expect(privacy).toContain('Azure OpenAI endpoint configured for that project');
+  expect(privacy).toContain('at most ten recent work items');
+  expect(privacy).toContain('provider-reported token usage when available');
+  expect(privacy).toContain('pruning happens on a later analysis request');
+  expect(privacy).toContain('Your report rows and request/idempotency metadata are deleted with your account or project');
 
   const terms = await page(hosted, '/terms');
   expect(terms).toContain('Elastic License 2.0');
+  expect(terms).toContain('Your managed analyst questions, reports, source records and request/idempotency metadata are deleted with your account');
   // Advisory signals, not locks: the sentence a reader must not be able to miss.
   expect(terms).toContain('They are not locks');
   // Card details never reach us; Stripe hosts the checkout.

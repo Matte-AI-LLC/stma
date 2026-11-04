@@ -13,7 +13,13 @@ export interface WorkerHookContext {
   schema: 1; checkout: string; server: string; token: string; sessionId: string; installationId: string;
   attemptId: string; startCall: Record<string, unknown>; repositoryIdentity: string | null; branch: string | null;
 }
-export interface WorkerHookState { runId?: string; started?: boolean; runClosed?: boolean; finished?: boolean; failed?: boolean; denied?: boolean; }
+export type WorkerGuardTool = 'Write' | 'Edit' | 'MultiEdit' | 'NotebookEdit' | 'unknown';
+export type WorkerGuardStage = 'run_state' | 'file_claims' | 'guard_request' | 'guard_response' | 'content_policy' | 'completion';
+export interface WorkerHookState {
+  runId?: string; started?: boolean; runClosed?: boolean; finished?: boolean; failed?: boolean; denied?: boolean;
+  /** First owned guard refusal only. Never retain tool arguments, paths, content or exceptions. */
+  guardRefusal?: { tool: WorkerGuardTool; stage: WorkerGuardStage };
+}
 /** Parallel file/MCP tools may finish together. Wait for the current hook; never evict it. */
 export async function acquireWorkerHookLock(file: string, timeoutMs = 10_000): Promise<{ owns(): boolean; release(): void }> {
   const owner = randomUUID(); const deadline = performance.now() + timeoutMs;
@@ -89,6 +95,7 @@ export function workerStartRequest(context: WorkerHookContext): Record<string, u
 export async function runWorkerHook(event: string, contextFile = process.env.STMA_WORKER_CONTEXT): Promise<void> {
   if (!['start', 'guard', 'heartbeat', 'finish'].includes(event) || !contextFile) throw new Error('Missing managed hook context.');
   let stateFile: string | undefined; let lock: Awaited<ReturnType<typeof acquireWorkerHookLock>> | undefined; let refused = false;
+  let guardTool: WorkerGuardTool = 'unknown'; let guardStage: WorkerGuardStage = 'run_state';
   const failureMarker = () => stateFile ? path.join(path.dirname(stateFile), 'hook-failed') : undefined;
   const failClosed = () => {
     // A contender must never overwrite state while another hook owns it.
@@ -98,7 +105,8 @@ export async function runWorkerHook(event: string, contextFile = process.env.STM
       if (ownsLock) {
         try {
           const state = readWorkerJson<WorkerHookState>(stateFile) ?? {};
-          writeWorkerJson(stateFile, { ...state, failed: event !== 'guard' || state.failed, denied: event === 'guard' || state.denied });
+          writeWorkerJson(stateFile, { ...state, failed: event !== 'guard' || state.failed, denied: event === 'guard' || state.denied,
+            ...(event === 'guard' ? { guardRefusal: state.guardRefusal ?? { tool: guardTool, stage: guardStage } } : {}) });
         } catch { statePersistenceFailed = true; }
       }
       if (event !== 'guard' || !ownsLock || statePersistenceFailed) {
@@ -119,6 +127,7 @@ export async function runWorkerHook(event: string, contextFile = process.env.STM
     const raw = readFileSync(0, 'utf8');
     if (raw.length > 2_000_000) throw new Error('Hook input exceeds bound.');
     const payload = JSON.parse(raw) as Record<string, unknown>;
+    if (typeof payload.tool_name === 'string' && ['Write', 'Edit', 'MultiEdit', 'NotebookEdit'].includes(payload.tool_name)) guardTool = payload.tool_name as WorkerGuardTool;
     if (payload.session_id !== context.sessionId || (payload.cwd && canonicalCheckout(String(payload.cwd)) !== context.checkout)) throw new Error('Managed session mismatch.');
     stateFile = path.join(path.dirname(contextFile), 'hook-state.json');
     lock = await acquireWorkerHookLock(path.join(path.dirname(contextFile), 'hook.lock'));
@@ -140,9 +149,13 @@ export async function runWorkerHook(event: string, contextFile = process.env.STM
       if (!state.started || !state.runId || state.finished) throw new Error('No live managed run.');
       if (event === 'guard') {
         if (state.runClosed) throw new Error('The managed run is closed; further writes require a new authorized execution.');
+        guardStage = 'file_claims';
         const claims = workerFileClaims(context.checkout, payload);
+        guardStage = 'guard_request';
         const guarded = await workerAttemptRequest<any>(context, `/api/agent/runs/${state.runId}/write-guard`, { claims, repositoryIdentity: context.repositoryIdentity, worktree: context.checkout });
+        guardStage = 'guard_response';
         if (guarded?.ok !== true || guarded.allowed !== true || guarded.runId !== state.runId || guarded.coverage !== 'installed_file_tool_hook_only') throw new Error('Write guard refused operation.');
+        guardStage = 'content_policy';
         const rules = parseContentRules(Array.isArray(guarded.contentRules) ? guarded.contentRules.filter((item: unknown): item is string => typeof item === 'string') : []);
         const hits = fileToolAddedText(context.checkout, payload).flatMap((added) => matchContentRules(rules, added.path, added.text).map((rule) => ({ rule: rule.rule, path: added.path })));
         if (hits.length) {
@@ -166,6 +179,7 @@ export async function runWorkerHook(event: string, contextFile = process.env.STM
     }
     // A timed-out contender can mark failure during an awaited request. It must
     // not be ignored by a guard that would otherwise return permission success.
+    if (event === 'guard') guardStage = 'completion';
     if (existsSync(failureMarker()!) || !lock.owns()) throw new Error('Managed hook ownership or completion became uncertain.');
   } catch { failClosed(); }
   finally {

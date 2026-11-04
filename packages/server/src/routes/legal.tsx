@@ -35,11 +35,10 @@ export const legalRoutes = new Hono<AppEnv>();
  * report; what STMA checks is the receiver's resume against it. A description
  * that promised less is not a material change either.
  */
-const TERMS_EFFECTIVE = '26 September 2026';
-// Moved on 22 October 2026 for authenticator apps: a new kind of stored data
-// (an encrypted secret and hashed recovery codes) and a new cookie (`mfa`).
-// The owner confirms or adjusts the date when the change is reviewed.
-const PRIVACY_EFFECTIVE = '22 October 2026';
+const TERMS_EFFECTIVE = '2 November 2026';
+// Moved on 2 November 2026 to describe the optional hosted analyst: its
+// Azure request data, returned report data, and lazy retention behavior.
+const PRIVACY_EFFECTIVE = '2 November 2026';
 const SUPPORT = 'support@stma.ai';
 const PRIVACY = 'gdpr@matteai.com';
 /**
@@ -377,11 +376,13 @@ const termsSections = (): Section[] => [
           anyway, write to <Mail to={SECURITY} /> and we will remove it.
         </P>
         <P head="What we do not do with it.">
-          We do not sell Customer Content, use it for advertising, send it from the Service to an AI
-          model provider or use it to train AI models. If you explicitly enable managed local
-          execution, the assigned task and its context are sent by the local Claude Code runtime on
-          your machine directly to the provider account you configure. That provider handles the
-          request under its own terms and privacy policy; STMA does not proxy model requests.
+          We do not sell Customer Content, use it for advertising or use it to train AI models.
+          When a workspace owner enables the hosted analyst and a member submits a request, STMA
+          sends that question and selected, bounded Work context to the configured Azure OpenAI
+          deployment. If you explicitly enable managed local execution, the assigned task and its
+          context are sent by the local runtime on your machine directly to the provider account
+          you configure. The provider handles these requests under its applicable terms and privacy
+          policy; STMA does not proxy the local runtime's model requests.
         </P>
         <P head="Removal.">
           We may remove content, or suspend access to it, if we reasonably believe it breaks these
@@ -579,8 +580,9 @@ const termsSections = (): Section[] => [
       <>
         <P head="Deleting a workspace">
           removes everything in it from our live database at once and permanently: debug sessions
-          and messages, snapshots, agent runs and their records, policies, baselines, delivery
-          flows, Knowledge, integrations and their stored credentials, activity and invitations.
+          and messages, snapshots, agent runs and their records, analyst reports and request
+          metadata, policies, baselines, delivery flows, Knowledge, integrations and their stored
+          credentials, activity and invitations.
           Credentials scoped to that workspace are deleted with it. Copies remain in database
           backups until those expire, within 30 days.
         </P>
@@ -592,7 +594,9 @@ const termsSections = (): Section[] => [
           account. Content you contributed to workspaces, such as messages, the sessions you opened,
           snapshots and Knowledge records, stays with those workspaces as part of their shared
           record; snapshots are deleted when they reach their 90-day limit, and activity entries
-          when they reach the workspace's history limit. Before you can delete your account you
+          when they reach the workspace's history limit. Your managed analyst questions, reports,
+          source records and request/idempotency metadata are deleted with your account. Before you
+          can delete your account you
           must hand over or delete every workspace of which you are the only owner, and finish your
           active agent runs.
         </P>
@@ -965,6 +969,15 @@ const privacySections = (): Section[] => [
             them; delivery flows; answers in the savings ledger; and the workspace activity log.
           </li>
           <li>
+            <b>Managed analyst data, when a workspace owner enables it and a member submits a
+            request:</b> the question and selected Work context, limited to at most ten recent work
+            items and possibly partial; the collection time; source references, manifests and hashes;
+            and the returned report. We send the question and selected context to the Azure OpenAI
+            endpoint configured for that project. We store the report with its requester, the
+            configured provider host and deployment, its status and source references, and numeric
+            provider-reported token usage when available. The usage figure is not a dollar charge.
+          </li>
+          <li>
             <b>Agent run data:</b> for each run, its task and intent, repository, branch and commit,
             the location of the checkout on disk as the agent reports it (which can include a user
             name), the files and areas it claims or changes, heartbeats, the usage and cost figures
@@ -1035,12 +1048,15 @@ const privacySections = (): Section[] => [
             trackers, and our emails contain no tracking images or tracked links.
           </li>
           <li>
-            <b>Data for sale or for AI training.</b> We do not sell personal data or share it for
-            advertising, send workspace content from the Service to any AI model provider, or use it
-            to train AI models. Managed local execution is separately opt-in: its local runtime
-            sends the assigned task and context from your machine directly to the provider account
-            you configure, under that provider's terms and privacy policy. STMA does not proxy those
-            model requests.
+            <b>Data for sale or for AI training.</b> We do not sell personal data, share it for
+            advertising, or use it to train AI models. If a workspace owner enables the optional
+            hosted analyst and a member submits a request, STMA sends the question and selected,
+            bounded Work context to the Azure OpenAI endpoint configured for that project and stores
+            the resulting report and source metadata. The Azure deployment processes that request
+            under the applicable provider terms. Managed local execution is separately opt-in: its
+            local runtime sends the assigned task and context from your machine directly to the
+            provider account you configure, under that provider's terms and privacy policy. STMA
+            does not proxy those local model requests.
           </li>
         </List>
         <P>
@@ -1140,6 +1156,11 @@ const privacySections = (): Section[] => [
               'European Union: the application, database and backups run in the North Europe region (Ireland)',
             ],
             [
+              <b>Microsoft Azure OpenAI</b>,
+              'When a workspace owner enables the hosted analyst and a member submits a request, processes the question and selected bounded Work context sent by STMA, and returns a report. The configured host and deployment are recorded with the report',
+              'The location depends on the Azure deployment configured for the project; this policy does not specify a region for it',
+            ],
+            [
               <b>Cloudflare</b>,
               'DNS, TLS and a proxy in front of stma.ai. Every request passes through it, including your IP address and the details of the request',
               'Worldwide, at the location nearest the visitor; Cloudflare, Inc. is based in the United States',
@@ -1163,6 +1184,12 @@ const privacySections = (): Section[] => [
         />
         <P>Personal data also reaches:</P>
         <List>
+          <li>
+            <b>Microsoft Azure OpenAI</b>, when the optional hosted analyst is enabled for a project
+            and a member submits a request: the question and selected bounded Work context are sent
+            to the project's configured endpoint, which returns the report. This endpoint is
+            separate from the Azure hosting the STMA application and database;
+          </li>
           <li>
             <b>the services you connect</b>, such as GitHub, Azure DevOps, Jira, ClickUp and your
             Slack or Discord webhooks, which receive what is needed for what you ask them to do,
@@ -1277,6 +1304,10 @@ const privacySections = (): Section[] => [
               'Until you change or remove them',
             ],
             ['Notification delivery records', '1 day'],
+            [
+              'Managed analyst reports and source snapshots',
+              'Eligible for pruning after 30 days; pruning happens on a later analysis request, not on a guaranteed clock schedule. Your report rows and request/idempotency metadata are deleted with your account or project',
+            ],
             ['Error records', '30 days'],
             ['Application logs', '30 days'],
             ['Database backups', '30 days; deleted data leaves the backups within that time'],

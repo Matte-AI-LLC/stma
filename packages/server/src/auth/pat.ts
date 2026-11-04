@@ -90,7 +90,7 @@ export const mcpAuth: MiddlewareHandler<AppEnv> = async (c, next) => {
   if (!(await testAccountAvailable(db, row.user))) return unauthorized(c, TEST_ACCOUNT_UNAVAILABLE, 'invalid_token');
   if (row.token.expiresAt && row.token.expiresAt <= new Date()) {
     logLine({ evt: 'credential', a: 'rejected', why: 'token_expired', installation: row.installationId });
-    return unauthorized(c, 'The OAuth access token expired. The MCP client should refresh it.', 'invalid_token');
+    return unauthorized(c, row.token.accessMode === 'analyst' ? 'This analyst credential expired. Create a new connection.' : 'The OAuth access token expired. The MCP client should refresh it.', 'invalid_token');
   }
   // The first-party local adapter uses the same STMA OAuth resource through
   // scoped REST agent/control operations. Never extend this to app/admin routes.
@@ -108,6 +108,12 @@ export const mcpAuth: MiddlewareHandler<AppEnv> = async (c, next) => {
   }
   if (pendingSetup && c.req.path !== '/mcp' && c.req.path !== '/api/agent/identity' && c.req.path !== '/api/agent-enrollments/self-revoke') {
     return c.json({ error: 'setup_pending', hint: 'Reload the MCP client and call whoami to confirm this installation first.' }, 403);
+  }
+  if (!['standard', 'analyst'].includes(row.token.accessMode) || (row.token.accessMode === 'analyst' && row.token.scope !== 'project')) {
+    return unauthorized(c, 'This credential has an invalid access mode.', 'invalid_token');
+  }
+  if ((row.token.accessMode === 'analyst' || attempt?.execution.readonlyChild) && c.req.path !== '/mcp') {
+    return c.json({ error: 'analyst_scope', hint: 'Analyst credentials are restricted to project MCP reads.' }, 403);
   }
   if (!isTokenScope(row.token.scope)) {
     return unauthorized(c, 'This token has an invalid access scope. Revoke it and create a new agent connection.', 'invalid_token');
@@ -166,6 +172,7 @@ export const mcpAuth: MiddlewareHandler<AppEnv> = async (c, next) => {
   const grant: AgentGrant = {
     ...(attempt ? { execution: attempt.execution } : {}),
     tokenId: row.token.id,
+    accessMode: attempt?.execution.readonlyChild ? 'analyst' : row.token.accessMode as 'standard' | 'analyst',
     scope: row.token.scope,
     teamId: row.token.teamId,
     teamSlug: row.teamSlug,

@@ -1094,10 +1094,22 @@ docsRoutes.get('/docs', (c) => {
                 </button>
               </div>
               <p class="m0 small muted">
-                There is no separate read-only credential yet. The connection you give the analyst is an
-                ordinary one, scoped to the project or workspace you choose, and it can call the write
-                tools too; the prompt asks it not to, and the Claude apps ask you before any tool that
-                writes. For stricter limits, give it a project-scoped connection.
+                Where project-scoped analyst credentials are enabled, open{' '}
+                <a href="/app/tokens">Agent connections</a> in the project and create an analyst
+                credential. It is revealed once; store it securely and send it as a Bearer token to
+                <code>/mcp</code>. Its closed catalog permits only <code>whoami</code>,{' '}
+                <code>list_projects</code>, <code>list_work</code>, <code>get_work</code> and{' '}
+                <code>get_work_context</code>; other MCP tools and REST requests are refused. Existing
+                membership, project and enterprise identity checks still apply.
+              </p>
+              <p class="m0 small muted" id="work-managed-analyst">
+                Managed analysis requires an operator-configured Azure profile and explicit
+                workspace-owner activation; it remains disabled until configured. Each report starts
+                only after a person submits a request; it uses at most ten recent work items with
+                bounded, potentially partial context. Azure usage is billed separately, and the request allowance is not a dollar
+                cap. Reports link to their source work and state limitations; they do not accept work
+                or verify provider evidence. There is no scheduled analysis. Profile setup is
+                operator-managed; customers cannot upload a provider key.
               </p>
             </div>
 
@@ -1107,8 +1119,9 @@ docsRoutes.get('/docs', (c) => {
                 <li>No email for "waiting for you". The rail badge and the Needs decision view carry it.</li>
                 <li>No writing back to a tracker, and no Jira or ClickUp reference.</li>
                 <li>No automatic refresh of a GitHub issue: a person reads it again from the work.</li>
-                <li>No OS service, machine wake-up, or cloud fallback. The managed Claude runtime is opt-in; its controlled API-key runtime path is verified, while CLI configuration/start, enrollment, Native Work delivery, and active-process cancellation remain separate scopes.</li>
-                <li>No managed analyst and no scheduled analysis.</li>
+                <li>The per-user worker service is experimental and opt-in: installation requires <code>stma worker service-install --apply</code>; it does not wake a machine or fall back to hosted execution. Inert service lifecycle checks passed on Windows and macOS; live worker operation on these services and Linux native lifecycle remain unaccepted. The Codex runtime requires Windows, the complete CLI 0.166.0 package, separately provisioned elevated sandbox support and an explicit <code>--model MODEL_ID</code>. Use a dedicated Windows host or VM: provisioning can invalidate another Codex home's sandbox credentials. Doctor withholds setup instructions when another known home is detected. Status shows the requested model; it is not a cost cap. Its prompt permits local read-only offline commands to inspect the dedicated checkout and carry out read-only assignment steps within existing sandbox permissions. STMA MCP access remains limited to scoped read-only tools. Generic instructions about assignment lifecycle are reference text; the supervisor owns run tracking, and the child cannot change Work or handoff state. This adds no file or network access. Two consecutive controlled Windows GPT-6 Sol read-only analysis runs passed with process cleanup. A separate active-cancellation check passed fail-closed checks: it stopped the process and revoked its child credential, but left the execution <code>dispatch_unknown</code>, quarantined the target, retained the owner lock and recorded no completed run or delivery. This does not establish ordinary Codex connect, OAuth or credential-store acceptance, live OS service-worker operation, customer acceptance or production acceptance. The runtime remains experimental.</li>
+                <li>Windows Codex execution requests also have a launch-size limit. Oversized requests are refused before that execution's launcher starts; this limit does not cap model tokens, tool calls or cost. Codex requests the provider's standard service tier, which is also not a spending cap.</li>
+                <li>The managed analyst is operator-profiled, request-only and disabled until configured. There is no scheduler.</li>
               </ul>
             </div>
           </section>

@@ -37,6 +37,7 @@ export const NOOP_LIFECYCLE_HOOKS: AppLifecycleHooks = {};
 
 /** Capabilities exposed by a composed distribution, independent of metering. */
 export interface AppCapabilities {
+  managedAnalyst?: boolean;
   managedBilling: boolean;
   organizationSecurity: boolean;
   /**

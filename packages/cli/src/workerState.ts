@@ -7,12 +7,15 @@ import { windowsDirectoryRefusal, windowsPrivateDirectory } from './windowsAcl.j
 export interface WorkerConfig {
   schema: 1; checkout: string; fingerprint: string; targetId: string; installationId: string; server: string;
   executable: string; runtimeVersion: string; apiKeyEnv: string; hookRuntime: string; profile?: string;
+  runtime?: 'claude-print-v1' | 'codex-read-only-v1';
+  codexModel?: string;
   maxRuntimeSeconds: number; maxTurns: number;
 }
 export interface WorkerJournal {
   schema: 1; workerId: string; phase: 'idle' | 'claiming' | 'claimed' | 'spawn_intent' | 'running' | 'terminal' | 'quarantined';
   updatedAt: string; jobId?: string; attemptId?: string; fence?: number; sessionId?: string;
   reason?: string; pid?: number; startedAt?: string;
+  providerThreadId?: string;
 }
 export interface WorkerControl { owner: string; command: 'run' | 'pause' | 'stop' | 'disable'; }
 export function canonicalCheckout(directory: string): string {

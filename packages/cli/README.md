@@ -129,6 +129,81 @@ Targets: `claude-code`, `codex`, `cursor`. Existing hooks in your client config 
 preserved; only STMA's own entries are replaced. Lifecycle events are queued in a bounded
 local outbox when the server is unreachable.
 
+## Persistent local worker
+
+After configuring a dedicated checkout with `stma worker configure` and having the installation
+owner enable its target, you can opt in to a per-user service from that checkout:
+
+```bash
+stma worker service-install --apply
+stma worker service-status
+stma worker service-start
+stma worker service-stop
+stma worker service-uninstall
+```
+
+The implementation provides a Windows interactive-user logon task, a Linux systemd user unit, and
+a macOS GUI LaunchAgent. These are per-user service definitions. Inert service lifecycle checks
+passed on Windows and macOS; live worker operation on these services and Linux native lifecycle
+remain unaccepted. Installing the macOS agent can start the worker
+immediately. These managers need the appropriate user session or user manager; the service does not
+wake the machine. On Linux a user
+manager configured for lingering can remain active after logout. Service definitions contain no
+credentials. The selected STMA profile and the provider API-key environment variable must already
+be available to the service's own user environment; a variable set only in an interactive shell
+may not be inherited. Authentication or a disabled target can prevent work from starting.
+
+`service-stop` disables future automatic starts and asks the recorded worker owner to stop. Inspect
+`stma worker status` and its journal for the observed result; a request is not proof that an active
+child process stopped. Uncertain execution keeps the checkout quarantined. Uninstall verifies the
+registered definition and refuses while the service or worker may still be running. The service
+does not change the worker's existing runtime limits or turn completion into delivery acceptance.
+
+The default managed worker uses Claude Code's restricted file-tool profile. The experimental
+`--runtime codex-read-only-v1` profile supports the complete official Codex CLI 0.166.0 native
+package on Windows, including its manifest and adjacent sandbox helpers, with a separately
+prepared elevated sandbox and a restricted child credential. `stma worker doctor` shows the
+separate setup command; STMA does not run it. Configuration requires `--model MODEL_ID`; the
+selected id is stored locally and passed as fixed arguments on every launch. `status` and `doctor`
+show the requested model, not a provider-confirmed model or cost limit. Codex launches explicitly
+request the provider's standard service tier; that is not a spending cap. Existing experimental
+configurations without a model must be replaced with a newly configured dedicated checkout.
+Use a separate approved project token through `STMA_TOKEN` and `STMA_URL`; ordinary Codex
+`stma connect` installs a `.codex` layer that this managed profile refuses. The isolated Codex home must have no `config.toml`
+or `hooks.json`, and the dedicated checkout must not have a `.codex` layer. Before every launch,
+STMA checks that selected credential paths cannot be read and that writes are denied. Other host
+files may remain readable. One outer turn, runtime and output are bounded; there is no hard
+tool-call or token ceiling. The bounded model report is not delivery or acceptance. This profile
+has passed controlled hosted Windows sandbox boundary and descendant-stop checks. Two consecutive
+controlled Windows GPT-6 Sol read-only analysis runs passed with process cleanup. A separate
+active-cancellation
+check passed its fail-closed checks: it stopped the process and revoked the child credential, but
+left the execution `dispatch_unknown`, the target quarantined and the owner lock retained; no
+completed run or delivery was recorded. This does not establish ordinary Codex connect, OAuth or
+credential-store acceptance, live OS service-worker operation, customer acceptance or production
+acceptance.
+The prompt permits local read-only offline commands to inspect the dedicated checkout and carry out
+read-only assignment steps within existing sandbox permissions; STMA MCP access remains limited to
+scoped read-only tools. Generic
+instructions about assignment lifecycle are reference text, and the supervisor owns run tracking. The
+child cannot change Work or handoff state, and this clarification grants no file or network
+permissions.
+The provider key remains in the explicitly named environment variable; never put it in argv.
+The serialized Windows Codex launch request is limited to 1,048,576 UTF-16 code units, including
+arguments and prompt. Oversized requests are refused before the execution's launcher starts;
+this transport limit is separate from model tokens, tool calls and billing. A complete request
+can start without waiting for the parent's input stream to close.
+The Windows launcher uses Windows PowerShell's built-in modules; inherited user module
+search paths are excluded from the worker environment.
+Codex shell commands use an empty inherited environment with an explicit, validated Windows
+`SystemRoot` value so native runtimes can initialize. Provider and STMA credentials are not
+included in that shell environment.
+Use a dedicated Windows host or VM with independent local accounts. Codex provisioning rotates
+machine-wide sandbox-account passwords, so a second home can invalidate an existing desktop
+sandbox. `doctor` reports blocked setup and omits its setup command when it detects another known
+home's sandbox marker/credential file; it does not read that file or discover every custom home.
+Do not copy another home's sandbox credentials to work around this requirement.
+
 ## Privacy
 
 Environment snapshots carry tool versions, lockfile hashes and environment variable

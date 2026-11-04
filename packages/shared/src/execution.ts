@@ -3,6 +3,9 @@ import { z } from 'zod/v3';
 /** Local foreground execution. Runtime completion is never delivery or acceptance. */
 export const EXECUTION_RUNTIME = 'claude-print-v1' as const;
 export const EXECUTION_PERMISSION_PROFILE = 'restricted-files-v1' as const;
+export const CODEX_EXECUTION_RUNTIME = 'codex-read-only-v1' as const;
+export const CODEX_PERMISSION_PROFILE = 'sandbox-read-only-v1' as const;
+export const EXECUTION_READONLY_TOOLS = ['whoami', 'get_work', 'get_work_context'] as const;
 export const EXECUTION_STATES = ['queued', 'leased', 'starting', 'running', 'needs_input', 'cancel_requested', 'succeeded', 'failed', 'cancelled', 'dispatch_unknown', 'lost'] as const;
 export type ExecutionState = (typeof EXECUTION_STATES)[number];
 export const EXECUTION_LEASE_SECONDS = 60;
@@ -13,13 +16,13 @@ export const EXECUTION_CHILD_TOOLS = ['whoami', 'get_policy', 'get_workflow', 'g
 export const executionConfigureSchema = z.object({
   checkout_path: z.string().min(1).max(2048),
   checkout_fingerprint: z.string().regex(/^[a-f0-9]{64}$/),
-  runtime: z.literal(EXECUTION_RUNTIME),
+  runtime: z.enum([EXECUTION_RUNTIME, CODEX_EXECUTION_RUNTIME]),
   runtime_version: z.string().min(1).max(80),
-  permission_profile: z.literal(EXECUTION_PERMISSION_PROFILE),
+  permission_profile: z.enum([EXECUTION_PERMISSION_PROFILE, CODEX_PERMISSION_PROFILE]),
   max_runtime_seconds: z.number().int().min(60).max(3600),
   max_turns: z.number().int().min(1).max(100),
   dedicated: z.literal(true),
-}).strict();
+}).strict().refine((value) => (value.runtime === EXECUTION_RUNTIME && value.permission_profile === EXECUTION_PERMISSION_PROFILE) || (value.runtime === CODEX_EXECUTION_RUNTIME && value.permission_profile === CODEX_PERMISSION_PROFILE), 'Runtime and permission profile must match.');
 export type ExecutionConfigureInput = z.infer<typeof executionConfigureSchema>;
 export const executionDispatchSchema = z.object({
   target_id: z.string().uuid(),
@@ -44,8 +47,8 @@ export interface ExecutionTargetDto {
   id: string; installation_id: string; installation_name: string; owner_id: string;
   team_id: string; project_id: string; project_name: string;
   checkout_path: string; checkout_fingerprint: string;
-  runtime: typeof EXECUTION_RUNTIME; runtime_version: string;
-  permission_profile: typeof EXECUTION_PERMISSION_PROFILE;
+  runtime: typeof EXECUTION_RUNTIME | typeof CODEX_EXECUTION_RUNTIME; runtime_version: string;
+  permission_profile: typeof EXECUTION_PERMISSION_PROFILE | typeof CODEX_PERMISSION_PROFILE;
   max_runtime_seconds: number; max_turns: number; grant_version: number;
   enabled: boolean; quarantined: boolean; last_seen: string | null;
   readiness: 'available' | 'busy' | 'offline' | 'disabled' | 'quarantined' | 'needs_auth';
@@ -61,7 +64,7 @@ export interface ExecutionJobDto {
   max_runtime_seconds: number; max_turns: number; created_at: string;
   assignment: { task: string; brief: string; branch: string | null; repository_identity: string | null; start_call: Record<string, unknown> };
 }
-export interface ExecutionClaimDto { job: ExecutionJobDto; attempt: ExecutionAttemptDto; attempt_token: string; }
+export interface ExecutionClaimDto { job: ExecutionJobDto; attempt: ExecutionAttemptDto; attempt_token: string; child_token?: string; }
 export interface ExecutionHeartbeatDto { state: ExecutionState; lease_expires_at: string; cancel_requested: boolean; }
 export interface ExecutionDetailDto {
   can_cancel: boolean;

@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { EXECUTION_CHILD_TOOLS } from '@bridge/shared';
+import { EXECUTION_CHILD_TOOLS, EXECUTION_READONLY_TOOLS, CODEX_EXECUTION_RUNTIME } from '@bridge/shared';
 import { and, eq, isNull } from 'drizzle-orm';
 import type { Db } from '../db';
 import { executionAttemptGrants, executionAttempts, executionJobs, executionTargets, knowledgeContexts, runCheckpoints, workDeliveries, workItems, workProjectCounters } from '../db/schema';
@@ -10,6 +10,7 @@ import { isCanonicalUuid } from './ids';
 export interface ExecutionGrant {
   targetId: string; jobId: string; attemptId: string; fence: number; grantVersion: number;
   grantId: string; sessionId: string; workId: string | null; specRevision: number | null;
+  readonlyChild: boolean;
 }
 const request = new AsyncLocalStorage<{ grant: AgentGrant; bound?: { target: ExecutionTargetRow; job: ExecutionJobRow; attempt: ExecutionAttemptRow } }>();
 export const currentExecutionGrant = () => request.getStore()?.grant;
@@ -22,7 +23,9 @@ export async function resolveExecutionCredential(db: Db, hash: string) {
     .where(eq(executionAttemptGrants.tokenHash, hash));
   if (!row || row.secret.revokedAt || row.secret.expiresAt <= new Date()) return null;
   const execution: ExecutionGrant = { targetId: row.target.id, jobId: row.job.id, attemptId: row.attempt.id, fence: row.attempt.fence,
-    grantVersion: row.job.grantVersion, grantId: row.secret.id, sessionId: row.job.sessionId, workId: row.job.workId, specRevision: row.job.specRevision };
+    grantVersion: row.job.grantVersion, grantId: row.secret.id, sessionId: row.job.sessionId, workId: row.job.workId, specRevision: row.job.specRevision,
+    readonlyChild: row.secret.purpose === 'readonly_child' };
+  if (!['supervisor', 'readonly_child'].includes(row.secret.purpose) || (execution.readonlyChild && row.target.runtime !== CODEX_EXECUTION_RUNTIME)) return null;
   return { parentTokenId: row.secret.parentTokenId, execution };
 }
 export async function validateExecutionGrant(db: Db, grant: AgentGrant) {
@@ -128,6 +131,7 @@ export async function guardExecutionTool(db: Db, grant: AgentGrant, tool: string
     return managedResourceRefusal(db, grant, { runId: typeof args.run_id === 'string' ? args.run_id : undefined,
       sessionId: typeof args.session_id === 'string' ? args.session_id : undefined });
   }
+  if (grant.execution.readonlyChild && !EXECUTION_READONLY_TOOLS.includes(tool as typeof EXECUTION_READONLY_TOOLS[number])) return 'This read-only execution credential cannot call this tool.';
   if (!CHILD_TOOLS.has(tool)) return 'This tool is outside the execution attempt capability.';
   if (args.checkpoint_id !== undefined) {
     if (!isCanonicalUuid(args.checkpoint_id)) return 'Name a checkpoint from this attempt’s bound run.';
@@ -190,6 +194,7 @@ export async function guardExecutionHttp(db: Db, grant: AgentGrant, path: string
     return null;
   }
   if (path === '/mcp') return null;
+  if (grant.execution.readonlyChild) return 'This read-only execution credential permits MCP reads only.';
   const e = grant.execution;
   if (path.startsWith('/api/agent/worker/') || path === '/api/agent-enrollments/self-revoke') return 'An attempt cannot operate or revoke its parent worker.';
   if (['/api/agent/identity','/api/agent/runs/start','/api/agent/policies/effective','/api/agent/environment/preflight'].includes(path)) return null;

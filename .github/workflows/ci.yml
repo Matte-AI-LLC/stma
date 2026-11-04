@@ -49,7 +49,7 @@ jobs:
       - if: hashFiles('acceptance/agent-worker/api-support.test.ts') != ''
         run: |
           npx tsc -p acceptance/agent-worker/tsconfig.json
-          npx tsx --test acceptance/agent-worker/api-support.test.ts
+          npx tsx --test acceptance/agent-worker/api-support.test.ts acceptance/agent-worker/codex-support.test.ts acceptance/agent-worker/codex-native-containment.test.ts acceptance/agent-worker/codex-fixture.test.ts acceptance/agent-worker/codex-proxy.test.ts acceptance/agent-worker/codex-lifecycle.test.ts acceptance/agent-worker/codex-native-exit.test.ts acceptance/agent-worker/codex-process.test.ts acceptance/agent-worker/codex-native-exec.test.ts acceptance/agent-worker/codex-native-mcp.test.ts
       # The public mirror's allowlist and scan, on every change rather than first
       # at the tag: v0.19.1's mirror was refused for one test comment after npm and
       # production had already shipped. The script is not in the public tree, so

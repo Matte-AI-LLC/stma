@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import {
-  EXECUTION_LEASE_SECONDS, EXECUTION_PERMISSION_PROFILE, EXECUTION_RUNTIME,
+  CODEX_EXECUTION_RUNTIME, CODEX_PERMISSION_PROFILE, EXECUTION_LEASE_SECONDS, EXECUTION_PERMISSION_PROFILE, EXECUTION_RUNTIME,
   executionConfigureSchema, executionDispatchSchema, executionEventSchema,
   type ExecutionAttemptDto, type ExecutionClaimDto, type ExecutionConfigureInput,
   type ExecutionDetailDto, type ExecutionDispatchInput, type ExecutionEventInput,
@@ -121,6 +121,7 @@ export async function executionAuthority(db: Db, target: ExecutionTargetRow, job
   }
 }
 async function targetDto(db: Db, target: ExecutionTargetRow): Promise<ExecutionTargetDto> {
+  if (!((target.runtime === EXECUTION_RUNTIME && target.permissionProfile === EXECUTION_PERMISSION_PROFILE) || (target.runtime === CODEX_EXECUTION_RUNTIME && target.permissionProfile === CODEX_PERMISSION_PROFILE))) throw new Error('Execution target has an invalid runtime and profile.');
   const [installation] = await db.select().from(agentInstallations).where(eq(agentInstallations.id, target.installationId));
   const [project] = await db.select().from(projects).where(eq(projects.id, target.projectId));
   const [busy] = await db.select({ id: executionJobs.id }).from(executionJobs).where(and(eq(executionJobs.targetId, target.id), inArray(executionJobs.state, OCCUPIED))).limit(1);
@@ -133,8 +134,8 @@ async function targetDto(db: Db, target: ExecutionTargetRow): Promise<ExecutionT
     disabled: 'Execution needs explicit permission from the installation owner.', quarantined: 'A previous process may still be running. This checkout cannot start more work.', needs_auth: 'The installation needs current project access.' };
   return { id: target.id, installation_id: target.installationId, installation_name: installation?.name ?? 'Unavailable installation', owner_id: target.ownerId,
     team_id: target.teamId, project_id: target.projectId, project_name: project?.name ?? 'Unavailable project', checkout_path: target.checkoutPath,
-    checkout_fingerprint: target.checkoutFingerprint, runtime: EXECUTION_RUNTIME, runtime_version: target.runtimeVersion,
-    permission_profile: EXECUTION_PERMISSION_PROFILE, max_runtime_seconds: target.maxRuntimeSeconds, max_turns: target.maxTurns,
+    checkout_fingerprint: target.checkoutFingerprint, runtime: target.runtime === CODEX_EXECUTION_RUNTIME ? CODEX_EXECUTION_RUNTIME : EXECUTION_RUNTIME, runtime_version: target.runtimeVersion,
+    permission_profile: target.permissionProfile === CODEX_PERMISSION_PROFILE ? CODEX_PERMISSION_PROFILE : EXECUTION_PERMISSION_PROFILE, max_runtime_seconds: target.maxRuntimeSeconds, max_turns: target.maxTurns,
     grant_version: target.grantVersion, enabled: target.enabled, quarantined: target.quarantined, last_seen: target.lastSeenAt ? iso(target.lastSeenAt) : null,
     readiness, reason: reasons[readiness] };
 }
@@ -165,7 +166,8 @@ export async function configureExecutionTarget(db: Db, userId: string, grant: Ag
   return result(async () => {
     const parsed = executionConfigureSchema.safeParse(input);
     if (!parsed.success) executionRefuse('INVALID_INPUT', 'Invalid worker configuration.');
-    if (grant.execution || !grant.installationId || grant.scope !== 'project' || !grant.projectId || !grant.teamId || grant.companionInstallationId || grant.clientType !== 'claude-code') executionRefuse('FORBIDDEN', 'Configure a dedicated project-scoped Claude Code installation.');
+    if (input.runtime === CODEX_EXECUTION_RUNTIME && input.max_turns !== 1) executionRefuse('INVALID_INPUT', 'The Codex read-only worker supports one outer turn.');
+    if (grant.execution || !grant.installationId || grant.scope !== 'project' || !grant.projectId || !grant.teamId || grant.companionInstallationId || grant.clientType !== (input.runtime === CODEX_EXECUTION_RUNTIME ? 'codex' : 'claude-code')) executionRefuse('FORBIDDEN', 'Configure a dedicated project-scoped installation matching the runtime.');
     const target = await db.transaction(async (transaction) => {
       const tx = transaction as unknown as Db;
       await lockExecutionWorkspace(tx, grant.teamId!);
@@ -356,9 +358,14 @@ export async function claimExecution(db: Db, userId: string, grant: AgentGrant, 
       deadlineAt: new Date(now + job.maxRuntimeSeconds * 1000), providerSessionId: randomUUID() }).returning();
     const secret = 'stma_attempt_' + randomHex(32);
     await tx.insert(executionAttemptGrants).values({ attemptId: attempt!.id, parentTokenId: grant.tokenId, tokenHash: sha256hex(secret), expiresAt: leaseExpiresAt });
+    let childToken: string | undefined;
+    if (target.runtime === CODEX_EXECUTION_RUNTIME) {
+      childToken = 'stma_attempt_' + randomHex(32);
+      await tx.insert(executionAttemptGrants).values({ attemptId: attempt!.id, parentTokenId: grant.tokenId, tokenHash: sha256hex(childToken), expiresAt: leaseExpiresAt, purpose: 'readonly_child' });
+    }
     const updated = (await tx.update(executionJobs).set({ state: 'leased', updatedAt: new Date() }).where(eq(executionJobs.id, job.id)).returning())[0]!;
     await event(tx, job, 'leased', 'worker_claimed', attempt!.id);
-    return { job: executionJobDto(updated), attempt: executionAttemptDto(attempt!), attempt_token: secret };
+    return { job: executionJobDto(updated), attempt: executionAttemptDto(attempt!), attempt_token: secret, ...(childToken ? { child_token: childToken } : {}) };
   }));
 }
 async function ownedAttempt(tx: Db, target: ExecutionTargetRow, input: ExecutionLeaseInput) {

@@ -62,7 +62,7 @@ import { mcpConnectPrompt, mcpServerAlias } from '../lib/mcpConnectPrompt';
 import { launchPrompts } from '../lib/quickStart';
 import { ensureRail } from '../lib/rail';
 import { connectionsHref, sectionHref } from '../lib/scope';
-import { membershipUser } from '../lib/securityHooks';
+import { analystCredentialIssued, membershipUser } from '../lib/securityHooks';
 import type { AppEnv, User } from '../types';
 import { ConnectCheckoutForm, ConnectCommand } from '../ui/ConnectAgent';
 import { Band, PageHead, teamTrail, type Crumb } from '../ui/Console';
@@ -136,6 +136,7 @@ interface Answer {
   refused?: { error: string; terminal: boolean; typed: Record<string, unknown> };
   /** Deprecated direct-POST compatibility; no form on the page submits this. */
   legacyToken?: string;
+  analystToken?: string;
 }
 
 const typedString = (typed: Record<string, unknown> | undefined, key: string) =>
@@ -279,7 +280,7 @@ async function launchHref(db: Db, launch: Launch) {
 }
 
 /** In page words: what a connection can reach, seen from inside this workspace. */
-function accessLabel(token: { scope: string; projectId: string | null }, projectsById: Map<string, ProjectRef>) {
+function accessLabel(token: { scope: string; projectId: string | null; accessMode?: string }, projectsById: Map<string, ProjectRef>) {
   if (token.scope === 'project') {
     return `Project only · ${token.projectId ? (projectsById.get(token.projectId)?.name ?? 'a project') : 'a project'}`;
   }
@@ -924,6 +925,25 @@ const ConnectionsPage = (props: PageProps) => {
           </div>
         </div>
       ) : null}
+
+      {answer.analystToken ? (
+        <div class="reveal"><div class="reveal-title">Read-only analyst credential created</div>
+          <p>Copy it now; it will not be shown again. Use it as a Bearer credential at {baseUrl}/mcp. It can read the selected project until revoked or access is lost.</p>
+          <div class="cmd"><code>{answer.analystToken}</code><button class="copybtn solid" type="button" data-copy={answer.analystToken}>Copy token</button></div>
+        </div>
+      ) : null}
+      <details class="card fold-card" id="analyst-credential">
+        <summary class="card-head"><div><div class="card-title">Read-only analyst credential</div><div class="card-note">A project-scoped credential for Work analysis.</div></div></summary>
+        <div class="card-pad">
+          <p>Read Work items and bounded context through MCP. This credential cannot modify project data or use the REST API. It follows your current access and can be revoked below.</p>
+          {scope.projects.length ? <form class="authform" method="post" action="/app/tokens">
+            {back}<input type="hidden" name="mode" value="analyst" />
+            <div class="field"><label for="analyst-name">Credential name</label><input class="in" id="analyst-name" name="name" maxlength={80} required /></div>
+            <div class="field"><label for="analyst-project">Project</label><select class="in" id="analyst-project" name="analyst_project" required>{scope.projects.map((p) => <option value={p.id} selected={p.id === project?.id}>{p.name}</option>)}</select></div>
+            <button class="btn" type="submit">Create analyst credential</button>
+          </form> : <p>Create a project first.</p>}
+        </div>
+      </details>
 
       <TwoWaysIn baseUrl={baseUrl} />
 
@@ -1891,6 +1911,23 @@ connectionsRoutes.post('/app/tokens', async (c) => {
   const db = c.get('db');
   const body = (await c.req.parseBody()) as Record<string, unknown>;
   const name = typeof body.name === 'string' && body.name.trim() ? body.name.trim().slice(0, 80) : '';
+  if (body.mode === 'analyst') {
+    const scope = await answerScope(c, body);
+    const selected = scope?.projects.find((project) => project.id === body.analyst_project);
+    if (!scope || !selected || !name) {
+      if (!scope) return renderAccount(c, { error: 'Choose an available project and a credential name.' });
+      return renderConnections(c, scope, {}, { error: 'Choose an available project and a credential name.' });
+    }
+    const pat = generatePat();
+    await db.transaction(async (tx) => {
+      const [issued] = await tx.insert(tokens).values({ userId: user.id, name, tokenHash: pat.hash, prefix: pat.prefix,
+        scope: 'project', accessMode: 'analyst', teamId: scope.team.id, projectId: selected.id }).returning();
+      const proof = await analystCredentialIssued(tx as unknown as Db, { userId: user.id, teamId: scope.team.id, projectId: selected.id, tokenId: issued!.id });
+      if (proof.expiresAt) await tx.update(tokens).set({ expiresAt: proof.expiresAt }).where(eq(tokens.id, issued!.id));
+    });
+    c.header('Cache-Control', 'private, no-store');
+    return renderConnections(c, scope, { analystToken: pat.token });
+  }
   if (body.device === undefined && body.access === undefined && name) {
     const pat = generatePat();
     await db.insert(tokens).values({ userId: user.id, name, tokenHash: pat.hash, prefix: pat.prefix });

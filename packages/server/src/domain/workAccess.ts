@@ -1,7 +1,7 @@
 import { and, eq, inArray, isNull, notInArray, or } from 'drizzle-orm';
 import type { Db } from '../db';
 import { agentInstallations, agentRuns, handoffs, memberships, workLinks } from '../db/schema';
-import { membershipUser } from '../lib/securityHooks';
+import { authorizeSecurity, currentSecurityPrincipal, membershipUser } from '../lib/securityHooks';
 import { collaborationAccess } from './collaboration';
 import { adapterListeningFor } from './companions';
 import { principalId, type WorkAccess, type WorkItemRow, type WorkPrincipal } from './workTypes';
@@ -22,6 +22,10 @@ export async function workAccess(
   teamId: string,
   projectId: string,
 ): Promise<WorkAccess | null> {
+  // Analyst requests deliberately admit a restricted workspace membership;
+  // recheck the exact project before any Work domain read or mutation.
+  if (principal.kind === 'human' && /^\/app\/teams\/[^/]+\/projects\/[^/]+\/analyst(?:\/|$)/.test(currentSecurityPrincipal()?.path ?? '') &&
+      await authorizeSecurity(db, 'project_read', { team_id: teamId, project_id: projectId, user_id: principal.userId })) return null;
   if (principal.kind === 'agent') {
     if (!(await collaborationAccess(db, principal.userId, teamId, projectId, principal.grant))) return null;
   }

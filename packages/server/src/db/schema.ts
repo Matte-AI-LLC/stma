@@ -100,12 +100,13 @@ export const executionAttempts = pgTable('execution_attempts', {
 
 export const executionAttemptGrants = pgTable('execution_attempt_grants', {
   id: uuid('id').primaryKey().defaultRandom(),
-  attemptId: uuid('attempt_id').notNull().references(() => executionAttempts.id, { onDelete: 'cascade' }).unique(),
+  attemptId: uuid('attempt_id').notNull().references(() => executionAttempts.id, { onDelete: 'cascade' }),
+  purpose: text('purpose').notNull().default('supervisor'),
   parentTokenId: uuid('parent_token_id').notNull().references(() => tokens.id, { onDelete: 'cascade' }),
   tokenHash: text('token_hash').notNull().unique(),
   expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
   revokedAt: timestamp('revoked_at', { withTimezone: true }),
-}, (t) => [index('execution_grants_parent_token').on(t.parentTokenId)]);
+}, (t) => [index('execution_grants_parent_token').on(t.parentTokenId), unique('execution_grants_attempt_purpose').on(t.attemptId, t.purpose), check('execution_grants_purpose', sql`${t.purpose} in ('supervisor', 'readonly_child')`)]);
 
 export const executionEvents = pgTable('execution_events', {
   id: uuid('id').primaryKey().defaultRandom(),
@@ -331,6 +332,7 @@ export const tokens = pgTable(
      * the user deliberately asks for it) the same personal/cross-team reach.
      */
     scope: text('scope').notNull().default('personal'),
+    accessMode: text('access_mode').notNull().default('standard'),
     teamId: uuid('team_id').references(() => teams.id, { onDelete: 'cascade' }),
     projectId: uuid('project_id').references(() => projects.id, { onDelete: 'cascade' }),
     tokenHash: text('token_hash').notNull().unique(),
@@ -351,6 +353,7 @@ export const tokens = pgTable(
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [
+    check('tokens_access_mode', sql`${t.accessMode} = 'standard' or (${t.accessMode} = 'analyst' and ${t.scope} = 'project')`),
     check(
       'tokens_scope_target',
       sql`(${t.scope} = 'personal' and ${t.teamId} is null and ${t.projectId} is null)
