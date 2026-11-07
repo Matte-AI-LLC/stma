@@ -47,6 +47,9 @@ export const CRITICAL_AUDIT_ACTIONS = [
   'execution_disabled',
   'execution_dispatched',
   'execution_cancelled',
+  'execution_dispatchers_changed',
+  'execution_capacity_changed',
+  'execution_capacity_reconciled',
 ] as const;
 export type CriticalAuditAction = (typeof CRITICAL_AUDIT_ACTIONS)[number];
 

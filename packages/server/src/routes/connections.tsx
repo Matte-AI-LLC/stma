@@ -1,4 +1,4 @@
-import { AGENT_CLIENT_TYPES, AGENT_ROLES, CLAUDE_APP_CLIENT, type AgentClientType, type ExecutionDetailDto, type ExecutionJobDto, type ExecutionTargetDto } from '@bridge/shared';
+import { AGENT_CLIENT_TYPES, AGENT_ROLES, CLAUDE_APP_CLIENT, type AgentClientType, type ExecutionJobDto, type ExecutionTargetDto } from '@bridge/shared';
 import { and, count, desc, eq, gt, inArray, isNull, max, or } from 'drizzle-orm';
 import { Hono, type Context } from 'hono';
 import type { Db } from '../db';
@@ -23,7 +23,12 @@ import {
   getExecution,
   listExecutionTargets,
   listExecutions,
+  readExecutionControls,
+  reconcileExecutionCapacity,
+  setExecutionCapacity,
+  setExecutionDispatchers,
   setExecutionTargetEnabled,
+  type ExecutionConsoleDetail,
 } from '../domain/execution';
 import { humanPrincipal } from '../domain/workTypes';
 import { revokeAgentInstallation } from '../domain/agents';
@@ -715,8 +720,9 @@ interface PageProps {
   filterQuery: string;
   executionTargets: ExecutionTargetDto[];
   executions: ExecutionJobDto[];
-  executionDetail?: ExecutionDetailDto;
+  executionDetail?: ExecutionConsoleDetail;
   executionError?: string;
+  executionControls?: Exclude<Awaited<ReturnType<typeof readExecutionControls>>, { error: unknown }>;
 }
 
 const ConnectionsPage = (props: PageProps) => {
@@ -1364,6 +1370,7 @@ const ConnectionsPage = (props: PageProps) => {
           targets={props.executionTargets}
           jobs={props.executions}
           detail={props.executionDetail}
+          controls={props.executionControls}
           back={back}
           pageHref={pageHref}
         />
@@ -1706,11 +1713,14 @@ async function renderConnections(
     ? []
     : targetsResult.targets.filter((target) => target.team_id === scope.team.id);
   const targetIds = new Set(executionTargets.map((target) => target.id));
+  const controls = scope.team.role === 'owner'
+    ? await readExecutionControls(db, principal, scope.team.id, [...targetIds])
+    : undefined;
   const executionsResult = targetError ? undefined : await listExecutions(db, principal, scope.project?.id, 100);
   const executions = !executionsResult || 'error' in executionsResult
     ? []
     : executionsResult.jobs.filter((job) => targetIds.has(job.target_id)).slice(0, 30);
-  let executionDetail: ExecutionDetailDto | undefined;
+  let executionDetail: ExecutionConsoleDetail | undefined;
   let executionReadError = targetError ?? (executionsResult && 'error' in executionsResult ? executionsResult.error.message : undefined);
   if (query.execution && isCanonicalUuid(query.execution)) {
     const detail = await getExecution(db, principal, query.execution);
@@ -1750,6 +1760,7 @@ async function renderConnections(
       executions={executions}
       executionDetail={executionDetail}
       executionError={executionReadError}
+      executionControls={controls && !('error' in controls) ? controls : undefined}
     />,
     answer.refused ? 422 : 200,
   );
@@ -2001,7 +2012,7 @@ connectionsRoutes.post('/app/tokens', async (c) => {
  * its name search kept and every state shown, so the row just revoked stays in
  * view instead of vanishing from an "active" filter.
  */
-async function connectionReturn(c: Context<AppEnv>, message: string, ok = true) {
+async function connectionReturn(c: Context<AppEnv>, message: string, ok = true, anchor = 'connections') {
   const body = (await c.req.parseBody()) as Record<string, unknown>;
   const params = new URLSearchParams({ [ok ? 'ok' : 'error']: message });
   const q = typeof body.back_q === 'string' ? body.back_q : typeof body.filter_q === 'string' ? body.filter_q : '';
@@ -2013,10 +2024,44 @@ async function connectionReturn(c: Context<AppEnv>, message: string, ok = true) 
   if (teamSlug) {
     const scope = await scopeFor(c.get('db'), c.get('user')!.id, teamSlug, (text('back_project') || text('filter_project')) || undefined)
       ?? await scopeFor(c.get('db'), c.get('user')!.id, teamSlug);
-    if (scope) return c.redirect(`${connectionsHref(scope.team.slug, scope.project?.slug ?? null)}?${params}#${isCanonicalUuid(execution) ? 'managed-execution' : 'connections'}`);
+    if (scope) return c.redirect(`${connectionsHref(scope.team.slug, scope.project?.slug ?? null)}?${params}#${isCanonicalUuid(execution) ? 'managed-execution' : anchor}`);
   }
   return c.redirect(`/app/tokens?${params}`);
 }
+
+connectionsRoutes.post('/app/teams/:slug/connections/execution-capacity', async (c) => {
+  const user = c.get('user');
+  if (!user) return loginRedirect(c);
+  const db = c.get('db');
+  const scope = await scopeFor(db, user.id, c.req.param('slug'));
+  if (!scope) return c.notFound();
+  const body = await c.req.parseBody();
+  if (typeof body.execution_cap !== 'string' || (body.execution_cap !== '' && !/^\d+$/.test(body.execution_cap))) {
+    return connectionReturn(c, 'Enter a whole number or leave the cap blank.', false, 'managed-execution');
+  }
+  const cap = body.execution_cap ? Number(body.execution_cap) : null;
+  const result = await setExecutionCapacity(db, humanPrincipal(user.id), scope.team.id, cap);
+  return 'error' in result
+    ? connectionReturn(c, result.error.message, false, 'managed-execution')
+    : connectionReturn(c, 'Workspace execution cap saved.', true, 'managed-execution');
+});
+
+connectionsRoutes.post('/app/execution-targets/:id/dispatchers', async (c) => {
+  const user = c.get('user');
+  if (!user) return loginRedirect(c);
+  const targetId = c.req.param('id');
+  if (!isCanonicalUuid(targetId)) return c.notFound();
+  const body = await c.req.parseBody({ all: true });
+  const selected = Array.isArray(body.dispatcher_id) ? body.dispatcher_id : body.dispatcher_id ? [body.dispatcher_id] : [];
+  if (!selected.every(isCanonicalUuid) || (body.dispatcher_mode !== 'any' && body.dispatcher_mode !== 'allowlist')) {
+    return connectionReturn(c, 'Choose a dispatcher policy and current workspace members.', false, 'managed-execution');
+  }
+  const result = await setExecutionDispatchers(c.get('db'), humanPrincipal(user.id), targetId,
+    body.dispatcher_mode === 'any' ? null : selected);
+  return 'error' in result
+    ? connectionReturn(c, result.error.message, false, 'managed-execution')
+    : connectionReturn(c, 'Target dispatcher policy saved.', true, 'managed-execution');
+});
 
 connectionsRoutes.post('/app/execution-targets/:id/enable', async (c) => {
   const user = c.get('user');
@@ -2048,6 +2093,29 @@ connectionsRoutes.post('/app/executions/:id/cancel', async (c) => {
     : connectionReturn(c, result.job.state === 'cancelled'
       ? 'The execution is cancelled. Review its last state before treating the task as delivered.'
       : 'Cancellation requested. The worker must report the process stopped; this request is not confirmation.', true);
+});
+
+connectionsRoutes.post('/app/executions/:id/reconcile-capacity', async (c) => {
+  const user = c.get('user');
+  if (!user) return loginRedirect(c);
+  const jobId = c.req.param('id');
+  if (!isCanonicalUuid(jobId)) return c.notFound();
+  const body = await c.req.parseBody();
+  if (typeof body.reason !== 'string' || typeof body.expected_state !== 'string' || !isCanonicalUuid(body.request_id) ||
+      typeof body.grant_version !== 'string' || !/^\d+$/.test(body.grant_version)) {
+    return c.text('Review the execution and confirm the local stop before releasing capacity.', 400);
+  }
+  const result = await reconcileExecutionCapacity(c.get('db'), humanPrincipal(user.id), jobId, {
+    requestId: body.request_id,
+    expectedState: body.expected_state,
+    expectedGrantVersion: Number(body.grant_version),
+    verifiedStopped: body.verified_stopped === 'yes',
+    reason: body.reason,
+  });
+  if ('error' in result && result.error.code === 'NOT_FOUND') return c.notFound();
+  return 'error' in result
+    ? connectionReturn(c, result.error.message, false, 'managed-execution')
+    : connectionReturn(c, 'Workspace slot released by owner attestation. The execution and checkout remain quarantined.', true, 'managed-execution');
 });
 
 connectionsRoutes.post('/app/enrollments/:id/revoke', async (c) => {

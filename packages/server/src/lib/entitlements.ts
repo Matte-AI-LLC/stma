@@ -120,6 +120,8 @@ export interface PlanLimits {
    * the only place the reason to upgrade is visible.
    */
   fleet: FleetAccess;
+  /** Workspace owner policies for managed execution across targets. */
+  executionControls: boolean;
   /** Publishing policy, receipts and drift, preflight, the governance screen. */
   governance: boolean;
   /**
@@ -158,6 +160,7 @@ export const PLANS = {
     maxIntegrations: 1,
     retentionDays: 90,
     fleet: 'readonly',
+    executionControls: false,
     governance: false,
     evidence: true,
     savings: false,
@@ -173,6 +176,7 @@ export const PLANS = {
     maxIntegrations: 1,
     retentionDays: 365,
     fleet: 'full',
+    executionControls: false,
     // Rules for your own agents is exactly the Solo case: one person, several
     // machines, and no other human to agree with.
     governance: true,
@@ -192,6 +196,7 @@ export const PLANS = {
     maxIntegrations: null,
     retentionDays: null,
     fleet: 'full',
+    executionControls: true,
     governance: true,
     evidence: true,
     savings: true,
@@ -205,6 +210,7 @@ export const PLANS = {
     maxIntegrations: null,
     retentionDays: null,
     fleet: 'full',
+    executionControls: true,
     governance: true,
     evidence: true,
     savings: true,
@@ -233,6 +239,7 @@ export const UNMETERED: PlanLimits = {
   maxIntegrations: null,
   retentionDays: null,
   fleet: 'full',
+  executionControls: true,
   governance: true,
   evidence: true,
   savings: true,

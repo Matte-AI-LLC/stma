@@ -12,6 +12,7 @@ import {
 import { RESPONSE_ALREADY_SENT } from '@hono/node-server/utils/response';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
 import {
   and,
   count,
@@ -50,6 +51,8 @@ import { randomCode } from '../lib/crypto';
 import { installationForOwner } from '../domain/agents';
 import { assignableAgents } from '../domain/assignments';
 import { projectForTeam } from '../domain/access';
+import { postWorkAnswer, withWorkQuestionContext, type ThreadMessage, type WorkQuestionContext } from '../domain/workQuestions';
+import { agentPrincipal } from '../domain/workTypes';
 import type { Env } from '../env';
 import {
   describeDevices,
@@ -89,6 +92,7 @@ import {
 } from '../lib/sessions';
 import { track } from '../lib/track';
 import { logLine } from '../lib/log';
+import { afterExecutionCommit } from '../lib/executionSecurity';
 import { ANALYST_TOOLS, guardMcpToolCall, type AgentGrant } from '../lib/grants';
 import { SNAPSHOT_CHECKLIST } from '../mcp/checklist';
 import { requireAnnotations } from '../mcp/annotations';
@@ -1159,11 +1163,13 @@ export function buildMcpServer(
       inputSchema: {
         session_id: z.string().describe('Session id (see list_sessions or inbox).'),
         max_messages: z.number().int().min(1).max(200).optional().describe('Maximum newest whole messages (default 200); omitted older messages are reported.'),
+        work_question_id: z.string().optional().describe('Read one exact Work question addressed to this installation.'),
       },
     },
-    async ({ session_id, max_messages }) => {
+    async ({ session_id, max_messages, work_question_id }) => {
       const found = await sessionForMember(db, session_id, user.id);
       if (!found) return err('No such session in your teams.');
+      const principal = agentPrincipal(user.id, grant);
       // Newest-first with the order restored for reading: taking the oldest 200
       // and then marking the thread read made the most recent messages
       // unreachable through this tool, and cleared the unread flag that was the
@@ -1175,61 +1181,79 @@ export function buildMcpServer(
       // budget is spent, the newest always; the rest stay on the web thread and
       // the reply says so, as it did for the 201st.
       const CHARACTER_BUDGET = 90_000;
-      const newest = await db
+      const newest = work_question_id !== undefined ? [] : await db
         .select({ m: messages, author: users.username })
         .from(messages)
         .leftJoin(users, eq(messages.authorId, users.id))
         .where(eq(messages.sessionId, found.session.id))
         .orderBy(desc(messages.createdAt))
         .limit(MESSAGE_WINDOW + 1);
-      const kept: typeof newest = [];
-      let used = 0;
-      for (const row of newest.slice(0, MESSAGE_WINDOW)) {
-        const size =
-          row.m.body.length + JSON.stringify(row.m.attachments ?? null).length + JSON.stringify(row.m.payload ?? null).length;
-        if (kept.length > 0 && used + size > CHARACTER_BUDGET) break;
-        kept.push(row);
-        used += size;
-      }
-      const truncated = newest.length > kept.length;
-      const msgs = kept.reverse();
       // Reading marks read; writing no longer does. Stamping the thread on
       // behalf of the person every time one of their agents posted is what hid
       // their own fleet's work from them on every other surface they own.
       // A read belongs to this connection, not all of the owner's devices or browser.
       // Use the newest returned message, not wall time after fetching: a concurrent
       // message which was not returned must stay unread.
-      if (msgs.length) await markRead(db, user.id, found.session.id, grant.tokenId, msgs.at(-1)!.m.id);
-      const hasHandoff = msgs.some((r) => r.m.kind === 'handoff' && r.m.payload !== null);
-      const allYours = msgs.length > 0 && msgs.every((r) => r.m.authorId === user.id);
+      // The newest is always kept. The exact question path leaves this cursor alone.
+      if (newest.length) await markRead(db, user.id, found.session.id, grant.tokenId, newest[0]!.m.id);
       const [handoff] = await db.select().from(handoffs).where(eq(handoffs.sessionId, found.session.id));
-      logLine({ evt: 'session', a: 'read', installation: grant.installationId, session: found.session.id, messageIds: msgs.map((r) => r.m.id) });
-      return text({
-        notice: sessionNotice({ hasHandoff, allYours }),
-        handoff: handoff ? { id: handoff.id, state: handoff.state, acceptedBy: handoff.acceptedBy, installationId: handoff.installationId, updatedAt: handoff.updatedAt, provenance: 'Authenticated lifecycle reports, not provider verification.' } : null,
-        truncated: truncated
-          ? `Showing the ${msgs.length} most recent messages; older ones are on the web thread.`
-          : undefined,
-        session: {
-          sessionId: found.session.id,
-          team: found.team.slug,
-          title: found.session.title,
-          status: found.session.status,
-          openedAt: found.session.createdAt.toISOString(),
-          resolution: (found.session.resolution as SessionResolution | null) ?? null,
-        },
-        messages: msgs.map((r) => ({
-          author: r.author,
-          mine: r.m.authorId === user.id,
-          via: r.m.via,
-          kind: r.m.kind,
-          at: r.m.createdAt.toISOString(),
-          body: r.m.body,
-          // STMA's own record of the run being handed over — see the notice.
-          resume: r.m.payload ?? undefined,
-          attachments: r.m.attachments ?? undefined,
-        })),
-      });
+      const build = (questions?: WorkQuestionContext) => {
+        const candidates = questions?.exact ? [questions.exact] : newest;
+        const kept: ThreadMessage[] = [];
+        let used = 0;
+        for (const row of candidates.slice(0, MESSAGE_WINDOW)) {
+          const meta = questions?.metadata.get(row.m.id);
+          const size = row.m.body.length + JSON.stringify(row.m.attachments ?? null).length +
+            JSON.stringify(row.m.payload ?? null).length + (meta ? JSON.stringify({ work_question: meta }).length : 0);
+          if (kept.length > 0 && used + size > CHARACTER_BUDGET) break;
+          kept.push(row);
+          used += size;
+        }
+        const truncated = candidates.length > kept.length;
+        const msgs = kept.reverse();
+        const ids = msgs.map((row) => row.m.id);
+        const includedIds = new Set(ids);
+        const pending = questions?.pending.filter((id) => !includedIds.has(id));
+        const hasHandoff = msgs.some((r) => r.m.kind === 'handoff' && r.m.payload !== null);
+        const allYours = msgs.length > 0 && msgs.every((r) => r.m.authorId === user.id);
+        const result = text({
+          notice: sessionNotice({ hasHandoff, allYours }),
+          handoff: handoff ? { id: handoff.id, state: handoff.state, acceptedBy: handoff.acceptedBy, installationId: handoff.installationId, updatedAt: handoff.updatedAt, provenance: 'Authenticated lifecycle reports, not provider verification.' } : null,
+          truncated: truncated ? `Showing the ${msgs.length} most recent messages; older ones are on the web thread.` : undefined,
+          session: {
+            sessionId: found.session.id,
+            team: found.team.slug,
+            title: found.session.title,
+            status: found.session.status,
+            openedAt: found.session.createdAt.toISOString(),
+            resolution: (found.session.resolution as SessionResolution | null) ?? null,
+          },
+          messages: msgs.map((r) => ({
+            author: r.author,
+            mine: r.m.authorId === user.id,
+            via: r.m.via,
+            kind: r.m.kind,
+            at: r.m.createdAt.toISOString(),
+            body: r.m.body,
+            // STMA's own record of the run being handed over — see the notice.
+            resume: r.m.payload ?? undefined,
+            attachments: r.m.attachments ?? undefined,
+            work_question: questions?.metadata.get(r.m.id),
+          })),
+          ...(pending?.length ? { pending_work_questions: pending,
+            pending_work_question_hint: 'Read a pending question with get_session and its work_question_id.' } : {}),
+        });
+        return { result: { reply: result, ids }, included: ids };
+      };
+      const tracked = handoff?.targetInstallationId === principal.installationId
+        ? await withWorkQuestionContext(db, principal, found.session.id, {
+          exactId: work_question_id, candidates: newest.slice(0, MESSAGE_WINDOW).map(({ m }) => m.id),
+        }, build)
+        : undefined;
+      if (!tracked && work_question_id !== undefined) return err('No current Work question is available in this assignment.');
+      const { reply, ids } = tracked ?? build().result;
+      logLine({ evt: 'session', a: 'read', installation: grant.installationId, session: found.session.id, messageIds: ids });
+      return reply;
     },
   );
 
@@ -1246,9 +1270,28 @@ export function buildMcpServer(
         kind: kindParam,
         attachments: attachmentsParam,
         via: viaParam,
+        reply_to_message_id: z.string().optional().describe('Answer one Work question explicitly by its message id.'),
       },
     },
-    async ({ session_id, body, kind, attachments, via }) => {
+    async ({ session_id, body, kind, attachments, via, reply_to_message_id }) => {
+      if (reply_to_message_id !== undefined) {
+        const answer = await postWorkAnswer(db, agentPrincipal(user.id, grant), session_id, {
+          questionId: reply_to_message_id, body, via, kind, attachments,
+        }, async (tx) => {
+          const hit = await hitCounter(tx, 'loop', `${session_id.toLowerCase()}:${user.id}`, LOOP_GUARD_WINDOW_MS, LOOP_GUARD_MAX);
+          if (hit.exceeded) metrics.recordLoopGuardTrip();
+          return !hit.exceeded;
+        });
+        if ('error' in answer) return err(answer.error);
+        if (!answer.replayed) await afterExecutionCommit(db, async (committed) => {
+          await notifySessionActivity(committed, env, { sessionId: session_id, teamId: answer.teamId,
+            actorId: user.id, kind: 'session_reply', at: answer.at });
+          await track(committed, { teamId: answer.teamId, projectId: answer.projectId, userId: user.id,
+            tokenId, action: 'post_message', detail: 'Answered a Work question' });
+        });
+        return text({ ok: true, sessionId: session_id.toLowerCase(), message_id: answer.messageId,
+          reply_to_message_id: answer.questionId, replayed: answer.replayed });
+      }
       if (kind !== undefined && !isThreadMessageKind(kind)) return err(kindRefusal(kind));
       const found = await sessionForMember(db, session_id, user.id);
       if (!found) return err('No such session in your teams.');
@@ -1604,8 +1647,8 @@ export const TOOL_PARAMS: Record<string, readonly string[]> = {
   announce: ['team', 'body', 'repo', 'via'],
   open_session: ['title', 'team', 'repo', 'body', 'kind', 'attachments', 'via'],
   list_sessions: ['team', 'project', 'status', 'limit'],
-  get_session: ['session_id', 'max_messages'],
-  post_message: ['session_id', 'body', 'kind', 'attachments', 'via'],
+  get_session: ['session_id', 'max_messages', 'work_question_id'],
+  post_message: ['session_id', 'body', 'kind', 'attachments', 'via', 'reply_to_message_id'],
   resolve_session: ['session_id', 'root_cause', 'fix', 'via'],
   inbox: ['team', 'project'],
   search_past_issues: ['query', 'team', 'project'],
@@ -1760,10 +1803,13 @@ mcpRoutes.post('/mcp', mcpAuth, mcpLimiter, async (c) => {
     c.get('mcpToken'),
     c.get('mcpGrant'),
   );
-  const transport = new StreamableHTTPServerTransport({
+  const transportOptions = {
     sessionIdGenerator: undefined,
     enableJsonResponse: true,
-  });
+  };
+  const transport = c.get('mcpGrant').execution
+    ? new WebStandardStreamableHTTPServerTransport(transportOptions)
+    : new StreamableHTTPServerTransport(transportOptions);
   const send = transport.send.bind(transport);
   transport.send = async (message, options) => {
     const call = 'id' in message
@@ -1835,6 +1881,16 @@ mcpRoutes.post('/mcp', mcpAuth, mcpLimiter, async (c) => {
       session: typeof call.params.arguments?.session_id === 'string' && /^[a-f0-9-]{36}$/i.test(call.params.arguments.session_id) ? call.params.arguments.session_id : undefined,
     });
   };
+  if (transport instanceof WebStandardStreamableHTTPServerTransport) {
+    // Return the prepared JSON to Hono so the attempt fence can still roll
+    // back and substitute a refusal before anything goes to the client.
+    await server.connect(transport);
+    try {
+      return await transport.handleRequest(c.req.raw, { parsedBody: body });
+    } finally {
+      await server.close();
+    }
+  }
   c.env.outgoing.on('close', () => {
     void transport.close();
     void server.close();

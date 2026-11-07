@@ -35,10 +35,9 @@ export const legalRoutes = new Hono<AppEnv>();
  * report; what STMA checks is the receiver's resume against it. A description
  * that promised less is not a material change either.
  */
-const TERMS_EFFECTIVE = '2 November 2026';
-// Moved on 2 November 2026 to describe the optional hosted analyst: its
-// Azure request data, returned report data, and lazy retention behavior.
-const PRIVACY_EFFECTIVE = '2 November 2026';
+const TERMS_EFFECTIVE = '6 November 2026';
+// Optional project Azure keys and the separate estimated-cost ledger.
+const PRIVACY_EFFECTIVE = '6 November 2026';
 const SUPPORT = 'support@stma.ai';
 const PRIVACY = 'gdpr@matteai.com';
 /**
@@ -595,7 +594,11 @@ const termsSections = (): Section[] => [
           snapshots and Knowledge records, stays with those workspaces as part of their shared
           record; snapshots are deleted when they reach their 90-day limit, and activity entries
           when they reach the workspace's history limit. Your managed analyst questions, reports,
-          source records and request/idempotency metadata are deleted with your account. Before you
+          source records and request/idempotency metadata are deleted with your account. The workspace's
+          separate estimated-cost ledger retains numeric token usage, amounts, price versions and
+          project/report identifiers until the workspace is deleted; it contains no question or report
+          content and no requester identity. Project Azure keys belong to the workspace and are removed
+          when revoked or when their project or workspace is deleted. Before you
           can delete your account you
           must hand over or delete every workspace of which you are the only owner, and finish your
           active agent runs.
@@ -975,7 +978,12 @@ const privacySections = (): Section[] => [
             and the returned report. We send the question and selected context to the Azure OpenAI
             endpoint configured for that project. We store the report with its requester, the
             configured provider host and deployment, its status and source references, and numeric
-            provider-reported token usage when available. The usage figure is not a dollar charge.
+            provider-reported token usage when available. The separate cost ledger stores approved
+            price versions, estimated amounts and unresolved reservations; these are estimates, not
+            STMA usage charges. Where project key setup is enabled, we store the owner's Azure API
+            key encrypted, its resource/deployment binding and the accepted consent version. Keys
+            are not redisplayed. Connecting checks catalog access; subsequent analysis sends the
+            question and selected Work context to the configured Azure deployment.
           </li>
           <li>
             <b>Agent run data:</b> for each run, its task and intent, repository, branch and commit,
@@ -1307,6 +1315,14 @@ const privacySections = (): Section[] => [
             [
               'Managed analyst reports and source snapshots',
               'Eligible for pruning after 30 days; pruning happens on a later analysis request, not on a guaranteed clock schedule. Your report rows and request/idempotency metadata are deleted with your account or project',
+            ],
+            [
+              'Managed analyst cost ledger',
+              'Until workspace deletion. Numeric usage, estimates, reservations, price versions and project/report identifiers survive report, account and project deletion; no question/report content or requester identity is stored in this ledger',
+            ],
+            [
+              'Encrypted project Azure API keys',
+              'Until replaced, revoked, or the project or workspace is deleted. Revocation in STMA does not revoke the key at Azure or retract data already sent',
             ],
             ['Error records', '30 days'],
             ['Application logs', '30 days'],

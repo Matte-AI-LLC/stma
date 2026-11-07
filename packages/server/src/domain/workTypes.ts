@@ -34,10 +34,10 @@ export type WorkPrincipal =
  */
 export type WorkActor = WorkPrincipal | { kind: 'system' };
 
-export const humanPrincipal = (userId: string): WorkPrincipal => ({ kind: 'human', userId });
+export const humanPrincipal = (userId: string): Extract<WorkPrincipal, { kind: 'human' }> => ({ kind: 'human', userId });
 
 /** The agent principal of one authenticated bearer request. */
-export const agentPrincipal = (userId: string, grant: AgentGrant): WorkPrincipal => ({
+export const agentPrincipal = (userId: string, grant: AgentGrant): Extract<WorkPrincipal, { kind: 'agent' }> => ({
   kind: 'agent',
   userId,
   installationId: grant.installationId,

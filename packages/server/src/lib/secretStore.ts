@@ -133,3 +133,25 @@ export async function resealAuthSecret(reference: string, userId: string): Promi
   if ((await openAuthSecret(sealed, userId)) !== plain) throw new Error('Encryption roundtrip failed.');
   return sealed;
 }
+
+/** Strict integration sealing for features that cannot accept plaintext compatibility mode. */
+export function integrationSecretKeyAvailable() {
+  try {
+    return configured() !== undefined;
+  } catch {
+    return false;
+  }
+}
+
+export async function sealIntegrationSecret(value: string, context: string) {
+  const store = configured();
+  if (!store) throw new Error('An integration encryption key is required.');
+  return store.seal(value, context);
+}
+
+export async function openSealedIntegrationSecret(reference: string, context: string) {
+  if (!reference.startsWith('enc:')) throw new Error('Integration credential is not sealed.');
+  const store = configured();
+  if (!store) throw new Error('An integration encryption key is required.');
+  return store.open(reference, context);
+}

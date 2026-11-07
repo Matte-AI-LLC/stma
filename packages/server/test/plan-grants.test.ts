@@ -497,6 +497,8 @@ describe('the beta ledger measures a workspace against the plan it lands on', ()
     const page = await (await get('/admin/beta', admin)).text();
     expect(page).toContain('data-lands-on="team"');
     expect(page).toContain('Given a plan');
+    expect(page).toContain('Fleet signs include recent runs, enabled worker targets and queued jobs');
+    expect(page).toContain('an enabled target alone does not prove that a worker has run');
     expect(page).not.toContain('Distance to the free ceilings');
     // The card note says what the rows say: evidence is kept, never a `?`.
     expect(page).toContain('Run evidence is on every plan, so its square reads kept on every row');

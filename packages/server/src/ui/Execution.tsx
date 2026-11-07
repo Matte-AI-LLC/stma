@@ -1,4 +1,6 @@
-import type { ExecutionDetailDto, ExecutionJobDto, ExecutionTargetDto } from '@bridge/shared';
+import { randomUUID } from 'node:crypto';
+import type { ExecutionJobDto, ExecutionTargetDto } from '@bridge/shared';
+import { EXECUTION_POLICY_LIMIT, EXECUTION_RECONCILIATION_REASON_LIMIT, type ExecutionConsoleDetail } from '../domain/execution';
 import type { Child } from 'hono/jsx';
 
 const readinessLabel: Record<ExecutionTargetDto['readiness'], string> = {
@@ -40,11 +42,13 @@ const TargetCard = ({
   userId,
   workspaceOwner,
   back,
+  dispatcherPolicy,
 }: {
   target: ExecutionTargetDto;
   userId: string;
   workspaceOwner: boolean;
   back: Child;
+  dispatcherPolicy?: { dispatchers: string[] | null; members: { id: string; username: string }[] };
 }) => {
   const canEnable = target.owner_id === userId && !target.enabled && !target.quarantined;
   const canDisable = target.enabled && (target.owner_id === userId || workspaceOwner);
@@ -87,6 +91,34 @@ const TargetCard = ({
         Readiness requires a recent worker heartbeat. An ordinary MCP connection does not make this target ready.
         Workers run as the same OS user. An optional user service is installed separately and does not wake the machine.
       </p>
+      {dispatcherPolicy ? (
+        <details>
+          <summary class="small">Dispatchers · {dispatcherPolicy.dispatchers === null ? 'Any authorized member' : `${dispatcherPolicy.dispatchers.length} allowed`}</summary>
+          {dispatcherPolicy.members.length > EXECUTION_POLICY_LIMIT ? (
+            <p class="small">This workspace has more than {EXECUTION_POLICY_LIMIT} members. The dispatcher editor cannot show the complete member list.</p>
+          ) : (
+            <form method="post" action={`/app/execution-targets/${target.id}/dispatchers`} style="display:flex;flex-direction:column;gap:8px;margin-top:8px">
+              {back}
+              <label for={`dispatcher-mode-${target.id}`}>Who can dispatch to this target</label>
+              <select class="in" id={`dispatcher-mode-${target.id}`} name="dispatcher_mode">
+                <option value="any" selected={dispatcherPolicy.dispatchers === null}>Any authorized member</option>
+                <option value="allowlist" selected={dispatcherPolicy.dispatchers !== null}>Only selected members</option>
+              </select>
+              <label for={`dispatchers-${target.id}`}>Allowed members</label>
+              <select class="in" id={`dispatchers-${target.id}`} name="dispatcher_id" multiple size={Math.min(6, Math.max(2, dispatcherPolicy.members.length))}>
+                {dispatcherPolicy.members.map((member) => (
+                  <option value={member.id} selected={dispatcherPolicy.dispatchers?.includes(member.id)}>{member.username}</option>
+                ))}
+              </select>
+              <p class="small muted m0">
+                This list applies to the person's console and agent credentials. Removing access cancels their queued jobs and requests active workers to stop.
+                An empty selected list blocks dispatch to this target.
+              </p>
+              <button class="btn btn-sm" type="submit" style="align-self:flex-start">Save dispatchers</button>
+            </form>
+          )}
+        </details>
+      ) : null}
     </article>
   );
 };
@@ -98,6 +130,7 @@ export const ManagedExecution = ({
   targets,
   jobs,
   detail,
+  controls,
   back,
   pageHref,
 }: {
@@ -106,7 +139,12 @@ export const ManagedExecution = ({
   userId: string;
   targets: ExecutionTargetDto[];
   jobs: ExecutionJobDto[];
-  detail?: ExecutionDetailDto;
+  detail?: ExecutionConsoleDetail;
+  controls?: {
+    cap: number | null;
+    targets: { id: string; dispatchers: string[] | null }[];
+    members: { id: string; username: string }[];
+  };
   back: Child;
   pageHref: string;
 }) => (
@@ -133,9 +171,30 @@ export const ManagedExecution = ({
         operations end as <code>needs_input</code> when stopping is verified; uncertain stops quarantine the checkout.
       </p>
     </div>
+    {controls ? (
+      <div class="card card-pad">
+        <div class="card-title">Workspace execution cap</div>
+        <p class="small muted">
+          This cap covers every managed target in the workspace. Queued jobs reserve a slot.
+          Active jobs keep their slots until the worker reports a stop. Unresolved jobs keep theirs until a workspace owner
+          verifies the process stopped on its machine and records that verification in the execution detail.
+        </p>
+        <form method="post" action={`/app/teams/${encodeURIComponent(teamSlug)}/connections/execution-capacity`} style="display:flex;flex-wrap:wrap;align-items:center;gap:8px">
+          {back}
+          <label for="execution-cap">Concurrent job reservations</label>
+          <input class="in" id="execution-cap" name="execution_cap" type="number" min={1} max={EXECUTION_POLICY_LIMIT}
+            value={controls.cap ?? ''} placeholder="No workspace cap" style="max-width:11rem" />
+          <button class="btn btn-sm" type="submit">Save cap</button>
+        </form>
+      </div>
+    ) : null}
     {targets.length ? (
       <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,320px),1fr));gap:12px">
-        {targets.map((target) => <TargetCard target={target} userId={userId} workspaceOwner={teamRole === 'owner'} back={back} />)}
+        {targets.map((target) => {
+          const policy = controls?.targets.find(row => row.id === target.id);
+          return <TargetCard target={target} userId={userId} workspaceOwner={teamRole === 'owner'} back={back}
+            dispatcherPolicy={policy && controls ? { dispatchers: policy.dispatchers, members: controls.members } : undefined} />;
+        })}
       </div>
     ) : (
       <div class="card card-pad">
@@ -144,7 +203,7 @@ export const ManagedExecution = ({
         <ol class="small" style="margin:10px 0 0;padding-left:20px">
           <li>Follow the <a href="/docs#tools-execution">setup guide</a> to connect and configure a dedicated checkout.</li>
           <li>Review and enable its target here, then run <code>stma worker start</code> on that machine.</li>
-          <li>Ask the assigning agent to use <code>dispatch_work</code> for the assignment and target. Assigning work alone does not start the worker.</li>
+          <li>Review and confirm execution from the assignment, or ask the assigning agent to use <code>dispatch_work</code>.</li>
         </ol>
       </div>
     )}
@@ -167,7 +226,7 @@ export const ManagedExecution = ({
     ) : targets.length ? (
       <div class="card card-pad">
         <b>No executions yet</b>
-        <p class="small m0" style="margin-top:6px">Once an enabled target is ready, ask the assigning agent to find it with <code>list_execution_targets</code> and call <code>dispatch_work</code> for the assignment. Assigning work alone does not start a worker. Executions and their reported results will appear here.</p>
+        <p class="small m0" style="margin-top:6px">Open an assignment to an enabled target and choose Review execution target. Agents can also call <code>dispatch_work</code>. Executions and their reported results will appear here.</p>
       </div>
     ) : null}
     {detail ? (
@@ -180,6 +239,26 @@ export const ManagedExecution = ({
         {detail.job.state === 'needs_input' ? <p class="small m0">Next step: open the worker machine and handle the provider permission, authentication or quota request. No broader permission is added automatically.</p> : null}
         {detail.job.state === 'cancel_requested' ? <p class="small m0">Cancellation was requested. Wait for a worker stop report; the process may still be running.</p> : null}
         {['dispatch_unknown', 'lost'].includes(detail.job.state) ? <p class="small m0">Inspect the worker machine. If process ownership cannot be verified, use a new dedicated checkout. Deleting the lock or killing a recorded PID is not verified recovery.</p> : null}
+        {detail.capacityReconciliation ? (
+          <p class="small m0">
+            Workspace slot released by {detail.capacityReconciliation.actor.label} on {new Date(detail.capacityReconciliation.attestedAt).toISOString().slice(0, 16).replace('T', ' ')} UTC.
+            The owner attested to a locally verified stop. Worker status and checkout quarantine still apply.
+            {' '}{detail.capacityReconciliation.reason}
+          </p>
+        ) : controls && detail.target.quarantined && ['dispatch_unknown', 'lost'].includes(detail.job.state) ? (
+          <form method="post" action={`/app/executions/${detail.job.id}/reconcile-capacity`} style="display:flex;flex-direction:column;gap:8px">
+            {back}
+            <input type="hidden" name="request_id" value={randomUUID()} />
+            <input type="hidden" name="expected_state" value={detail.job.state} />
+            <input type="hidden" name="grant_version" value={detail.target.grant_version} />
+            <b>Release this workspace slot</b>
+            <p class="small m0">This records your attestation for this execution. The checkout stays quarantined and the worker status stays as shown above.</p>
+            <label><input type="checkbox" name="verified_stopped" value="yes" required /> I verified on the worker machine that this execution's process tree stopped.</label>
+            <label for="capacity-release-reason">How you verified the stop</label>
+            <textarea class="in" id="capacity-release-reason" name="reason" rows={2} maxlength={EXECUTION_RECONCILIATION_REASON_LIMIT} required />
+            <button class="btn btn-sm" type="submit" style="align-self:flex-start">Record verification and release slot</button>
+          </form>
+        ) : null}
         {detail.events.slice(0, 5).map((event) => <div class="small muted">{event.state} · {event.reason} · {new Date(event.created_at).toISOString().slice(0, 16).replace('T', ' ')} UTC{event.detail ? ` · ${event.detail}` : ''}</div>)}
         {detail.can_cancel && activeState(detail.job.state) ? (
           <form method="post" action={`/app/executions/${detail.job.id}/cancel`} data-confirm="Request cancellation of this execution? The request revokes its child STMA credential. It does not prove the local process stopped." data-confirm-title="Request cancellation?" data-confirm-action="Request cancel">

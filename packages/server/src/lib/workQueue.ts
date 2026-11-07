@@ -1,7 +1,8 @@
 import { and, count, desc, eq, inArray, isNull, sql, type SQL } from 'drizzle-orm';
 import { alias } from 'drizzle-orm/pg-core';
 import type { Db } from '../db';
-import { projects, users, workItems, workRevisions } from '../db/schema';
+import { executionJobs, executionTargets, handoffs, projects, users, workBlockers, workItems, workLinks, workRevisions } from '../db/schema';
+import { OPEN_HANDOFF_STATES } from '../domain/workAccess';
 import { blockedWorkSql } from '../domain/workGraph';
 import { needsDecisionSql } from '../domain/workRead';
 
@@ -68,6 +69,8 @@ export interface QueueRow {
    * decide.
    */
   decisionIsMine: boolean;
+  blockerIsMine: boolean;
+  workerJobId: string | null;
   updatedAt: Date;
 }
 
@@ -77,6 +80,7 @@ export interface QueueSection {
 }
 
 export interface WorkQueue {
+  needsAction: QueueSection;
   needsDecision: QueueSection;
   mine: QueueSection;
   blocked: QueueSection;
@@ -87,11 +91,12 @@ export const QUEUE_ROWS = 25;
 
 const owners = alias(users, 'work_queue_owner');
 const acceptors = alias(users, 'work_queue_acceptor');
+const newerJobs = alias(executionJobs, 'work_queue_newer_job');
 
 /** Open work: not archived, and not already closed one way or the other. */
 const openWork = (): SQL => sql`(${workItems.archivedAt} is null and ${workItems.state} not in ('accepted', 'cancelled'))`;
 
-async function section(db: Db, where: SQL, userId: string): Promise<QueueSection> {
+async function section(db: Db, where: SQL, userId: string, action?: { blocker: SQL<boolean>; worker: SQL<string | null> }): Promise<QueueSection> {
   const [total] = await db.select({ n: count() }).from(workItems).where(where);
   const rows = await db
     .select({
@@ -105,6 +110,8 @@ async function section(db: Db, where: SQL, userId: string): Promise<QueueSection
       acceptor: acceptors.username,
       acceptorUserId: workItems.acceptorUserId,
       awaitingDecision: sql<boolean>`(${workItems.archivedAt} is null and ${needsDecisionWhere()})`,
+      blockerIsMine: action?.blocker ?? sql<boolean>`false`,
+      workerJobId: action?.worker ?? sql<null>`null`,
       updatedAt: workItems.updatedAt,
     })
     .from(workItems)
@@ -130,6 +137,8 @@ async function section(db: Db, where: SQL, userId: string): Promise<QueueSection
       owner: row.owner,
       acceptor: row.acceptor,
       decisionIsMine: row.acceptorUserId === userId && row.awaitingDecision === true,
+      blockerIsMine: row.blockerIsMine,
+      workerJobId: row.workerJobId,
       updatedAt: row.updatedAt,
     })),
   };
@@ -142,7 +151,31 @@ async function section(db: Db, where: SQL, userId: string): Promise<QueueSection
  */
 export async function workQueue(db: Db, teamId: string, userId: string): Promise<WorkQueue> {
   const inTeam = eq(workItems.teamId, teamId);
+  const blocker = sql<boolean>`exists (
+    select 1 from ${workBlockers} where ${workBlockers.workId} = ${workItems.id}
+      and ${workBlockers.ownerUserId} = ${userId} and ${workBlockers.resolvedAt} is null
+  )`;
+  // A later job can replace a terminal needs_input result for the same assignment.
+  // An unresolved process remains actionable even if the Work revision changes.
+  const worker = sql<string | null>`(
+    select ${executionJobs.id} from ${executionJobs} join ${executionTargets} on ${executionJobs.targetId} = ${executionTargets.id}
+    where ${executionJobs.workId} = ${workItems.id} and ${executionTargets.ownerId} = ${userId}
+      and ${executionTargets.teamId} = ${workItems.teamId} and ${executionTargets.projectId} = ${workItems.projectId}
+      and ((${executionJobs.state} = 'needs_input' and ${executionJobs.specRevision} = ${workItems.specRevision}
+        and exists (select 1 from ${workLinks} join ${handoffs} on ${handoffs.id} = ${workLinks.handoffId}
+          where ${workLinks.workId} = ${workItems.id} and ${workLinks.handoffId} = ${executionJobs.handoffId}
+            and ${workLinks.kind} = 'assignment' and ${workLinks.supersededAt} is null
+            and ${workLinks.specRevision} = ${workItems.specRevision} and ${inArray(handoffs.state, OPEN_HANDOFF_STATES)})
+        and not exists (select 1 from ${executionJobs} as ${sql.identifier('work_queue_newer_job')}
+          where ${newerJobs.handoffId} = ${executionJobs.handoffId}
+            and (${newerJobs.createdAt}, ${newerJobs.id}) > (${executionJobs.createdAt}, ${executionJobs.id})))
+        or (${executionJobs.state} in ('dispatch_unknown', 'lost') and ${executionJobs.capacityReconciliation} is null))
+    order by ${executionJobs.updatedAt} desc, ${executionJobs.id} desc limit 1
+  )`;
   return {
+    needsAction: await section(db, and(inTeam, openWork(), sql`(
+      (${workItems.acceptorUserId} = ${userId} and ${needsDecisionWhere()}) or ${blocker} or ${worker} is not null
+    )`)!, userId, { blocker, worker }),
     needsDecision: await section(db, and(inTeam, isNull(workItems.archivedAt), needsDecisionWhere())!, userId),
     mine: await section(
       db,

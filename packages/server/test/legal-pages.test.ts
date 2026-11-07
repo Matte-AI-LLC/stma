@@ -59,8 +59,8 @@ it('serves both documents to a stranger, with the addresses a person writes to',
       // 2026: the Privacy Policy for emailed invitations, and both for the
       // support address moving to support@stma.ai. The Terms again on 26
       // September, for a description that no longer calls a checkpoint verified,
-      // and both documents on 2 November for the hosted analyst data flow.
-      expect(html).toContain('Effective 2 November 2026');
+      // and on 6 November for project Azure keys and cost-ledger retention.
+      expect(html).toContain('Effective 6 November 2026');
       expect(html).not.toContain('verified git checkpoint');
       // Data protection and everything else go to different mailboxes, and both
       // are in both documents: somebody reading one must not have to find the

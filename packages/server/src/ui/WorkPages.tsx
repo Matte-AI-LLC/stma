@@ -4,6 +4,7 @@ import type { Child } from 'hono/jsx';
 import { timeAgo } from '../lib/format';
 import { connectionsHref } from '../lib/scope';
 import { PERSON_BLOCKER_KINDS, CRITERION_KINDS, EDIT_SPARE_ROWS, PROVIDERS, rowField, type CriterionRow } from '../lib/workForm';
+import type { WorkExecutionRow } from '../lib/workExecution';
 import type { QueueRow, WorkQueue } from '../lib/workQueue';
 import type { User } from '../types';
 import { Band, Field, PageHead, teamTrail, scopedTrail } from './Console';
@@ -649,6 +650,8 @@ const QueueTable = ({ rows, team }: { rows: QueueRow[]; team: string }) => (
             <td>
               <StatePill state={row.state} />
               {row.decisionIsMine ? <span class="pill pill-warn wk-gap">Yours to decide</span> : null}
+              {row.blockerIsMine ? <> <a href={`${workItemHref(team, row.projectSlug, row.key)}#blockers`}>Your blocker</a></> : null}
+              {row.workerJobId ? <> <a href={`${workItemHref(team, row.projectSlug, row.key)}?execution=${row.workerJobId}#execution-${row.workerJobId}`}>Check your worker</a></> : null}
             </td>
             <td class="small">
               <div>{row.owner ?? 'no owner'}</div>
@@ -671,7 +674,14 @@ export const WorkQueuePage = ({
   team: { slug: string; name: string };
   queue: WorkQueue;
 }) => {
-  const parts: { title: string; note: string; section: WorkQueue['mine']; empty: string }[] = [
+  const parts: { id?: string; title: string; note: string; section: WorkQueue['mine']; empty: string }[] = [
+    {
+      id: 'needs-your-action',
+      title: 'Needs your action',
+      note: 'Decisions assigned to you, open blockers you own, and managed executions that need attention on your worker.',
+      section: queue.needsAction,
+      empty: 'Nothing needs your action here.',
+    },
     {
       title: 'Waiting for a decision',
       note: 'In review with a delivery nobody has decided on. A person decides; the acceptor, or a workspace owner who gives a reason.',
@@ -712,7 +722,7 @@ export const WorkQueuePage = ({
       <div data-autorefresh="30" style="display:none"></div>
       <div class="wk-stack">
         {parts.map((part) => (
-          <section class="card">
+          <section class="card" id={part.id}>
             <div class="card-head">
               <div>
                 <div class="card-title">
@@ -1278,7 +1288,75 @@ export interface ExecutionRow {
   title: string;
   lines: string[];
   href: string | null;
+  dispatchHref?: string;
 }
+
+const MANAGED_STATE_LABEL: Record<WorkExecutionRow['state'], string> = {
+  queued: 'Queued',
+  leased: 'Claimed by worker',
+  starting: 'Spawn intent recorded',
+  running: 'Runtime session observed by worker',
+  needs_input: 'Human step needed',
+  cancel_requested: 'Cancellation requested',
+  succeeded: 'Turn finished · worker reported success',
+  failed: 'Worker reported a failure',
+  cancelled: 'Cancelled',
+  dispatch_unknown: 'Execution status unknown',
+  lost: 'Worker lease lost',
+};
+
+function executionObservation(row: WorkExecutionRow) {
+  if (row.capacityReconciliation) return 'A human recorded verification that the process stopped and released the capacity slot. This is separate from a worker stop report.';
+  if (row.state === 'cancel_requested') return 'Waiting for a worker stop report. The process may still be running.';
+  if (row.state === 'dispatch_unknown' || row.state === 'lost') return 'Process ownership is unresolved. Inspect the worker machine.';
+  if (!row.attemptId) return row.state === 'cancelled'
+    ? 'Cancelled before claim. No attempt was created.' : 'Waiting for the worker to claim this request.';
+  if (row.workerReportedStopped) return row.observedStartAt
+    ? 'The worker reported the process stopped.' : 'The worker reported no process remains. No runtime start was recorded.';
+  return row.observedStartAt ? null : 'The worker has yet to report a runtime session.';
+}
+
+const WorkExecutionHistory = ({ execution, team, project, revision }: {
+  execution: DetailProps['managedExecution']; team: string; project: string; revision: number;
+}) => (
+  <section class="card-pad wk-prose" id="managed-execution">
+    <h3 class="wk-h3">Managed execution</h3>
+    <p class="small muted wk-tight">A queue request, a worker observation and a delivery each have their own record.</p>
+    {execution.rows.length ? (
+      <ul class="wk-rows">
+        {execution.rows.map((row) => {
+          const observation = executionObservation(row);
+          return (
+            <li class="wk-row" id={`execution-${row.id}`} data-execution-state={row.state}>
+              <b>{MANAGED_STATE_LABEL[row.state]}</b>{' · '}{row.target}{' · '}<code>{row.runtime}</code>
+              <div class="small muted">
+                Queued {at(row.queuedAt)} · contract revision {row.specRevision ?? 'unavailable'}
+                {row.specRevision !== revision ? ` · current revision ${revision}` : ''}
+              </div>
+              <div class="small muted">Worker last contacted STMA {row.lastWorkerContact ? ago(row.lastWorkerContact) : 'never'}.</div>
+              {row.observedStartAt ? <div class="small">Worker observed runtime start {at(row.observedStartAt)}.</div> : null}
+              {observation ? <div class="small">{observation}</div> : null}
+              {row.capacityReconciliation ? <div class="small">
+                Verified by {row.capacityReconciliation.actor.label} · {at(row.capacityReconciliation.attestedAt)}
+                {' · '}{row.capacityReconciliation.reason}
+              </div> : null}
+              {row.checkoutQuarantined ? <div class="small">Checkout is currently quarantined; releasing capacity does not make it ready.</div> : null}
+              {row.lastEvent ? <div class="small muted">Latest event {row.lastEvent.reason.replace(/_/g, ' ')} · {at(row.lastEvent.at)}</div> : null}
+              <div class="small">
+                <a href={`/app/sessions/${row.sessionId}`}>Assignment thread</a>
+                {row.runId ? <> · <a href={`/app/teams/${team}/runs/${row.runId}`}>Run and checkpoints</a></> : null}
+                {' · '}<a href={`${connectionsHref(team, project)}?execution=${row.id}#managed-execution`}>
+                  {row.canCancel ? 'Inspect or cancel execution' : 'Inspect execution'}
+                </a>
+              </div>
+            </li>
+          );
+        })}
+      </ul>
+    ) : <p class="small muted wk-tight">No managed execution is visible for this work.</p>}
+    {execution.more ? <p class="small muted wk-tight">This list shows up to five executions. <a href={`${connectionsHref(team, project)}#managed-execution`}>Browse managed execution</a>.</p> : null}
+  </section>
+);
 
 export interface AgentChoice {
   installationId: string;
@@ -1294,6 +1372,7 @@ export interface DetailProps {
   /** `readEvidence`: readiness, the manifest, the four decision snapshot values and `may_decide`. */
   evidence: Rec;
   execution: ExecutionRow[];
+  managedExecution: { rows: WorkExecutionRow[]; more: boolean };
   /** The stored criteria as form rows, so the edit form keeps rules it cannot show. */
   criteriaRows: CriterionRow[];
   members: Member[];
@@ -1505,12 +1584,13 @@ export const WorkDetailPage = (p: DetailProps) => {
   const sections: Rec = work.sections ?? {};
   const contract: Rec = sections.contract ?? {};
   const criteria: Rec[] = sections.criteria?.items ?? [];
-  const readiness: Rec = evidence.readiness ?? { criteria: [] };
-  const byCriterion = new Map<string, Rec>((readiness.criteria as Rec[]).map((c) => [c.id, c]));
   const state = String(work.state);
   const archived = Boolean(work.archived);
   const deliveries: Rec[] = sections.deliveries?.items ?? [];
   const current = deliveries.find((d) => d.current) ?? null;
+  const deliveryMatches = evidence.delivery_id === (current?.id ?? null) && evidence.version === work.version;
+  const readiness: Rec = (deliveryMatches ? evidence.readiness : null) ?? { criteria: [] };
+  const byCriterion = new Map<string, Rec>((readiness.criteria as Rec[]).map((c) => [c.id, c]));
   // How many there are, not how many the section's one page held: sequences
   // run 1, 2, 3 with no gap and the newest comes first, so its number is the
   // count. Read off the page, an item delivered eighty times said 49 earlier.
@@ -1536,9 +1616,9 @@ export const WorkDetailPage = (p: DetailProps) => {
   const acceptances: Rec[] = sections.acceptances?.items ?? [];
   const events: Rec[] = sections.events?.items ?? [];
   const externals: Rec[] = sections.external?.items ?? [];
-  const evidenceRows: Rec[] = sections.evidence?.items ?? [];
-  const provider: Rec[] = evidence.manifest?.provider_subjects?.items ?? [];
-  const mayDecide = Boolean(evidence.may_decide);
+  const evidenceRows: Rec[] = deliveryMatches ? sections.evidence?.items ?? [] : [];
+  const provider: Rec[] = deliveryMatches ? evidence.manifest?.provider_subjects?.items ?? [] : [];
+  const mayDecide = deliveryMatches && Boolean(evidence.may_decide);
   // A delivery somebody already decided on is not sent back to review unchanged: it
   // would sit in review with nothing for anyone to decide. Changes mean a new delivery.
   const decidedCurrent = current !== null && acceptances.some((a) => a.delivery_id === current.id);
@@ -1721,6 +1801,7 @@ export const WorkDetailPage = (p: DetailProps) => {
 
             <Card
               title="Criteria and readiness"
+              id="criteria-and-readiness"
               note="Each result is read from evidence against the current delivery. Unknown is not a pass."
             >
               {criteria.length === 0 ? (
@@ -1787,6 +1868,7 @@ export const WorkDetailPage = (p: DetailProps) => {
                       <div>
                         <span class="pill pill-muted">{row.kind}</span>{' '}
                         {row.href ? <a href={row.href}>{row.title}</a> : <b>{row.title}</b>}
+                        {row.dispatchHref ? <> · <a href={row.dispatchHref}>Review execution target</a></> : null}
                         {row.superseded ? <span class="pill pill-muted wk-gap">Corrected</span> : null}
                       </div>
                       {row.lines.map((line) => (
@@ -1806,10 +1888,14 @@ export const WorkDetailPage = (p: DetailProps) => {
                   ))}
                 </ul>
               )}
+              <WorkExecutionHistory execution={p.managedExecution} team={p.team.slug} project={p.project.slug} revision={Number(work.spec_revision)} />
             </Card>
 
-            <Card title="Delivery" note="An immutable set of artifacts submitted against one contract revision.">
-              {current ? (
+            <Card title="Delivery review" id="delivery-review" note="Review the exact artifact versions, evidence and human decision together.">
+              {!deliveryMatches ? (
+                <div class="card-pad muted small">The delivery or evidence changed while this page loaded. <a href={`${here}#delivery-review`}>Reload the review</a>.</div>
+              ) : null}
+              {deliveryMatches && (current ? (
                 <div class="card-pad wk-prose">
                   <p class="wk-tight">
                     Delivery {current.sequence}, submitted by {actorWords(current.submitted_by)}, {ago(current.submitted_at)}, for
@@ -1819,6 +1905,7 @@ export const WorkDetailPage = (p: DetailProps) => {
                     ) : null}
                     .
                   </p>
+                  {current.run_id ? <p class="small wk-tight"><a href={`/app/teams/${p.team.slug}/runs/${current.run_id}`}>Run linked to this delivery</a></p> : null}
                   {current.note ? <p class="wk-text small">{current.note}</p> : null}
                   <ul class="wk-rows">
                     {(current.artifacts as Rec[]).map((artifact, index) => {
@@ -1830,17 +1917,19 @@ export const WorkDetailPage = (p: DetailProps) => {
                           </div>
                           <div class="small muted">
                             {line.exact ? (
-                              <>exact version: <span class="mono">{line.version}</span></>
+                              <>exact version: <span class="mono" style="overflow-wrap:anywhere">{line.version}</span></>
                             ) : (
                               <span class="pill pill-warn">unversioned</span>
                             )}
                             {!line.exact ? ' a mutable link is never exact-version evidence' : ''}
                           </div>
+                          {artifact.checkpoint_id ? <div class="small muted" style="overflow-wrap:anywhere">Reported checkpoint <code>{artifact.checkpoint_id}</code></div> : null}
                           {artifact.note ? <div class="small wk-text">{artifact.note}</div> : null}
                         </li>
                       );
                     })}
                   </ul>
+                  <p class="small muted wk-tight">The decision applies to these artifact versions. A newer commit needs a new delivery for review.</p>
                   {deliveryCount > 1 ? (
                     <p class="small muted wk-tight">
                       {deliveryCount - 1} earlier {deliveryCount === 2 ? 'delivery' : 'deliveries'}:{' '}
@@ -1857,11 +1946,12 @@ export const WorkDetailPage = (p: DetailProps) => {
                 <div class="card-pad muted small">
                   No delivery has been submitted. An agent linked to this work submits one, and the work moves to review.
                 </div>
-              )}
-            </Card>
-
-            <Card title="Evidence" note="Each row shows its assertion and validity separately. A provider fact is observed by the provider; an agent's report is not verified by STMA.">
-              {evidenceRows.length === 0 && provider.length === 0 ? (
+              ))}
+              {deliveryMatches && current ? <div class="card-pad wk-prose">
+                <h3 class="wk-h3">Evidence for this delivery</h3>
+                <p class="small muted wk-tight">Assertions, validity and provenance are listed separately. <a href="#criteria-and-readiness">See criteria and readiness</a>.</p>
+              </div> : null}
+              {deliveryMatches && current && (evidenceRows.length === 0 && provider.length === 0 ? (
                 <div class="card-pad muted small">No evidence has been recorded against the current delivery.</div>
               ) : (
                 <div class="scroll-x">
@@ -1955,7 +2045,7 @@ export const WorkDetailPage = (p: DetailProps) => {
                             <tr>
                               <td>{fact.provider}</td>
                               <td class="small">{cut(String(fact.subject_name ?? fact.subject_id), 60)}</td>
-                              <td class="mono">{String(fact.commit_sha).slice(0, 12)}</td>
+                              <td class="mono" style="overflow-wrap:anywhere">{String(fact.commit_sha)}</td>
                               <td>
                                 <span class={`pill ${fact.state === 'success' ? 'pill-active' : fact.state === 'failure' ? 'pill-danger' : 'pill-warn'}`}>
                                   {fact.state}
@@ -1973,10 +2063,12 @@ export const WorkDetailPage = (p: DetailProps) => {
                     </>
                   ) : null}
                 </div>
-              )}
-            </Card>
-
-            <Card title="Decisions" note="Every decision is kept, with the evidence it was made on.">
+              ))}
+              {mayDecide ? <DecisionPanel p={p} ctx={ctx} current={current} criteria={criteria} byCriterion={byCriterion} /> : null}
+              <div class="card-pad wk-prose" id="delivery-decisions">
+                <h3 class="wk-h3">Decision history</h3>
+                <p class="small muted wk-tight">Each decision keeps the delivery and evidence it was made on.</p>
+              </div>
               {acceptances.length === 0 ? (
                 <div class="card-pad muted small">Nobody has decided on a delivery of this work yet.</div>
               ) : (
@@ -1988,6 +2080,7 @@ export const WorkDetailPage = (p: DetailProps) => {
                           {a.decision === 'accept' ? 'Accepted' : 'Changes requested'}
                         </span>{' '}
                         by {a.actor ?? 'a person'}, {ago(a.created_at)}, revision {a.spec_revision}
+                        {' · '}delivery {deliveries.find((d) => d.id === a.delivery_id)?.sequence ?? String(a.delivery_id).slice(0, 8)}
                         {a.current ? <span class="pill pill-muted wk-gap">Current</span> : null}
                         {a.current && flags.acceptance_stale ? <span class="pill pill-danger wk-gap">Stale</span> : null}
                       </div>
@@ -2205,8 +2298,6 @@ export const WorkDetailPage = (p: DetailProps) => {
           </div>
 
           <div class="col">
-            {mayDecide ? <DecisionPanel p={p} ctx={ctx} current={current} criteria={criteria} byCriterion={byCriterion} /> : null}
-
             {!archived ? (
               <Card title="What you can do" note="Only what the server will accept from you now.">
                 <div class="card-pad wk-prose">
@@ -2895,20 +2986,18 @@ function DecisionPanel({
   const byCheck = notPassing.filter((c) => humanCheckCanPass(byCriterion.get(c.id)));
   const unmet = notPassing.filter((c) => !byCheck.includes(c));
   const one = (n: number, singular: string, plural: string) => (n === 1 ? singular : plural);
-  // With more evidence than the Evidence card lists, "shown here" would say the
+  // With more evidence than the review lists, "shown here" would say the
   // decision rests on fewer rows than the manifest it is bound to holds.
   const evidenceCut = Boolean(work.sections?.evidence?.next_cursor);
   return (
-    <Card
-      title="Your decision"
-      id="decision-card"
-      note={
+    <section class="card-pad wk-prose" id="decision-card">
+      <h3 class="wk-h3">Your decision</h3>
+      <p class="small muted wk-tight">{
         evidenceCut
-          ? 'Recorded against the exact delivery and every row of its evidence, including the rows the Evidence card does not list. If either moves while you read, the decision is refused and you decide again.'
+          ? 'Recorded against the exact delivery and every row of its evidence, including rows this card does not list. If either moves while you read, the decision is refused and you decide again.'
           : 'Recorded against the exact delivery and evidence shown here. If either moves while you read, the decision is refused and you decide again.'
-      }
-    >
-      <div class="card-pad wk-prose">
+      }</p>
+      <div>
         <p class="small wk-tight">
           {readiness.ready_for_review ? (
             <>
@@ -3056,6 +3145,6 @@ function DecisionPanel({
           </button>
         </form>
       </div>
-    </Card>
+    </section>
   );
 }

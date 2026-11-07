@@ -217,7 +217,7 @@ const ProductMock = () => (
         </span>
         <span class="lx-check warn">
           <i class="w">!</i>
-          <span>Allowance 81%, measured · handoff prepared</span>
+          <span>81% allowance reported · agent prepared handoff</span>
           <No n={4} />
         </span>
         <span class="lx-check">
@@ -235,7 +235,7 @@ const CAPTIONS: { title: string; body: string }[] = [
   { title: 'Every run, live', body: 'Whose agent, which ticket and branch, which files, when it last checked in.' },
   { title: 'Collision caught', body: 'Two runs want retry.ts. Ada was first and keeps going; Jonas is told before he writes.' },
   { title: 'Rules confirmed', body: 'Policy v12 reached all four runs. Three confirmed it; the fourth is counted.' },
-  { title: 'A limit coming, a handoff ready', body: 'At 81% of its allowance, the run has a handoff prepared at a tested commit.' },
+  { title: 'A limit coming, a handoff ready', body: 'The agent reports 81% used and prepares a handoff with its tested checkpoint.' },
 ];
 
 /* ---- an agent's session, drawn the way the tools print it ---- */
@@ -301,9 +301,9 @@ const Break = ({ children }: { children?: Child }) => (
 
 const TABS: { key: string; title: string; desc: string }[] = [
   { key: 'rules', title: 'Team rules', desc: 'Published once and served to every run. With hooks, a forbidden edit is stopped at the file tool.' },
-  { key: 'handoff', title: 'Handoffs', desc: 'Before a usage limit ends a session, the work moves to another agent at the exact commit.' },
+  { key: 'handoff', title: 'Handoffs', desc: 'STMA suggests a handoff when an agent reports low allowance. The receiver checks the reported checkpoint before resuming.' },
   { key: 'assign', title: 'Assign work', desc: 'Give a task to a named agent from the browser, or from another agent.' },
-  { key: 'work', title: 'Native Work', desc: 'Keep the goal, acceptance criteria and delivery evidence together. No external tracker required.' },
+  { key: 'work', title: 'Native Work', desc: 'Keep goals, acceptance criteria and delivery evidence together. Review work across projects without an external tracker.' },
   { key: 'worker', title: 'Local worker', desc: 'Explicitly dispatch an assignment to your enabled Claude Code worker, without opening another agent chat.' },
   { key: 'env', title: 'Environment drift', desc: "Preflight compares the machine with the project's baseline before the first edit." },
   { key: 'evidence', title: 'Evidence', desc: 'One page per run, with what the agent reported kept apart from what was observed.' },
@@ -921,6 +921,7 @@ export const Landing = ({ site, baseUrl }: { site: SiteInfo; baseUrl: string }) 
                       Visit stma.ai
                     </a>
                   )}
+                  {site.pricing ? <p style="margin-top:16px"><a href="/pricing">{beta ? 'Compare plans for after beta' : 'Compare Free, Solo and Team plans'} →</a></p> : null}
                 </div>
                 <div class="lx-plan">
                   <span class="lx-ov dim">Self-hosted</span>

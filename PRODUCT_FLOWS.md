@@ -1314,8 +1314,10 @@ is composed through the private operator layer; core code must not import it.
    then permits the documented 2–50-human collaboration range.
 3. In-app changes own plan/interval/seat arithmetic; signed webhooks are authoritative.
 4. Membership changes synchronize billed human quantity. Agents/devices never affect quantity.
-5. Portal handles supported billing-account operations. Enterprise remains contract-scoped; copy
-   must not promise an unimplemented identity/audit/residency feature.
+5. Portal handles supported billing-account operations. The Plan page shows the cancellation date
+   Stripe confirms. A scheduled cancellation leaves the current plan in place until Stripe confirms
+   a status change. Enterprise remains contract-scoped; copy must not promise an unimplemented
+   identity/audit/residency feature.
 6. An operator may **give** a workspace Solo, Team or Enterprise, with no end date or through a last
    day. This is entitlement state, not billing state, so it lives in the core beside the workspace's
    own plan and never writes it. While it lasts it decides every limit, whatever the workspace's own
@@ -1469,6 +1471,46 @@ their REST twins under `/api/agent/`; four managed-execution MCP tools (`list_ex
 A work item is a durable unit of work that outlives the agents, runs, sessions and trackers that
 touch it. Work, assignment, run and handoff are four records; the end of one never ends another.
 
+The existing Work detail execution area shows a bounded history of at most five authorized
+managed jobs for that exact work item. A job linked from dispatch appears first, with separate
+assignment, run, and execution records. The page distinguishes
+queue admission from a worker-observed runtime start, a cancellation request from a worker-reported
+stop, and heartbeat readiness from queue eligibility and target capability. This is part of Work,
+with one consistent execution-history snapshot. A human's recorded stop verification and capacity
+release appear separately from a worker stop report; checkout quarantine remains visible.
+The workspace Work queue adds **Needs your action** for the named acceptor's
+decisions, owned blockers and owned execution jobs needing input or reconciliation, while retaining
+its existing decision, personal and blocked sections.
+
+An owner, acceptor or workspace owner can post a tracked question on an open assignment only while
+it remains linked to current executable Work. The question is pinned to that exact assignment link
+and named installation. At most five questions may be awaiting replies; each body is limited to
+4,000 characters. The agent's `get_session` accepts an optional `work_question_id` for one exact
+question, and `post_message` accepts `reply_to_message_id` to answer it. In MCP, only the named,
+currently authorized installation receives tracking metadata and can use the exact-question lookup.
+Thread text retains its existing shared visibility, and people with access to the thread can see
+question status there. The named ordinary agent can answer; a managed
+target can answer only through its current authorized attempt. Analyst credentials and read-only
+Codex targets cannot answer. The server's `Included in context` marker means it
+prepared a tool result containing the question for that installation. It does not establish that a
+client received, displayed, read or understood the result. Exact reads do not advance the ordinary
+thread cursor. A pending ID alone or a question omitted from the final result creates no inclusion
+receipt; ordinary reads can record inclusion when the question is returned to its recipient.
+One answer is accepted per
+question; retries with the same answer are idempotent, and removal of answer content leaves an
+answered tombstone. Asking does not dispatch work. Asking or answering does not change the Work
+version, lifecycle, delivery or evidence; ordinary messages keep their existing behavior.
+
+The workspace home page adds **Work across projects** beside the existing Work queue. It counts
+open, ready, in-progress and in-review items and lists the oldest 20 matching updates. Views use
+the same decision and blocker predicates as project Work. Archived and closed items are excluded.
+At most the first 100 projects by name are included, and both project and item truncation are
+disclosed. Counts cover the included projects, not just the displayed items. Project links open
+their complete lists; the Work queue remains the place for personal and decision queues.
+An old update is not evidence that an agent stopped. This is a human browser read model on every
+plan, guarded by workspace membership and the configured organization role/proof filters; it does
+not dispatch agents, change work or grant project-only roles workspace-wide access.
+
 ### Optional managed local execution
 
 An assignment still waits for its named agent unless a person separately requests managed
@@ -1494,7 +1536,10 @@ separate from the model provider account.
 
 `list_execution_targets` reports readiness only from a fresh worker heartbeat; an ordinary MCP
 contact does not make a target ready. `dispatch_work` names an existing assignment session, target
-and request ID. Its queued response does not mean a process started. `get_execution` reports the
+and request ID. A Native Work assignment must still be linked to the exact contract revision it
+was created for. Correcting the link requires a new assignment. A queued job with a corrected link
+is cancelled when the worker tries to claim it. An active attempt loses authority and is asked
+to stop. A queued response does not mean a process started. `get_execution` reports the
 job, attempt, worker-reported state and bounded events. `cancel_execution` requests cancellation;
 `cancel_requested` is not proof that the process stopped. A worker-reported successful turn is not
 delivery evidence, work completion or human acceptance. A separately authorized subscriber
@@ -1505,6 +1550,11 @@ and the two-device T3 lab are separate flows and do not broaden managed-worker c
 MCP clients see 49 tools; attempt-scoped worker credentials see only their
 18 shared allowed tools, omitting the other schemas from the worker's model context while keeping
 request authorization in force.
+
+STMA holds attempt-scoped managed MCP responses until the request's final
+authority check and database transaction finish. Other MCP requests retain their existing
+transport behavior. Organization proof expiry is checked at that final authority point, so a lock
+wait cannot make an expired proof valid. This does not enable managed execution.
 
 The experimental `codex-read-only-v1` runtime is Windows-only, pins Codex CLI 0.166.0 and requires
 the complete native package with its matching adjacent sandbox helpers and separately provisioned
@@ -2083,18 +2133,37 @@ Review questions:
 - Native Work reads GitHub issues and nothing else. It never writes to a tracker, refreshes an issue
   by itself or reads Jira or ClickUp records as references. It sends no email for "waiting for you":
   the rail badge and the Needs decision view carry it. An assignment starts nothing; a separate
-  `dispatch_work` request to an explicitly enabled target creates execution. "Sent", "accepted" and
+  `dispatch_work` request, or **Review execution target** followed by **Confirm and queue execution**
+  on the assignment's console thread, to an explicitly enabled target creates execution. "Sent", "accepted" and
   "started" are separate recorded facts, and the console never says an agent is running when only an
   assignment or ordinary agent heartbeat is recorded.
 - A user's MCP analyst can use a project-scoped core analyst credential, whose closed catalog
   permits only `whoami`, `list_projects`, `list_work`, `get_work` and `get_work_context`; write
   tools and REST are refused. Where the private managed analyst is configured, a workspace owner
-  enables a project profile and a person requests each analysis.
+  enables a project profile and a person requests each analysis. Where the operator enables Azure
+  key setup, the owner can connect, rotate or revoke an encrypted project-scoped key. Saving a key
+  checks catalog access, not the deployment-to-model mapping; the owner attests that mapping and
+  price, and reported inference model mismatches block further requests. Key rotation disables
+  analysis until the owner enables it again.
   It sends at most ten recent work items with bounded, potentially partial context to the selected
-  Azure model. Provider usage is billed separately, and the request quota is not a dollar cap.
+  Azure model. Provider usage is billed separately. A versioned price and lifetime project cost
+  ceiling are required; each call reserves its approved input window plus output limit atomically.
+  Valid model/usage reports settle the estimate. Unknown usage retains its hold; changing keys,
+  pruning reports or disabling analysis cannot clear incurred or uncertain usage. The request
+  quota limits frequency; the estimated admission ceiling is not an Azure invoice cap.
   Reports cite source pointers and limitations; they do not accept work or verify a provider run.
 - A delivery is its submitter's report, a decision is a person's, and a provider observation covers
   one workflow on one exact commit. None of them is a proof that the work is correct or safe to merge.
+- Team workspace owners can configure a workspace execution capacity and target dispatcher
+  allowlists; self-hosted core has the same controls. A null allowlist preserves membership-based
+  access; an empty list blocks dispatch. Current membership, project scope and identity proof are
+  rechecked on claim and heartbeat. Browser dispatch persists only a session digest, not its bearer
+  secret. Queued, active and uncertain jobs reserve capacity. Revocation requests active stops;
+  it does not certify a process exit. Saved restrictions remain enforced after a plan downgrade.
+  A workspace owner can reconcile only a quarantined terminal `lost`/`dispatch_unknown` job by
+  attesting that they checked the local process tree stopped and recording a reason. This releases
+  its workspace capacity reservation with actor/time/audit and retry protection. It changes neither
+  the uncertain worker state nor the checkout quarantine and never restores attempt credentials.
 - Announcements and the member directory are team-level coordination surfaces visible to project
   credentials; other project data is filtered.
 - STMA cannot see a checkout. Whether hooks are present and trusted on disk, and whether a client is

@@ -1,11 +1,13 @@
 import { membershipUser } from '../lib/securityHooks';
-import { THREAD_MESSAGE_KINDS, isThreadMessageKind } from '@bridge/shared';
+import { randomUUID } from 'node:crypto';
+import { THREAD_MESSAGE_KINDS, isThreadMessageKind, type ExecutionTargetDto } from '@bridge/shared';
 import { and, count, desc, eq, ilike, inArray, ne, or, sql } from 'drizzle-orm';
 import { Hono, type Context, type MiddlewareHandler } from 'hono';
 import type { Db } from '../db';
 import {
   agentInstallations,
   debugSessions,
+  executionTargets,
   handoffs,
   memberships,
   messages,
@@ -13,6 +15,7 @@ import {
   teams,
   tokens,
   users,
+  workItems,
 } from '../db/schema';
 import { loginRedirect } from '../auth/session';
 import { fmtDate, initials, timeAgo } from '../lib/format';
@@ -23,12 +26,18 @@ import { pageWindow, slicePage } from '../lib/pagination';
 import { redactSecrets } from '../lib/redact';
 import { track } from '../lib/track';
 import { markRead, sessionForMember, sessionStats, type SessionResolution } from '../lib/sessions';
+import { postWorkQuestion, readWorkQuestionThread } from '../domain/workQuestions';
+import { threadMessageHref, threadMessageId, WorkQuestionMessage, WorkQuestionThread } from '../ui/WorkQuestionThread';
 import type { AppEnv } from '../types';
 import { AppLayout } from '../ui/Layout';
 import { Pager } from '../ui/Pager';
 import { HandoffFlow } from '../ui/HandoffFlow';
+import { workItemHref } from '../ui/WorkPages';
 import { transitionHandoff } from '../domain/collaboration';
 import { handoverFor } from '../domain/evidence';
+import { dispatchExecution, reviewExecutionDispatch } from '../domain/execution';
+import { OPEN_HANDOFF_STATES } from '../domain/workAccess';
+import { humanPrincipal } from '../domain/workTypes';
 import { runHref } from './runs';
 import { Band, Inspector, PageHead, scopedTrail, teamTrail, Trail } from '../ui/Console';
 import { ensureRail } from '../lib/rail';
@@ -681,6 +690,12 @@ sessionsRoutes.get('/app/sessions/:id', async (c) => {
   }
   const { session, team } = found;
   const [offer] = await db.select().from(handoffs).where(eq(handoffs.sessionId, session.id));
+  const [managedTarget] = offer?.kind === 'assignment' && offer.targetInstallationId && session.projectId &&
+      (OPEN_HANDOFF_STATES as readonly string[]).includes(offer.state)
+    ? await db.select({ id: executionTargets.id }).from(executionTargets)
+      .where(and(eq(executionTargets.installationId, offer.targetInstallationId),
+        eq(executionTargets.projectId, session.projectId), eq(executionTargets.teamId, team.id)))
+    : [];
   // Work dispatched from a project page is read from here; without the way back
   // a lead assigning four tasks walked rail → projects → project each time.
   const [home] = session.projectId
@@ -754,7 +769,18 @@ sessionsRoutes.get('/app/sessions/:id', async (c) => {
     .limit(win.limit)
     .offset(win.offset);
   const page = slicePage(fetched, win);
-  const msgs = [...page.items].reverse(); // oldest-first inside the page
+  const focus = c.req.query('message');
+  const [focused] = offer?.kind === 'assignment' && isCanonicalUuid(focus) &&
+      !page.items.some(({ m }) => m.id === focus.toLowerCase())
+    ? await db.select({ m: messages, author: users.username }).from(messages)
+      .leftJoin(users, eq(messages.authorId, users.id))
+      .where(and(eq(messages.sessionId, session.id), eq(messages.id, focus)))
+    : [];
+  const msgs = [...page.items.slice(0, focused ? win.size - 1 : win.size)].reverse(); // oldest-first inside the page
+  const workQuestions = offer?.kind === 'assignment'
+    ? await readWorkQuestionThread(db, humanPrincipal(user.id), session, offer,
+      [...msgs.map(({ m }) => m.id), ...(focused ? [focused.m.id] : [])])
+    : undefined;
   const opener = session.openedBy
     ? (
         await db
@@ -811,6 +837,9 @@ sessionsRoutes.get('/app/sessions/:id', async (c) => {
                   : null
               }
             />
+            {managedTarget ? (
+              <a class="btn btn-sm" href={`/app/sessions/${session.id}/dispatch`}>Review execution target</a>
+            ) : null}
           </Inspector>
         ) : undefined
       }
@@ -849,6 +878,8 @@ sessionsRoutes.get('/app/sessions/:id', async (c) => {
           )}
         </div>
 
+        {workQuestions ? <WorkQuestionThread sessionId={session.id} pending={workQuestions.pending} composer={workQuestions.composer} /> : null}
+
         {page.hasMore || win.page > 1 ? (
           <Pager
             path={`/app/sessions/${session.id}`}
@@ -861,8 +892,8 @@ sessionsRoutes.get('/app/sessions/:id', async (c) => {
 
         <div class="thread">
           {msgs.length === 0 ? <p class="muted small m0">No messages yet.</p> : null}
-          {msgs.map((r) => (
-            <div class="msg">
+          {(focused ? [focused, ...msgs] : msgs).map((r) => (
+            <div class="msg" id={threadMessageId(r.m.id)}>
               <span class={`avatar ${r.m.authorId === user.id ? 'ink' : 'light'}`}>
                 {initials(r.author ?? 'ci')}
               </span>
@@ -876,6 +907,9 @@ sessionsRoutes.get('/app/sessions/:id', async (c) => {
                   <span class="msg-time">{timeAgo(r.m.createdAt)}</span>
                 </div>
                 <p class="msg-text">{r.m.body}</p>
+                {workQuestions?.byMessage.has(r.m.id) ? (
+                  <WorkQuestionMessage item={workQuestions.byMessage.get(r.m.id)!} messageId={r.m.id} sessionId={session.id} />
+                ) : null}
                 {((r.m.attachments as { name: string; content: string }[] | null) ?? []).map(
                   (a) => (
                     <div class="attach">
@@ -1119,6 +1153,122 @@ const workPage = (c: Context<AppEnv>) => dispatchedLedger(c);
 // list (`routes/work.tsx`, registered first); this ledger is its `?tab=dispatched`.
 sessionsRoutes.get('/app/handoffs', workPage);
 
+interface DispatchContext {
+  work?: { key: string; specRevision: number };
+  repo?: string;
+  branch?: string;
+}
+
+const DispatchReview = ({ href, title, target, error, assignment, connections }: {
+  href: string;
+  title: string;
+  target?: ExecutionTargetDto;
+  error?: string;
+  assignment?: DispatchContext;
+  connections?: string;
+}) => (
+  <section class="card card-pad" style="max-width:720px;display:flex;flex-direction:column;gap:12px;overflow-wrap:anywhere">
+    <a href={href}>← Back to assignment</a>
+    <h1 class="title m0">Review execution target</h1>
+    <p class="m0">{title}</p>
+    {error ? <div class="banner banner-warn"><b>Queue eligibility · Blocked</b><div>{error}</div></div> : null}
+    {target ? (
+      <form method="post" action={`${href}/dispatch`} style="display:flex;flex-direction:column;gap:12px">
+        <label for="execution-target">Target assigned to this work</label>
+        <select class="in" id="execution-target" name="target_id" required>
+          <option value={target.id}>{target.installation_name} · {target.project_name}</option>
+        </select>
+        <dl class="flow-facts">
+          <dt>Checkout declared by worker</dt><dd><code>{target.checkout_path}</code></dd>
+          <dt>Runtime</dt><dd><code>{target.runtime}</code> · {target.runtime_version}</dd>
+          <dt>Permission profile</dt><dd><code>{target.permission_profile}</code></dd>
+          {assignment?.work ? <><dt>Work contract</dt><dd>{assignment.work.key} · revision {assignment.work.specRevision}</dd></> : null}
+          {assignment?.repo ? <><dt>Assignment repository</dt><dd><code>{assignment.repo}</code></dd></> : null}
+          {assignment?.branch ? <><dt>Assignment branch</dt><dd><code>{assignment.branch}</code></dd></> : null}
+          <dt>Limits</dt><dd>{target.max_runtime_seconds}s · {target.max_turns} requested outer turn(s)</dd>
+          <dt>Worker readiness</dt><dd>{target.reason} Last worker contact {target.last_seen ? timeAgo(new Date(target.last_seen)) ?? 'just now' : 'never'}.</dd>
+          <dt>Queue eligibility</dt><dd>Eligible for confirmation. The queue checks permissions and capacity again when you submit.</dd>
+          <dt>What this target can do</dt><dd>{target.runtime === 'codex-read-only-v1'
+            ? 'Read-only analysis. File edits and delivery submission require a separate step.'
+            : 'Scoped file tools and STMA reporting. Shell commands, tests and commits require a separate step.'}</dd>
+        </dl>
+        <p class="small m0">
+          The local worker runs in this checkout as its OS user and can incur usage on its configured provider account.
+          {target.runtime === 'codex-read-only-v1'
+            ? ' Codex uses the read-only profile and can read other host files.'
+            : ' The Claude file-tool profile limits tools but provides no OS sandbox.'}
+          {' '}Dispatch queues the assignment. The worker reports any subsequent start.
+          This browser session authorizes the job. Signing out or losing session access can cancel it.
+        </p>
+        <input type="hidden" name="request_id" value={randomUUID()} />
+        <input type="hidden" name="grant_version" value={target.grant_version} />
+        <button class="btn btn-primary" style="align-self:flex-start" type="submit">Confirm and queue execution</button>
+      </form>
+    ) : null}
+    <p class="small muted m0">
+      On the target machine, run <code>stma worker doctor</code> from the dedicated checkout to inspect its local runtime and journal.
+      {connections ? <> <a href={`${connections}#managed-execution`}>Open managed targets</a>.</> : null}
+    </p>
+  </section>
+);
+
+sessionsRoutes.get('/app/sessions/:id/dispatch', async (c) => {
+  const user = c.get('user');
+  if (!user) return loginRedirect(c);
+  const db = c.get('db');
+  const found = await sessionForMember(db, c.req.param('id'), user.id);
+  if (!found) return c.notFound();
+  const review = await reviewExecutionDispatch(db, humanPrincipal(user.id), found.session.id);
+  const [project] = found.session.projectId ? await db.select({ slug: projects.slug }).from(projects)
+    .where(eq(projects.id, found.session.projectId)) : [];
+  const [brief] = 'error' in review ? [] : await db.select({ payload: messages.payload }).from(messages)
+    .where(and(eq(messages.sessionId, found.session.id), eq(messages.kind, 'handoff')))
+    .orderBy(messages.createdAt).limit(1);
+  return c.html(
+    <AppLayout user={user} active="projects" title="Review execution target">
+      <DispatchReview href={`/app/sessions/${found.session.id}`} title={found.session.title}
+        assignment={(brief?.payload as DispatchContext | null) ?? undefined}
+        connections={connectionsHref(found.team.slug, project?.slug)}
+        target={'error' in review ? undefined : review.target} error={'error' in review ? review.error.message : undefined} />
+    </AppLayout>,
+    'error' in review ? 409 : 200,
+  );
+});
+
+sessionsRoutes.post('/app/sessions/:id/dispatch', async (c) => {
+  const user = c.get('user');
+  if (!user) return loginRedirect(c);
+  const db = c.get('db');
+  const found = await sessionForMember(db, c.req.param('id'), user.id);
+  if (!found) return c.notFound();
+  const body = await c.req.parseBody();
+  const grantVersion = Number(body.grant_version);
+  if (!isCanonicalUuid(body.target_id) || !isCanonicalUuid(body.request_id) ||
+      typeof body.grant_version !== 'string' || !Number.isSafeInteger(grantVersion) || grantVersion < 1) {
+    return c.text('Review the target before confirming execution.', 400);
+  }
+  const dispatch = await dispatchExecution(db, humanPrincipal(user.id), {
+    target_id: body.target_id, session_id: found.session.id, request_id: body.request_id,
+  }, grantVersion);
+  if ('error' in dispatch) {
+    return c.html(
+      <AppLayout user={user} active="projects" title="Execution could not be queued">
+        <DispatchReview href={`/app/sessions/${found.session.id}`} title={found.session.title} error={dispatch.error.message} />
+      </AppLayout>,
+      dispatch.error.code === 'NOT_FOUND' ? 404 : dispatch.error.code === 'FORBIDDEN' ? 403 : 409,
+    );
+  }
+  const [project] = found.session.projectId ? await db.select({ slug: projects.slug }).from(projects)
+    .where(eq(projects.id, found.session.projectId)) : [];
+  if (project && dispatch.job.work_id && found.session.projectId) {
+    const [work] = await db.select({ key: workItems.displayKey }).from(workItems)
+      .where(and(eq(workItems.id, dispatch.job.work_id), eq(workItems.projectId, found.session.projectId),
+        eq(workItems.teamId, found.team.id))).limit(1);
+    if (work) return c.redirect(`${workItemHref(found.team.slug, project.slug, work.key)}?execution=${dispatch.job.id}#execution-${dispatch.job.id}`, 303);
+  }
+  return c.redirect(`${connectionsHref(found.team.slug, project?.slug ?? null)}?execution=${dispatch.job.id}#managed-execution`, 303);
+});
+
 sessionsRoutes.post('/app/sessions/:id/handoff/:action', async (c) => {
   const user = c.get('user');
   if (!user) return loginRedirect(c);
@@ -1162,9 +1312,34 @@ sessionsRoutes.post('/app/sessions/:id/messages', async (c) => {
   const user = c.get('user');
   if (!user) return loginRedirect(c);
   const db = c.get('db');
+  const body = await c.req.parseBody();
+  if (body.mode === 'work_question') {
+    const sessionId = c.req.param('id');
+    const question = await postWorkQuestion(db, humanPrincipal(user.id), sessionId, {
+      body: body.body, requestId: body.request_id, linkId: body.expected_work_link_id,
+    });
+    if ('error' in question) {
+      if (question.status === 404) return c.notFound();
+      return c.html(
+        <AppLayout user={user} active="sessions" title="Work question">
+          <div class="card card-pad">
+            <p>{question.error}</p>
+            <a class="btn" href={`/app/sessions/${sessionId}#work-questions`}>Return to the thread</a>
+          </div>
+        </AppLayout>,
+        question.status,
+      );
+    }
+    if (!question.replayed) {
+      await notifySessionActivity(db, c.get('env'), { sessionId, teamId: question.teamId,
+        actorId: user.id, kind: 'session_reply', at: question.at });
+      await track(db, { teamId: question.teamId, projectId: question.projectId,
+        userId: user.id, action: 'post_message', detail: 'Asked a Work question' });
+    }
+    return c.redirect(threadMessageHref(sessionId, question.messageId), 303);
+  }
   const found = await sessionForMember(db, c.req.param('id'), user.id);
   if (!found) return c.notFound();
-  const body = await c.req.parseBody();
   const content = typeof body.body === 'string' ? body.body.trim().slice(0, 20_000) : '';
   // A browser reply is conversation. `handoff` and `announcement` are what the
   // product writes through its own flows, and a posted one used to turn any open

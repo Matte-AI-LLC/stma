@@ -7,12 +7,12 @@ import {
   type ExecutionHeartbeatDto, type ExecutionJobDto, type ExecutionLeaseInput,
   type ExecutionResult, type ExecutionState, type ExecutionTargetDto,
 } from '@bridge/shared';
-import { and, asc, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, gt, inArray, isNull, sql } from 'drizzle-orm';
 import type { Db } from '../db';
 import {
   agentInstallations, agentRuns, debugSessions, executionAttemptGrants, executionAttempts,
   executionEvents, executionJobs, executionTargets, handoffs, memberships, messages,
-  projects, teams, tokens, workerInstances, workItems, workLinks, workProjectCounters,
+  projects, teams, tokens, users, webSessions, workerInstances, workItems, workLinks, workProjectCounters,
 } from '../db/schema';
 import { fingerprintJson } from '../lib/canonical';
 import { randomHex, sha256hex } from '../lib/crypto';
@@ -26,15 +26,23 @@ import {
   withSecurityPrincipal,
 } from '../lib/securityHooks';
 import { collaborationAccess } from './collaboration';
-import { workAccess } from './workAccess';
+import { OPEN_HANDOFF_STATES, workAccess } from './workAccess';
 import { principalId, type WorkPrincipal } from './workTypes';
 
 export type ExecutionTargetRow = typeof executionTargets.$inferSelect;
 export type ExecutionJobRow = typeof executionJobs.$inferSelect;
 export type ExecutionAttemptRow = typeof executionAttempts.$inferSelect;
+export type ExecutionConsoleDetail = ExecutionDetailDto & {
+  capacityReconciliation: (Pick<NonNullable<ExecutionJobRow['capacityReconciliation']>, 'attestedAt' | 'reason'> &
+    { actor: { id: string; label: string } }) | null;
+};
 export const EXECUTION_ACTIVE = ['leased', 'starting', 'running', 'cancel_requested'] as const;
-const OCCUPIED = [...EXECUTION_ACTIVE, 'dispatch_unknown', 'lost'];
+const UNCERTAIN = ['dispatch_unknown', 'lost'];
+const OCCUPIED = [...EXECUTION_ACTIVE, ...UNCERTAIN];
+const RESERVED = ['queued', ...OCCUPIED];
 const END = ['succeeded', 'failed', 'cancelled', 'needs_input'];
+export const EXECUTION_POLICY_LIMIT = 1000;
+export const EXECUTION_RECONCILIATION_REASON_LIMIT = 500;
 export class ExecutionRefusal extends Error {
   constructor(readonly code: string, message: string) { super(message); }
 }
@@ -70,12 +78,34 @@ export async function lockExecutionTarget(tx: Db, id: string): Promise<Execution
   return target;
 }
 async function access(db: Db, principal: WorkPrincipal, target: ExecutionTargetRow, tool: string) {
-  if (!(await workAccess(db, principal, target.teamId, target.projectId))) executionRefuse('NOT_FOUND', 'No execution target is visible to this principal.');
+  const member = await workAccess(db, principal, target.teamId, target.projectId);
+  if (!member) return executionRefuse('NOT_FOUND', 'No execution target is visible to this principal.');
   if (principal.kind === 'agent' && principal.grant.execution) executionRefuse('FORBIDDEN', 'An attempt cannot control execution.');
   const denied = await authorizeSecurity(db, principal.kind === 'agent' ? 'tool' : 'browser', {
-    tool, project_id: target.projectId, team_id: target.teamId,
+    tool, target_id: target.id, project_id: target.projectId, team_id: target.teamId,
   });
   if (denied) executionRefuse('FORBIDDEN', denied);
+  return member;
+}
+
+const dispatcherAllowed = (target: ExecutionTargetRow, userId: string) =>
+  target.dispatcherUserIds === null || target.dispatcherUserIds.includes(userId);
+
+/** Queue admission reserves a slot until the attempt stops or queued work is cancelled. */
+async function reservations(db: Db, teamId: string, limit: number) {
+  const rows = await db.select({ id: executionJobs.id }).from(executionJobs)
+    .innerJoin(executionTargets, eq(executionTargets.id, executionJobs.targetId))
+    .where(and(eq(executionTargets.teamId, teamId), inArray(executionJobs.state, RESERVED),
+      isNull(executionJobs.capacityReconciliation))).limit(limit);
+  return rows.length;
+}
+
+async function checkExecutionCapacity(db: Db, team: typeof teams.$inferSelect, admitting: boolean) {
+  if (team.executionJobCap === null) return;
+  const threshold = team.executionJobCap + (admitting ? 0 : 1);
+  if (await reservations(db, team.id, threshold) >= threshold) {
+    executionRefuse('CAPACITY_EXCEEDED', 'The workspace has reached its execution job cap.');
+  }
 }
 async function liveTargetCredential(db: Db, target: ExecutionTargetRow) {
   const [row] = await db.select({ installation: agentInstallations, token: tokens }).from(agentInstallations)
@@ -101,6 +131,8 @@ export async function executionAuthority(db: Db, target: ExecutionTargetRow, job
   const [team] = await db.select().from(teams).where(eq(teams.id, target.teamId));
   const limits = team ? await effectiveLimits(db, team) : null;
   if (!limits || limits.fleet !== 'full' || limits.readOnly) executionRefuse('LIMIT_EXCEEDED', 'Current fleet entitlement no longer permits execution.');
+  if (!dispatcherAllowed(target, job.actorUserId)) executionRefuse('REVOKED', 'This dispatcher is no longer allowed on the target.');
+  await checkExecutionCapacity(db, team!, false);
   const [member] = await db.select().from(memberships).where(and(eq(memberships.teamId, target.teamId), eq(memberships.userId, job.actorUserId)));
   if (!member) executionRefuse('REVOKED', 'The dispatcher no longer belongs to this workspace.');
   if (job.actorSecurityPrincipal.tokenId) {
@@ -108,16 +140,28 @@ export async function executionAuthority(db: Db, target: ExecutionTargetRow, job
     if (!token || token.revokedAt || (token.expiresAt && token.expiresAt <= new Date())) executionRefuse('REVOKED', 'The dispatch credential is no longer current.');
     if (token.scope !== 'personal' && (token.teamId !== target.teamId || (token.scope === 'project' && token.projectId !== target.projectId))) executionRefuse('REVOKED', 'The dispatch credential no longer reaches this project.');
   }
-  const denied = await withSecurityPrincipal(job.actorSecurityPrincipal, async () =>
-    (await authorizeSecurity(db, job.principalKind === 'agent' ? 'credential' : 'browser', { project_id: target.projectId })) ??
-    (job.principalKind === 'agent' ? await authorizeSecurity(db, 'tool', { tool: 'dispatch_work', project_id: target.projectId }) : null));
+  const security = { ...job.actorSecurityPrincipal };
+  if (job.actorSessionProof) {
+    // Browser session ids are bearer credentials. Persist only the hash, then
+    // resolve the original proof for current session/organization checks.
+    const [session] = await db.select({ id: webSessions.id }).from(webSessions).where(and(
+      eq(webSessions.userId, job.actorUserId), gt(webSessions.expiresAt, new Date()),
+      sql`encode(sha256(convert_to(${webSessions.id}, 'UTF8')), 'hex') = ${job.actorSessionProof}`,
+    )).limit(1);
+    if (!session) executionRefuse('REVOKED', 'The browser session that dispatched this job has expired or been revoked.');
+    security.sessionId = session!.id;
+  }
+  const scope = { target_id: target.id, project_id: target.projectId, team_id: target.teamId };
+  const denied = await withSecurityPrincipal(security, async () =>
+    (await authorizeSecurity(db, job.principalKind === 'agent' ? 'credential' : 'browser', scope)) ??
+    (job.principalKind === 'agent' ? await authorizeSecurity(db, 'tool', { ...scope, tool: 'dispatch_work' }) : null));
   if (denied) executionRefuse('REVOKED', denied);
   const [offer] = await db.select().from(handoffs).where(eq(handoffs.id, job.handoffId));
   if (!offer || offer.targetInstallationId !== target.installationId || ['cancelled', 'declined'].includes(offer.state)) executionRefuse('REVOKED', 'The assignment was cancelled or is no longer addressed to this installation.');
-  if (job.workId) {
-    const [work] = await db.select().from(workItems).where(eq(workItems.id, job.workId));
-    if (!work || work.specRevision !== job.specRevision) executionRefuse('CONTRACT_CHANGED', 'The pinned work contract changed. Dispatch the current contract explicitly.');
-    if (work.archivedAt || ['draft', 'accepted', 'cancelled'].includes(work.state)) executionRefuse('CONTRACT_CHANGED', 'The work is no longer executable.');
+  const startCall = job.assignment.start_call;
+  if (job.workId || hasWorkPin(startCall)) {
+    const pin = await currentAssignmentWork(db, target, job.handoffId, startCall);
+    if (pin.workId !== job.workId || pin.specRevision !== job.specRevision) assignmentContractChanged();
   }
 }
 async function targetDto(db: Db, target: ExecutionTargetRow): Promise<ExecutionTargetDto> {
@@ -205,13 +249,13 @@ async function revokeAttempt(tx: Db, jobId: string) {
   const attempts = await tx.select().from(executionAttempts).where(eq(executionAttempts.jobId, jobId));
   for (const attempt of attempts) await tx.update(executionAttemptGrants).set({ revokedAt: new Date() }).where(eq(executionAttemptGrants.attemptId, attempt.id));
 }
-async function requestCancel(tx: Db, job: ExecutionJobRow) {
+async function requestCancel(tx: Db, job: ExecutionJobRow, reason = 'cancel_requested') {
   if (END.includes(job.state) || ['dispatch_unknown','lost'].includes(job.state)) return job;
   const state = job.state === 'queued' ? 'cancelled' : 'cancel_requested';
   await revokeAttempt(tx, job.id);
   await tx.update(executionAttempts).set({ state }).where(eq(executionAttempts.jobId, job.id));
   const updated = (await tx.update(executionJobs).set({ state, updatedAt: new Date() }).where(eq(executionJobs.id, job.id)).returning())[0]!;
-  if (job.state !== state) await event(tx, job, state, 'cancel_requested');
+  if (job.state !== state) await event(tx, job, state, reason);
   return updated;
 }
 export async function setExecutionTargetEnabled(db: Db, principal: WorkPrincipal, targetId: string, enabled: boolean): Promise<ExecutionResult<{ target: ExecutionTargetDto }>> {
@@ -219,8 +263,7 @@ export async function setExecutionTargetEnabled(db: Db, principal: WorkPrincipal
     const target = await db.transaction(async (transaction) => {
       const tx = transaction as unknown as Db;
       const target = await lockExecutionTarget(tx, targetId);
-      await access(tx, principal, target, enabled ? 'enable_execution' : 'disable_execution');
-      const membership = await workAccess(tx, principal, target.teamId, target.projectId);
+      const membership = await access(tx, principal, target, enabled ? 'enable_execution' : 'disable_execution');
       const workerOwnDisable = !enabled && principal.kind === 'agent' && principal.grant.installationId === target.installationId && !principal.grant.execution;
       if (!workerOwnDisable && (principal.kind !== 'human' || (principal.userId !== target.ownerId && (enabled || membership?.role !== 'owner')))) executionRefuse('FORBIDDEN', enabled ? 'Only the installation owner in the console may enable execution.' : 'Only its owner or a workspace owner may disable execution.');
       if (enabled) { await liveTargetCredential(tx, target); if (target.quarantined) executionRefuse('QUARANTINED', 'An unresolved process still owns this checkout.'); }
@@ -236,7 +279,199 @@ export async function setExecutionTargetEnabled(db: Db, principal: WorkPrincipal
     return { target: await targetDto(db, target) };
   });
 }
-export async function dispatchExecution(db: Db, principal: WorkPrincipal, input: ExecutionDispatchInput): Promise<ExecutionResult<{ job: ExecutionJobDto; replayed: boolean }>> {
+
+async function executionPolicyTeam(db: Db, principal: WorkPrincipal, teamId: string) {
+  if (principal.kind !== 'human') return executionRefuse('FORBIDDEN', 'Only a workspace owner in the console may edit execution controls.');
+  const [row] = await db.select({ team: teams, role: memberships.role }).from(teams)
+    .innerJoin(memberships, eq(memberships.teamId, teams.id))
+    .where(and(eq(teams.id, teamId), membershipUser(principal.userId))).limit(1);
+  if (!row) return executionRefuse('NOT_FOUND', 'No workspace is visible to this principal.');
+  if (row.role !== 'owner') executionRefuse('FORBIDDEN', 'Only a workspace owner may edit execution controls.');
+  const denied = await authorizeSecurity(db, 'browser', { team_id: teamId });
+  if (denied) executionRefuse('FORBIDDEN', denied);
+  const limits = await effectiveLimits(db, row.team);
+  if (!limits.executionControls || limits.readOnly || limits.fleet !== 'full') {
+    executionRefuse('LIMIT_EXCEEDED', 'Editing workspace execution controls requires the Team fleet entitlement.');
+  }
+  return row.team;
+}
+
+export async function readExecutionControls(db: Db, principal: WorkPrincipal, teamId: string, targetIds: string[]) {
+  return result(async () => {
+    const team = await executionPolicyTeam(db, principal, teamId);
+    const targets = targetIds.length ? await db.select({ id: executionTargets.id, dispatchers: executionTargets.dispatcherUserIds })
+      .from(executionTargets).where(and(eq(executionTargets.teamId, teamId), inArray(executionTargets.id, targetIds))) : [];
+    // Only a workspace-wide owner sees this roster. The membership filter in
+    // executionPolicyTeam excludes restricted organization project roles.
+    const members = targets.length ? await db.select({ id: users.id, username: users.username }).from(memberships)
+      .innerJoin(users, eq(users.id, memberships.userId)).where(eq(memberships.teamId, teamId))
+      .orderBy(asc(users.username)).limit(EXECUTION_POLICY_LIMIT + 1) : [];
+    return { cap: team.executionJobCap, targets, members };
+  });
+}
+
+export async function setExecutionCapacity(db: Db, principal: WorkPrincipal, teamId: string, cap: number | null): Promise<ExecutionResult<{ cap: number | null }>> {
+  return result(() => db.transaction(async transaction => {
+    const tx = transaction as unknown as Db;
+    if (!isCanonicalUuid(teamId)) executionRefuse('NOT_FOUND', 'No workspace is visible to this principal.');
+    await lockExecutionWorkspace(tx, teamId);
+    const team = await executionPolicyTeam(tx, principal, teamId);
+    if (cap !== null && (!Number.isInteger(cap) || cap < 1 || cap > EXECUTION_POLICY_LIMIT)) {
+      executionRefuse('INVALID_INPUT', `Enter a cap from 1 to ${EXECUTION_POLICY_LIMIT}, or leave it blank.`);
+    }
+    if (team.executionJobCap === cap) return { cap };
+    if (cap !== null && await reservations(tx, team.id, cap + 1) > cap) {
+      executionRefuse('CAPACITY_EXCEEDED', 'The cap is below the number of reserved jobs. Cancel queued jobs or wait for an active job to stop.');
+    }
+    await tx.update(teams).set({ executionJobCap: cap }).where(eq(teams.id, team.id));
+    await criticalAudit(tx, { teamId: team.id, actorId: principal.userId, action: 'execution_capacity_changed', subjectId: team.id });
+    return { cap };
+  }));
+}
+
+export async function setExecutionDispatchers(db: Db, principal: WorkPrincipal, targetId: string, userIds: string[] | null): Promise<ExecutionResult<{ dispatchers: string[] | null }>> {
+  return result(() => db.transaction(async transaction => {
+    const tx = transaction as unknown as Db;
+    const target = await lockExecutionTarget(tx, targetId);
+    await access(tx, principal, target, 'manage_execution_dispatchers');
+    await executionPolicyTeam(tx, principal, target.teamId);
+    if (userIds !== null && (userIds.length > EXECUTION_POLICY_LIMIT || !userIds.every(isCanonicalUuid))) {
+      executionRefuse('INVALID_INPUT', 'Choose current workspace members as dispatchers.');
+    }
+    const dispatchers = userIds === null ? null : [...new Set(userIds.map(id => id.toLowerCase()))].sort();
+    if (dispatchers?.length) {
+      const members = await tx.select({ id: memberships.userId }).from(memberships)
+        .where(and(eq(memberships.teamId, target.teamId), inArray(memberships.userId, dispatchers)));
+      if (members.length !== dispatchers.length) executionRefuse('INVALID_INPUT', 'Choose current workspace members as dispatchers.');
+    }
+    if (fingerprintJson(target.dispatcherUserIds) === fingerprintJson(dispatchers)) return { dispatchers };
+    const [updated] = await tx.update(executionTargets).set({ dispatcherUserIds: dispatchers })
+      .where(eq(executionTargets.id, target.id)).returning();
+    if (dispatchers !== null) {
+      const jobs = await tx.select().from(executionJobs).where(and(eq(executionJobs.targetId, target.id), inArray(executionJobs.state, ['queued', ...EXECUTION_ACTIVE])));
+      for (const job of jobs) {
+        if (!dispatcherAllowed(updated!, job.actorUserId)) await requestCancel(tx, job, 'dispatcher_revoked');
+      }
+    }
+    await criticalAudit(tx, { teamId: target.teamId, actorId: principal.userId, action: 'execution_dispatchers_changed', subjectId: target.id });
+    return { dispatchers };
+  }));
+}
+
+export async function reconcileExecutionCapacity(db: Db, principal: WorkPrincipal, jobId: string, input: {
+  requestId: string;
+  expectedState: string;
+  expectedGrantVersion: number;
+  verifiedStopped: boolean;
+  reason: string;
+}): Promise<ExecutionResult<{ replayed: boolean }>> {
+  return result(() => db.transaction(async transaction => {
+    const tx = transaction as unknown as Db;
+    if (!isCanonicalUuid(jobId)) executionRefuse('NOT_FOUND', 'No execution is visible to this principal.');
+    const [seen] = await tx.select({ targetId: executionJobs.targetId }).from(executionJobs).where(eq(executionJobs.id, jobId));
+    if (!seen) return executionRefuse('NOT_FOUND', 'No execution is visible to this principal.');
+    const target = await lockExecutionTarget(tx, seen.targetId);
+    await access(tx, principal, target, 'reconcile_execution_capacity');
+    await executionPolicyTeam(tx, principal, target.teamId);
+    const reason = input.reason.trim();
+    if (!input.verifiedStopped || !isCanonicalUuid(input.requestId) || !reason || reason.length > EXECUTION_RECONCILIATION_REASON_LIMIT) {
+      return executionRefuse('INVALID_INPUT', 'Confirm you verified the local process stopped and enter a reason.');
+    }
+    const [job] = await tx.select().from(executionJobs).where(eq(executionJobs.id, jobId)).for('no key update');
+    if (!job) return executionRefuse('NOT_FOUND', 'No execution is visible to this principal.');
+    const requestHash = fingerprintJson({
+      jobId: job.id, actorUserId: principal.userId, expectedState: input.expectedState, expectedGrantVersion: input.expectedGrantVersion, reason,
+    });
+    const previous = job.capacityReconciliation;
+    if (previous) {
+      if (previous.requestId === input.requestId && previous.requestHash === requestHash) return { replayed: true };
+      return executionRefuse(previous.requestId === input.requestId ? 'REQUEST_REUSED' : 'ALREADY_RECONCILED', 'The workspace slot already has an owner reconciliation.');
+    }
+    if (!target.quarantined || target.grantVersion !== input.expectedGrantVersion ||
+        job.state !== input.expectedState || !UNCERTAIN.includes(job.state)) {
+      return executionRefuse('STALE_EXECUTION', 'Review the current quarantined execution before releasing its workspace slot.');
+    }
+    await tx.update(executionJobs).set({
+      capacityReconciliation: { actorUserId: principal.userId, attestedAt: iso(new Date()), reason: redactSecrets(reason),
+        requestId: input.requestId, requestHash },
+    }).where(eq(executionJobs.id, job.id));
+    await criticalAudit(tx, { teamId: target.teamId, actorId: principal.userId, action: 'execution_capacity_reconciled', subjectId: job.id });
+    return { replayed: false };
+  }));
+}
+
+async function requireDispatchTarget(db: Db, principal: WorkPrincipal, target: ExecutionTargetRow) {
+  if (!target.enabled || target.quarantined) executionRefuse('NOT_ENABLED', 'This target is disabled or quarantined. Its owner must explicitly permit execution.');
+  if (!dispatcherAllowed(target, principal.userId)) executionRefuse('FORBIDDEN', 'This workspace has restricted who can dispatch to this target.');
+  await liveTargetCredential(db, target);
+  const [team] = await db.select().from(teams).where(eq(teams.id, target.teamId));
+  const limits = team ? await effectiveLimits(db, team) : null;
+  if (!limits || limits.fleet !== 'full' || limits.readOnly) return executionRefuse('LIMIT_EXCEEDED', 'Execution requires an active fleet entitlement.');
+  await checkExecutionCapacity(db, team!, true);
+  return limits;
+}
+
+async function readExecutionAssignment(db: Db, sessionId: string, title: string): Promise<ExecutionJobRow['assignment']> {
+  const [message] = await db.select().from(messages).where(and(eq(messages.sessionId, sessionId), eq(messages.kind, 'handoff')))
+    .orderBy(asc(messages.createdAt)).limit(1);
+  const resume = message?.payload as { reclaim?: { arguments?: Record<string, unknown> }; task?: string; branch?: string; repo?: string } | null;
+  const startCall = resume?.reclaim?.arguments;
+  if (!startCall) return executionRefuse('INVALID_ASSIGNMENT', 'This assignment has no structured start record.');
+  return { task: String(resume?.task ?? title), brief: redactSecrets(message?.body ?? '').slice(0, 24000),
+    branch: typeof resume?.branch === 'string' ? resume.branch : null, repository_identity: typeof resume?.repo === 'string' ? resume.repo : null,
+    start_call: startCall };
+}
+
+const hasWorkPin = (startCall: Record<string, unknown>) =>
+  startCall.work_id !== undefined || startCall.expected_spec_revision !== undefined;
+
+const assignmentContractChanged = () => executionRefuse('CONTRACT_CHANGED',
+  'The pinned work contract changed or the assignment link was corrected. Create a new assignment for the current contract.');
+
+async function currentAssignmentWork(db: Db, target: ExecutionTargetRow, handoffId: string, startCall: Record<string, unknown>) {
+  // An after-the-fact link has no revision. A corrected Native Work assignment
+  // also cannot become standalone, because its immutable brief still pins Work.
+  const [link] = await db.select({ work: workItems, specRevision: workLinks.specRevision }).from(workLinks)
+    .innerJoin(workItems, eq(workItems.id, workLinks.workId))
+    .where(and(eq(workLinks.handoffId, handoffId), eq(workLinks.kind, 'assignment'), isNull(workLinks.supersededAt),
+      eq(workLinks.teamId, target.teamId), eq(workLinks.projectId, target.projectId))).limit(1);
+  if (!link && !hasWorkPin(startCall)) return { workId: null, specRevision: null };
+  if (!link || link.specRevision === null || link.work.id !== startCall.work_id ||
+      link.specRevision !== startCall.expected_spec_revision || link.specRevision !== link.work.specRevision) {
+    return assignmentContractChanged();
+  }
+  if (link.work.archivedAt || ['draft', 'accepted', 'cancelled'].includes(link.work.state)) {
+    return executionRefuse('CONTRACT_CHANGED', 'The work is no longer executable.');
+  }
+  return { workId: link.work.id, specRevision: link.specRevision };
+}
+
+async function lockAssignmentWorkProject(db: Db, projectId: string) {
+  // All Work writers lock the counter first. Take this after execution locks
+  // and before reading the assignment link so a correction cannot cross admission.
+  await db.select({ projectId: workProjectCounters.projectId }).from(workProjectCounters)
+    .where(eq(workProjectCounters.projectId, projectId)).for('key share');
+}
+
+/** Browser review is an advisory read. Dispatch repeats every check under the workspace lock. */
+export async function reviewExecutionDispatch(db: Db, principal: WorkPrincipal, sessionId: string): Promise<ExecutionResult<{ target: ExecutionTargetDto }>> {
+  return result(async () => {
+    if (principal.kind !== 'human' || !isCanonicalUuid(sessionId)) return executionRefuse('NOT_FOUND', 'No open assignment is visible.');
+    const [row] = await db.select({ target: executionTargets, handoffId: handoffs.id, title: debugSessions.title }).from(handoffs)
+      .innerJoin(debugSessions, eq(debugSessions.id, handoffs.sessionId))
+      .innerJoin(executionTargets, and(eq(executionTargets.installationId, handoffs.targetInstallationId),
+        eq(executionTargets.projectId, debugSessions.projectId), eq(executionTargets.teamId, debugSessions.teamId)))
+      .where(and(eq(handoffs.sessionId, sessionId), eq(handoffs.kind, 'assignment'), inArray(handoffs.state, OPEN_HANDOFF_STATES)));
+    if (!row) return executionRefuse('NOT_FOUND', 'This assignment has no matching managed target.');
+    await access(db, principal, row.target, 'dispatch_work');
+    await requireDispatchTarget(db, principal, row.target);
+    const assignment = await readExecutionAssignment(db, sessionId, row.title);
+    await currentAssignmentWork(db, row.target, row.handoffId, assignment.start_call);
+    return { target: await targetDto(db, row.target) };
+  });
+}
+
+export async function dispatchExecution(db: Db, principal: WorkPrincipal, input: ExecutionDispatchInput, reviewedGrantVersion?: number): Promise<ExecutionResult<{ job: ExecutionJobDto; replayed: boolean }>> {
   return result(() => db.transaction(async (transaction) => {
     const tx = transaction as unknown as Db;
     if (!executionDispatchSchema.safeParse(input).success) executionRefuse('INVALID_INPUT', 'Dispatch needs an exact target, assignment session and UUID request id.');
@@ -249,56 +484,51 @@ export async function dispatchExecution(db: Db, principal: WorkPrincipal, input:
       if (old.targetId !== target.id || old.sessionId !== input.session_id) executionRefuse('REQUEST_REUSED', 'This request id already names another dispatch.');
       return { job: executionJobDto(old), replayed: true };
     }
-    if (!target.enabled || target.quarantined) executionRefuse('NOT_ENABLED', 'This target is disabled or quarantined. Its owner must explicitly permit execution.');
-    await liveTargetCredential(tx, target);
-    const [team] = await tx.select().from(teams).where(eq(teams.id, target.teamId));
-    const limits = team ? await effectiveLimits(tx, team) : null;
-    if (!limits || limits.fleet !== 'full' || limits.readOnly) executionRefuse('LIMIT_EXCEEDED', 'Execution requires an active fleet entitlement.');
+    if (reviewedGrantVersion !== undefined && reviewedGrantVersion !== target.grantVersion) {
+      executionRefuse('TARGET_CHANGED', 'The target configuration or permission changed. Review the current target before dispatching.');
+    }
+    const limits = await requireDispatchTarget(tx, principal, target);
     const [offer] = await tx.select({ handoff: handoffs, session: debugSessions }).from(handoffs).innerJoin(debugSessions, eq(debugSessions.id, handoffs.sessionId))
       .where(eq(handoffs.sessionId, input.session_id)).for('no key update', { of: handoffs });
-    if (!offer || offer.handoff.kind !== 'assignment' || offer.handoff.targetInstallationId !== target.installationId || offer.session.projectId !== target.projectId || offer.session.teamId !== target.teamId || !['offered','accepted','in_progress','needs_attention'].includes(offer.handoff.state)) executionRefuse('NOT_FOUND', 'No open assignment to this target is visible.');
-    const [duplicate] = await tx.select().from(executionJobs).where(and(eq(executionJobs.handoffId, offer.handoff.id), inArray(executionJobs.state, ['queued', ...OCCUPIED]))).limit(1);
+    if (!offer || offer.handoff.kind !== 'assignment' || offer.handoff.targetInstallationId !== target.installationId || offer.session.projectId !== target.projectId || offer.session.teamId !== target.teamId || !(OPEN_HANDOFF_STATES as readonly string[]).includes(offer.handoff.state)) executionRefuse('NOT_FOUND', 'No open assignment to this target is visible.');
+    const [duplicate] = await tx.select().from(executionJobs).where(and(eq(executionJobs.handoffId, offer.handoff.id), inArray(executionJobs.state, RESERVED))).limit(1);
     if (duplicate) executionRefuse('ALREADY_DISPATCHED', 'This assignment already has a queued, active or unresolved execution.');
     const queued = await tx.select({ id: executionJobs.id }).from(executionJobs).where(and(eq(executionJobs.targetId, target.id), eq(executionJobs.state, 'queued'))).limit(20);
     if (queued.length >= 20) executionRefuse('LIMIT_EXCEEDED', 'This target already has twenty queued jobs.');
-    const [message] = await tx.select().from(messages).where(and(eq(messages.sessionId, input.session_id), eq(messages.kind, 'handoff'))).orderBy(asc(messages.createdAt)).limit(1);
-    const resume = message?.payload as { reclaim?: { arguments?: Record<string, unknown> }; task?: string; branch?: string; repo?: string } | null;
-    const startCall = resume?.reclaim?.arguments;
-    if (!startCall) executionRefuse('INVALID_ASSIGNMENT', 'This assignment has no structured start record.');
-    const [link] = await tx.select().from(workLinks).where(and(eq(workLinks.handoffId, offer.handoff.id), eq(workLinks.kind, 'assignment'), isNull(workLinks.supersededAt))).limit(1);
-    const workId = link?.workId ?? null;
-    const specRevision = link?.specRevision ?? null;
-    if (workId) {
-      await tx.select().from(workProjectCounters).where(eq(workProjectCounters.projectId, target.projectId)).for('update');
-      const [work] = await tx.select().from(workItems).where(eq(workItems.id, workId)).for('update');
-      if (!work || specRevision === null || work.specRevision !== specRevision || work.archivedAt || ['draft','accepted','cancelled'].includes(work.state)) executionRefuse('CONTRACT_CHANGED', 'The assignment must be made against the current executable work contract.');
-    }
+    const assignment = await readExecutionAssignment(tx, input.session_id, offer.session.title);
+    if (hasWorkPin(assignment.start_call)) await lockAssignmentWorkProject(tx, target.projectId);
+    const { workId, specRevision } = await currentAssignmentWork(tx, target, offer.handoff.id, assignment.start_call);
     if (principal.kind === 'agent') {
-      const charged = await hitCounter(tx, 'team-day', target.teamId, DAY_MS, limits!.maxToolCallsPerDay);
+      const charged = await hitCounter(tx, 'team-day', target.teamId, DAY_MS, limits.maxToolCallsPerDay);
       if (charged.exceeded) executionRefuse('LIMIT_EXCEEDED', 'This workspace has used its daily tool allowance. Nothing was dispatched.');
     }
-    const assignment = { task: String(resume?.task ?? offer.session.title), brief: redactSecrets(message?.body ?? '').slice(0, 24000),
-      branch: typeof resume?.branch === 'string' ? resume.branch : null, repository_identity: typeof resume?.repo === 'string' ? resume.repo : null, start_call: startCall! };
     const requestHash = fingerprintJson({ target: target.id, session: input.session_id, workId, specRevision, maxRuntimeSeconds: target.maxRuntimeSeconds, maxTurns: target.maxTurns, grantVersion: target.grantVersion });
-    const security = currentSecurityPrincipal() ?? { userId: principal.userId, ...(principal.kind === 'agent' ? { tokenId: principal.grant.tokenId, teamId: principal.grant.teamId, projectId: principal.grant.projectId } : {}), path: principal.kind === 'agent' ? '/mcp' : '/app', method: 'POST' };
+    const { sessionId, ...security } = currentSecurityPrincipal() ?? { userId: principal.userId, ...(principal.kind === 'agent' ? { tokenId: principal.grant.tokenId, teamId: principal.grant.teamId, projectId: principal.grant.projectId } : {}), path: principal.kind === 'agent' ? '/mcp' : '/app', method: 'POST' };
     const [job] = await tx.insert(executionJobs).values({ targetId: target.id, sessionId: input.session_id, handoffId: offer.handoff.id, workId, specRevision,
       principalKind: principal.kind, principalId: principalId(principal), actorUserId: principal.userId, actorTokenId: principal.kind === 'agent' ? principal.grant.tokenId : null,
-      actorSecurityPrincipal: security, requestId: input.request_id, requestHash, grantVersion: target.grantVersion, maxRuntimeSeconds: target.maxRuntimeSeconds, maxTurns: target.maxTurns, assignment }).returning();
+      actorSecurityPrincipal: security, actorSessionProof: sessionId ? sha256hex(sessionId) : null,
+      requestId: input.request_id, requestHash, grantVersion: target.grantVersion, maxRuntimeSeconds: target.maxRuntimeSeconds, maxTurns: target.maxTurns, assignment }).returning();
     await event(tx, job!, 'queued', 'explicit_dispatch');
     await criticalAudit(tx, { teamId: target.teamId, actorId: principal.userId, action: 'execution_dispatched', subjectId: job!.id });
     return { job: executionJobDto(job!), replayed: false };
   }));
 }
-export async function getExecution(db: Db, principal: WorkPrincipal, jobId: string): Promise<ExecutionResult<ExecutionDetailDto>> {
+export async function getExecution(db: Db, principal: WorkPrincipal, jobId: string): Promise<ExecutionResult<ExecutionConsoleDetail>> {
   return result(async () => {
     if (!isCanonicalUuid(jobId)) executionRefuse('NOT_FOUND', 'No execution is visible to this principal.');
     const [row] = await db.select({ job: executionJobs, target: executionTargets }).from(executionJobs).innerJoin(executionTargets, eq(executionTargets.id, executionJobs.targetId)).where(eq(executionJobs.id, jobId));
     if (!row) executionRefuse('NOT_FOUND', 'No execution is visible to this principal.');
-    await access(db, principal, row.target, 'get_execution');
+    const member = await access(db, principal, row.target, 'get_execution');
     const [attempt] = await db.select().from(executionAttempts).where(eq(executionAttempts.jobId, jobId));
     const events = await db.select().from(executionEvents).where(eq(executionEvents.jobId, jobId)).orderBy(desc(executionEvents.createdAt)).limit(50);
-    const member = await workAccess(db, principal, row.target.teamId, row.target.projectId);
+    const attestation = principal.kind === 'human' ? row.job.capacityReconciliation : null;
+    const [actor] = attestation ? await db.select({ username: users.username }).from(users)
+      .where(eq(users.id, attestation.actorUserId)) : [];
     return { job: executionJobDto(row.job), target: await targetDto(db, row.target), attempt: attempt ? executionAttemptDto(attempt) : null,
+      capacityReconciliation: attestation ? { attestedAt: attestation.attestedAt, reason: attestation.reason,
+        actor: { id: attestation.actorUserId,
+          label: actor && actor.username !== `deleted-${attestation.actorUserId}` ? actor.username : 'Deleted account' },
+      } : null,
       can_cancel: principal.userId === row.job.actorUserId || principal.userId === row.target.ownerId || (principal.kind === 'human' && member?.role === 'owner'),
       events: events.map(e => ({ id: e.id, state: e.state, reason: e.reason, detail: e.detail, created_at: iso(e.createdAt) })), result_provenance: 'worker_reported', acceptance: 'separate' };
   });
@@ -310,8 +540,7 @@ export async function cancelExecution(db: Db, principal: WorkPrincipal, jobId: s
     const [seen] = await tx.select().from(executionJobs).where(eq(executionJobs.id, jobId));
     if (!seen) executionRefuse('NOT_FOUND', 'No execution is visible to this principal.');
     const target = await lockExecutionTarget(tx, seen.targetId);
-    await access(tx, principal, target, 'cancel_execution');
-    const member = await workAccess(tx, principal, target.teamId, target.projectId);
+    const member = await access(tx, principal, target, 'cancel_execution');
     if (principal.userId !== seen.actorUserId && principal.userId !== target.ownerId && (principal.kind !== 'human' || member?.role !== 'owner')) executionRefuse('FORBIDDEN', 'Only the dispatcher, target owner or a workspace owner may cancel this execution.');
     const [job] = await tx.select().from(executionJobs).where(eq(executionJobs.id, jobId)).for('no key update');
     const updated = await requestCancel(tx, job!);
@@ -346,6 +575,12 @@ export async function claimExecution(db: Db, userId: string, grant: AgentGrant, 
     if (!target.enabled || target.quarantined) return { job: null };
     const [job] = await tx.select().from(executionJobs).where(and(eq(executionJobs.targetId, target.id), eq(executionJobs.state, 'queued'))).orderBy(asc(executionJobs.createdAt)).limit(1).for('no key update');
     if (!job) return { job: null };
+    if (job.workId || hasWorkPin(job.assignment.start_call)) {
+      // The child grant references the worker credential. Establish that FK lock
+      // before the Work counter, as Work locks come last.
+      await tx.select({ id: tokens.id }).from(tokens).where(eq(tokens.id, grant.tokenId)).for('key share');
+      await lockAssignmentWorkProject(tx, target.projectId);
+    }
     try { await executionAuthority(tx, target, job); } catch (error) {
       if (!(error instanceof ExecutionRefusal)) throw error;
       await tx.update(executionJobs).set({ state: 'cancelled', updatedAt: new Date() }).where(eq(executionJobs.id, job.id));

@@ -34,6 +34,7 @@ export const executionTargets = pgTable('execution_targets', {
   maxRuntimeSeconds: integer('max_runtime_seconds').notNull(),
   maxTurns: integer('max_turns').notNull(),
   enabled: boolean('enabled').notNull().default(false),
+  dispatcherUserIds: uuid('dispatcher_user_ids').array(),
   quarantined: boolean('quarantined').notNull().default(false),
   grantVersion: integer('grant_version').notNull().default(1),
   lastSeenAt: timestamp('last_seen_at', { withTimezone: true }),
@@ -63,6 +64,7 @@ export const executionJobs = pgTable('execution_jobs', {
   actorUserId: uuid('actor_user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
   actorTokenId: uuid('actor_token_id').references(() => tokens.id, { onDelete: 'set null' }),
   actorSecurityPrincipal: jsonb('actor_security_principal').$type<import('../lib/securityHooks').SecurityPrincipal>().notNull(),
+  actorSessionProof: text('actor_session_proof'),
   requestId: uuid('request_id').notNull(),
   requestHash: text('request_hash').notNull(),
   grantVersion: integer('grant_version').notNull(),
@@ -70,12 +72,20 @@ export const executionJobs = pgTable('execution_jobs', {
   maxRuntimeSeconds: integer('max_runtime_seconds').notNull(),
   maxTurns: integer('max_turns').notNull(),
   assignment: jsonb('assignment').$type<ExecutionJobDto['assignment']>().notNull(),
+  capacityReconciliation: jsonb('capacity_reconciliation').$type<{
+    actorUserId: string;
+    attestedAt: string;
+    reason: string;
+    requestId: string;
+    requestHash: string;
+  }>(),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
 }, (t) => [
   uniqueIndex('execution_request_once').on(t.principalKind, t.principalId, t.requestId),
   uniqueIndex('execution_assignment_active').on(t.handoffId).where(sql`state in ('queued','leased','starting','running','cancel_requested','dispatch_unknown','lost')`),
   index('execution_target_queue').on(t.targetId, t.createdAt),
+  index('execution_jobs_target_state').on(t.targetId, t.state),
   index('execution_jobs_session').on(t.sessionId),
   index('execution_jobs_actor_user').on(t.actorUserId),
   index('execution_jobs_actor_token').on(t.actorTokenId),
@@ -232,6 +242,7 @@ export const teams = pgTable('teams', {
   webhookUrl: text('webhook_url'),
   /** Entitlement plan id; limits resolved in lib/entitlements. */
   plan: text('plan').notNull().default('free'),
+  executionJobCap: integer('execution_job_cap'),
   /**
    * What an hour of this team's engineering time is worth, in cents.
    *
@@ -244,7 +255,7 @@ export const teams = pgTable('teams', {
   /** Secret path segment for inbound announce/github hooks. */
   inboundToken: text('inbound_token').unique(),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
-});
+}, (t) => [check('teams_execution_job_cap', sql`${t.executionJobCap} between 1 and 1000`)]);
 
 export const projects = pgTable(
   'projects',
@@ -561,7 +572,7 @@ export const webSessions = pgTable('web_sessions', {
    * (`auth/signIn.ts`), so this records how it began rather than gating it.
    */
   mfaAt: timestamp('mfa_at', { withTimezone: true }),
-});
+}, (t) => [index('web_sessions_user').on(t.userId)]);
 
 /**
  * One authenticator app per account (RFC 6238 TOTP).
@@ -2065,6 +2076,29 @@ export const workLinks = pgTable(
         (${t.kind} in ('assignment', 'handoff') and ${t.handoffId} is not null) or
         (${t.kind} = 'knowledge' and ${t.knowledgeItemId} is not null))`,
     ),
+  ],
+);
+
+/** Tracking for messages already stored in an assignment thread. */
+export const workAssignmentQuestions = pgTable(
+  'work_assignment_questions',
+  {
+    questionMessageId: uuid('question_message_id').primaryKey().references(() => messages.id, { onDelete: 'cascade' }),
+    assignmentLinkId: uuid('assignment_link_id').notNull().references(() => workLinks.id, { onDelete: 'cascade' }),
+    recipientInstallationId: uuid('recipient_installation_id').notNull(),
+    requestId: uuid('request_id').notNull(),
+    firstServedAt: timestamp('first_served_at', { withTimezone: true }),
+    answeredAt: timestamp('answered_at', { withTimezone: true }),
+    answerFingerprint: text('answer_fingerprint'),
+    replyMessageId: uuid('reply_message_id').unique().references(() => messages.id, { onDelete: 'set null' }),
+  },
+  (t) => [
+    unique('work_assignment_questions_request').on(t.assignmentLinkId, t.requestId),
+    index('work_assignment_questions_pending').on(t.assignmentLinkId, t.questionMessageId).where(sql`${t.answeredAt} is null`),
+    check('work_assignment_questions_answer', sql`
+      (${t.answeredAt} is null and ${t.replyMessageId} is null and ${t.answerFingerprint} is null)
+      or (${t.answeredAt} is not null and ${t.firstServedAt} is not null and ${t.answerFingerprint} is not null)
+    `),
   ],
 );
 

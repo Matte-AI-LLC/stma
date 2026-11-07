@@ -30,6 +30,11 @@ try {
   if (!apply) {
     const counts =
       await client`select count(*)::int as total, count(*) filter (where token like 'enc:v1:%')::int as encrypted from team_integrations`;
+    const integrations = Object.fromEntries(
+      (await client`select split_part(token, ':', 3) as key_id, count(*)::int as n
+        from team_integrations where token like 'enc:v1:%' group by 1 order by 1`)
+        .map((row) => [row.key_id, row.n]),
+    );
     // Counted by key version, never read: which versions are still in use is
     // what decides whether an old key may be dropped.
     const authenticators = (await hasAuthenticators(client))
@@ -43,6 +48,7 @@ try {
       JSON.stringify({
         mode: 'dry-run',
         ...counts[0],
+        integrationsByKey: integrations,
         authenticatorsByKey: authenticators,
         action:
           'Back up the database and key versions separately; review the target before --apply.',

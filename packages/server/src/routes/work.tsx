@@ -8,6 +8,7 @@ import {
   agentInstallations,
   agentRuns,
   debugSessions,
+  executionTargets,
   handoffs,
   knowledgeItems,
   memberships,
@@ -43,6 +44,7 @@ import {
   rowFromCriterion,
 } from '../lib/workForm';
 import { workQueue } from '../lib/workQueue';
+import { workExecutions } from '../lib/workExecution';
 import type { AppEnv, User } from '../types';
 import {
   NewWorkPage,
@@ -726,11 +728,14 @@ async function executionRows(db: Db, teamSlug: string, links: Rec[]): Promise<Ex
           title: debugSessions.title,
           target: targets.name,
           taker: takers.name,
+          managedTarget: executionTargets.id,
         })
         .from(handoffs)
         .innerJoin(debugSessions, eq(debugSessions.id, handoffs.sessionId))
         .leftJoin(targets, eq(targets.id, handoffs.targetInstallationId))
         .leftJoin(takers, eq(takers.id, handoffs.installationId))
+        .leftJoin(executionTargets, and(eq(executionTargets.installationId, handoffs.targetInstallationId),
+          eq(executionTargets.projectId, debugSessions.projectId), eq(executionTargets.teamId, debugSessions.teamId)))
         .where(inArray(handoffs.id, offerIds))
     : [];
   const knowledge = knowledgeIds.length
@@ -772,6 +777,9 @@ async function executionRows(db: Db, teamSlug: string, links: Rec[]): Promise<Ex
       ...base,
       title: short(offer.title, 100),
       href: `/app/sessions/${offer.sessionId}`,
+      dispatchHref: offer.kind === 'assignment' && offer.managedTarget && !base.superseded &&
+        (OPEN_HANDOFF_STATES as readonly string[]).includes(offer.state)
+        ? `/app/sessions/${offer.sessionId}/dispatch` : undefined,
       lines: [offerPhrase(offer)],
     };
   });
@@ -813,6 +821,9 @@ async function renderDetail(
 
   await ensureRail(db, f.user, f.team.slug, f.project.slug);
   const execution = await executionRows(db, f.team.slug, links);
+  const managedExecution = await workExecutions(db, f.user.id, {
+    teamId: f.team.id, projectId: f.project.id, workId: detail.id,
+  }, c.req.query('execution'));
   const members = await membersOf(db, f.team.id);
   const page = (refused: Refused | undefined) => (
     <WorkDetailPage
@@ -822,6 +833,7 @@ async function renderDetail(
       work={detail}
       evidence={evidence as Rec}
       execution={execution}
+      managedExecution={managedExecution}
       criteriaRows={(revision?.criteria ?? []).map((criterion) =>
         rowFromCriterion({
           id: criterion.id,

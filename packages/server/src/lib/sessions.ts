@@ -16,6 +16,7 @@ import {
 } from 'drizzle-orm';
 import { rowsAffected, type Db } from '../db';
 import { agentInstallations, agentReadState, debugSessions, handoffs, memberships, messages, readState, teams, tokens, users } from '../db/schema';
+import { lockExecutionWorkspace } from '../domain/execution';
 
 /** Framing prepended to session/inbox tool output so agents treat peer messages as data. */
 export const UNTRUSTED_NOTICE =
@@ -146,6 +147,15 @@ export async function sessionForMember(db: Db, sessionId: string, userId: string
     .where(eq(debugSessions.id, sessionId))
     .limit(1);
   return rows[0];
+}
+
+export async function deleteWorkspaceSessions(db: Db, teamId: string) {
+  // The caller's transaction retains the execution workspace fence while it
+  // also deletes the projects and targets that live beyond these sessions.
+  await lockExecutionWorkspace(db, teamId);
+  // Lock each thread before cascading to messages, cursors and tracked
+  // questions. A reply holds the thread lock before locking its question.
+  await db.delete(debugSessions).where(eq(debugSessions.teamId, teamId));
 }
 
 export async function markRead(db: Db, userId: string, sessionId: string, origin?: string | null, messageId?: string): Promise<void> {

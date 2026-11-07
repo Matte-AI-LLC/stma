@@ -517,13 +517,16 @@ describe('the list', () => {
       ),
     );
     await step(lead, betaWork.work_id, 'transition', { to: 'ready' });
-    await step(lead, betaWork.work_id, 'set_blocker', { kind: 'other', reason: 'Waiting on legal.', next_action: 'Chase legal.' });
+    await step(lead, betaWork.work_id, 'set_blocker', { kind: 'other', reason: 'Waiting on legal.', next_action: 'Chase legal.', owner: 'bob' });
 
     const html = await page('/app/teams/work-console/work', bobCookie);
     expect(litRail(html)).toEqual(['Work']);
     expect(html).toContain('Waiting for a decision');
     expect(html).toContain('Review four');
     expect(html).toContain('Yours to decide');
+    const personal = (content: string) => /id="needs-your-action"([\s\S]*?)<\/section>/.exec(content)?.[1];
+    expect(personal(html)).toContain('Review four');
+    expect(personal(html)).toContain('Your blocker');
     // Bob accepts the beta work too, so it is his, and it is blocked: both projects appear.
     expect(html).toContain('Beta only');
     expect(html).toContain('/app/teams/work-console/projects/beta/work/WORK-1');
@@ -534,6 +537,7 @@ describe('the list', () => {
     const dave = await page('/app/teams/work-console/work', daveCookie);
     expect(dave).toContain('You own or accept nothing that is open.');
     expect(dave).toContain('Review four');
+    expect(personal(dave)).toContain('Nothing needs your action here.');
   });
 });
 
@@ -904,6 +908,10 @@ describe('the decision', () => {
 
   it('offers the panel to the acceptor and to nobody else', async () => {
     const bobs = await page(url(), bobCookie);
+    const card = /id="delivery-review"([\s\S]*?)<\/section>\s*<div class="card-pad wk-prose" id="delivery-decisions"/.exec(bobs)?.[1];
+    for (const label of ['report.pdf', 'a'.repeat(64), 'Evidence for this delivery', 'Your decision', 'id="decision"']) {
+      expect(card).toContain(label);
+    }
     expect(bobs).toContain('Your decision');
     expect(bobs).toContain('id="decision"');
     expect(bobs).toContain('Human checks');
@@ -1878,7 +1886,7 @@ describe('lists a page cuts short', () => {
     expect(html.includes('class="pill pill-muted">pass</span>')).toBe(true);
     expect(html).toContain('These are the newest 50 evidence rows of the current delivery; more are recorded against');
     expect(html).toContain('These are the newest 50 decisions; earlier ones are kept and not listed here.');
-    expect(html).toContain('every row of its evidence, including the rows the Evidence card does not list');
+    expect(html).toContain('every row of its evidence, including rows this card does not list');
     expect(html).not.toContain('evidence shown here');
   });
 });

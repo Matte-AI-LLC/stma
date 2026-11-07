@@ -41,6 +41,7 @@ import {
 } from '../lib/authenticatorResets';
 import { hashPassword, randomHex } from '../lib/crypto';
 import { TEST_EMAIL_DOMAIN, TEST_ACCOUNT_LOCKED } from '../lib/testAccounts';
+import { createTestParticipants } from '../lib/testParticipants';
 import { DEMO_WORKSPACE, seedDemoWorkspace } from '../domain/demoWorkspace';
 import {
   ACTIVATION_COHORT_MAX,
@@ -1390,7 +1391,7 @@ adminRoutes.get('/admin/beta', async (c) => {
         <Stat
           label="Would lose a feature"
           value={nfmt(losing.length)}
-          note="using something its landing plan does not carry"
+          note="recorded signs of a feature its landing plan does not carry"
           metric="beta-losing"
         />
         <Stat
@@ -1494,7 +1495,8 @@ adminRoutes.get('/admin/beta', async (c) => {
               does not lift it, so the sweep already keeps each workspace's own rule — free's 90
               days, or what the plan you gave it keeps, and unsetting the flag deletes nothing. Run
               evidence is on every plan, so its square reads kept on every row and the flip closes
-              none of it.
+              none of it. Fleet signs include recent runs, enabled worker targets and queued jobs;
+              an enabled target alone does not prove that a worker has run.
             </div>
           </div>
         </div>
@@ -3189,6 +3191,38 @@ adminRoutes.post('/admin/test-accounts', async (c) => {
   </AppLayout>);
 });
 
+adminRoutes.post('/admin/users/:id/test-participants', async (c) => {
+  const actor = c.get('user')!;
+  const env = c.get('env');
+  const id = c.req.param('id');
+  if (!UUID_RE.test(id)) return c.notFound();
+  const back = (message: string) => c.redirect(`/admin/users/${id}?error=${encodeURIComponent(message)}`);
+  if (!env.localAuth) return back('Password sign-in must be enabled before creating test participants.');
+  const body = await c.req.parseBody();
+  const requested = typeof body.count === 'string' && /^[1-5]$/.test(body.count) ? Number(body.count) : 0;
+  try {
+    const result = await createTestParticipants(c.get('db'), {
+      ownerId: id, actorId: actor.id, count: requested,
+      reserved: (username, email) => reservedUsername(env, username) || isAdminEmail(env, email),
+    });
+    logLine({ evt: 'admin', a: 'test_participants_created', u: actor.username, count: result.participants.length });
+    c.header('Cache-Control', 'private, no-store');
+    return c.html(<AppLayout user={actor} active="admin" title="Test participants created">
+      <h1 class="title">Test participants created</h1>
+      <p class="sub">These simulated people can only join the selected test workspace through its ordinary invite flow. They have no membership yet. They are not verified mailboxes or real customer acceptance.</p>
+      <p class="sub">Save the passwords privately now; they are shown once. Access expires after {reviewAccessLastDay(result.until)} UTC. Each account can be disabled separately from its operator page.</p>
+      <div class="card card-pad" data-test-workspace={result.workspace.id}>{result.participants.map(participant => <dl class="kv" data-test-participant={participant.id}>
+        <dt>Sign-in</dt><dd data-test-email>{participant.email}</dd>
+        <dt>Password</dt><dd><code data-test-password>{participant.password}</code></dd>
+        <dt>Manage</dt><dd><a href={`/admin/users/${participant.id}`}>Manage test participant</a></dd>
+      </dl>)}</div>
+      <a class="btn" href={`/admin/users/${id}`}>Back to test owner</a>
+    </AppLayout>);
+  } catch (error) {
+    return back(error instanceof SecurityRefusal ? error.message : 'The participants could not be created. No partial accounts were kept.');
+  }
+});
+
 adminRoutes.post('/admin/users/:id/test-presentation', async (c) => {
   const actor = c.get('user')!;
   const db = c.get('db');
@@ -3511,6 +3545,12 @@ adminRoutes.get('/admin/users/:id', async (c) => {
         </form>
         <form class="inline" method="post" action={`/admin/users/${account.id}/test-access`} data-confirm="Disable this test account and revoke every browser session and agent credential?"><input type="hidden" name="action" value="disable" /><button class="btn btn-danger" type="submit">Disable test account</button></form>
         <form class="inline" method="post" action={`/admin/users/${account.id}/test-access`} data-confirm="Generate a new password? The current password stops working; every browser session and agent credential is revoked."><input type="hidden" name="action" value="rotate" /><button class="btn" type="submit">Generate new test password</button></form>
+        {testWorkspace && workspaceRows.some((row) => row.team.id === testWorkspace.id && row.role === 'owner') ? <form method="post" action={`/admin/users/${account.id}/test-participants`} style="margin-top:20px" data-confirm="Create simulated people confined to this isolated workspace? No memberships are added; use the ordinary invite flow.">
+          <div class="card-title">Team simulation participants</div>
+          <p class="small muted">Create up to five additional test identities for this workspace. Each has a separate one-time password and the owner's current expiry. Ordinary invites, plan limits and human-seat accounting still apply. Use Stripe test mode for billing simulations.</p>
+          <label class="field"><span>New participants</span><input class="in" type="number" name="count" min="1" max="5" value="5" required /></label>
+          <button class="btn" type="submit">Create test participants</button>
+        </form> : null}
         {testWorkspace ? <form method="post" action={`/admin/users/${account.id}/test-presentation`} style="margin-top:20px">
           <div class="card-title">Presentation names</div>
           <p class="small muted">Name the person, workspace and projects independently. This changes their visible names, not sign-in, access, expiry, stable links or existing connections.</p>

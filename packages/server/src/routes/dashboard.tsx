@@ -16,7 +16,6 @@ import {
   environmentBaselines,
   invites,
   memberships,
-  messages,
   mfaChallenges,
   policyBundles,
   policyReceipts,
@@ -46,6 +45,7 @@ import {
   sessionsFor,
   type BrowserSession,
 } from '../auth/session';
+import { deleteWorkspaceSessions } from '../lib/sessions';
 import { checkUserCode, CODE_TTL_MINUTES, issueAuthCode } from '../auth/codes';
 import {
   authenticatorStatus,
@@ -69,6 +69,8 @@ import {
   type DeviceSummary,
 } from '../lib/devices';
 import { effectiveLimits, effectivePlanLabel } from '../lib/entitlements';
+import { workspaceWorkOverview } from '../lib/workspaceWorkOverview';
+import { WorkspaceWorkOverview } from '../ui/WorkspaceWorkOverview';
 import { hitCounter } from '../lib/counters';
 import { humanMembership } from '../lib/seats';
 import type { AppCapabilities } from '../extensions';
@@ -1043,6 +1045,7 @@ async function renderTeamPage(c: Context<AppEnv>, refused?: InviteRefusal) {
   const notice = c.req.query('ok');
   const limits = await effectiveLimits(db, team, env.hosted);
   const planLabel = effectivePlanLabel(team.plan, limits);
+  const workOverview = tab === 'overview' ? await workspaceWorkOverview(db, user.id, team.id, c.req.query('work_view')) : null;
 
   // Only an owner can see or change it, and even they never get the token back.
   const github = role === 'owner' ? await githubForTeam(db, team.id) : undefined;
@@ -1178,6 +1181,8 @@ async function renderTeamPage(c: Context<AppEnv>, refused?: InviteRefusal) {
           </a>
         ))}
       </div>
+
+      {workOverview ? <WorkspaceWorkOverview teamSlug={team.slug} data={workOverview} /> : null}
 
       <div class={tab === 'overview' ? 'grid2' : 'col'}>
         <div class="col">
@@ -2148,16 +2153,8 @@ dashboardRoutes.post('/app/teams/:slug/delete', async (c) => {
       `/app/teams/${found.team.slug}?tab=settings&error=${encodeURIComponent(deletion.message)}`,
     );
   }
-  // Explicit ordered deletes: children before the rows they reference, so the
-  // wipe is correct regardless of FK cascade configuration.
   await db.transaction(async (tx) => {
-    const teamSessionIds = tx
-      .select({ id: debugSessions.id })
-      .from(debugSessions)
-      .where(eq(debugSessions.teamId, teamId));
-    await tx.delete(readState).where(inArray(readState.sessionId, teamSessionIds));
-    await tx.delete(messages).where(inArray(messages.sessionId, teamSessionIds));
-    await tx.delete(debugSessions).where(eq(debugSessions.teamId, teamId));
+    await deleteWorkspaceSessions(tx, teamId);
     await tx.delete(snapshots).where(eq(snapshots.teamId, teamId));
     await tx.delete(activity).where(eq(activity.teamId, teamId));
     await tx.delete(invites).where(eq(invites.teamId, teamId));

@@ -997,6 +997,36 @@ docsRoutes.get('/docs', (c) => {
                 downloads as a versioned <code>export.json</code>.
               </p>
               <p class="m0 small">
+                The work detail page keeps its managed execution history with that work: up to five
+                authorized jobs, with links to each assignment thread, run and execution record.
+                Dispatch opens the exact work item and selected job. Queue admission, a worker-observed
+                runtime start, a cancellation request and a worker-reported stop are separate facts.
+                Worker heartbeat readiness is distinct from whether a target is eligible or capable
+                for a particular queue request. The existing Work queue adds actionable execution
+                blockers and statuses; it is not a separate execution dashboard.
+              </p>
+              <p class="m0 small">
+                On an open assignment pinned to current executable Work, its owner, acceptor or a
+                workspace owner can ask the named installation a tracked question. Up to five may
+                await a reply, with a 4,000-character limit per question. The named authorized agent
+                reads one with <code>get_session</code> and its exact <code>work_question_id</code>, then
+                answers with <code>post_message</code> and <code>reply_to_message_id</code>. A managed
+                target answers only through its current authorized attempt; analyst credentials and
+                read-only Codex targets cannot answer. Thread text retains its existing shared
+                visibility, and people with thread access can see question status there. In MCP, only
+                the named installation receives tracking metadata and can use the exact lookup. The
+                <b>Included in context</b> marker means STMA prepared a tool result containing that
+                question for the installation; it does not prove delivery, display, reading or
+                comprehension. Exact question reads do not move the ordinary message cursor, and
+                pending IDs alone or questions omitted from the final result create no inclusion
+                receipt. Ordinary reads can record inclusion when the question is returned to its
+                recipient. Only one answer is accepted; retrying the
+                same answer is idempotent, and deleting its content leaves an answered record. A
+                question does not dispatch a job, and questions or
+                answers do not change Work version, lifecycle or evidence. Ordinary messages stay
+                unchanged.
+              </p>
+              <p class="m0 small">
                 <b>From an agent</b>, eight tools (<a href="#tools-work">tool reference</a>) and their
                 REST twins. Every write takes a new <code>request_id</code>, and a change to an existing
                 item the <code>expected_version</code> you read: the same request id again is answered
@@ -1103,13 +1133,17 @@ docsRoutes.get('/docs', (c) => {
                 membership, project and enterprise identity checks still apply.
               </p>
               <p class="m0 small muted" id="work-managed-analyst">
-                Managed analysis requires an operator-configured Azure profile and explicit
-                workspace-owner activation; it remains disabled until configured. Each report starts
+                Managed analysis uses an operator-configured Azure profile or, where key setup is
+                enabled, an owner's encrypted project Azure key. On the project's Analyst page,
+                connect the key, select an approved model and price, set an estimated cost ceiling,
+                and explicitly enable the profile. Each report starts
                 only after a person submits a request; it uses at most ten recent work items with
-                bounded, potentially partial context. Azure usage is billed separately, and the request allowance is not a dollar
-                cap. Reports link to their source work and state limitations; they do not accept work
-                or verify provider evidence. There is no scheduled analysis. Profile setup is
-                operator-managed; customers cannot upload a provider key.
+                bounded, potentially partial context. Azure bills usage separately. The owner can see
+                settled estimates, active reservations and unresolved holds. Unknown usage keeps its
+                reservation; the ceiling is not an Azure invoice cap. Connecting checks catalog access;
+                confirm the deployment's model and rates in Azure. Replacing a key disables analysis
+                until enabled again. Reports link to sources and state limitations; they do not accept
+                work or verify provider evidence. There is no scheduled analysis.
               </p>
             </div>
 
@@ -1121,7 +1155,8 @@ docsRoutes.get('/docs', (c) => {
                 <li>No automatic refresh of a GitHub issue: a person reads it again from the work.</li>
                 <li>The per-user worker service is experimental and opt-in: installation requires <code>stma worker service-install --apply</code>; it does not wake a machine or fall back to hosted execution. Inert service lifecycle checks passed on Windows and macOS; live worker operation on these services and Linux native lifecycle remain unaccepted. The Codex runtime requires Windows, the complete CLI 0.166.0 package, separately provisioned elevated sandbox support and an explicit <code>--model MODEL_ID</code>. Use a dedicated Windows host or VM: provisioning can invalidate another Codex home's sandbox credentials. Doctor withholds setup instructions when another known home is detected. Status shows the requested model; it is not a cost cap. Its prompt permits local read-only offline commands to inspect the dedicated checkout and carry out read-only assignment steps within existing sandbox permissions. STMA MCP access remains limited to scoped read-only tools. Generic instructions about assignment lifecycle are reference text; the supervisor owns run tracking, and the child cannot change Work or handoff state. This adds no file or network access. Two consecutive controlled Windows GPT-6 Sol read-only analysis runs passed with process cleanup. A separate active-cancellation check passed fail-closed checks: it stopped the process and revoked its child credential, but left the execution <code>dispatch_unknown</code>, quarantined the target, retained the owner lock and recorded no completed run or delivery. This does not establish ordinary Codex connect, OAuth or credential-store acceptance, live OS service-worker operation, customer acceptance or production acceptance. The runtime remains experimental.</li>
                 <li>Windows Codex execution requests also have a launch-size limit. Oversized requests are refused before that execution's launcher starts; this limit does not cap model tokens, tool calls or cost. Codex requests the provider's standard service tier, which is also not a spending cap.</li>
-                <li>The managed analyst is operator-profiled, request-only and disabled until configured. There is no scheduler.</li>
+                <li>The managed analyst is request-only and disabled until credentials, approved prices, estimated cost limits and project activation are configured. There is no scheduler or included provider credit.</li>
+                <li>STMA returns a managed worker's tool result after its final access check and database commit. Expired organization access is refused even if the request waited for a lock. Managed execution still requires explicit opt-in.</li>
               </ul>
             </div>
           </section>
@@ -1248,11 +1283,11 @@ docsRoutes.get('/docs', (c) => {
                 </tr>
                 <tr id="tool-get_session">
                   <td class="mono">get_session</td>
-                  <td>Read a thread (marks it read for you).</td>
+                  <td>Read a thread and advance the ordinary read cursor. An exact <code>work_question_id</code> reads that tracked question for the named assignment installation without advancing that cursor; only questions actually included in the prepared tool result for their recipient are marked included. Pending IDs alone create no inclusion receipt. Thread text keeps its existing shared visibility.</td>
                 </tr>
                 <tr id="tool-post_message">
                   <td class="mono">post_message</td>
-                  <td>Typed reply: question · answer · hypothesis · info-request · resolution · note (the default).</td>
+                  <td>Typed reply: question · answer · hypothesis · info-request · resolution · note (the default). On a tracked Work question, set <code>reply_to_message_id</code> to its message id to post the single idempotent answer. This is available only to the named authorized installation; ordinary messages are unaffected.</td>
                 </tr>
                 <tr id="tool-resolve_session">
                   <td class="mono">resolve_session</td>
@@ -1504,6 +1539,10 @@ docsRoutes.get('/docs', (c) => {
                     assignments, deliveries and their evidence. Every write takes a request id and the
                     version it was read at. Titles, goals and reasons are data written by people and
                     agents. No agent door can accept work: a decision is a person's, made in the console.
+                    The workspace home page adds open counts and the oldest 20 matching items across
+                    up to 100 projects, with decision, blocked, ready and in-progress views. Truncation
+                    is disclosed; project links open the complete lists. The existing Work queue keeps
+                    personal and decision queues together. An old update does not prove an agent stopped.
                   </div>
                 </div>
               </div>
@@ -1551,7 +1590,7 @@ docsRoutes.get('/docs', (c) => {
               <table class="tbl">
                 <tr><th>Tool</th><th>What it does</th></tr>
                 <tr id="tool-list_execution_targets"><td class="mono">list_execution_targets</td><td>Returns up to 50 visible managed execution targets and their worker readiness. Optional <code>project_id</code> narrows the list. Results include runtime, permission profile, configured limits, last worker heartbeat, readiness and reason. Readiness requires a fresh worker heartbeat; an ordinary MCP contact is not enough.</td></tr>
-                <tr id="tool-dispatch_work"><td class="mono">dispatch_work</td><td>Requests execution of an existing assignment session on one target with a request ID: <code>target_id</code>, <code>session_id</code> and <code>request_id</code>. The local worker may start Claude and consume the configured API account usage. Repeating the same request ID and payload returns the same job. A queued response confirms only that STMA recorded the request; check <code>get_execution</code> for an observed start.</td></tr>
+                <tr id="tool-dispatch_work"><td class="mono">dispatch_work</td><td>Requests execution of an existing assignment session on one target with a request ID: <code>target_id</code>, <code>session_id</code> and <code>request_id</code>. The local worker may start its configured runtime and consume the configured API account usage. A Native Work assignment must retain its original work and contract revision; after correcting its link, create a new assignment. Workers recheck that link before claiming and during execution. Repeating the same request ID and payload returns the same job. A queued response confirms only that STMA recorded the request; check <code>get_execution</code> for an observed start.</td></tr>
                 <tr id="tool-get_execution"><td class="mono">get_execution</td><td>Returns one job by <code>execution_id</code>, its current attempt and run link, and optionally its five most recent event summaries with <code>include_events</code>. States distinguish queued, starting, running, needs_input, cancel_requested, succeeded, failed, cancelled, dispatch_unknown and lost. A worker report is not provider verification, delivery evidence or acceptance.</td></tr>
                 <tr id="tool-cancel_execution"><td class="mono">cancel_execution</td><td>Requests cancellation of one execution by <code>execution_id</code>. The response may remain <code>cancel_requested</code> until a worker reports the process stopped; a request is not proof that it stopped. An ambiguous or uncontained stop keeps the checkout quarantined.</td></tr>
               </table>
@@ -2394,6 +2433,8 @@ docsRoutes.get('/docs', (c) => {
                   feature and none of the plan limits except the one on how long history is kept,
                   and its Plan &amp; billing page says so. The rest of this section is how billing
                   works once pricing starts.
+                  {' '}The <a href="/pricing">plan comparison</a> stays readable; checkout and
+                  evaluation enrollment stay closed during beta.
                 </p>
               ) : null}
               <div class="card card-pad">
@@ -2402,12 +2443,33 @@ docsRoutes.get('/docs', (c) => {
                   <b>Plan &amp; billing</b> page under Workspace settings in the rail, where its
                   owner buys and manages the plan. Checkout
                   and payment details stay on Stripe-hosted pages; STMA changes entitlement only
-                  after a signed webhook confirms the subscription's current state. Cancellation
-                  stays active through the paid period. Plan and billing-interval changes keep
-                  Team's included-seat formula inside STMA and remain pending when Stripe needs
+                  after a signed webhook confirms the subscription's current state. Plan &amp; billing
+                  shows the cancellation schedule, including the date when Stripe provides it.
+                  Scheduling the cancellation leaves the current plan in place. Plan and
+                  billing-interval changes keep Team's included-seat formula inside STMA and remain
+                  pending when Stripe needs
                   payment action. A failed payment is shown as a warning during the collection
                   grace period. Stripe may add applicable tax at Checkout according to the product
                   classification and customer location; the plan cards show the base USD price.
+                </p>
+                <p class="m0 small" style="margin-top:10px">
+                  Native Work, the workspace summary and run evidence are available on every plan.
+                  Managed local dispatch requires full fleet access (Solo or above on metered hosting),
+                  an enabled target and its machine and foreground worker running. Provider model usage
+                  and dedicated compute are separate charges. Team owners can set target dispatcher
+                  allowlists and workspace execution capacity in Agent connections. From an assignment
+                  thread, use Review execution target and Confirm and queue execution to request a
+                  worker explicitly. Analyst Azure key setup is available only where enabled by the
+                  operator; no plan includes a model-usage allowance.
+                  Once beta ends, the cardless Team evaluation lasts 14 days for up to 3 humans and
+                  1 project, once per account. It never starts billing automatically and preserves
+                  existing data read-only on expiry.
+                </p>
+                <p class="m0 small" style="margin-top:10px">
+                  Queued and uncertain jobs reserve workspace capacity. For a quarantined lost or
+                  dispatch_unknown execution, the owner can open its detail, verify the local process
+                  tree has stopped and record a reason to release that reservation. This is a visible
+                  owner assertion; the execution remains uncertain and the checkout remains quarantined.
                 </p>
                 <p class="m0 small" style="margin-top:10px">
                   See the public <a href="/pricing">pricing page</a>. Configured organizations

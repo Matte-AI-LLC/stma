@@ -59,6 +59,7 @@ jobs:
         run: |
           npx tsc -p acceptance/agent-worker/tsconfig.json
           npx tsx --test acceptance/agent-worker/api-support.test.ts acceptance/agent-worker/codex-support.test.ts acceptance/agent-worker/codex-native-containment.test.ts acceptance/agent-worker/codex-fixture.test.ts acceptance/agent-worker/codex-proxy.test.ts acceptance/agent-worker/codex-lifecycle.test.ts acceptance/agent-worker/codex-native-exit.test.ts acceptance/agent-worker/codex-process.test.ts acceptance/agent-worker/codex-native-exec.test.ts acceptance/agent-worker/codex-native-mcp.test.ts
+          npx tsx --test acceptance/agent-worker/work-question-trace.test.ts
       - run: node --test scripts/ci-status.test.mjs
       - if: hashFiles('ee/package-lock.json') != ''
         run: npm test --prefix ee

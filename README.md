@@ -117,7 +117,7 @@ Use a dedicated Git checkout bound to the intended project's repository. Install
 CLI containing the worker commands:
 
 ```
-npm install -g @matteai/stma@0.21.0
+npm install -g @matteai/stma@0.23.0
 ```
 
 From the project's **Agent connections** page, create a Claude Code connect command and run it in
@@ -140,6 +140,18 @@ and a fresh `request_id`. Assignment alone does not start a worker. Poll `get_ex
 returned `execution_id` to see whether the job started and its reported state. Use
 `cancel_execution` to request cancellation; check the resulting state because a request does not
 prove the process stopped.
+
+You can also open the assignment's thread in the console, choose **Review execution target**,
+review the dedicated checkout, runtime, permissions and limits, then **Confirm and queue execution**.
+The worker must still claim the request before it is running. Team workspace owners can set a
+workspace execution capacity and a dispatcher allowlist for each target in **Agent connections**.
+The installation owner still controls target enablement. Queued and uncertain jobs reserve capacity;
+an uncertain stop requires recovery before the checkout can be reused. Restricting a dispatcher
+cancels their queued requests and asks active executions to stop; it does not prove they stopped.
+For a quarantined `lost` or `dispatch_unknown` execution, an owner can inspect its detail, verify
+the local process tree stopped, and record a reason to release its workspace capacity reservation.
+The page shows who made that assertion. It preserves the uncertain execution state and checkout
+quarantine; it is not a worker-observed exit or permission to reuse that checkout.
 
 The worker verifies API-key authentication in an isolated configuration directory; subscription
 login is not accepted. It follows the assignment's current state, and unavailable required Native
@@ -411,9 +423,12 @@ a deployment until that build is released and its environment-specific gates pas
   package inside a byte budget; `get_work_changes` returns what entered, changed in and left a
   filter since a signed cursor. A work item can start from, or reference, a GitHub issue that STMA
   only reads. Your MCP analyst can use a project-scoped credential with a closed read-only tool
-  catalog. The separate, private managed analyst requires an operator-configured Azure profile;
-  after setup, a workspace owner can enable it and a person can request a
-  bounded report. Provider usage is billed separately and the request quota is not a dollar cap.
+  catalog. The separate, private managed analyst supports operator-configured Azure profiles and,
+  where enabled by the operator, an owner's encrypted project Azure key. After configuring an
+  approved model/price and estimated cost ceiling, the owner enables analysis and a person requests
+  each bounded report. Azure usage is billed separately. Reservations and reported token usage are
+  visible to the owner; the ceiling is an admission limit based on approved rates, not an Azure
+  invoice cap. Unknown usage keeps its reservation.
   Both kinds of analyst report sources and limitations; neither accepts work or verifies provider
   evidence. An analyst answers
   "what is waiting for my decision?", "which delivery's evidence is stale?" and "which dependency
@@ -421,7 +436,32 @@ a deployment until that build is released and its environment-specific gates pas
   not see; a connection limited to one project sees no count, key or title of another. Work sends
   no "waiting for you" email yet and writes to no tracker. It is included on every plan; the hosted
   service caps a project at 5,000 work items, 200 deliveries per item and 500 evidence rows per
-  delivery as a safety limit.
+  delivery as a safety limit. STMA returns a managed worker's MCP result only after its final
+  access check and database commit. Organization proof expiry is evaluated when that check runs,
+  including after any wait for a lock. Ordinary MCP keeps its existing transport, and managed
+  execution still requires explicit opt-in.
+
+  A work item's existing execution area shows up to five authorized managed jobs, with links
+  to their assignment thread, run and execution record.
+  Dispatch returns to that exact work item and job. The display keeps queueing, worker-observed
+  runtime start, cancellation request and worker-reported stop distinct; heartbeat readiness is
+  separate from queue eligibility and target
+  capability. The existing Work queue adds **Needs your action** for the named acceptor's
+  decisions, owned blockers and owned execution jobs needing input or reconciliation.
+  On an open assignment pinned to current executable Work, its owner, acceptor or workspace owner
+  can ask the named installation a tracked question (up to five unanswered questions, 4,000
+  characters each). Thread text keeps its existing shared visibility, and people with access to the
+  thread can see question status there. In MCP, only the named, currently authorized installation
+  receives tracking metadata or uses the exact-question lookup and answer path. A managed target
+  answers only in its current authorized attempt. Analyst credentials and
+  read-only Codex targets cannot answer.
+  The server marks a question included only when it prepared a tool result containing it; that
+  does not prove delivery, reading or comprehension. Exact question reads do not advance the ordinary thread
+  cursor. A pending ID alone or a question omitted from the final result creates no inclusion
+  receipt; ordinary reads can record inclusion when the question is actually returned to its
+  recipient. Answers are one-per-question and idempotent;
+  deleting answer content leaves an answered tombstone. Asking does not start a job, and answering
+  does not change Work version, lifecycle or evidence. Ordinary messages remain ordinary messages.
 - **Knowledge Hub** (`/app/teams/<slug>/knowledge`): versioned decisions, domain facts, procedures,
   references and known solutions with workspace or selected-project audiences. Agents and owners
   may create immutable drafts; only a workspace owner publishes, supersedes, archives or withdraws
@@ -849,10 +889,14 @@ nothing to do and touches nothing.
 **The hosted service is in a public beta and nothing is for sale yet.** Signing up needs an email
 address and nothing else; every workspace has every feature and none of the plan limits on members,
 projects, integrations, snapshot devices, calls or handoffs, there is no card and no trial clock, and the plan pages say so
-rather than offering a checkout. History is the one exception, on purpose: the activity feed and
-the agent run trail keep Cloud Free's 90 days, so the end of the beta deletes nothing. The table
+rather than offering a checkout. History is the one exception: the activity feed and the agent
+run trail follow each workspace's stored plan (Cloud Free: up to 90 days; storage row caps apply).
+Ending beta alone does not shorten that retention. The table
 below is the pricing the beta is testing toward — read it as the plan, not as today's bill.
 Nothing switches off underneath an existing workspace without a conversation first.
+
+The public pricing page remains readable during beta so teams can compare the intended plans;
+checkout and the cardless evaluation stay closed while the beta flag is on.
 
 An instance you run yourself is unaffected either way. `SIGNUP_ACCESS_CODES` and `BETA_UNMETERED`
 are ordinary switches shipped in this source: the first makes signup invite-only without closing
@@ -864,17 +908,33 @@ lifting ceilings says neither, because by then somebody is paying.
 Hosted billing counts **humans**, never agents, devices, worktrees, sessions, calls or CI runs.
 Cloud Free is permanent rather than a trial clock. A one-human workspace can purchase Team before
 inviting its second human; current member count is not a checkout prerequisite.
+After Stripe confirms a scheduled cancellation, **Plan & billing** shows the schedule and its date
+when Stripe provides one. Scheduling the cancellation leaves the current plan in place.
 
 | Plan | Price | Human limit | Hosted service |
 | --- | --- | --- | --- |
 | Cloud Free | $0 | 1 | snapshots from 2 devices per 30 days, 90-day history, 3 handoffs/30 days, read-only fleet, run evidence and Markdown export |
 | Solo | $9/month or $90/year | exactly 1 | unlimited agents/devices/handoffs, governance, 1-year history, run evidence and Markdown export |
-| Team | $49/month or $490/year includes 5; then $12/month or $120/year per human | 2–50 | full collaboration, evidence, integrations and history |
+| Team | $49/month or $490/year includes 5; then $12/month or $120/year per human | up to 50; owner can buy before inviting | shared projects, governance, full fleet, integrations and history without an age cutoff; storage row caps still apply |
 | Enterprise | from $15K/year, annual contract | contract | operator-provisioned identity and limited audit capabilities; exact support and rollout agreed separately |
 
 Every plan reads and exports the evidence of runs its members can already see: the run page, its
 Markdown, the map's inspector and `get_evidence` answer one decision, and a downgrade removes none
 of it. Enterprise audit, identity enforcement and retention are separate from it.
+
+Native Work, the workspace Work queue and the home page's project summary are available on every
+plan. The summary shows open counts and the oldest 20 matching items across up to 100 projects,
+with decision, blocked, ready and in-progress views and links to the complete project lists.
+Managed local dispatch needs full fleet access (Solo or above on metered hosting), an explicitly
+enabled target, and its machine and foreground worker running. Model-provider charges and dedicated
+compute are separate from the subscription. Team adds owner-managed dispatcher allowlists and a
+workspace execution capacity. An operator may enable project Azure key setup for the private
+analyst; no subscription includes model-provider credit. Key setup, consent, an approved price and
+an estimated cost ceiling precede explicit project activation.
+
+Once beta ends, hosted accounts can start the implemented cardless Team evaluation: 14 days,
+up to 3 humans and 1 project, once per account. It never starts billing automatically, includes no
+model-provider credit, and preserves existing data read-only when it expires.
 
 Cloud Free's device ceiling counts the device labels one person pushed environment snapshots under
 in the last 30 days. A third is refused before anything is stored, the reply names the two that
@@ -886,8 +946,9 @@ Billing and managed-service operation belong to the hosted operator layer. Its o
 foundation implements configured OIDC sign-in, bounded SCIM Users provisioning, workspace/project
 roles and service identities; it is not included in the public server or enabled by a plan label.
 Provider-tenant acceptance and explicit rollout are still required. SAML, SCIM Groups, legal hold,
-residency and HA/SLA guarantees are not implemented by these controls. Limited signed audit exports
-are not comprehensive compliance evidence. A signed order may name a capability only after its
+residency and HA/SLA guarantees are not implemented by these controls. Audit exports are signed only
+when the operator configures a signing key. These limited exports are not comprehensive compliance
+evidence. A signed order may name a capability only after its
 implementation and acceptance criteria both exist. The hosted
 catalog classifies Solo as personal-use cloud SaaS and Team lines as business-use cloud SaaS so
 Stripe can apply the relevant product rules; applicable taxes remain separate from the listed price.

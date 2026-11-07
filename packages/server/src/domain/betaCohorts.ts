@@ -4,6 +4,8 @@ import {
   activity,
   agentRuns,
   environmentBaselines,
+  executionJobs,
+  executionTargets,
   memberships,
   policyBundles,
   projects,
@@ -198,6 +200,8 @@ export async function betaLedger(db: Db, limit = BETA_LEDGER_MAX): Promise<BetaL
     projectCounts,
     integrations,
     runs,
+    enabledWorkers,
+    queuedJobs,
     policies,
     baselines,
     savings,
@@ -226,6 +230,17 @@ export async function betaLedger(db: Db, limit = BETA_LEDGER_MAX): Promise<BetaL
       .from(agentRuns)
       .where(and(inArray(agentRuns.teamId, ids), gt(agentRuns.startedAt, since)))
       .groupBy(agentRuns.teamId),
+    db
+      .select({ id: executionTargets.teamId, v: count() })
+      .from(executionTargets)
+      .where(and(inArray(executionTargets.teamId, ids), eq(executionTargets.enabled, true)))
+      .groupBy(executionTargets.teamId),
+    db
+      .select({ id: executionTargets.teamId, v: count() })
+      .from(executionJobs)
+      .innerJoin(executionTargets, eq(executionJobs.targetId, executionTargets.id))
+      .where(and(inArray(executionTargets.teamId, ids), eq(executionJobs.state, 'queued')))
+      .groupBy(executionTargets.teamId),
     db
       .select({ id: policyBundles.teamId, v: count() })
       .from(policyBundles)
@@ -262,6 +277,8 @@ export async function betaLedger(db: Db, limit = BETA_LEDGER_MAX): Promise<BetaL
   const projectMap = byId(projectCounts);
   const integrationMap = byId(integrations);
   const runMap = byId(runs);
+  const workerMap = byId(enabledWorkers);
+  const queuedMap = byId(queuedJobs);
   const policyMap = byId(policies);
   const baselineMap = byId(baselines);
   const savingMap = byId(savings);
@@ -314,6 +331,8 @@ export async function betaLedger(db: Db, limit = BETA_LEDGER_MAX): Promise<BetaL
     ];
 
     const runCount = runMap.get(row.id) ?? 0;
+    const workerCount = workerMap.get(row.id) ?? 0;
+    const queuedCount = queuedMap.get(row.id) ?? 0;
     // Two separate records of the same entitlement: publishing a policy and
     // recording a baseline are both gated on `governance`, so either one being
     // there means the flip closes something.
@@ -323,12 +342,12 @@ export async function betaLedger(db: Db, limit = BETA_LEDGER_MAX): Promise<BetaL
     const measured: FeatureLoss[] = [
       {
         key: 'fleet',
-        label: 'Claiming ground',
-        state: runCount > 0 ? 'in_use' : 'no_sign',
+        label: 'Fleet and workers',
+        state: runCount + workerCount + queuedCount > 0 ? 'in_use' : 'no_sign',
         evidence:
-          runCount > 0
-            ? `${runCount} run${runCount === 1 ? '' : 's'} started in the last ${BETA_WINDOW_DAYS} days; start_run would be refused`
-            : `no run started in the last ${BETA_WINDOW_DAYS} days`,
+          `${runCount} run${runCount === 1 ? '' : 's'} started in the last ${BETA_WINDOW_DAYS} days; ` +
+          `${workerCount} enabled worker target${workerCount === 1 ? '' : 's'} and ${queuedCount} queued job${queuedCount === 1 ? '' : 's'}. ` +
+          'A plan without fleet access refuses new runs and dispatches; queued work cannot be claimed.',
       },
       {
         key: 'governance',

@@ -2,8 +2,8 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { EXECUTION_CHILD_TOOLS, EXECUTION_READONLY_TOOLS, CODEX_EXECUTION_RUNTIME } from '@bridge/shared';
 import { and, eq, isNull } from 'drizzle-orm';
 import type { Db } from '../db';
-import { executionAttemptGrants, executionAttempts, executionJobs, executionTargets, knowledgeContexts, runCheckpoints, workDeliveries, workItems, workProjectCounters } from '../db/schema';
-import { executionAuthority, executionRefuse, ExecutionRefusal, lockExecutionTarget, type ExecutionAttemptRow, type ExecutionJobRow, type ExecutionTargetRow } from '../domain/execution';
+import { debugSessions, executionAttemptGrants, executionAttempts, executionJobs, executionTargets, knowledgeContexts, runCheckpoints, workDeliveries, workItems, workProjectCounters } from '../db/schema';
+import { executionAuthority, executionRefuse, ExecutionRefusal, lockExecutionTarget, lockExecutionWorkspace, type ExecutionAttemptRow, type ExecutionJobRow, type ExecutionTargetRow } from '../domain/execution';
 import type { AgentGrant } from './grants';
 import { isCanonicalUuid } from './ids';
 
@@ -12,9 +12,21 @@ export interface ExecutionGrant {
   grantId: string; sessionId: string; workId: string | null; specRevision: number | null;
   readonlyChild: boolean;
 }
-const request = new AsyncLocalStorage<{ grant: AgentGrant; bound?: { target: ExecutionTargetRow; job: ExecutionJobRow; attempt: ExecutionAttemptRow } }>();
+type CommittedEffect = (db: Db) => Promise<void>;
+const request = new AsyncLocalStorage<{
+  grant: AgentGrant;
+  bound?: { target: ExecutionTargetRow; job: ExecutionJobRow; attempt: ExecutionAttemptRow };
+  committedEffects?: CommittedEffect[];
+}>();
 export const currentExecutionGrant = () => request.getStore()?.grant;
 export const currentExecutionBinding = () => request.getStore()?.bound;
+
+/** Run outside the attempt fence. A domain savepoint can still roll back with the request. */
+export async function afterExecutionCommit(db: Db, effect: CommittedEffect): Promise<void> {
+  const pending = request.getStore()?.committedEffects;
+  if (pending) pending.push(effect);
+  else await effect(db);
+}
 
 export async function resolveExecutionCredential(db: Db, hash: string) {
   const [row] = await db.select({ secret: executionAttemptGrants, attempt: executionAttempts, job: executionJobs, target: executionTargets })
@@ -31,12 +43,23 @@ export async function resolveExecutionCredential(db: Db, hash: string) {
 export async function validateExecutionGrant(db: Db, grant: AgentGrant) {
   const e = grant.execution;
   if (!e) executionRefuse('ATTEMPT_REQUIRED', 'Managed execution needs an attempt credential.');
+  if (!grant.teamId || !grant.projectId) return executionRefuse('STALE_ATTEMPT', 'The assigned execution scope is no longer available.');
+  await lockExecutionWorkspace(db, grant.teamId);
+  // Session deletion cascades to the job. Lock the assigned session before
+  // its job so reads and tracked replies cannot invert that order.
+  const [session] = await db.select({ id: debugSessions.id }).from(debugSessions)
+    .innerJoin(executionTargets, and(eq(executionTargets.id, e!.targetId), eq(executionTargets.teamId, debugSessions.teamId),
+      eq(executionTargets.projectId, debugSessions.projectId)))
+    .where(and(eq(debugSessions.id, e!.sessionId), eq(debugSessions.teamId, grant.teamId), eq(debugSessions.projectId, grant.projectId)))
+    .for('no key update', { of: debugSessions });
+  if (!session) return executionRefuse('STALE_ATTEMPT', 'The assigned execution scope is no longer available.');
   const target = await lockExecutionTarget(db, e!.targetId);
   const [job] = await db.select().from(executionJobs).where(eq(executionJobs.id, e!.jobId)).for('no key update');
   const [attempt] = await db.select().from(executionAttempts).where(eq(executionAttempts.id, e!.attemptId)).for('no key update');
   const [secret] = await db.select().from(executionAttemptGrants).where(eq(executionAttemptGrants.id, e!.grantId));
   if (!job || !attempt || !secret || secret.revokedAt || secret.expiresAt <= new Date() || attempt.leaseExpiresAt <= new Date() || attempt.deadlineAt <= new Date() ||
-      attempt.jobId !== job.id || job.targetId !== target.id || attempt.fence !== e!.fence || job.grantVersion !== e!.grantVersion ||
+      attempt.jobId !== job.id || job.targetId !== target.id || job.sessionId !== session.id ||
+      attempt.fence !== e!.fence || job.grantVersion !== e!.grantVersion ||
       secret.parentTokenId !== grant.tokenId || target.installationId !== grant.installationId || !['leased','starting','running'].includes(job.state)) {
     executionRefuse('STALE_ATTEMPT', 'The execution lease or attempt credential is no longer current. Stop this managed session.');
   }
@@ -46,10 +69,11 @@ export async function validateExecutionGrant(db: Db, grant: AgentGrant) {
 /** Fence spans the complete request, including the existing domain transaction/savepoint. */
 export async function withExecutionRequest<T>(db: Db, grant: AgentGrant, fn: (db: Db) => Promise<T>): Promise<T> {
   if (!grant.execution) return request.run({ grant }, () => fn(db));
-  return db.transaction(async transaction => {
+  const committedEffects: CommittedEffect[] = [];
+  const result = await db.transaction(async transaction => {
     const tx = transaction as unknown as Db;
     const bound = await validateExecutionGrant(tx, grant);
-    const value = await request.run({ grant, bound }, () => fn(tx));
+    const value = await request.run({ grant, bound, committedEffects }, () => fn(tx));
     // Final locks: a contract mutation cannot cross the last authorization read
     // and commit. Nothing below takes a non-Work row lock.
     if (bound.job.workId) {
@@ -62,6 +86,8 @@ export async function withExecutionRequest<T>(db: Db, grant: AgentGrant, fn: (db
     await executionAuthority(tx, bound.target, bound.job);
     return value;
   });
+  for (const effect of committedEffects) await effect(db);
+  return result;
 }
 
 const CHILD_TOOLS = new Set<string>(EXECUTION_CHILD_TOOLS);

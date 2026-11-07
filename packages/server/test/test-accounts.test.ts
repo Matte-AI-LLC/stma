@@ -6,7 +6,7 @@ import { and, eq } from 'drizzle-orm';
 import { afterAll, beforeAll, expect, it } from 'vitest';
 import { agentEnrollments, agentInstallations, invites, memberships, mfaChallenges, oauthClients, oauthRefreshTokens, projects, teams, tokens, userAuthenticators, users } from '../src/db/schema';
 import { createAgentEnrollment, redeemAgentEnrollment } from '../src/domain/enrollments';
-import { claimInviteMembership } from '../src/domain/invites';
+import { claimInviteMembership, createLinkInvite } from '../src/domain/invites';
 import { loadEnv } from '../src/env';
 import { isAdminUser } from '../src/lib/admin';
 import { randomHex, sha256hex } from '../src/lib/crypto';
@@ -382,4 +382,62 @@ it('refuses a test identity that somehow has an authenticator, with no session a
   expect(set).not.toMatch(/(^|\s)sid=[^;]/);
   expect(set).not.toMatch(/(^|\s)mfa=[^;]/);
   expect(await srv.db.select().from(mfaChallenges).where(eq(mfaChallenges.userId, account.id))).toHaveLength(0);
+});
+
+it('creates bounded simulated people with no memberships and uses an ordinary scoped invite', async () => {
+  const owner = await create('team-fixture');
+  const res = await post(`/admin/users/${owner.id}/test-participants`, { count: '5' }, operatorCookie);
+  expect(res.status).toBe(200);
+  expect(res.headers.get('cache-control')).toContain('no-store');
+  const html = await res.text();
+  const entries = [...html.matchAll(/data-test-participant="([a-f0-9-]+)"[\s\S]*?data-test-email[^>]*>([^<]+)<[\s\S]*?data-test-password[^>]*>([a-f0-9]{40})</g)];
+  expect(entries).toHaveLength(5);
+  const entry = entries[0]!;
+  const [participant] = await srv.db.select().from(users).where(eq(users.id, entry[1]!));
+  expect(participant).toMatchObject({ isTest: true, testWorkspaceId: owner.testWorkspaceId, emailVerifiedAt: null, reviewAccessUntil: owner.reviewAccessUntil });
+  expect(await srv.db.select().from(memberships).where(eq(memberships.userId, participant!.id))).toHaveLength(0);
+  const signed = await login(entry[2]!, entry[3]!, '31');
+  expect(where(signed)).toBe('/app');
+  const sid = cookie(signed);
+  expect((await get('/admin/users', sid)).status).toBe(404);
+  expect(where(await post('/app/teams', { name: 'Escaped fixture', slug: 'escaped-fixture' }, sid))).toContain('isolated workspace');
+  const invite = await createLinkInvite(srv.db, { teamId: owner.testWorkspaceId!, createdBy: owner.id, role: 'member', uses: '5' });
+  expect(await claimInviteMembership(srv.db, { code: invite.code, userId: participant!.id })).toMatchObject({ ok: true });
+  expect(await srv.db.select().from(memberships).where(eq(memberships.userId, participant!.id))).toMatchObject([{ teamId: owner.testWorkspaceId, role: 'member' }]);
+  const [foreign] = await srv.db.insert(teams).values({ name: 'Fixture foreign', slug: 'fixture-foreign' }).returning();
+  const other = await createLinkInvite(srv.db, { teamId: foreign!.id, createdBy: owner.id, role: 'member', uses: '1' });
+  expect(await claimInviteMembership(srv.db, { code: other.code, userId: participant!.id })).toEqual({ ok: false, reason: 'invalid' });
+  expect(where(await post(`/admin/users/${owner.id}/test-participants`, { count: '1' }, operatorCookie))).toContain('at most six');
+  expect(await (await get(`/admin/users/${participant!.id}`, operatorCookie)).text()).not.toContain(entry[3]!);
+});
+
+it('refuses fixture creation by nonoperators, cross-origin requests, expired owners or mixed workspaces', async () => {
+  const owner = await create('team-fixture-guard');
+  const route = `/admin/users/${owner.id}/test-participants`;
+  expect((await post(route, { count: '1' })).status).toBe(404);
+  expect((await post(route, { count: '1' }, cookie(await login(owner.email!, owner.password, '32')))).status).toBe(404);
+  expect((await post(route, { count: '1' }, operatorCookie, { origin: 'https://untrusted.example' })).status).toBe(403);
+  for (const count of ['0', '6', '1.5', '01', '-1']) {
+    expect(where(await post(route, { count }, operatorCookie))).toContain('between one and five');
+  }
+  await srv.db.update(users).set({ reviewAccessUntil: null }).where(eq(users.id, owner.id));
+  expect(where(await post(route, { count: '1' }, operatorCookie))).toContain('current access');
+  await srv.db.update(users).set({ reviewAccessUntil: owner.reviewAccessUntil }).where(eq(users.id, owner.id));
+  const [ordinary] = await srv.db.insert(users).values({ username: 'fixture-normal-person' }).returning();
+  await srv.db.insert(memberships).values({ userId: ordinary!.id, teamId: owner.testWorkspaceId!, role: 'member' });
+  expect(where(await post(route, { count: '1' }, operatorCookie))).toContain('containing test identities');
+  expect(await srv.db.select().from(users).where(eq(users.testWorkspaceId, owner.testWorkspaceId!))).toHaveLength(1);
+});
+
+it('rolls back fixture creation on audit refusal and serializes the six-identity ceiling', async () => {
+  const owner = await create('team-fixture-atomic');
+  const route = `/admin/users/${owner.id}/test-participants`;
+  refuseAudit = true;
+  try {
+    expect(where(await post(route, { count: '2' }, operatorCookie))).toContain('Test audit refused');
+  } finally { refuseAudit = false; }
+  expect(await srv.db.select().from(users).where(eq(users.testWorkspaceId, owner.testWorkspaceId!))).toHaveLength(1);
+  const attempts = await Promise.all([post(route, { count: '3' }, operatorCookie), post(route, { count: '3' }, operatorCookie)]);
+  expect(attempts.map(r => r.status).sort()).toEqual([200, 302]);
+  expect(await srv.db.select().from(users).where(eq(users.testWorkspaceId, owner.testWorkspaceId!))).toHaveLength(4);
 });
