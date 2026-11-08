@@ -790,7 +790,7 @@ The same commit reaches people through four artefacts, and they carry **one vers
 | --- | --- | --- |
 | Source | public snapshot, ELv2 | anyone reading or forking the code |
 | npm | `@matteai/stma-server`, `@matteai/stma` | self-hosters and `stma serve` |
-| Container | `ghcr.io/matte-ai-llc/stma` | self-hosters |
+| Container | `ghcr.io/matte-ai-llc/stma-server` (from 0.23.1) | self-hosters |
 | Hosted | stma.ai's composed service image | Matte AI operates it for customers |
 
 A `v*` tag publishes or deploys all four from one commit, and each workflow refuses a tag that
@@ -828,8 +828,12 @@ services needed; email codes stay off until you set `RESEND_API_KEY`). Or run th
 (one instance, data in a volume):
 
 ```bash
-docker run -d -p 3000:3000 -e NODE_ENV=production -e EMBEDDED_DB=1 -e BASE_URL=http://localhost:3000 -v stma-data:/app/packages/server/.data ghcr.io/matte-ai-llc/stma:latest
+docker run -d -p 3000:3000 -e NODE_ENV=production -e EMBEDDED_DB=1 -e BASE_URL=http://localhost:3000 -v stma-data:/app/packages/server/.data ghcr.io/matte-ai-llc/stma-server:latest
 ```
+
+The replacement registry package starts with 0.23.1. Its initial anonymous-access activation
+is a separate release check; until that is confirmed, use the Compose build above or npm below.
+Existing installations using an older image continue to run; change the image name when upgrading.
 
 Or straight from npm, with no container at all:
 
@@ -897,6 +901,9 @@ Nothing switches off underneath an existing workspace without a conversation fir
 
 The public pricing page remains readable during beta so teams can compare the intended plans;
 checkout and the cardless evaluation stay closed while the beta flag is on.
+If beta is restored after subscriptions have been sold, existing Stripe subscriptions and
+Team seat adjustments can still bill. The workspace owner retains the customer Portal link on
+Plan & billing for invoices, payment methods and cancellation; beta does not cancel a subscription.
 
 An instance you run yourself is unaffected either way. `SIGNUP_ACCESS_CODES` and `BETA_UNMETERED`
 are ordinary switches shipped in this source: the first makes signup invite-only without closing

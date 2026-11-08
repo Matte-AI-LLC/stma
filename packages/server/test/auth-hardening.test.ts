@@ -673,7 +673,8 @@ it('A12d: Account names each workspace and its plan, owners first', async () => 
   expect(card).toContain('<td>owner</td>');
   // The beta decides the label, as it does everywhere else a plan is printed.
   expect(card).toContain('<b>Beta</b>');
-  expect(card).toContain('nothing is billed and no card is on file');
+  expect(card).toContain('new subscriptions are unavailable');
+  expect(card).toContain('Existing Stripe subscriptions can continue billing');
   expect(card, 'no link to billing pages this server does not have').not.toContain('/plan"');
   expect(html, 'and the account menu leads to it').toContain('href="/app/account#plan"');
 });

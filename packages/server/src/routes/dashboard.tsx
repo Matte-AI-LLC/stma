@@ -395,7 +395,8 @@ const InviteCard = ({
       <div class="card-pad col" style="gap:14px">
         {beta ? (
           <p class="m0 small muted">
-            While the beta runs, a workspace can have any number of people and nothing is billed.
+            While the beta runs, a workspace can have any number of people. An existing Stripe subscription
+            can still renew and bill additional people; its owner manages billing on Plan &amp; billing.
           </p>
         ) : null}
         {priced ? (
@@ -3595,7 +3596,7 @@ const PlanCard = ({ user, plans, beta }: { user: User; plans: WorkspacePlans; be
         it. Using STMA on your own, that is simply your workspace. Its owners invite people from
         Members and invites.{' '}
         {beta
-          ? 'STMA is in beta, so every workspace has every feature, nothing is billed and no card is on file. When pricing starts, this is where a plan is bought and managed.'
+          ? 'STMA is in beta, so feature limits are lifted and new subscriptions are unavailable. Existing Stripe subscriptions can continue billing; their owners manage payment methods, invoices and cancellation on Plan & billing.'
           : user.plans === 'billing'
             ? 'An owner buys, changes or cancels a plan, and finds payment methods and invoices, on its Plan & billing page.'
             : 'On this server plans are set by its operator.'}

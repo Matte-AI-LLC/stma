@@ -2347,16 +2347,17 @@ export function helpSections(
           means: (
             <>
               STMA is in beta. Every workspace has every feature and none of the plan
-              limits, and plans are not for sale yet, so there is no billing to manage. History is
-              the one exception: kept for 90 days, as on Cloud Free, so the end of the beta deletes
-              nothing.
+              limits, and new plans are not for sale yet. Existing Stripe subscriptions and
+              additional Team seats can still bill. History follows the stored plan throughout
+              beta (90 days on Cloud Free); ending beta alone does not shorten retention.
             </>
           ),
           todo: (
             <>
-              Nothing. <b>Account</b> shows the plan of every workspace you are in; when pricing
-              starts, a workspace's owner buys and manages its plan from there, and you will hear it
-              from us first.
+              <b>Account</b> shows the plan of every workspace you are in. If the workspace
+              already has Stripe billing, its owner can open <b>Plan &amp; billing</b> to manage
+              payment methods, invoices and cancellation. Otherwise there is no payment action
+              to take during beta.
             </>
           ),
         },

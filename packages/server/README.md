@@ -106,8 +106,9 @@ Migrations run automatically on boot. The full table is in the repository README
 Plan limits only apply to the hosted service (`STMA_HOSTED=1`). An instance you run
 yourself is unmetered: the fleet, governance, evidence, savings and retention are all included.
 
-Docker and Compose files ship with the repository; `ghcr.io/matte-ai-llc/stma` is the same
-build as this package.
+Docker and Compose files ship with the repository. Starting with 0.23.1, the release image
+uses `ghcr.io/matte-ai-llc/stma-server`, built from the public source export. Until the new
+package's initial anonymous-access activation is confirmed, build with Compose or use npm.
 
 ## Licence
 

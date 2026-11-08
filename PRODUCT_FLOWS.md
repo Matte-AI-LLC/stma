@@ -1307,8 +1307,10 @@ is composed through the private operator layer; core code must not import it.
    the beta reads the same everywhere. A plan is the workspace's and its owner buys it; one person
    on their own owns exactly one workspace, and that row is their plan. From there, and from
    **Plan & billing** under the workspace rail's settings, an owner opens the Plan page and a
-   member views it. While the beta runs that page says there is nothing to pay, inside the
-   console, and still sells nothing.
+   member views it. While the beta runs that page sells nothing. A workspace with an existing
+   Stripe customer instead shows billing continuity: its owner can still open the customer
+   Portal for payment methods, invoices and cancellation. Beta does not stop existing renewals
+   or Team seat adjustments; new checkout, plan changes and evaluation enrollment stay closed.
 2. Checkout creates the first Solo/Team subscription. A one-human workspace may buy Team before
    inviting the second human; current membership is not a purchase prerequisite. Team entitlement
    then permits the documented 2–50-human collaboration range.

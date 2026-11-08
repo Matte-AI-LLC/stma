@@ -2426,8 +2426,7 @@ docsRoutes.get('/docs', (c) => {
                 and exports the evidence of runs its members can already see.
               </p>
               {env.betaUnmetered ? (
-                // The rest of this section describes buying, which the beta does not
-                // do: /help's "Nothing to pay yet" entry says the same thing.
+                // Beta closes new sales, but does not cancel existing Stripe subscriptions.
                 <p class="m0" style="max-width:72ch">
                   <b>Nothing is for sale while STMA is in beta.</b> Every workspace has every
                   feature and none of the plan limits except the one on how long history is kept,
@@ -2435,6 +2434,9 @@ docsRoutes.get('/docs', (c) => {
                   works once pricing starts.
                   {' '}The <a href="/pricing">plan comparison</a> stays readable; checkout and
                   evaluation enrollment stay closed during beta.
+                  {' '}If a workspace already has Stripe billing, its owner can still manage
+                  payment methods, invoices and cancellation through Plan &amp; billing.
+                  Existing subscriptions and additional Team seats can continue billing.
                 </p>
               ) : null}
               <div class="card card-pad">

@@ -906,7 +906,7 @@ export const Landing = ({ site, baseUrl }: { site: SiteInfo; baseUrl: string }) 
                   </div>
                   <p>
                     {beta
-                      ? `${betaDoor} STMA features are included with no STMA fees or card required. Local workers still require owner opt-in. `
+                      ? `${betaDoor} Joining beta requires no STMA subscription or card. Existing Stripe subscriptions can continue billing. Local workers still require owner opt-in. `
                       : 'The console, the MCP server, email notifications and integrations, operated for you. '}
                     Updates, backups kept for 30 days and support by email. There is no uptime commitment outside
                     a signed order. Plans are priced by the people, never by the agents. Model provider usage is billed
